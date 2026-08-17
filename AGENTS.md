@@ -58,6 +58,9 @@ uv run media-agent run                # 完整自治轮次
    见 [声明式规则 DSL](.agents/notes/implemented/architecture/2026-08-17-declarative-rule-dsl.md)。
 6. **订阅番剧必须走 AutoBangumi 自己的 API**，手动往 qBittorrent 加种子会丢
    `ab:` 标签、永久脱离自动改名管辖。
+7. **修订阅时三步顺序不能反**：先改 `title_aliases`/`rss_link` → 再清"已登记但
+   不在 qBittorrent"的 torrent 记录 → 最后刷新。`pull_rss` 只处理 `check_new()`
+   筛出的新条目，顺序反了会让 AutoBangumi 用**仍然失效**的规则把条目重新登记一遍。
 
 ## 自演进的闭环
 

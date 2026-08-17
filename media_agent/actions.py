@@ -72,13 +72,15 @@ class Executor:
     # 文件改名必须早于目录改名——目录一改，之前算出的文件路径全部失效。
     # 分类/标签不涉及路径，放最前无所谓；删除放最后，让前面的判断都基于完整状态。
     _OP_ORDER = {
-        "relink_torrent": 0,     # 先把失联种子接回来，后续规则才看得到它们
-        "retag": 1, "recategorize": 2, "delete_category": 3,
-        "write_nfo": 4,
-        "rename": 5,            # 先改文件名（此时目录名还是旧的，路径有效）
-        "relocate": 6,
-        "rename_show_dir": 7,   # 再改目录名，一次性带走里面所有文件
-        "trash": 8,
+        "fix_title_aliases": 0,  # 订阅失效则下游全部无从谈起，最先修
+        "write_sidecar": 10,     # 最后写档案，记录本轮结束后的最终状态
+        "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
+        "retag": 2, "recategorize": 3, "delete_category": 4,
+        "write_nfo": 5,
+        "rename": 6,            # 先改文件名（此时目录名还是旧的，路径有效）
+        "relocate": 7,
+        "rename_show_dir": 8,   # 再改目录名，一次性带走里面所有文件
+        "trash": 9,
     }
 
     # ---------------- 入口 ----------------
@@ -215,6 +217,80 @@ class Executor:
         self._audit("applied", f, a,
                     undo={"op": "recategorize", "torrent_hash": a.args["torrent_hash"],
                           "category": prev})
+
+    def _op_write_sidecar(self, f: Finding, a: Action) -> None:
+        """写入每部番的采集档案。纯写自有文件，不碰媒体内容。"""
+        from . import sidecar as sc_mod
+        show_dir = Path(a.args["show_dir"])
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run"})
+            return
+        prev = sc_mod.path_for(show_dir)
+        prev_content = prev.read_text(encoding="utf-8") if prev.exists() else None
+        payload = a.args["payload"]
+        known = {k for k in sc_mod.Sidecar.__dataclass_fields__}
+        sc = sc_mod.Sidecar(**{k: v for k, v in payload.items() if k in known})
+        sc_mod.save(show_dir, sc)
+        self._audit("applied", f, a,
+                    undo={"op": "restore_sidecar", "show_dir": str(show_dir),
+                          "prev": prev_content})
+
+    def _op_fix_title_aliases(self, f: Finding, a: Action) -> None:
+        """修复订阅的标题匹配，并解除因此卡住的重抓阻塞。
+
+        **三步顺序不能反**，这是实测踩出来的：
+        1. 先写 `title_aliases` —— 让匹配重新生效
+        2. 再清掉该订阅下"已登记但 qBittorrent 里不存在"的 torrent 记录 ——
+           `pull_rss` 只处理 `check_new()` 筛出的新条目，已登记的永不重评
+        3. 最后刷新 RSS
+
+        顺序反了（先清记录再改别名）的话，AutoBangumi 会用**仍然失效**的匹配规则
+        把这些条目重新登记一遍，于是它们又变成"不新"，白清一轮。
+        """
+        bid = a.args["bangumi_id"]
+        aliases = a.args["aliases"]
+        if self.dry_run:
+            self._audit("skipped", f, a,
+                        {"reason": "dry-run", "would_set_aliases": aliases})
+            return
+
+        rows = self.ctx.abdb.query(
+            "SELECT title_aliases FROM bangumi WHERE id=?", (bid,))
+        prev = rows[0]["title_aliases"] if rows else None
+
+        # 步骤 1+2 合并成一次停容器写库，减少中断
+        stmts = [("UPDATE bangumi SET title_aliases=? WHERE id=?",
+                  (json.dumps(aliases, ensure_ascii=False), bid))]
+
+        b = next((x for x in self.ctx.abdb.bangumi() if x["id"] == bid), None)
+        cleared = 0
+        if b:
+            keys = [k for k in (b.get("title_raw"), b.get("official_title")) if k]
+            qbit_names = {t["name"] for t in self.ctx.qbit.torrents()}
+            for r in self.ctx.abdb.query(
+                    "SELECT id, bangumi_id, name FROM torrent"):
+                if (r["bangumi_id"] == bid
+                        or any(k in (r["name"] or "") for k in keys)):
+                    if (r["name"] or "") not in qbit_names:
+                        stmts.append(("DELETE FROM torrent WHERE id=?", (r["id"],)))
+                        cleared += 1
+
+        self.ctx.abdb.write(stmts)
+
+        # 步骤 3：让 AutoBangumi 重新拉一遍
+        refreshed = False
+        if self.ctx.ab:
+            try:
+                self.ctx.ab.refresh_all()
+                refreshed = True
+            except Exception as e:
+                self.ctx.log(f"[fix_title_aliases] 刷新失败: {e}")
+
+        self._audit("applied", f, a,
+                    {"aliases": aliases, "cleared_stuck_records": cleared,
+                     "refreshed": refreshed},
+                    undo={"op": "restore_title_aliases",
+                          "bangumi_id": bid, "prev": prev})
 
     def _op_relink_torrent(self, f: Finding, a: Action) -> None:
         """把路径失效的种子重新关联到磁盘上的实际文件。
@@ -559,6 +635,26 @@ class Executor:
                 self.ctx.abdb.write([
                     ("UPDATE bangumi SET save_path=? WHERE id=?", (prev, bid))
                 ])
+            return True, ""
+
+        if op == "restore_sidecar":
+            if self.dry_run:
+                return True, ""
+            from . import sidecar as sc_mod
+            p = sc_mod.path_for(Path(u["show_dir"]))
+            if u.get("prev") is None:
+                p.unlink(missing_ok=True)
+            else:
+                p.write_text(u["prev"], encoding="utf-8")
+            return True, ""
+
+        if op == "restore_title_aliases":
+            if self.dry_run:
+                return True, ""
+            self.ctx.abdb.write([
+                ("UPDATE bangumi SET title_aliases=? WHERE id=?",
+                 (u.get("prev"), u["bangumi_id"]))
+            ])
             return True, ""
 
         if op == "relink_torrent":

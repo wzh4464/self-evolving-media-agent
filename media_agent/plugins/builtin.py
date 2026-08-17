@@ -634,6 +634,9 @@ BUILTIN = [
 
 
 def register_builtins(registry: Registry) -> Registry:
-    for cls in BUILTIN:
+    from .sidecar_sync import SIDECAR_DETECTORS
+    from .subscription import SUBSCRIPTION_DETECTORS
+    # 订阅健康度规则排在最前：订阅本身失效时，下游一切规则都无从谈起
+    for cls in SUBSCRIPTION_DETECTORS + BUILTIN + SIDECAR_DETECTORS:
         registry.register(cls())
     return registry
