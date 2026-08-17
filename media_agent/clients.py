@@ -88,6 +88,11 @@ class QBitClient:
         self._post("torrents/setCategory",
                    {"hashes": "|".join(hashes), "category": category})
 
+    def remove_categories(self, categories: list[str]) -> None:
+        """删除分类定义。分类下若还有种子，它们会变成"无分类"而非被删除。"""
+        self._post("torrents/removeCategories",
+                   {"categories": "\n".join(categories)})   # 注意是换行分隔
+
     def add_tags(self, hashes: list[str], tags: str) -> None:
         self._post("torrents/addTags", {"hashes": "|".join(hashes), "tags": tags})
 

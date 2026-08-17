@@ -404,43 +404,135 @@ class MissingNfoDetector:
 
 
 # ---------------------------------------------------------------------------
-class WrongCategoryDetector:
-    """qBittorrent 分类不是番名（AutoBangumi 默认全丢进 `Bangumi`）。"""
-    id = "wrong-category"
-    kind = "wrong_category"
+class CategoryConsolidationDetector:
+    """同一部番的种子必须归入**同一个**分类，且该分类名 = official_title。
+
+    出处：同一部番的不同译名会各自长成一个分类，实测 8 个目录被拆成 2-3 类：
+    `黄泉使者`/`黄泉的使者`、`古诺希亚`/`古诺西亚`、`入间同学入魔了`/`入间同学入魔了！`、
+    `攻壳机动队`/`攻壳机动队 THE GHOST IN THE SHELL`……
+    成因是每次换个来源订阅、或按不同译名建分类，就多出一个碎片。
+
+    **归属判定用磁盘目录，不用分类名。** 落在同一个 show 目录下的种子必然是同一部番，
+    这是唯一可靠的分组依据；分类名本身正是要被修正的对象，不能拿它当分组依据。
+
+    这里刻意不保留"分类等于目录名就放过"的宽容分支——那正是碎片长期存活的原因
+    （`黄泉使者` 等于目录名，于是永远不会被修正到 TMDB 的 `黄泉的使者`）。
+    """
+    id = "category-consolidation"
+    kind = "category_fragmented"
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
-        seen: set[str] = set()
+        # 分类 → 它当前持有的种子；用于判断合并后是否变空
+        cat_members: dict[str, set[str]] = defaultdict(set)
+        for t in state.torrents:
+            cat_members[t.get("category") or ""].add(t.get("hash", ""))
+
+        reassigned: set[str] = set()
+
+        # 种子 → 分类，用于路径前缀兜底
+        t_by_hash = {t.get("hash", ""): t for t in state.torrents}
+
         for show in state.shows:
-            title = show.official_title
+            canonical = show.official_title
+            # 该目录下每个种子当前的分类
+            cur: dict[str, str] = {}
             for f in show.files:
-                if not f.torrent_hash or f.torrent_hash in seen:
+                if f.torrent_hash:
+                    cur[f.torrent_hash] = f.torrent_category or ""
+
+            # 兜底：content_path 已成死链（文件被外部改名/移动）的种子，
+            # 磁盘扫描关联不上，但路径前缀仍能证明它属于这个目录。
+            # 不兜这一层的话，这类种子会永远留在旧分类里合并不掉。
+            prefix = str(show.dir_path) + "/"
+            for h, t in t_by_hash.items():
+                if h in cur:
                     continue
-                cat = f.torrent_category
-                if not cat or cat == title:
+                if (t.get("content_path") or "").startswith(prefix):
+                    cur[h] = t.get("category") or ""
+
+            if not cur:
+                continue
+
+            variants = sorted({c for c in cur.values() if c and c != canonical})
+            for h, cat in cur.items():
+                if cat == canonical or h in reassigned:
                     continue
-                if cat != "Bangumi" and normalize(cat) == normalize(show.dir_name):
-                    continue      # 用的是目录名，可接受
-                seen.add(f.torrent_hash)
+                reassigned.add(h)
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="minor",
-                    summary=f"分类 `{cat}` 应为 `{title}`",
-                    show=show.dir_name, path=str(f.path), torrent_hash=f.torrent_hash,
-                    evidence={"current": cat, "expected": title},
+                    summary=(f"分类 `{cat or '(无)'}` → `{canonical}`"
+                             + (f"（该目录共有 {len(variants) + 1} 个分类待合并）"
+                                if variants else "")),
+                    show=show.dir_name, torrent_hash=h,
+                    evidence={"current": cat, "canonical": canonical,
+                              "sibling_categories": variants,
+                              "title_source": ("tmdb" if show.tmdb_title else
+                                               "autobangumi" if show.bangumi else "dirname")},
                     action=Action(op="recategorize",
-                                  args={"torrent_hash": f.torrent_hash,
-                                        "category": title}),
+                                  args={"torrent_hash": h, "category": canonical}),
                 )
+
+        # 合并之后会变空的分类 + 本来就空的分类，一并清掉
+        canonical_names = {s.official_title for s in state.shows}
+        for cat, members in sorted(cat_members.items()):
+            if not cat or cat in canonical_names:
+                continue
+            if members - reassigned:
+                continue          # 还有种子留在这个分类里，不能删
+            yield Finding(
+                rule=self.id, kind="empty_category", severity="minor",
+                summary=f"分类 `{cat}` 合并后已无种子，可删除",
+                evidence={"had_torrents": len(members)},
+                action=Action(op="delete_category", args={"category": cat},
+                              note="仅删分类定义，不动任何文件"),
+            )
+
+
+# ---------------------------------------------------------------------------
+class StaleTorrentPathDetector:
+    """种子的 content_path 指向已不存在的文件 —— 做种会失效。
+
+    出处：本项目自己的 AGENTS.md 第 3 条写着"有种子的文件改名必须走 qBittorrent API"，
+    而实测库里有 18 个 Gnosia 种子正是因为当初用文件系统 `mv` 改了名，
+    导致 qBittorrent 记录的路径成了死链：文件还在、种子却找不到它，
+    既无法继续做种，也让所有按磁盘归属分组的规则都够不着这些种子。
+
+    这条规则只报不改：修复要么是把种子重新定位到新路径（需要人确认对应关系），
+    要么是重新校验，都不是能闭眼自动做的事。
+    """
+    id = "stale-torrent-path"
+    kind = "stale_torrent_path"
+
+    def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
+        root = str(ctx.config.media_root)
+        for t in state.torrents:
+            cp = t.get("content_path") or ""
+            if not cp.startswith(root):
+                continue
+            if Path(cp).exists():
+                continue
+            parent = Path(cp).parent
+            yield Finding(
+                rule=self.id, kind=self.kind, severity="important",
+                summary=f"种子路径已失效（文件被外部改名/移动）：{Path(cp).name[:60]}",
+                show=cp[len(root):].lstrip("/").split("/")[0],
+                path=cp, torrent_hash=t.get("hash", ""),
+                evidence={"state": t.get("state"), "progress": t.get("progress"),
+                          "parent_exists": parent.exists(),
+                          "hint": "当初应走 qBittorrent renameFile 而非文件系统 mv"},
+                # 不给 action：重新定位需要确认新旧文件对应关系，不能盲目自动做
+            )
 
 
 BUILTIN = [
     RenameCollisionDetector,     # critical 优先
+    StaleTorrentPathDetector,
     OrphanTorrentDetector,
     DuplicateEpisodeDetector,
     UnrenamedDetector,
     DeadTorrentDetector,
     TitleDriftDetector,
-    WrongCategoryDetector,
+    CategoryConsolidationDetector,
     MissingNfoDetector,
     ExtrasDetector,
 ]

@@ -125,6 +125,24 @@ class Executor:
         self.ctx.qbit.set_category([a.args["torrent_hash"]], a.args["category"])
         self._audit("applied", f, a)
 
+    def _op_delete_category(self, f: Finding, a: Action) -> None:
+        """删除空分类。只动分类定义，不碰任何文件。
+
+        执行前重新核对该分类确实已无种子——合并动作可能在本轮早些时候失败，
+        那样这个分类里还留着东西，删了会让它们变成"无分类"。
+        """
+        cat = a.args["category"]
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run"})
+            return
+        still = [t for t in self.ctx.qbit.torrents() if (t.get("category") or "") == cat]
+        if still:
+            self._audit("skipped", f, a,
+                        {"reason": f"该分类仍有 {len(still)} 个种子，可能是合并失败，不删"})
+            return
+        self.ctx.qbit.remove_categories([cat])
+        self._audit("applied", f, a)
+
     def _op_relocate(self, f: Finding, a: Action) -> None:
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run"})

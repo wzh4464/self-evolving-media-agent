@@ -170,6 +170,7 @@ _ACTION_CONTRACT: dict[str, set[str]] = {
     "rename": {"new_name"},
     "retag": {"tags"},
     "recategorize": {"category"},
+    "delete_category": {"category"},
     "relocate": {"location"},
     "write_nfo": {"tmdb_id", "title"},
     "trash": set(),
