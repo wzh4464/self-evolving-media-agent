@@ -72,12 +72,13 @@ class Executor:
     # 文件改名必须早于目录改名——目录一改，之前算出的文件路径全部失效。
     # 分类/标签不涉及路径，放最前无所谓；删除放最后，让前面的判断都基于完整状态。
     _OP_ORDER = {
-        "retag": 0, "recategorize": 1, "delete_category": 2,
-        "write_nfo": 3,
-        "rename": 4,            # 先改文件名（此时目录名还是旧的，路径有效）
-        "relocate": 5,
-        "rename_show_dir": 6,   # 再改目录名，一次性带走里面所有文件
-        "trash": 7,
+        "relink_torrent": 0,     # 先把失联种子接回来，后续规则才看得到它们
+        "retag": 1, "recategorize": 2, "delete_category": 3,
+        "write_nfo": 4,
+        "rename": 5,            # 先改文件名（此时目录名还是旧的，路径有效）
+        "relocate": 6,
+        "rename_show_dir": 7,   # 再改目录名，一次性带走里面所有文件
+        "trash": 8,
     }
 
     # ---------------- 入口 ----------------
@@ -214,6 +215,59 @@ class Executor:
         self._audit("applied", f, a,
                     undo={"op": "recategorize", "torrent_hash": a.args["torrent_hash"],
                           "category": prev})
+
+    def _op_relink_torrent(self, f: Finding, a: Action) -> None:
+        """把路径失效的种子重新关联到磁盘上的实际文件。
+
+        `renameFile` 在这里不是"改文件名"而是"改种子对文件的期望路径"——
+        目标文件已经存在，qBittorrent 只更新自己的映射。随后 `recheck`
+        让 libtorrent 逐分片校验哈希：**校验通过才算真的修好了**，
+        这一步是这套修复能自动做的依据（大小匹配只是定位手段，哈希才是证据）。
+        """
+        h = a.args["torrent_hash"]
+        mapping = a.args["mapping"]
+        new_save_path = a.args.get("new_save_path") or ""
+        if self.dry_run:
+            self._audit("skipped", f, a,
+                        {"reason": "dry-run", "would_relink": len(mapping),
+                         "would_relocate_to": new_save_path})
+            return
+
+        prev_save_path = ""
+        if new_save_path:
+            # 文件已搬到别的目录：先把 save_path 挪过去，renameFile 用的是
+            # 相对 save_path 的路径，跨不出去。
+            cur = next((t for t in self.ctx.qbit.torrents() if t["hash"] == h), None)
+            prev_save_path = (cur or {}).get("save_path") or ""
+            self.ctx.qbit.set_location([h], new_save_path)
+
+        before = {e["name"] for e in self.ctx.qbit.files(h)}
+        renamed, failed = [], []
+        for m in mapping:
+            if m["old"] not in before:
+                failed.append({**m, "error": "种子文件列表里已无此条目"})
+                continue
+            try:
+                self.ctx.qbit.rename_file(h, m["old"], m["new"])
+                renamed.append(m)
+            except Exception as e:
+                failed.append({**m, "error": str(e)})
+
+        if not renamed:
+            self._audit("failed", f, a, {"error": "没有任何文件重建关联成功",
+                                         "failures": failed[:3]})
+            return
+
+        # 交给 libtorrent 校验哈希；结果异步产生，这里只负责触发
+        self.ctx.qbit.recheck([h])
+        self._audit("applied", f, a,
+                    {"relinked": len(renamed), "failed": len(failed),
+                     "relocated_to": new_save_path, "recheck_triggered": True,
+                     "note": "recheck 为异步，稍后确认 progress 回到 100%"},
+                    undo={"op": "relink_torrent",
+                          "torrent_hash": h,
+                          "new_save_path": prev_save_path,
+                          "mapping": [{"old": m["new"], "new": m["old"]} for m in renamed]})
 
     def _op_delete_category(self, f: Finding, a: Action) -> None:
         """删除空分类。只动分类定义，不碰任何文件。
@@ -505,6 +559,22 @@ class Executor:
                 self.ctx.abdb.write([
                     ("UPDATE bangumi SET save_path=? WHERE id=?", (prev, bid))
                 ])
+            return True, ""
+
+        if op == "relink_torrent":
+            if self.dry_run:
+                return True, ""
+            h = u["torrent_hash"]
+            for m in u.get("mapping", []):
+                try:
+                    self.ctx.qbit.rename_file(h, m["old"], m["new"])
+                except Exception:
+                    continue
+            if u.get("new_save_path"):        # 还原到原来的 save_path
+                try:
+                    self.ctx.qbit.set_location([h], u["new_save_path"])
+                except Exception:
+                    pass
             return True, ""
 
         if op == "recategorize":

@@ -106,6 +106,10 @@ class QBitClient:
             "priority": priority,
         })
 
+    def recheck(self, hashes: list[str]) -> None:
+        """强制重新校验分片哈希。重新建立文件关联后用它确认数据确实对得上。"""
+        self._post("torrents/recheck", {"hashes": "|".join(hashes)})
+
     def delete(self, hashes: list[str], delete_files: bool) -> None:
         self._post("torrents/delete", {
             "hashes": "|".join(hashes),

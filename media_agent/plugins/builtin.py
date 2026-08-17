@@ -497,31 +497,111 @@ class StaleTorrentPathDetector:
     导致 qBittorrent 记录的路径成了死链：文件还在、种子却找不到它，
     既无法继续做种，也让所有按磁盘归属分组的规则都够不着这些种子。
 
-    这条规则只报不改：修复要么是把种子重新定位到新路径（需要人确认对应关系），
-    要么是重新校验，都不是能闭眼自动做的事。
+    **修复靠文件大小唯一定位。** 种子记录里存着每个文件的精确字节数；
+    在同一个 show 目录下按大小找，若恰好只有一个候选，那就是它——
+    体积精确到字节相同而内容不同的概率可以忽略。定位后用 `renameFile`
+    把种子指向新文件名，再 `recheck` 让 libtorrent 逐分片校验哈希做最终确认。
+    这一整套都走 qBittorrent，不碰文件系统。
+
+    大小有歧义或找不到候选时**只报不改**——宁可留着让人看，
+    也不要把种子指到错误的文件上。
     """
     id = "stale-torrent-path"
     kind = "stale_torrent_path"
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         root = str(ctx.config.media_root)
+        size_index: dict[str, dict[int, list[str]]] = {}
+
         for t in state.torrents:
             cp = t.get("content_path") or ""
-            if not cp.startswith(root):
+            if not cp.startswith(root) or Path(cp).exists():
                 continue
-            if Path(cp).exists():
-                continue
-            parent = Path(cp).parent
-            yield Finding(
-                rule=self.id, kind=self.kind, severity="important",
-                summary=f"种子路径已失效（文件被外部改名/移动）：{Path(cp).name[:60]}",
-                show=cp[len(root):].lstrip("/").split("/")[0],
-                path=cp, torrent_hash=t.get("hash", ""),
-                evidence={"state": t.get("state"), "progress": t.get("progress"),
-                          "parent_exists": parent.exists(),
-                          "hint": "当初应走 qBittorrent renameFile 而非文件系统 mv"},
-                # 不给 action：重新定位需要确认新旧文件对应关系，不能盲目自动做
-            )
+
+            show = cp[len(root):].lstrip("/").split("/")[0]
+            show_dir = Path(root) / show
+
+            # "大小 → 文件"索引。show 目录还在就只索引它（范围小、更安全）；
+            # 目录本身已经不存在（被改名/合并掉了）则退化为全库索引——
+            # 文件很可能已经搬去了新目录，只在原地找必然找不到。
+            key = show if show_dir.is_dir() else "*ALL*"
+            if key not in size_index:
+                scope = show_dir if key != "*ALL*" else Path(root)
+                idx: dict[int, list[str]] = {}
+                for p in scope.rglob("*"):
+                    if not p.is_file() or p.name.startswith("._"):
+                        continue
+                    if ".autobangumi" in p.parts:
+                        continue
+                    try:
+                        idx.setdefault(p.stat().st_size, []).append(str(p))
+                    except OSError:
+                        pass
+                size_index[key] = idx
+            idx = size_index[key]
+
+            save_path = (t.get("save_path") or "").rstrip("/")
+            mapping, unresolved, matched_dirs = [], [], set()
+            try:
+                entries = [e for e in ctx.qbit.files(t["hash"])
+                           if e.get("priority", 1) != 0]
+            except Exception:
+                entries = []
+
+            for e in entries:
+                # 已经正确关联的文件不用动
+                if (Path(save_path) / e["name"]).exists():
+                    continue
+                cands = idx.get(e["size"], [])
+                if len(cands) == 1:
+                    hit = Path(cands[0])
+                    matched_dirs.add(str(hit.parent))
+                    mapping.append({"old": e["name"], "new": hit.name,
+                                    "size": e["size"], "abs": str(hit)})
+                elif len(cands) > 1:
+                    unresolved.append((e["name"], f"{len(cands)} 个同样大小的候选，无法确定"))
+                else:
+                    unresolved.append((e["name"], "找不到大小匹配的文件"))
+
+            # 文件若已搬到别的目录，光改名不够，还要把 save_path 挪过去。
+            # 多个文件分散在不同目录时不敢自动处理（种子内部结构无从还原）。
+            new_save_path = ""
+            if len(matched_dirs) == 1:
+                only = matched_dirs.pop()
+                if only != save_path:
+                    new_save_path = only
+            elif len(matched_dirs) > 1:
+                unresolved.append(("(整体)", f"匹配到的文件分散在 {len(matched_dirs)} 个目录，不敢自动重定位"))
+
+            base = dict(state=t.get("state"), progress=t.get("progress"),
+                        resolved=len(mapping), unresolved=len(unresolved),
+                        unresolved_detail=unresolved[:3])
+
+            if mapping and not unresolved:
+                where = (f"（并重定位到 {Path(new_save_path).parent.name}/"
+                         f"{Path(new_save_path).name}）" if new_save_path else "")
+                yield Finding(
+                    rule=self.id, kind=self.kind, severity="important",
+                    summary=(f"种子路径失效，已按文件大小唯一定位："
+                             f"{Path(mapping[0]['new']).name[:40]}{where}"),
+                    show=show, path=cp, torrent_hash=t["hash"],
+                    evidence={**base, "mapping": mapping[:3],
+                              "new_save_path": new_save_path},
+                    action=Action(op="relink_torrent",
+                                  args={"torrent_hash": t["hash"], "mapping": mapping,
+                                        "new_save_path": new_save_path},
+                                  note="setLocation + renameFile 重建关联后 recheck 校验分片哈希"),
+                )
+            else:
+                yield Finding(
+                    rule=self.id, kind=self.kind, severity="important",
+                    summary=(f"种子路径失效且无法自动定位（{len(unresolved)} 个文件对不上）："
+                             f"{Path(cp).name[:44]}"),
+                    show=show, path=cp, torrent_hash=t["hash"],
+                    evidence={**base,
+                              "hint": "当初应走 qBittorrent renameFile 而非文件系统 mv"},
+                    # 定位不了就不给 action——指错文件比不修更糟
+                )
 
 
 BUILTIN = [
