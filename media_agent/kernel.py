@@ -77,6 +77,13 @@ class MediaFile:
 
     @property
     def is_incomplete(self) -> bool:
+        """是否尚未下载完成。
+
+        来源是 `torrents/files` 时文件名已经是干净的目标名（没有 `.!qB` 后缀），
+        所以主要看种子进度；`.!qB` 后缀只在从磁盘扫到的文件上出现，作为兜底。
+        """
+        if self.torrent_hash and self.torrent_progress < 1.0:
+            return True
         return self.filename.endswith(".!qB")
 
 

@@ -104,11 +104,16 @@ class OrphanTorrentDetector:
 
 # ---------------------------------------------------------------------------
 class UnrenamedDetector:
-    """磁盘文件名不符合 `{official_title} SxxExx.ext` 规范。
+    """文件名不符合 `{official_title} SxxExx.ext` 规范。
 
-    出处：判断依据必须是**磁盘文件名**——qBittorrent 的 `name` 字段在
-    renameFile 之后不更新，用它判断会产生上百条误报。
-    归一化比较（全角/半角、大小写）也是必须的：`Re：` vs `Re:`、`GNOSIA` vs `Gnosia`
+    **事实来源分两种**（见 scan.py）：
+    - 有种子的内容以 `torrents/files` 为准——那是 qBittorrent 实际会写入的路径，
+      renameFile 后会同步更新，且包含尚未落盘的文件。
+      注意不要用 `torrents/info` 的 `name` 字段：那是种子**显示名**，
+      renameFile 后不变，拿它判断会产生上百条误报（早先踩过）。
+    - 无种子的纯本地文件才以磁盘为准。
+
+    归一化比较（全角/半角、大小写）是必须的：`Re：` vs `Re:`、`GNOSIA` vs `Gnosia`
     都曾被误判成未改名。
     """
     id = "unrenamed-file"
@@ -118,13 +123,17 @@ class UnrenamedDetector:
         for show in state.shows:
             title = show.official_title
             for f in show.files:
-                if f.is_incomplete:
-                    continue                       # 下载中，等它完成
-                if is_extra(f.filename):
+                # 下载中的也要改名 —— 拿到种子就改好，不等下载完。
+                # 走 qBittorrent renameFile 是安全的：它会同步处理 `.!qB` 临时文件
+                # 并继续往新名字写入，不中断下载。
+                # 来源是 torrents/files，文件名本身已是干净的目标名，无需裁剪后缀。
+                stem = f.filename
+                if is_extra(stem):
                     continue                       # 交给 ExtrasDetector
-                if is_normalized(f.filename, title):
+                if is_normalized(stem, title):
                     continue
-                if f.ext not in VIDEO_EXTS and f.ext not in SUB_EXTS:
+                real_ext = Path(stem).suffix.lower()
+                if real_ext not in VIDEO_EXTS and real_ext not in SUB_EXTS:
                     continue
 
                 resolved = _resolve(f, show)
@@ -139,20 +148,22 @@ class UnrenamedDetector:
                     continue
 
                 season, ep = resolved
-                if f.ext in SUB_EXTS:
-                    lang = subtitle_lang_tag(f.filename)
-                    new = (target_subtitle_filename(title, season, ep, lang, f.ext)
-                           if lang else target_filename(title, season, ep, f.ext))
+                if real_ext in SUB_EXTS:
+                    lang = subtitle_lang_tag(stem)
+                    new = (target_subtitle_filename(title, season, ep, lang, real_ext)
+                           if lang else target_filename(title, season, ep, real_ext))
                 else:
-                    new = target_filename(title, season, ep, f.ext)
+                    new = target_filename(title, season, ep, real_ext)
 
-                if new == f.filename:
+                if new == stem:
                     continue
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="important",
-                    summary=f"{f.filename} → {new}",
+                    summary=(f"{stem} → {new}"
+                             + ("（下载中，改名不中断下载）" if f.is_incomplete else "")),
                     show=show.dir_name, path=str(f.path), torrent_hash=f.torrent_hash,
-                    evidence={"season": season, "episode": ep, "official_title": title},
+                    evidence={"season": season, "episode": ep, "official_title": title,
+                              "downloading": f.is_incomplete},
                     action=Action(op="rename",
                                   args={"path": str(f.path), "new_name": new,
                                         "torrent_hash": f.torrent_hash}),
@@ -516,6 +527,10 @@ class StaleTorrentPathDetector:
         for t in state.torrents:
             cp = t.get("content_path") or ""
             if not cp.startswith(root) or Path(cp).exists():
+                continue
+            # 还没下完的种子文件本来就还不在磁盘上（或带 .!qB 后缀），
+            # 那是正常的下载中状态，不是失联。
+            if t.get("progress", 0) < 1.0 or Path(cp + ".!qB").exists():
                 continue
 
             show = cp[len(root):].lstrip("/").split("/")[0]

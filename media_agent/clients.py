@@ -239,6 +239,18 @@ class TMDBClient:
         original = (d.get("original_name") or "").strip()
         return (local or original), original
 
+    def season_episodes(self, tv_id: int, season: int) -> list[dict]:
+        """某一季的分集列表，含每集播出日期。
+
+        判断"缺集"必须靠它：只有**已经播出**的集数缺席才算缺口，
+        否则连载中的番会被整季报成缺失。
+        """
+        d = self._get(f"/tv/{tv_id}/season/{season}")
+        return [{"episode_number": e.get("episode_number"),
+                 "air_date": e.get("air_date") or "",
+                 "name": e.get("name", "")}
+                for e in d.get("episodes", [])]
+
     def seasons(self, tv_id: int) -> list[dict]:
         """返回 [{season_number, episode_count, name}]，已过滤 specials 之外的空季。"""
         d = self.tv_detail(tv_id)

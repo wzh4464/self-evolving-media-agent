@@ -43,8 +43,11 @@ uv run media-agent run                # 完整自治轮次
 这些是踩坑换来的，改动前必须先读对应 Agent Note：
 
 1. **判重只认内容哈希，绝不认文件名。** AutoBangumi 会改名，文件名不可靠。
-2. **判断"是否已改名"只查磁盘。** qBittorrent 的 `name` 字段在 `renameFile`
-   之后不更新，用它判断会产生上百条误报。
+2. **事实来源分两种。** 有种子的内容以 `torrents/files` 为准——那是 qBittorrent
+   实际会写入的路径，`renameFile` 后同步更新，且包含尚未落盘的文件；
+   无种子的纯本地文件才以磁盘为准。
+   **不要用 `torrents/info` 的 `name` 字段**：那是种子*显示名*，`renameFile`
+   后不变，拿它判断会产生上百条误报。
 3. **所有改动必经 qBittorrent。** 有种子的文件改名走 `renameFile`，种子里找不到
    该文件就报失败中止，**绝不退化成文件系统 `mv`**；目录改名由 `setLocation`
    让 qBittorrent 自己搬运，不要 `Path.rename` 整个目录。库里现存的 28 个死链

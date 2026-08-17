@@ -31,6 +31,20 @@ def _iter_files(show_dir: Path) -> list[Path]:
     return out
 
 
+def _torrent_files(ctx: Context, torrent_hash: str) -> list[dict]:
+    """取种子的文件列表。单次扫描内按 hash 缓存，避免同一种子重复请求。"""
+    cache = getattr(ctx, "_tfile_cache", None)
+    if cache is None:
+        cache = {}
+        ctx._tfile_cache = cache          # type: ignore[attr-defined]
+    if torrent_hash not in cache:
+        try:
+            cache[torrent_hash] = ctx.qbit.files(torrent_hash)
+        except Exception:
+            cache[torrent_hash] = []
+    return cache[torrent_hash]
+
+
 def _season_dir_of(path: Path, show_dir: Path) -> str:
     try:
         rel = path.relative_to(show_dir)
@@ -46,6 +60,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
     # --- qBittorrent：按 content_path 建索引 ---
     torrents = ctx.qbit.torrents() if ctx.qbit else []
     state.torrents = torrents
+    torrent_by_hash = {t["hash"]: t for t in torrents}
     by_path: dict[str, dict] = {}
     for t in torrents:
         cp = t.get("content_path", "")
@@ -88,16 +103,55 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
         show = Show(dir_name=show_dir.name, dir_path=show_dir,
                     bangumi=bangumi_by_dir.get(show_dir.name))
 
+        # --- 来源 1：qBittorrent 的文件列表（种子内容的权威来源）---
+        #
+        # 对有种子的内容，`torrents/files` 才是事实来源，不是磁盘：
+        # - renameFile 之后它**会**更新（不更新的是 `torrents/info` 的 `name` 字段，
+        #   那是种子显示名，两者不是一回事——早先混淆过这一点）
+        # - 它包含尚未落盘的文件（0% 进度时磁盘上什么都没有）
+        # - 下载中的文件磁盘上带 `.!qB` 后缀，这里给的是干净的目标名
+        covered: set[Path] = set()
+        for h, t in torrent_by_hash.items():
+            sp = (t.get("save_path") or "").rstrip("/")
+            if not sp or not sp.startswith(str(show_dir)):
+                continue
+            for entry in _torrent_files(ctx, h):
+                if entry.get("priority", 1) == 0:
+                    continue            # 被标记为不下载
+                abs_p = Path(sp) / entry["name"]
+                suffix = abs_p.suffix.lower()
+                if suffix not in VIDEO_EXTS and suffix not in SUB_EXTS:
+                    continue
+                covered.add(abs_p)
+                covered.add(Path(str(abs_p) + ".!qB"))
+                show.files.append(MediaFile(
+                    path=abs_p,
+                    size=entry.get("size", 0),
+                    show_dir=show_dir.name,
+                    season_dir=_season_dir_of(abs_p, show_dir),
+                    filename=abs_p.name,
+                    torrent_hash=h,
+                    torrent_name=t.get("name", ""),
+                    torrent_state=t.get("state", ""),
+                    torrent_progress=t.get("progress", 0.0),
+                    torrent_tags=t.get("tags", ""),
+                    torrent_category=t.get("category", ""),
+                ))
+
+        # --- 来源 2：磁盘上没有种子覆盖的文件（纯本地内容）---
         for p in _iter_files(show_dir):
+            if p in covered:
+                continue
             t = by_path.get(str(p))
             if t is None:
-                # 合集种子：向上找父目录匹配
-                for parent in p.parents:
+                for parent in p.parents:          # 合集种子：向上找父目录
                     if parent == media_root:
                         break
                     t = by_path.get(str(parent))
                     if t is not None:
                         break
+            if t is not None and Path(t.get("save_path") or "") == p.parent:
+                continue                          # 已由来源 1 覆盖
             try:
                 size = p.stat().st_size
             except OSError:
