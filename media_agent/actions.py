@@ -28,18 +28,28 @@ class ExecReport:
 
 
 class Executor:
-    def __init__(self, ctx: Context, dry_run: bool = True):
+    def __init__(self, ctx: Context, dry_run: bool = True, run_id: str | None = None):
         self.ctx = ctx
         self.cfg = ctx.config
         self.dry_run = dry_run
+        # 一次 apply = 一个 run_id，回退以 run 为单位，这就是"一键回退"的单元
+        self.run_id = run_id or datetime.now().strftime("%Y%m%dT%H%M%S")
         self.report = ExecReport()
         self._deleted_count = 0
         self._deleted_bytes = 0
 
     # ---------------- 审计 ----------------
-    def _audit(self, status: str, finding: Finding, action: Action, extra: dict | None = None):
+    def _audit(self, status: str, finding: Finding, action: Action,
+               extra: dict | None = None, undo: dict | None = None):
+        """记录一条审计。
+
+        `undo` 是**逆操作的完整描述**——有它才谈得上回退。每个真正改动了
+        系统状态的动作都必须提供，否则这次改动就是不可逆的，
+        `rollback` 会明确报告它跳过了什么，而不是假装回退干净了。
+        """
         rec = {
             "ts": datetime.now().isoformat(timespec="seconds"),
+            "run_id": self.run_id,
             "status": status,
             "dry_run": self.dry_run,
             "rule": finding.rule,
@@ -49,6 +59,8 @@ class Executor:
             "summary": finding.summary,
             **(extra or {}),
         }
+        if undo is not None:
+            rec["undo"] = undo
         with self.cfg.audit_log.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         bucket = {"applied": self.report.applied,
@@ -56,11 +68,25 @@ class Executor:
                   "failed": self.report.failed}[status]
         bucket.append(rec)
 
+    # 动作之间存在安全顺序，与问题严重度无关：
+    # 文件改名必须早于目录改名——目录一改，之前算出的文件路径全部失效。
+    # 分类/标签不涉及路径，放最前无所谓；删除放最后，让前面的判断都基于完整状态。
+    _OP_ORDER = {
+        "retag": 0, "recategorize": 1, "delete_category": 2,
+        "write_nfo": 3,
+        "rename": 4,            # 先改文件名（此时目录名还是旧的，路径有效）
+        "relocate": 5,
+        "rename_show_dir": 6,   # 再改目录名，一次性带走里面所有文件
+        "trash": 7,
+    }
+
     # ---------------- 入口 ----------------
     def apply(self, findings: list[Finding]) -> ExecReport:
-        for f in findings:
-            if not f.action:
-                continue
+        ordered = sorted(
+            (f for f in findings if f.action),
+            key=lambda f: (self._OP_ORDER.get(f.action.op, 99), f.show, f.path),
+        )
+        for f in ordered:
             try:
                 self._dispatch(f, f.action)
             except Exception as e:
@@ -92,17 +118,75 @@ class Executor:
             return
 
         h = a.args.get("torrent_hash")
+        via = "filesystem"
         if h and self.ctx.qbit:
-            # 有种子的走 qBittorrent API，否则会破坏做种路径映射
+            # 有种子的一律走 qBittorrent API。找不到对应条目就报失败，
+            # **绝不退化成文件系统改名**——那会让种子路径失效、做种中断。
             old_rel = self._torrent_rel_path(h, path)
             if old_rel is None:
-                self._audit("failed", f, a, {"error": "在种子文件列表里找不到该文件"})
+                self._audit("failed", f, a,
+                            {"error": "种子文件列表里找不到该文件，拒绝绕过 qBittorrent 改名"})
                 return
             new_rel = str(Path(old_rel).parent / new_name) if "/" in old_rel else new_name
             self.ctx.qbit.rename_file(h, old_rel, new_rel)
+            via = "qbittorrent"
         else:
+            # 确认无种子关联才允许文件系统改名（纯本地文件，无从同步）
             path.rename(target)
-        self._audit("applied", f, a, {"new_path": str(target)})
+        self._audit("applied", f, a, {"new_path": str(target), "via": via},
+                    undo={"op": "rename", "path": str(target),
+                          "new_name": path.name, "torrent_hash": h or ""})
+
+    # macOS 会在共享卷上撒这些元数据文件，它们不算"内容"，
+    # 判断目录是否为空、是否值得搬运时都应忽略
+    _JUNK_PREFIXES = ("._",)
+    _JUNK_NAMES = {".DS_Store", "Thumbs.db", ".localized"}
+
+    @classmethod
+    def _is_junk(cls, name: str) -> bool:
+        return name in cls._JUNK_NAMES or name.startswith(cls._JUNK_PREFIXES)
+
+    def _merge_tree(self, old: Path, new: Path) -> tuple[int, int]:
+        """把 old 目录树递归合并进 new，逐**文件**移动并保持相对结构。
+
+        必须递归：早先的实现只遍历顶层，遇到 `Season 1` 这种子目录时，
+        若 new 下已存在同名子目录就整个跳过，导致里面的文件全部滞留在旧目录，
+        造成新旧两个目录并存的分裂状态（实测 19 个目录、50 个文件中招）。
+
+        返回 (已移动文件数, 因目标已存在而滞留的文件数)。
+        """
+        moved = stranded = 0
+        if not old.exists():
+            return 0, 0
+        new.mkdir(parents=True, exist_ok=True)
+
+        for src in sorted(old.rglob("*")):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(old)
+            if self._is_junk(src.name):
+                src.unlink(missing_ok=True)     # 元数据垃圾直接丢弃，不搬
+                continue
+            dest = new / rel
+            if dest.exists():
+                stranded += 1                   # 同名文件已在，留着让去重规则处理
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            moved += 1
+
+        # 自底向上清理空目录（此时只剩空壳）
+        for d in sorted((p for p in old.rglob("*") if p.is_dir()),
+                        key=lambda p: len(p.parts), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        try:
+            old.rmdir()
+        except OSError:
+            pass
+        return moved, stranded
 
     def _torrent_rel_path(self, torrent_hash: str, abs_path: Path) -> str | None:
         """qBittorrent 的 renameFile 用的是种子内相对路径，不是绝对路径。"""
@@ -116,14 +200,20 @@ class Executor:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
         self.ctx.qbit.add_tags([a.args["torrent_hash"]], a.args["tags"])
-        self._audit("applied", f, a)
+        self._audit("applied", f, a,
+                    undo={"op": "remove_tags", "torrent_hash": a.args["torrent_hash"],
+                          "tags": a.args["tags"]})
 
     def _op_recategorize(self, f: Finding, a: Action) -> None:
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
+        # 旧分类要在改之前记下来，否则无从回退
+        prev = f.evidence.get("current", "")
         self.ctx.qbit.set_category([a.args["torrent_hash"]], a.args["category"])
-        self._audit("applied", f, a)
+        self._audit("applied", f, a,
+                    undo={"op": "recategorize", "torrent_hash": a.args["torrent_hash"],
+                          "category": prev})
 
     def _op_delete_category(self, f: Finding, a: Action) -> None:
         """删除空分类。只动分类定义，不碰任何文件。
@@ -182,29 +272,59 @@ class Executor:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
 
-        hashes = [t["hash"] for t in self.ctx.qbit.torrents()
-                  if (t.get("content_path") or "").startswith(str(old))]
-        old.rename(new)
-
-        # 种子的保存路径要跟着走，否则做种会报文件丢失
-        if hashes and self.ctx.qbit:
-            for h in hashes:
-                try:
-                    t = next(x for x in self.ctx.qbit.torrents() if x["hash"] == h)
-                    loc = (t.get("save_path") or "").replace(str(old), str(new))
-                    self.ctx.qbit.set_location([h], loc)
-                except Exception:
-                    continue
+        # 改动前记下所有受影响种子的原始 save_path，供回退使用
+        affected = [(t["hash"], t.get("save_path") or "")
+                    for t in self.ctx.qbit.torrents()
+                    if (t.get("content_path") or "").startswith(str(old) + "/")
+                    or (t.get("save_path") or "").startswith(str(old))]
 
         bid = a.args.get("bangumi_id")
+        prev_savepath = ""
         if bid and self.ctx.abdb:
             rows = self.ctx.abdb.query("SELECT save_path FROM bangumi WHERE id=?", (bid,))
             if rows:
-                newsp = (rows[0]["save_path"] or "").replace(str(old), str(new))
-                self.ctx.abdb.write([
-                    ("UPDATE bangumi SET save_path=? WHERE id=?", (newsp, bid))
-                ])
-        self._audit("applied", f, a, {"new_path": str(new), "torrents_moved": len(hashes)})
+                prev_savepath = rows[0]["save_path"] or ""
+
+        # === 由 qBittorrent 搬运，而不是自己 mv 目录 ===
+        # 裸 mv 会让所有种子的记录路径瞬间失效（实测已因此产生 28 个死链种子）。
+        # setLocation 让 qBittorrent 自己移动文件并同步记录，做种不中断。
+        moved_ok, move_failed = [], []
+        for h, sp in affected:
+            try:
+                self.ctx.qbit.set_location([h], sp.replace(str(old), str(new), 1))
+                moved_ok.append(h)
+            except Exception as e:
+                move_failed.append({"hash": h, "error": str(e)})
+
+        if move_failed:
+            # 有种子没搬成功就中止：此时目录处于半迁移状态，
+            # 继续 mv 剩余文件只会让情况更糟，交给人处理。
+            self._audit("failed", f, a,
+                        {"error": f"{len(move_failed)} 个种子 setLocation 失败，已中止目录改名",
+                         "moved_ok": len(moved_ok), "failures": move_failed[:3]},
+                        undo={"op": "rename_show_dir_partial",
+                              "moved_hashes": moved_ok,
+                              "torrent_savepaths": affected})
+            return
+
+        # 种子搬完后，把没有种子关联的残留文件（NFO、孤儿字幕、失联种子的文件等）挪过去
+        leftovers, stranded = self._merge_tree(old, new)
+
+        if bid and self.ctx.abdb and prev_savepath:
+            self.ctx.abdb.write([
+                ("UPDATE bangumi SET save_path=? WHERE id=?",
+                 (prev_savepath.replace(str(old), str(new), 1), bid))
+            ])
+
+        self._audit("applied", f, a,
+                    {"new_path": str(new), "torrents_moved": len(moved_ok),
+                     "leftover_files_moved": leftovers,
+                     "stranded_files": stranded,
+                     "old_dir_removed": not old.exists()},
+                    undo={"op": "rename_show_dir", "path": str(new),
+                          "new_name": old.name, "bangumi_id": bid,
+                          "prev_savepath": prev_savepath,
+                          "torrent_savepaths": affected})
 
     def _op_trash(self, f: Finding, a: Action) -> None:
         """删除 = 移入隔离区。受配额上限保护。"""
@@ -256,7 +376,246 @@ class Executor:
             self._deleted_count += 1
             self._deleted_bytes += size
 
-        self._audit("applied", f, a, {"trashed_to": moved, "freed_bytes": size})
+        # 文件可从隔离区还原；但被删掉的种子记录还原不了（种子文件本身已不在）
+        undo = {"op": "restore_from_trash", "path": str(path) if path else "",
+                "trash_path": moved or "",
+                "torrent_record_lost": bool(h and not file_only)}
+        self._audit("applied", f, a, {"trashed_to": moved, "freed_bytes": size},
+                    undo=undo)
+
+    # ---------------- 回退 ----------------
+    def rollback(self, run_id: str) -> dict:
+        """把某一次 run 的所有改动逆序还原。
+
+        逆序（LIFO）是必须的：先改文件名再改目录名的话，回退必须先还原目录名，
+        否则文件的路径已经不对了。
+
+        每一步都先核对当前状态与预期一致才动手——如果之后又有别的改动叠加上来，
+        宁可跳过并报告，也不要盲目覆盖。
+        """
+        records = self._read_audit(run_id)
+        undoable = [r for r in records if r.get("status") == "applied" and r.get("undo")]
+        no_undo = [r for r in records
+                   if r.get("status") == "applied" and not r.get("undo")]
+
+        done, skipped, failed, lost = [], [], [], []
+
+        for rec in reversed(undoable):        # LIFO
+            u = rec["undo"]
+            try:
+                ok, reason = self._apply_undo(u)
+                if ok:
+                    done.append(rec)
+                else:
+                    skipped.append({**rec, "skip_reason": reason})
+            except Exception as e:
+                failed.append({**rec, "error": f"{type(e).__name__}: {e}"})
+            if u.get("torrent_record_lost"):
+                lost.append(rec)
+
+        result = {
+            "run_id": run_id,
+            "total": len(records),
+            "reverted": len(done),
+            "skipped": len(skipped),
+            "failed": len(failed),
+            "irreversible": len(no_undo),
+            "torrent_records_lost": len(lost),
+            "skipped_detail": skipped[:10],
+            "failed_detail": failed[:10],
+        }
+        if not self.dry_run:
+            with self.cfg.audit_log.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps({
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "run_id": f"rollback-of-{run_id}",
+                    "status": "rollback",
+                    **result,
+                }, ensure_ascii=False) + "\n")
+        return result
+
+    def _read_audit(self, run_id: str) -> list[dict]:
+        if not self.cfg.audit_log.exists():
+            return []
+        out = []
+        for line in self.cfg.audit_log.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("run_id") == run_id and not rec.get("dry_run"):
+                out.append(rec)
+        return out
+
+    def _apply_undo(self, u: dict) -> tuple[bool, str]:
+        """执行一条逆操作。返回 (是否成功, 跳过原因)。"""
+        op = u["op"]
+
+        if op == "rename":
+            cur = Path(u["path"])
+            if not cur.exists():
+                return False, f"当前文件不存在，可能已被再次改名：{cur.name}"
+            back = cur.parent / u["new_name"]
+            if back.exists():
+                return False, f"还原目标已存在：{back.name}"
+            if self.dry_run:
+                return True, ""
+            h = u.get("torrent_hash")
+            if h and self.ctx.qbit:
+                rel = self._torrent_rel_path(h, cur)
+                if rel is None:
+                    cur.rename(back)      # 种子里找不到，退化为文件系统改名
+                else:
+                    new_rel = (str(Path(rel).parent / u["new_name"])
+                               if "/" in rel else u["new_name"])
+                    self.ctx.qbit.rename_file(h, rel, new_rel)
+            else:
+                cur.rename(back)
+            return True, ""
+
+        if op == "rename_show_dir":
+            cur = Path(u["path"])
+            back = cur.parent / u["new_name"]
+            if back.exists():
+                return False, f"还原目标目录已存在：{back.name}"
+            if self.dry_run:
+                return True, ""
+
+            # 回退同样由 qBittorrent 搬运，保持"改动必经 qBit"的不变式
+            for h, sp in u.get("torrent_savepaths", []):
+                try:
+                    self.ctx.qbit.set_location([h], sp)   # 还原为原始 save_path
+                except Exception:
+                    continue
+
+            # 残留文件搬回去，再清掉空的新目录
+            if cur.exists():
+                back.mkdir(parents=True, exist_ok=True)
+                for item in list(cur.iterdir()):
+                    dest = back / item.name
+                    if not dest.exists():
+                        shutil.move(str(item), str(dest))
+                try:
+                    cur.rmdir()
+                except OSError:
+                    pass
+
+            bid, prev = u.get("bangumi_id"), u.get("prev_savepath")
+            if bid and prev and self.ctx.abdb:
+                self.ctx.abdb.write([
+                    ("UPDATE bangumi SET save_path=? WHERE id=?", (prev, bid))
+                ])
+            return True, ""
+
+        if op == "recategorize":
+            if self.dry_run:
+                return True, ""
+            self.ctx.qbit.set_category([u["torrent_hash"]], u.get("category") or "")
+            return True, ""
+
+        if op == "remove_tags":
+            if self.dry_run:
+                return True, ""
+            self.ctx.qbit.remove_tags([u["torrent_hash"]], u["tags"])
+            return True, ""
+
+        if op == "restore_from_trash":
+            src = Path(u.get("trash_path") or "")
+            dst = Path(u.get("path") or "")
+            if not src or not src.exists():
+                return False, "隔离区文件已不存在（可能已过保留期被清理）"
+            if dst.exists():
+                return False, f"原位置已被占用：{dst.name}"
+            if self.dry_run:
+                return True, ""
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            return True, ""
+
+        return False, f"未知逆操作 {op}"
+
+    def repair_split_dirs(self, run_id: str) -> dict:
+        """修复目录改名后新旧并存的分裂状态。
+
+        场景：`rename_show_dir` 执行过但旧目录没清干净（早期版本的递归合并 bug，
+        或 setLocation 失败导致半迁移）。这里按审计记录找出所有 old/new 配对，
+        把旧目录残留内容合并进新目录。
+
+        对**仍有有效种子**的文件优先走 qBittorrent setLocation；
+        种子已失联的（stale path）只能走文件系统——那些种子本来就已经断了，
+        搬运不会让情况更糟，但会记录下来。
+        """
+        pairs = []
+        for rec in self._read_audit(run_id):
+            if rec.get("status") != "applied" or rec.get("op") != "rename_show_dir":
+                continue
+            u = rec.get("undo") or {}
+            new = Path(u.get("path", ""))
+            old = new.parent / u.get("new_name", "")
+            if old.exists() and new.exists() and old != new:
+                pairs.append((old, new))
+
+        results = []
+        for old, new in pairs:
+            # 先让还活着的种子自己搬
+            via_qbit = 0
+            if self.ctx.qbit:
+                for t in self.ctx.qbit.torrents():
+                    sp = t.get("save_path") or ""
+                    cp = t.get("content_path") or ""
+                    if not sp.startswith(str(old)):
+                        continue
+                    if not Path(cp).exists():
+                        continue          # 死链种子，setLocation 搬不动它
+                    try:
+                        self.ctx.qbit.set_location(
+                            [t["hash"]], sp.replace(str(old), str(new), 1))
+                        via_qbit += 1
+                    except Exception:
+                        continue
+
+            if self.dry_run:
+                remaining = sum(1 for p in old.rglob("*")
+                                if p.is_file() and not self._is_junk(p.name))
+                results.append({"old": old.name, "new": new.name,
+                                "would_move_via_qbit": via_qbit,
+                                "would_move_via_fs": remaining})
+                continue
+
+            moved, stranded = self._merge_tree(old, new)
+            results.append({"old": old.name, "new": new.name,
+                            "moved_via_qbit": via_qbit, "moved_via_fs": moved,
+                            "stranded": stranded, "old_removed": not old.exists()})
+
+        return {"pairs": len(pairs), "detail": results}
+
+    def list_runs(self) -> list[dict]:
+        """列出历史 run，供选择回退哪一次。"""
+        if not self.cfg.audit_log.exists():
+            return []
+        runs: dict[str, dict] = {}
+        for line in self.cfg.audit_log.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = rec.get("run_id")
+            if not rid or rec.get("dry_run"):
+                continue
+            r = runs.setdefault(rid, {"run_id": rid, "ts": rec.get("ts", ""),
+                                      "applied": 0, "undoable": 0, "kinds": set()})
+            if rec.get("status") == "applied":
+                r["applied"] += 1
+                if rec.get("undo"):
+                    r["undoable"] += 1
+                r["kinds"].add(rec.get("kind", ""))
+            if rec.get("status") == "rollback":
+                r["rolled_back"] = True
+        out = []
+        for r in runs.values():
+            r["kinds"] = sorted(k for k in r["kinds"] if k)
+            out.append(r)
+        return sorted(out, key=lambda r: r["ts"])
 
     # ---------------- 隔离区维护 ----------------
     def purge_trash(self) -> dict:

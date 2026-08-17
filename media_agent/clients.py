@@ -96,6 +96,9 @@ class QBitClient:
     def add_tags(self, hashes: list[str], tags: str) -> None:
         self._post("torrents/addTags", {"hashes": "|".join(hashes), "tags": tags})
 
+    def remove_tags(self, hashes: list[str], tags: str) -> None:
+        self._post("torrents/removeTags", {"hashes": "|".join(hashes), "tags": tags})
+
     def set_file_priority(self, torrent_hash: str, ids: list[int], priority: int) -> None:
         self._post("torrents/filePrio", {
             "hash": torrent_hash,

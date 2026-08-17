@@ -45,8 +45,12 @@ uv run media-agent run                # 完整自治轮次
 1. **判重只认内容哈希，绝不认文件名。** AutoBangumi 会改名，文件名不可靠。
 2. **判断"是否已改名"只查磁盘。** qBittorrent 的 `name` 字段在 `renameFile`
    之后不更新，用它判断会产生上百条误报。
-3. **有种子的文件改名走 qBittorrent API**，不走文件系统 `mv`，否则破坏做种路径映射。
+3. **所有改动必经 qBittorrent。** 有种子的文件改名走 `renameFile`，种子里找不到
+   该文件就报失败中止，**绝不退化成文件系统 `mv`**；目录改名由 `setLocation`
+   让 qBittorrent 自己搬运，不要 `Path.rename` 整个目录。库里现存的 28 个死链
+   种子就是早先违反这条留下的。
 4. **删除 = 移入隔离区**，不是 `rm`。全自动模式的前提就是这一条。
+   同理，**每个改动状态的动作都必须记录逆操作**，否则 `rollback` 救不回来。
 5. **演进产物是声明式 DSL，永不 `exec()` 模型生成的代码。**
    见 [声明式规则 DSL](.agents/notes/implemented/architecture/2026-08-17-declarative-rule-dsl.md)。
 6. **订阅番剧必须走 AutoBangumi 自己的 API**，手动往 qBittorrent 加种子会丢

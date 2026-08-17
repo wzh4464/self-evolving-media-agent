@@ -124,18 +124,86 @@ def cmd_apply(args, cfg) -> int:
 
     if args.kind:
         findings = [f for f in findings if f.kind in args.kind]
+    if args.show:
+        findings = [f for f in findings if f.show in args.show]
+    if args.limit:
+        findings = findings[:args.limit]
 
     dry = args.dry_run or not cfg.auto_apply
     ex = Executor(ctx, dry_run=dry)
     report = ex.apply(findings)
 
-    print(("【预演】" if dry else "【已执行】") + report.summary())
+    print(("【预演】" if dry else "【已执行】") + report.summary()
+          + (f"   批次 ID: {ex.run_id}" if not dry else ""))
     for rec in report.applied:
         print(f"  ✅ [{rec['op']}] {rec['summary']}")
     for rec in report.skipped:
         print(f"  ⏭️  [{rec['op']}] {rec['summary']} —— {rec.get('reason','')}")
     for rec in report.failed:
         print(f"  ❌ [{rec['op']}] {rec['summary']} —— {rec.get('error','')}")
+    return 0
+
+
+def cmd_runs(args, cfg) -> int:
+    """列出历史批次，供选择回退目标。"""
+    ex = Executor(Context(cfg, logger=_log), dry_run=True)
+    runs = ex.list_runs()
+    if not runs:
+        print("还没有任何已执行的批次")
+        return 0
+    print(f"{'批次 ID':<20} {'时间':<20} {'已执行':>6} {'可回退':>6}  类型")
+    for r in runs:
+        mark = " ↩已回退" if r.get("rolled_back") else ""
+        print(f"{r['run_id']:<20} {r['ts']:<20} {r['applied']:>6} {r['undoable']:>6}  "
+              f"{','.join(r['kinds'][:3])}{mark}")
+    print(f"\n回退最近一次： media-agent rollback --last")
+    return 0
+
+
+def cmd_rollback(args, cfg) -> int:
+    ctx = build_context(cfg)
+    ex = Executor(ctx, dry_run=args.dry_run)
+
+    run_id = args.run
+    if args.last or not run_id:
+        runs = [r for r in ex.list_runs() if not r.get("rolled_back") and r["undoable"]]
+        if not runs:
+            print("没有可回退的批次")
+            return 1
+        run_id = runs[-1]["run_id"]
+
+    print(("【预演回退】" if args.dry_run else "【回退】") + f"批次 {run_id}")
+    res = ex.rollback(run_id)
+    print(f"  已还原: {res['reverted']}")
+    print(f"  跳过:   {res['skipped']}")
+    print(f"  失败:   {res['failed']}")
+    if res["irreversible"]:
+        print(f"  ⚠️  不可逆: {res['irreversible']} 项（当初未记录逆操作）")
+    if res["torrent_records_lost"]:
+        print(f"  ⚠️  种子记录已丢失: {res['torrent_records_lost']} 项"
+              f"（文件可还原，但需重新添加种子才能继续做种）")
+    for d in res["skipped_detail"]:
+        print(f"    ⏭️  {d.get('skip_reason','')}")
+    for d in res["failed_detail"]:
+        print(f"    ❌ {d.get('error','')}")
+    return 0
+
+
+def cmd_repair(args, cfg) -> int:
+    """修复目录改名后新旧并存的分裂状态。"""
+    ctx = build_context(cfg)
+    ex = Executor(ctx, dry_run=args.dry_run)
+    res = ex.repair_split_dirs(args.run)
+    print(("【预演】" if args.dry_run else "【修复】") + f"分裂目录 {res['pairs']} 对")
+    for d in res["detail"]:
+        if args.dry_run:
+            print(f"  {d['old']} → {d['new']}: "
+                  f"qBit 搬 {d['would_move_via_qbit']}，文件系统搬 {d['would_move_via_fs']}")
+        else:
+            mark = "✅" if d["old_removed"] else "⚠️ 旧目录未清空"
+            print(f"  {mark} {d['old']} → {d['new']}: "
+                  f"qBit {d['moved_via_qbit']} + 文件系统 {d['moved_via_fs']}"
+                  + (f"，{d['stranded']} 个同名滞留" if d["stranded"] else ""))
     return 0
 
 
@@ -225,7 +293,23 @@ def main() -> int:
     s = sub.add_parser("apply", help="执行修复")
     s.add_argument("--dry-run", action="store_true", help="只预演不实际改动")
     s.add_argument("--kind", nargs="*", help="只处理指定类型的问题")
+    s.add_argument("--show", nargs="*", help="只处理指定番剧（目录名）")
+    s.add_argument("--limit", type=int, help="最多处理多少条（受控试跑用）")
     s.set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("runs", help="列出历史批次（回退用）")
+    s.set_defaults(func=cmd_runs)
+
+    s = sub.add_parser("rollback", help="一键回退某一批次的全部改动")
+    s.add_argument("--run", help="批次 ID，省略则回退最近一次")
+    s.add_argument("--last", action="store_true", help="回退最近一次未回退的批次")
+    s.add_argument("--dry-run", action="store_true", help="只预演回退，不实际还原")
+    s.set_defaults(func=cmd_rollback)
+
+    s = sub.add_parser("repair", help="修复目录改名后新旧并存的分裂状态")
+    s.add_argument("--run", required=True, help="出问题的批次 ID")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_repair)
 
     s = sub.add_parser("evolve", help="自演进：为规则盲区提议新规则")
     s.add_argument("--max-proposals", type=int, default=3)
