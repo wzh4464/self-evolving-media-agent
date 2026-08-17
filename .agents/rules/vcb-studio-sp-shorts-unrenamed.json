@@ -1,0 +1,23 @@
+{
+  "id": "vcb-studio-sp-shorts-unrenamed",
+  "kind": "special_episode_unrenamed",
+  "severity": "minor",
+  "summary": "抓取 .shorts 目录下 VCB-Studio 特典命名格式（SPxx_xx）未按官方标题规范重命名的文件",
+  "match": {
+    "all": [
+      {
+        "field": "parent_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "^\\[VCB-Studio\\].*\\[SP\\d{2}_\\d{2}\\].*\\.mkv$"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

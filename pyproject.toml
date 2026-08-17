@@ -1,0 +1,18 @@
+[project]
+name = "media-agent"
+version = "0.1.0"
+description = "自治的番剧媒体库管理 agent：查重、改名、TMDB 对齐、死种清理"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.scripts]
+media-agent = "media_agent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["media_agent"]

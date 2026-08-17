@@ -1,0 +1,28 @@
+{
+  "id": "vcb-studio-preview-shorts-unrenamed",
+  "kind": "preview_episode_unrenamed",
+  "severity": "minor",
+  "summary": "VCB-Studio 发布的 Preview 特典视频未按规范命名",
+  "match": {
+    "all": [
+      {
+        "field": "season_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "\\[Preview\\d{2}\\]"
+      },
+      {
+        "field": "filename",
+        "op": "not_regex",
+        "value": "^魔女之旅 S\\d{2}E\\d{2}"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

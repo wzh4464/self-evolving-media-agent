@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.zihan.media-agent</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/zihan/.local/bin/uv</string>
+    <string>run</string>
+    <string>--directory</string>
+    <string>/Users/zihan/media-agent</string>
+    <string>media-agent</string>
+    <string>run</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/zihan/media-agent</string>
+
+  <!-- 每 6 小时一轮 -->
+  <key>StartInterval</key>
+  <integer>21600</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/zihan/media-agent/state/run.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/zihan/media-agent/state/run.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- 低优先级，不跟下载/播放抢 IO -->
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>
