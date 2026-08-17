@@ -1,80 +1,188 @@
-# media-agent
+<div align="center">
 
-番剧媒体库的自治治理 agent：**查重、改名、TMDB 对齐、死种清理**，
-并且能发现自身规则的盲区、提议新规则、验证通过后自动上线。
+# self-evolving-media-agent
 
-跑在 `zihan_air` 上，直连本机的 qBittorrent 与 AutoBangumi。
+**An anime library agent that finds the gaps in its own rules — and writes new ones.**
 
-## 它解决什么
+English | [中文](README.zh.md)
 
-这套东西是从一次持续多天的手工整理里长出来的。那次整理反复撞上同几类问题：
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
-| 问题 | 手工时的表现 |
+</div>
+
+---
+
+Dedupe, rename, align to TMDB, purge dead torrents — across a qBittorrent +
+AutoBangumi library. Every rule it ships with came from a real problem that cost
+real hours. And when it hits something *no* rule can explain, it drafts a new
+rule, proves it on your actual library, and only then puts it into service.
+
+## The problems it was built from
+
+This started as a multi-day manual cleanup that kept hitting the same walls:
+
+| Problem | What it looked like by hand |
 |---|---|
-| 手动加种子绕过 AutoBangumi | 丢 `ab:` 标签 → 永远不会被自动改名 → 每隔几天就要人工补一批 |
-| 同集多版本抢同一文件名 | AutoBangumi 每 60 秒重试一次改名，永不收敛，日志刷屏 |
-| 按文件名判重 | AutoBangumi 会改名，文件名不可靠，漏判误判都有 |
-| 用 qBit 的 `name` 字段判断改名状态 | `renameFile` 不更新该字段 → 上百条误报 |
-| 目录名不是 TMDB 官方标题 | 刮削失败或匹配错剧 |
-| 死种 | 干等几天才发现全网 0 做种 |
+| Torrents added outside AutoBangumi | Missing `ab:` tag → never auto-renamed → re-fixing a fresh batch every few days |
+| Two releases of one episode | AutoBangumi retries the same rename every 60s, forever, never converging |
+| Deduping by filename | AutoBangumi renames files — filenames lie, both ways |
+| Trusting qBittorrent's `name` field | `renameFile` never updates it → hundreds of false "unrenamed" reports |
+| Directory ≠ TMDB official title | Scraper matches the wrong show, or nothing at all |
+| Dead torrents | Days of waiting before noticing zero seeders exist anywhere |
 
-现在这些都是规则，跑一条命令就查完，且**能自己长出新规则**。
+Each is now a rule. One command finds all of them.
 
-## 用法
+## Self-evolution, with teeth
+
+```
+diagnose → find residue (a real problem no rule can act on)
+         → LLM drafts a declarative rule
+         → shadow-validate against your live library
+         → promote to .agents/rules/  |  or reject with reasons
+```
+
+Shadow validation is a hard gate. **All five** must pass:
+
+1. It actually covers the samples it was drafted for
+2. **Zero false positives** — it must not match a single already-correct file
+3. Hits ≤ 3× the residue cluster size (catches over-broad rules)
+4. No overlap with an existing rule that can already act on those files
+5. Action args match the executor contract, and **contain no placeholders**
+   (`new_name: ""`, `tmdb_id: 0`, `title: "TBD"` are all rejected)
+
+Real output from a first run against a 173-show / 2404-file library:
+
+```
+🚫 rejected: unrenamed-vcb-raw
+   - matched 83 files, far beyond the 27-file residue — rule too broad
+   - overlaps existing rule extras-in-library
+🎉 promoted: vcb-studio-sp-shorts-unrenamed   (50 hits, zero false positives)
+🎉 promoted: vcb-studio-preview-shorts-unrenamed  (12 hits, zero false positives)
+```
+
+Every proposal — promoted *and* rejected — is written up as an
+[Agent Note](.agents/notes/) recording the reasoning, the alternatives
+considered, and the risks. Rejections are kept so the same bad idea doesn't
+get re-proposed next week.
+
+### Evolved rules are data, never code
+
+The agent emits **declarative JSON**, interpreted by a fixed evaluator. It can
+only compose conditions from a closed vocabulary of fields and operators — it
+can never ask the kernel to execute arbitrary logic.
+
+```json
+{
+  "id": "vcb-studio-sp-shorts-unrenamed",
+  "kind": "special_episode_unrenamed",
+  "match": {"all": [
+    {"field": "parent_dir", "op": "eq", "value": ".shorts"},
+    {"field": "filename", "op": "regex", "value": "^\\[VCB-Studio\\].*\\[SP\\d{2}_\\d{2}\\].*\\.mkv$"}
+  ]},
+  "action": null
+}
+```
+
+This isn't a stylistic preference. The agent runs fully autonomous, with delete
+permission, over files that are often **unrecoverable** (dead torrents, long-finished
+seasons). Torrent and file names are untrusted external input. `exec()`-ing model
+output under those conditions is not a risk worth taking — the reasoning is
+written up in [an Agent Note](.agents/notes/implemented/architecture/2026-08-17-declarative-rule-dsl.md).
+
+## Safety
+
+Even in full-auto mode:
+
+- **Quarantine, not deletion.** Removals move to `state/trash/<date>/`, restorable
+  for 30 days before being purged for real.
+- **Per-run caps.** More than 50 files or 200 GB in one pass? The whole batch is
+  skipped and flagged — a wrong rule can't run away.
+- **Full audit trail.** Every action, skip, and failure lands in `state/audit.jsonl`.
+- **Defense in depth.** Action args are validated at proposal time *and* again at
+  execution time.
+- **Parse-failure guard.** If more than 3 files claim to be the same episode, that's
+  treated as a parsing bug, not a duplicate — and nothing gets deleted.
+
+That last one isn't hypothetical. On its very first dry run this agent proposed
+deleting 11 episodes of a 12-episode season, because collection torrents share one
+name across all their files. The dry run caught it; the fix and the reasoning are
+[recorded as a bug-fix note](.agents/notes/implemented/bug-fix/2026-08-17-collection-torrent-episode-collapse.md).
+Two more self-defects surfaced the same way. **Rules will be wrong — full autonomy
+is only safe because being wrong is recoverable.**
+
+## Quick start
 
 ```sh
-uv run media-agent scan               # 看库现状
-uv run media-agent diagnose           # 跑全部规则出问题清单（只读）
-uv run media-agent apply --dry-run    # 预演修复
-uv run media-agent apply              # 执行修复
-uv run media-agent apply --kind orphan_torrent   # 只修某一类
-uv run media-agent evolve             # 为规则盲区提议新规则
-uv run media-agent run                # 完整自治轮次（launchd 每 6 小时跑这个）
-```
-
-## 自演进怎么工作
-
-```
-诊断 → 找残留（有问题但没规则能动它）→ deepseek 提议声明式规则
-     → 影子验证 → 通过则写入 .agents/rules/ 并立即生效
-                → 不通过则记入 .agents/notes/rejected/
-```
-
-**影子验证是硬门槛**，四条全过才能上线：
-1. 确实命中了它本该解决的样本
-2. **零误伤**——不命中任何已规范的文件
-3. 命中数不超过残留簇规模的 3 倍（防规则写得过宽）
-4. 与现有规则无重叠（只算"能给出动作"的规则）
-5. 动作参数符合执行器契约且**不是占位值**（`new_name:""`、`tmdb_id:0` 一律驳回）
-
-实测第一轮：3 条提议 → 1 条因过宽+重叠驳回，2 条上线（命中 50/12 个，零误伤）。
-
-演进产物是**声明式 JSON**，不是生成的代码——理由见
-[声明式规则 DSL](.agents/notes/implemented/architecture/2026-08-17-declarative-rule-dsl.md)。
-
-## 安全设计
-
-全自动模式（`AUTO_APPLY=true`）下仍有三层保护：
-
-1. **隔离区**：删除 = 移入 `state/trash/<日期>/`，30 天后才真删，期间可整体还原
-2. **配额上限**：单轮删除超过 50 个文件或 200GB 就整体跳过并告警
-3. **审计日志**：每个动作（含跳过与失败）落 `state/audit.jsonl`
-
-外加两处纵深防御：动作参数在验证层和执行层各查一次；同一集出现 >3 个文件时
-判定为解析异常而非重复，绝不产出删除动作。
-
-## 配置
-
-```sh
-cp .env.example .env && chmod 600 .env   # 填入各服务的地址与密钥
+git clone https://github.com/wzh4464/self-evolving-media-agent
+cd self-evolving-media-agent
+cp .env.example .env && chmod 600 .env   # fill in your endpoints and keys
 uv sync
 ```
 
-需要的外部服务：qBittorrent WebUI、AutoBangumi、TMDB API key、
-LLM（openlux 上的 deepseek-v4-pro）。缺 TMDB key 时标题对齐规则自动跳过，
-缺 LLM key 时自演进跳过，其余功能不受影响。
+```sh
+uv run media-agent scan                # what's in the library right now
+uv run media-agent diagnose            # run every rule, read-only
+uv run media-agent apply --dry-run     # preview fixes
+uv run media-agent apply               # execute
+uv run media-agent evolve              # draft rules for the blind spots
+uv run media-agent run                 # one full autonomous cycle
+```
 
-## 想改动的话
+Start with `diagnose`, then `apply --dry-run`. Only flip `AUTO_APPLY=true` once
+you've read what it wants to do.
 
-先读 [AGENTS.md](AGENTS.md)，里面列了六条不可动摇的约束——每条都是踩坑换来的。
-非平凡改动要在同一次提交里写 Agent Note。
+A launchd plist for a 6-hourly cycle is in [`deploy/`](deploy/).
+
+### What it needs
+
+| Service | Required? | Without it |
+|---|---|---|
+| qBittorrent WebUI | yes | — |
+| AutoBangumi | optional | Loses `ab:` tag rules and subscription awareness |
+| TMDB API key | optional | Title-alignment rules skip (free at [themoviedb.org](https://www.themoviedb.org/settings/api)) |
+| LLM (OpenAI-compatible) | optional | Self-evolution skips; everything else works |
+
+Built against DeepSeek V4 Pro, but any OpenAI-compatible chat endpoint works —
+set `LLM_BASE` / `LLM_MODEL`.
+
+## Architecture
+
+Everything is a plugin; capabilities are separated from providers; decisions
+settle into Agent Notes. The shape is borrowed from
+[deepseek-harness](https://github.com/deepseek-ai).
+
+```
+media_agent/
+  kernel.py       Finding/Action/Context/Registry + the declarative rule interpreter
+  naming.py       Episode parsing, normalization, quality ranking — every line earned
+  dedup.py        Content hashing (size + first/last 8 MB)
+  scan.py         Disk + qBittorrent + AutoBangumi → one LibraryState
+  plugins/        The nine built-in detectors
+  actions.py      Executor + quarantine + caps + audit log
+  evolution.py    Residue → propose → shadow-validate → promote
+.agents/
+  notes/          Agent Notes, path-encoded {lifecycle}/{class}/date-title.md
+  rules/          Evolved rules (JSON), auto-mounted on the next run
+```
+
+Read [AGENTS.md](AGENTS.md) before changing anything — it lists six constraints
+that are not up for debate, each one paid for in lost hours.
+
+## Honest limitations
+
+- **Tuned for Chinese-subtitled anime releases.** Episode parsing covers the naming
+  conventions of mikan/dmhy fansub groups. Western TV releases mostly work; your
+  mileage will vary.
+- **The DSL can't express everything.** Some genuine problems can't be written as a
+  rule with the current field/operator vocabulary. Those land in
+  `.agents/notes/rejected/` and are the evidence for extending the vocabulary — a
+  human decision, never the model's.
+- **TMDB is treated as authoritative.** If it has no localized title for a show, the
+  agent writes an NFO pinning the TMDB ID rather than guessing.
+- **Only tested on one library.** 173 shows, 2404 files, macOS. Expect rough edges
+  elsewhere — issues and PRs welcome.
+
+## License
+
+[MIT](LICENSE)
