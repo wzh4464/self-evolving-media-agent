@@ -73,6 +73,7 @@ class Executor:
     # 分类/标签不涉及路径，放最前无所谓；删除放最后，让前面的判断都基于完整状态。
     _OP_ORDER = {
         "fix_title_aliases": 0,  # 订阅失效则下游全部无从谈起，最先修
+        "repoint_rss": 0,        # 同上：链接指错地方，下游同样无从谈起
         "write_sidecar": 10,     # 最后写档案，记录本轮结束后的最终状态
         "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
         "retag": 2, "recategorize": 3, "delete_category": 4,
@@ -235,6 +236,25 @@ class Executor:
                     undo={"op": "restore_sidecar", "show_dir": str(show_dir),
                           "prev": prev_content})
 
+    def _wait_ab_ready(self, timeout: float = 45.0) -> bool:
+        """等 AutoBangumi 重新起来再调它的接口。
+
+        `abdb.write()` 是"停容器 → 改库 → 起容器"，而容器起来后 uvicorn
+        还要几秒才开始监听。紧接着调 refresh 会撞上 `Connection reset by
+        peer`——**库改对了、刷新却没做**，外部看起来像"改了不生效"，
+        很容易误判成规则本身有问题。实测踩过。
+        """
+        if not self.ctx.ab:
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                self.ctx.ab.all_bangumi()
+                return True
+            except Exception:
+                time.sleep(2)
+        return False
+
     def _op_fix_title_aliases(self, f: Finding, a: Action) -> None:
         """修复订阅的标题匹配，并解除因此卡住的重抓阻塞。
 
@@ -277,9 +297,9 @@ class Executor:
 
         self.ctx.abdb.write(stmts)
 
-        # 步骤 3：让 AutoBangumi 重新拉一遍
+        # 步骤 3：让 AutoBangumi 重新拉一遍（必须等它起来，见 _wait_ab_ready）
         refreshed = False
-        if self.ctx.ab:
+        if self.ctx.ab and self._wait_ab_ready():
             try:
                 self.ctx.ab.refresh_all()
                 refreshed = True
@@ -291,6 +311,68 @@ class Executor:
                      "refreshed": refreshed},
                     undo={"op": "restore_title_aliases",
                           "bangumi_id": bid, "prev": prev})
+
+    def _op_repoint_rss(self, f: Finding, a: Action) -> None:
+        """把订阅从"搜索式 RSS"改到"番组+字幕组式 RSS"，并补上新发布名的别名。
+
+        搜索式链接（`RSS/Search?searchstr=ANi+You+and+I+Are+Polar+Opposites+...`）
+        把字幕组当时的发布名写死进了查询，对方一改名就再也搜不到新集。
+        番组式链接（`RSS/Bangumi?bangumiId=..&subgroupid=..`）绑的是 Mikan 的
+        番组与字幕组 id，改名不受影响。
+
+        两件事必须一起做：**只换链接不补别名等于白换**——新集是拉回来了，
+        但 `match_torrent` 用的还是旧 `title_raw`，照样认领不了。实测踩过。
+
+        `rssitem` 表也要跟着改：AutoBangumi 的定时刷新遍历的是那张表，
+        只改 `bangumi.rss_link` 的话手动刷新有效、定时刷新依旧走老链接。
+
+        **不清 torrent 记录**——这是与 `fix_title_aliases` 的关键差别。
+        那套清理是给"条目已登记但没下下来"准备的；这里旧集本来就下好了，
+        而新集从未登记、天然是新条目。而且 torrent 表存的是 RSS 原始标题，
+        与 qBit 里被 AutoBangumi 改过的名字对不上，"不在 qBit"会全部误判为真，
+        照搬会把已下好的记录一并抹掉。
+        """
+        bid = a.args["bangumi_id"]
+        new_url = a.args["rss_link"]
+        aliases = a.args.get("aliases") or []
+
+        rows = self.ctx.abdb.query(
+            "SELECT rss_link, title_aliases FROM bangumi WHERE id=?", (bid,))
+        prev_url = rows[0]["rss_link"] if rows else ""
+        prev_aliases = rows[0]["title_aliases"] if rows else None
+
+        # 指向同一条旧链接的 rssitem 一并改；先取出来，回退时要按 id 还原
+        item_ids = [r["id"] for r in self.ctx.abdb.rss_items()
+                    if (r.get("url") or "") == prev_url]
+
+        if self.dry_run:
+            self._audit("skipped", f, a,
+                        {"reason": "dry-run", "would_set_rss": new_url,
+                         "would_set_aliases": aliases,
+                         "would_update_rssitem": item_ids})
+            return
+
+        stmts = [("UPDATE bangumi SET rss_link=?, title_aliases=? WHERE id=?",
+                  (new_url, json.dumps(aliases, ensure_ascii=False), bid))]
+        stmts += [("UPDATE rssitem SET url=? WHERE id=?", (new_url, i))
+                  for i in item_ids]
+        self.ctx.abdb.write(stmts)
+
+        refreshed = False
+        if self.ctx.ab and self._wait_ab_ready():
+            try:
+                self.ctx.ab.refresh_all()
+                refreshed = True
+            except Exception as e:
+                self.ctx.log(f"[repoint_rss] 刷新失败: {e}")
+
+        self._audit("applied", f, a,
+                    {"rss_link": new_url, "aliases": aliases,
+                     "updated_rssitem": item_ids, "refreshed": refreshed},
+                    undo={"op": "restore_rss_link", "bangumi_id": bid,
+                          "prev_rss_link": prev_url,
+                          "prev_aliases": prev_aliases,
+                          "rssitem_ids": item_ids})
 
     def _op_relink_torrent(self, f: Finding, a: Action) -> None:
         """把路径失效的种子重新关联到磁盘上的实际文件。
@@ -655,6 +737,20 @@ class Executor:
                 ("UPDATE bangumi SET title_aliases=? WHERE id=?",
                  (u.get("prev"), u["bangumi_id"]))
             ])
+            return True, ""
+
+        if op == "restore_rss_link":
+            if self.dry_run:
+                return True, ""
+            # rss_link 和 aliases 是一次写进去的，回退也要一起还原，
+            # 否则会留下"新链接配旧别名"或反之的半吊子状态
+            stmts = [("UPDATE bangumi SET rss_link=?, title_aliases=? WHERE id=?",
+                      (u.get("prev_rss_link") or "", u.get("prev_aliases"),
+                       u["bangumi_id"]))]
+            stmts += [("UPDATE rssitem SET url=? WHERE id=?",
+                       (u.get("prev_rss_link") or "", i))
+                      for i in u.get("rssitem_ids", [])]
+            self.ctx.abdb.write(stmts)
             return True, ""
 
         if op == "relink_torrent":
