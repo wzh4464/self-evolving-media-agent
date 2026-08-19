@@ -558,6 +558,22 @@ class Executor:
         h = a.args.get("torrent_hash")
         file_only = a.args.get("file_only", False)
 
+        # `file_only` 的本意是"合集种子里只作废一个文件，其余正片保留"，
+        # 检测器（如 extras-in-library）不知道种子里到底有几个文件就一律设了 True。
+        # 种子只含这一个文件时，把它设为不下载 = 留下一个指向空内容的孤儿种子：
+        # 文件进了隔离区，种子记录还赖在 qBittorrent 里，之后被 stale-torrent-path
+        # 报成"路径失效且无法自动定位"——攻壳机动队实测留下 6 个，全都修不了，
+        # 因为磁盘上根本没有对应体积的文件可供重新关联。
+        # 所以在这里按种子的**实际文件数**复核，只含一个就退化成整种子作废。
+        if h and self.ctx.qbit and file_only:
+            try:
+                wanted = [e for e in self.ctx.qbit.files(h)
+                          if e.get("priority", 1) != 0]
+                if len(wanted) <= 1:
+                    file_only = False
+            except Exception as e:
+                self.ctx.log(f"[trash] 读取种子文件列表失败 {h}: {e}")
+
         if h and self.ctx.qbit and not file_only:
             # 整个种子作废：先删种子记录（不删文件），文件再单独进隔离区
             try:
