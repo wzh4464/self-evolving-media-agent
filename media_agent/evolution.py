@@ -45,12 +45,19 @@ def find_residue(state: LibraryState, findings: list[Finding]) -> list[Residue]:
 
     盲区 = 以下两种之一：
     - 没有任何 Finding 指向它（完全没被看见）
-    - 有 Finding 但**给不出动作**（看见了但不知道怎么办，典型是 `unparsable`）
+    - 有 Finding 但**既没有动作、也没被归类**（看见了但不知道怎么办，典型是 `unparsable`）
 
     第二种才是主要来源：检测器能说"这文件名不规范"，却解析不出集号，
     于是既不能改名也不能删除，只能干瞪眼——正该由演进器为它立新规则。
+
+    `classified` 必须计入已解释，否则演进永远不收敛：模型提出的无动作规则
+    （"这批 VCB 特典属于 specials"）是有效的分类知识，但按旧判据它一个文件
+    都"解释"不了，于是同一批残留每轮重新提议一遍。实测因此累积出 28 条同质
+    规则（`-v2` `-v3` `-residual` `-leftover` `-final`），其中 0 条带动作。
+    详见 `.agents/notes/implemented/bug-fix/2026-08-20-evolution-never-converges.md`。
     """
-    explained = {f.path for f in findings if f.path and f.action is not None}
+    explained = {f.path for f in findings
+                 if f.path and (f.action is not None or f.classified)}
     clusters: dict[str, Residue] = {}
 
     for show in state.shows:
@@ -137,6 +144,14 @@ _PROPOSE_SYSTEM = """你是媒体库治理 agent 的规则演进器。
 `title: "待识别"` 这类占位值会被直接驳回。只报告问题的规则同样有价值，
 它让这批文件从"没人看见"变成"有名字的已知问题"，这就够了。
 
+省略 action 时，用 `resolution` 声明你的意图（默认 `classified`）：
+- `classified`：**已看懂并归类**，这批文件不需要自动动作。选它意味着
+  你认为这件事到此为止，残留检测从此不再把它们当盲区。绝大多数情况选这个。
+- `unresolved`：只是先标记出来，问题仍悬而未决，期待后续规则接手。
+  **慎用**——每一条 unresolved 都会让同一批文件在下一轮再次进入提议流程。
+  历史上因为没有这个字段，同一批 VCB 特典被反复提议，累积出 28 条
+  `-v2` `-v3` `-residual` `-leftover` 同质规则，全部没有动作，一条也没能收敛。
+
 返回 JSON：
 {{
   "worth_a_rule": true/false,
@@ -147,7 +162,8 @@ _PROPOSE_SYSTEM = """你是媒体库治理 agent 的规则演进器。
     "severity": "critical|important|minor",
     "summary": "一句话说明这条规则抓什么",
     "match": {{"all": [{{"field": "...", "op": "...", "value": "..."}}]}},
-    "action": {{"op": "...", "args": {{}}, "note": "..."}}
+    "action": {{"op": "...", "args": {{}}, "note": "..."}},
+    "resolution": "classified|unresolved"
   }},
   "note": {{
     "class": "feature|bug-fix|simplification|architecture|process|testing",
@@ -313,20 +329,24 @@ class Evolver:
                            hits: list[str]) -> str | None:
         """是否与现有规则重复。
 
-        只有当现有规则**能对同一文件给出动作**时才算重叠。
-        像 `unrenamed-file` 那样"检测到但解析不出集号、给不出动作"的情况，
-        正是新规则要填补的空白，不构成重叠——否则演进器永远无法为
-        任何已被标记 `unparsable` 的文件立规则。
+        现有规则**能给出动作**，或**已明确归类**（`resolution: classified`），
+        都算重叠。
+        像 `unrenamed-file` 那样"检测到但解析不出集号、给不出动作"的内置检测器
+        不算——那正是新规则要填补的空白，否则演进器永远无法为任何被标记
+        `unparsable` 的文件立规则。内置检测器不会置 `classified`，不受影响。
+
+        把 classified 纳入判定是防重复的第二道闸：残留过滤本已挡住这些文件，
+        这里再挡一次，免得同一批残留因任何原因漏过上游又生出一条同质规则。
         """
         for d in self.registry.detectors:
             if getattr(d, "id", "") == spec.id:
                 return getattr(d, "id")
             try:
-                actionable = {f.path for f in d.detect(self.ctx, state)
-                              if f.path and f.action is not None}
+                covered = {f.path for f in d.detect(self.ctx, state)
+                           if f.path and (f.action is not None or f.classified)}
             except Exception:
                 continue
-            if actionable and set(hits) & actionable:
+            if covered and set(hits) & covered:
                 return getattr(d, "id", "?")
         return None
 

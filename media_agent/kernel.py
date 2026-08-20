@@ -42,6 +42,11 @@ class Finding:
     torrent_hash: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
     action: Action | None = None
+    # "已归类"：某条规则看懂了这个文件，但不存在值得自动执行的动作。
+    # 它与"没有动作"不是一回事——后者可能只是规则没写全。
+    # 演进器的残留判据要认这个标记，否则同一批文件会被永远重新提议，
+    # 产出一串 v2/v3/residual/leftover 变体（实测累积了 28 条同质规则）。
+    classified: bool = False
 
     def key(self) -> tuple:
         """去重键：同一文件同一类问题只报一次。"""
@@ -244,6 +249,12 @@ class RuleSpec:
     action: dict | None = None
     source: str = "evolved"       # builtin | evolved
     enabled: bool = True
+    # 无动作规则的意图声明：
+    #   classified —— 已看懂并归类，不需要自动动作（默认）
+    #   unresolved —— 只是标记出来，问题仍悬而未决，欢迎后续规则接手
+    # 默认取 classified：一条规则既然写得出精确的匹配条件，就说明它已经
+    # 理解了这批文件。若默认成 unresolved，演进器会永远重新提议同一批残留。
+    resolution: str = "classified"
 
     @classmethod
     def from_json(cls, data: dict) -> "RuleSpec":
@@ -256,6 +267,7 @@ class RuleSpec:
             action=data.get("action"),
             source=data.get("source", "evolved"),
             enabled=data.get("enabled", True),
+            resolution=data.get("resolution", "classified"),
         )
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
@@ -285,8 +297,11 @@ class RuleSpec:
                     show=show.dir_name,
                     path=str(f.path),
                     torrent_hash=f.torrent_hash,
-                    evidence={"matched_by": self.id, "source": self.source},
+                    evidence={"matched_by": self.id, "source": self.source,
+                              "resolution": self.resolution},
                     action=action,
+                    # 有动作的规则天然算已解释；无动作的按其声明的意图判定
+                    classified=(action is None and self.resolution == "classified"),
                 )
 
 
