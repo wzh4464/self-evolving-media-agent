@@ -634,9 +634,13 @@ BUILTIN = [
 
 
 def register_builtins(registry: Registry) -> Registry:
+    from .grab import GRAB_DETECTORS
     from .sidecar_sync import SIDECAR_DETECTORS
     from .subscription import SUBSCRIPTION_DETECTORS
-    # 订阅健康度规则排在最前：订阅本身失效时，下游一切规则都无从谈起
-    for cls in SUBSCRIPTION_DETECTORS + BUILTIN + SIDECAR_DETECTORS:
+    # 订阅健康度规则排在最前：订阅本身失效时，下游一切规则都无从谈起。
+    # 抓取器紧随其后——先补齐缺的集，后面的改名/归类规则才有东西可处理。
+    # sidecar 同步放最后，记录本轮结束后的最终状态。
+    for cls in (SUBSCRIPTION_DETECTORS + GRAB_DETECTORS + BUILTIN
+                + SIDECAR_DETECTORS):
         registry.register(cls())
     return registry

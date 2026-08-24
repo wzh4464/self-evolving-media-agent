@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -74,6 +75,7 @@ class Executor:
     _OP_ORDER = {
         "fix_title_aliases": 0,  # 订阅失效则下游全部无从谈起，最先修
         "repoint_rss": 0,        # 同上：链接指错地方，下游同样无从谈起
+        "grab_episode": 0,       # 抓取只加种子、不碰已有文件，与下游动作互不干扰
         "write_sidecar": 10,     # 最后写档案，记录本轮结束后的最终状态
         "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
         "retag": 2, "recategorize": 3, "delete_category": 4,
@@ -373,6 +375,72 @@ class Executor:
                           "prev_rss_link": prev_url,
                           "prev_aliases": prev_aliases,
                           "rssitem_ids": item_ids})
+
+    def _op_grab_episode(self, f: Finding, a: Action) -> None:
+        """抓取某一集：下 .torrent、加进 qBittorrent、把集号写进 sidecar。
+
+        `have` 清单是"先到先得"模型的判重依据——不锁字幕组，靠集号去重。
+        所以**必须在加种成功后立刻写**，否则下一轮会把同一集再抓一遍。
+
+        qBittorrent 对已存在的 infohash 返回 409。那不是失败，是"已经有了"，
+        同样要把集号记进 have（本 session 在 Re:Zero 上把 409 误判成失败过一次，
+        白查了半天）。
+        """
+        import urllib.request
+
+        from . import sidecar as sc_mod
+
+        url = a.args["url"]
+        show_dir = Path(a.args["show_dir"])
+        season = int(a.args["season"])
+        ep = int(a.args["episode"])
+        bid = a.args.get("bangumi_id")
+        save_path = show_dir / f"Season {season}"
+
+        if self.dry_run:
+            self._audit("skipped", f, a,
+                        {"reason": "dry-run", "would_save_to": str(save_path)})
+            return
+
+        req = urllib.request.Request(url, headers={"User-Agent": "media-agent/0.1"})
+        blob = urllib.request.urlopen(req, timeout=60).read()
+
+        data = {"savepath": str(save_path), "category": "Bangumi",
+                "paused": "false", "autoTMM": "false",
+                "contentLayout": "NoSubfolder"}
+        if bid:
+            data["tags"] = f"ab:{bid}"      # 没这个标签 AutoBangumi 永远不会改名
+        resp = self.ctx.qbit._client.post(
+            f"{self.ctx.qbit.base}/api/v2/torrents/add",
+            data=data,
+            files={"torrents": ("t.torrent", blob, "application/x-bittorrent")})
+
+        already = resp.status_code == 409
+        if resp.status_code not in (200, 409):
+            self._audit("failed", f, a,
+                        {"error": f"qBit 返回 HTTP {resp.status_code}: {resp.text[:120]}"})
+            return
+
+        # 写 sidecar：加进 have，并把这个发布名记成别名（下次匹配用得上）
+        sc = sc_mod.load(show_dir)
+        info = sc.seasons.setdefault(str(season), {})
+        have = sorted(set(info.get("have") or []) | {ep})
+        info["have"] = have
+        title = a.args.get("title", "")
+        for part in re.split(r"\s*/\s*", title):
+            part = part.strip()
+            if 4 <= len(part) <= 60 and not part.startswith("["):
+                sc.add_alias(part)
+        sc_mod.save(show_dir, sc)
+
+        self._audit("applied", f, a,
+                    {"qbit_status": resp.status_code,
+                     "already_present": already,
+                     "save_path": str(save_path),
+                     "have_after": have},
+                    undo={"op": "ungrab_episode", "show_dir": str(show_dir),
+                          "season": season, "episode": ep,
+                          "title": title})
 
     def _op_relink_torrent(self, f: Finding, a: Action) -> None:
         """把路径失效的种子重新关联到磁盘上的实际文件。
@@ -753,6 +821,22 @@ class Executor:
                 ("UPDATE bangumi SET title_aliases=? WHERE id=?",
                  (u.get("prev"), u["bangumi_id"]))
             ])
+            return True, ""
+
+        if op == "ungrab_episode":
+            # 只把集号从 have 里摘掉，**不动种子和文件**：
+            # 回退的语义是"当作没抓过、下轮可重抓"，而不是"删掉已下的内容"。
+            # 真要删种子，走 trash 动作，那条有隔离区和配额保护。
+            if self.dry_run:
+                return True, ""
+            from . import sidecar as sc_mod
+            d = Path(u["show_dir"])
+            sc = sc_mod.load(d)
+            info = sc.seasons.get(str(u["season"]))
+            if info:
+                info["have"] = [x for x in (info.get("have") or [])
+                                if x != int(u["episode"])]
+                sc_mod.save(d, sc)
             return True, ""
 
         if op == "restore_rss_link":

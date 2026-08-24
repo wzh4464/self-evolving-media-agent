@@ -63,6 +63,22 @@ def _longest_common(a: str, b: str) -> str:
     return a[end - best:end].strip(" /,")
 
 
+def _disk_episodes(show) -> dict[int, set[int]]:
+    """磁盘上实际有哪些集：`{季号: {集号…}}`。
+
+    以文件名里的 SxxExx 为准——这是全库改名后的规范形态。
+    未下载完的（`.!qB` 或种子进度 <1）不算，否则会把"正在下"误当成"已有"。
+    """
+    have: dict[int, set[int]] = defaultdict(set)
+    for f in show.files:
+        if f.is_incomplete or f.path.suffix.lower() not in VIDEO_EXTS:
+            continue
+        m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
+        if m:
+            have[int(m.group(1))].add(int(m.group(2)))
+    return have
+
+
 def _patterns_of(b: dict) -> list[str]:
     pats = [b["title_raw"]] if b.get("title_raw") else []
     try:
@@ -268,6 +284,9 @@ class IncompleteSeasonDetector:
     """
     id = "incomplete-season"
     kind = "incomplete_season"
+    # 播出多久之内还没拿到算正常等待。字幕组普遍滞后一到数日，
+    # 冷门番更久；超过这个窗口还缺，才说明链路可能出了问题。
+    RECENT_DAYS = 7
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         if not (ctx.tmdb and ctx.tmdb.enabled):
@@ -324,12 +343,24 @@ class IncompleteSeasonDetector:
                 if not missing:
                     continue
 
+                # 按"缺了多久"定严重度，而不是一律 important。
+                # 刚播出一两天还没人做出来是常态，报成需要处理的问题纯属噪音——
+                # 实测《二十世纪电气目录》E08 播出次日就被报出来，而扫遍整个
+                # 番组页**全部字幕组** 0 个候选，报了也无从下手。
+                # 真正值得警觉的是"播出很久了却始终没拿到"，那说明链路有问题。
+                air_of = {n: d for d, n in dated}
+                overdue = [n for n in missing
+                           if (today - air_of[n]).days > self.RECENT_DAYS]
+                sev = "important" if overdue else "minor"
+                tail = ("" if overdue else
+                        f"（均在 {self.RECENT_DAYS} 天内播出，等发布即可）")
+
                 upcoming = [e["air_date"] for d, n in dated
                             for e in eps if e["episode_number"] == n and d > today]
                 yield Finding(
-                    rule=self.id, kind=self.kind, severity="important",
+                    rule=self.id, kind=self.kind, severity=sev,
                     summary=(f"S{sn:02d} 缺 {len(missing)} 集（已播 {len(aired)} 集，"
-                             f"已有 {len(have[sn] & aired)} 集）：{missing[:10]}"),
+                             f"已有 {len(have[sn] & aired)} 集）：{missing[:10]}{tail}"),
                     show=show.dir_name,
                     evidence={"season": sn, "missing": missing,
                               "aired": len(aired), "have": len(have[sn] & aired),
@@ -377,6 +408,10 @@ class SourceAbandonedDetector:
     kind = "source_abandoned"
     STALE_KIND = "stale_rss_query"
     LAG_THRESHOLD = 2
+    # 与 IncompleteSeasonDetector 同一把尺子：落后的集若都在这个窗口内播出，
+    # 那是字幕组的正常滞后，不是弃坑。两条规则用同一标准，才不会对同一个
+    # 事实给出相反结论。
+    RECENT_DAYS = 7
     MAX_CANDIDATES = 4          # 每部番最多探几个 Mikan 番组条目，控制网络开销
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
@@ -409,6 +444,27 @@ class SourceAbandonedDetector:
                 continue
             show = _show_of(b)
             if not show or not show.tmdb_id:
+                continue
+
+            # 内容已经齐了就别报"源停更"。
+            # 本规则只看订阅 RSS 的最大集号，看不见磁盘——于是换过源、
+            # 或从别处补齐过的番会被永久误报。实测《朱音落语》：LoliHouse
+            # 确实慢（只发到第 9 集），但磁盘上 E01-E13 早已齐全，
+            # TMDB 全 12 集也都播完了，这条告警连续多轮报了个寂寞。
+            # 源快不快，在内容不缺时不构成问题。
+            season = int(b.get("season") or 1)
+            disk = _disk_episodes(show).get(season, set())
+            ck0 = f"tmdbeps:{show.tmdb_id}:{season}"
+            c0 = cache.get_llm(ck0)
+            if c0 is None:
+                try:
+                    c0 = {"eps": ctx.tmdb.season_episodes(show.tmdb_id, season)}
+                except Exception:
+                    c0 = {"eps": []}
+                cache.put_llm(ck0, c0)
+            aired_eps = {e["episode_number"] for e in (c0.get("eps") or [])
+                         if e.get("air_date") and e["air_date"] <= today.isoformat()}
+            if aired_eps and not (aired_eps - disk):
                 continue
 
             ck = f"rss:{b['rss_link']}"
@@ -465,6 +521,23 @@ class SourceAbandonedDetector:
 
             lag = max(aired) - max(rss_eps)
             if lag < self.LAG_THRESHOLD:
+                continue
+
+            # 落后的这几集**是不是刚播出的**？字幕组普遍滞后一到数日，
+            # 连载中的番几乎总是"落后 1-2 集"，光看集号差会把常态判成弃坑。
+            # 实测：二十世纪电气目录 / 无职转生 / 穹庐下的魔女 三部同时被报
+            # "源已停更"，而 incomplete-season 对同一批集数给出的是
+            # "均在 7 天内播出，等发布即可"——同一个事实，两条规则结论相反。
+            # 真正的弃坑是"早就该有却一直没有"，所以要求落后的集里至少有一集
+            # 已经播出超过 RECENT_DAYS。
+            # 只算**既落后、又确实缺在磁盘上**的集。
+            # 改成"谁先出要谁"之后，"订阅锁定的那个源落后"本身已不构成问题：
+            # 实测二十世纪电气目录的 E07 桜都没发，但抓取器早从别的组拿到了，
+            # 磁盘上有。此时报"源已停更"是拿旧模型的尺子量新模型。
+            air_of = {n: d for d, n in dated}
+            behind = [n for n in aired if n > max(rss_eps) and n not in disk]
+            if not any((today - air_of[n]).days > self.RECENT_DAYS
+                       for n in behind if n in air_of):
                 continue
 
             # 下结论前先分辨：字幕组真弃坑，还是只是订阅这条 feed 看不到了
