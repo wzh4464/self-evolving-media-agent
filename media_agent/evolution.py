@@ -61,6 +61,11 @@ def find_residue(state: LibraryState, findings: list[Finding]) -> list[Residue]:
     clusters: dict[str, Residue] = {}
 
     for show in state.shows:
+        if show.is_movie:
+            # 电影没有集号，也就没有"命名规范"可言。把它们当盲区，演进器
+            # 只会一遍遍去为"如何给电影解析集号"立规则——一个不存在的问题。
+            # 实测 43 簇盲区里全是电影（A Few Good Men、Oppenheimer…）。
+            continue
         title = show.official_title
         for f in show.files:
             if str(f.path) in explained:

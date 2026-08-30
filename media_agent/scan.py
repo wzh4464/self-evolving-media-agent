@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
-from .kernel import Context, LibraryState, MediaFile, Show
+from .kernel import Context, LibraryState, MediaFile, Show, under
 from .naming import SUB_EXTS, VIDEO_EXTS
 
 SKIP_DIRS = {".autobangumi", "@eaDir", ".Trash", "lost+found"}
+SEASON_DIR_RE = re.compile(r"Season \d+$")
 SKIP_FILES = {".DS_Store", "Thumbs.db"}
 
 
@@ -43,6 +45,33 @@ def _torrent_files(ctx: Context, torrent_hash: str) -> list[dict]:
         except Exception:
             cache[torrent_hash] = []
     return cache[torrent_hash]
+
+
+def _file_into(show: Show, f: MediaFile) -> None:
+    """把文件分流进 `files`（参与整理）或 `extras_files`（已归置）。"""
+    (show.extras_files if f.quarantined else show.files).append(f)
+
+
+def _looks_like_movie(show_dir: Path, video_count: int) -> bool:
+    """这个目录装的是一部电影，而不是一部剧集？
+
+    库里剧集和电影混在同一个 Media 根下（178 个目录里 45 个是电影）。
+    对电影问"集号是多少"永远没有答案，于是每部电影都会稳定产出一条
+    "无法解析集号，需人工或模型判断"——45 条纯噪音，还把真正需要人看的
+    条目淹没了。
+
+    判据用结构而不是文件名：**有 `Season N` 子目录的一定是剧集**，
+    这是本库雷打不动的组织方式。没有 Season 子目录、视频又不超过 2 个
+    （正片 + 可能的特典/预告），按电影处理。
+
+    故意不靠目录名里的 `(YYYY)`：45 个里有 4 个不带年份
+    （超时空辉夜姬 / 铃芽之旅 / 小林家的龙女仆剧场版 / 世界奇妙物语SP），
+    靠年份会漏掉它们。
+    """
+    for x in show_dir.iterdir():
+        if x.is_dir() and SEASON_DIR_RE.match(x.name):
+            return False
+    return video_count <= 2
 
 
 def _season_dir_of(path: Path, show_dir: Path) -> str:
@@ -113,7 +142,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
         covered: set[Path] = set()
         for h, t in torrent_by_hash.items():
             sp = (t.get("save_path") or "").rstrip("/")
-            if not sp or not sp.startswith(str(show_dir)):
+            if not sp or not under(sp, show_dir):
                 continue
             for entry in _torrent_files(ctx, h):
                 if entry.get("priority", 1) == 0:
@@ -124,7 +153,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                     continue
                 covered.add(abs_p)
                 covered.add(Path(str(abs_p) + ".!qB"))
-                show.files.append(MediaFile(
+                _file_into(show, MediaFile(
                     path=abs_p,
                     size=entry.get("size", 0),
                     show_dir=show_dir.name,
@@ -156,7 +185,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                 size = p.stat().st_size
             except OSError:
                 size = 0
-            show.files.append(MediaFile(
+            _file_into(show, MediaFile(
                 path=p,
                 size=size,
                 show_dir=show_dir.name,
@@ -170,7 +199,9 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                 torrent_category=(t or {}).get("category", ""),
             ))
 
-        if show.files:
+        if show.files or show.extras_files:
+            show.is_movie = _looks_like_movie(
+                show_dir, sum(1 for f in show.files if f.ext in VIDEO_EXTS))
             state.shows.append(show)
 
     # --- 不在 Media 下的种子（下载中/别处）---

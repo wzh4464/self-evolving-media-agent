@@ -11,10 +11,24 @@ from dataclasses import dataclass
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".flv", ".wmv"}
 SUB_EXTS = {".ass", ".srt", ".ssa", ".sub", ".sup", ".vtt"}
 
-# 特典/周边：TMDB 不收录这些为 episode，放进库里只会污染刮削
+# 特典/周边：TMDB 不收录这些为 episode，放进库里只会污染刮削。
+#
+# **这些标记必须带编号**（`IN01` 而不是裸 `IN`）。教训：原先写的是
+# `\bIN\d*\b`，`\d*` 允许零个数字，再叠上 IGNORECASE，于是它匹配英文介词
+# "in"——《The Ghost **in** the Shell》整部番的每一集都被判成特典。
+# 同类地雷还有 Made **in** Abyss、In the Land of Leadale…… 这条规则潜伏了很久，
+# 直到抓了攻壳机动队才引爆：刚下的正片当场被 trash 进隔离区，而日志里
+# 显示的是一次成功的"清理特典"。
+#
+# 两个字母的缩写（IN/PV/CM/SP）一律要求 `\d+`；语义明确的整词（NCOP/NCED/
+# trailer/menu）才允许不带编号。
 EXTRA_MARKERS = [
-    r"\bmenu\d*\b", r"\bNCOP\d*\b", r"\bNCED\d*\b", r"\bIN\d*\b",
-    r"\bPV\d*\b", r"\bCM\d*\b", r"\bSP\d*\b", r"\btrailer\b", r"\bpreview\b",
+    r"\bmenu\d*\b", r"\bNCOP\d*\b", r"\bNCED\d*\b",
+    r"\bIN\d+\b", r"\bPV\d+\b", r"\bCM\d+\b", r"\bSP\d+\b",
+    # 裸缩写只在"独占一个方括号"时才算标记——`[SP]` `[CM]` 是特典，
+    # 而正文里的 in/cm/sp 不是。PV 没有常见英文同形词，可以放宽。
+    r"\bPV\b(?!\w)", r"\b(?:SP|CM|IN)\b(?=\s*[\]\)])",
+    r"\btrailer\b", r"\bpreview\b",
     r"\bweb\s*preview\b", r"特典", r"tokuten", r"映像特典", r"菜单",
     r"\bBDMenu\b", r"\bcreditless\b",
 ]

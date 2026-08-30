@@ -66,7 +66,18 @@ def _longest_common(a: str, b: str) -> str:
 def _disk_episodes(show) -> dict[int, set[int]]:
     """磁盘上实际有哪些集：`{季号: {集号…}}`。
 
-    以文件名里的 SxxExx 为准——这是全库改名后的规范形态。
+    优先认文件名里的 SxxExx——这是全库改名后的规范形态。
+
+    但**刚下完还没改名的文件也得算数**。实测朱音落语：E12 早就下好躺在
+    磁盘上，文件名还是 `[Nekomoe kissaten][Akane-banashi][12][1080p][JPSC].mp4`，
+    正则匹配不到 SxxExx，于是 `source-abandoned` 判定"订阅源已停更、落后 3 集"
+    并报成 critical。**东西明明在，只是名字还没换。**
+
+    这是两条规则之间的时序耦合：改名规则和订阅健康规则在同一轮里跑，
+    前者还没执行，后者就已经拿"没有 SxxExx"当成"没下到"。所以这里退一步，
+    从原始发布名里也认集号（季号归到 `season_dir` 指示的那一季，
+    拿不到就算第 1 季——发布标题里几乎不带季号）。
+
     未下载完的（`.!qB` 或种子进度 <1）不算，否则会把"正在下"误当成"已有"。
     """
     have: dict[int, set[int]] = defaultdict(set)
@@ -76,6 +87,12 @@ def _disk_episodes(show) -> dict[int, set[int]]:
         m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
         if m:
             have[int(m.group(1))].add(int(m.group(2)))
+            continue
+        from .grab import _episode_of
+        n = _episode_of(f.filename)
+        if n is not None:
+            sm = re.search(r"Season\s+(\d+)", f.season_dir or "")
+            have[int(sm.group(1)) if sm else 1].add(n)
     return have
 
 

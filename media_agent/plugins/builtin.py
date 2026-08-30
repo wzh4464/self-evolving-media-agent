@@ -11,7 +11,8 @@ from typing import Iterable
 
 from ..cache import Cache
 from ..dedup import content_digest
-from ..kernel import Action, Context, Finding, LibraryState, MediaFile, Registry, Show
+from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
+                      Registry, Show, tmdb_groups)
 from ..naming import (
     SUB_EXTS, VIDEO_EXTS, is_extra, is_normalized, normalize, parse_episode,
     parse_quality, subtitle_lang_tag, target_filename, target_subtitle_filename,
@@ -121,6 +122,11 @@ class UnrenamedDetector:
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         for show in state.shows:
+            if show.is_movie:
+                # 电影没有集号。硬要解析，每部都稳定产出一条"无法解析集号，
+                # 需人工或模型判断"——本库 45 部电影就是 45 条纯噪音，
+                # 还把真正需要人看的条目淹在里面。
+                continue
             title = show.official_title
             for f in show.files:
                 # 下载中的也要改名 —— 拿到种子就改好，不等下载完。
@@ -184,6 +190,8 @@ class DuplicateEpisodeDetector:
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         cache = Cache(ctx.config.cache_db)
         for show in state.shows:
+            if show.is_movie:
+                continue
             buckets: dict[tuple[int, int], list[MediaFile]] = defaultdict(list)
             for f in show.files:
                 if not _is_video(f) or f.is_incomplete or is_extra(f.filename):
@@ -446,10 +454,16 @@ class TitleDriftDetector:
     kind = "title_drift"
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
+        groups = tmdb_groups(state.shows)
         for show in state.shows:
             if not show.tmdb_id or not show.tmdb_title:
                 continue
             if normalize(show.dir_name) == normalize(show.tmdb_title):
+                continue
+            g = groups.get(show.tmdb_id) or {}
+            if g.get("kind") == "volumes":
+                # TMDB 把多部独立作品收成了一个条目（物语系列 14 个目录都是
+                # "物语系列"）。这不是目录名漂移，改了反而毁掉分卷组织。
                 continue
             yield Finding(
                 rule=self.id, kind=self.kind, severity="important",

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .kernel import Action, Context, Finding
+from .kernel import Action, Context, Finding, repath, under
 
 
 @dataclass
@@ -611,10 +611,12 @@ class Executor:
             return
 
         # 改动前记下所有受影响种子的原始 save_path，供回退使用
+        # 用 under() 而不是 startswith：见 kernel.under 的注释——
+        # 这一行曾把兄弟目录的种子圈进来，把库里三个目录名叠成了一团。
         affected = [(t["hash"], t.get("save_path") or "")
                     for t in self.ctx.qbit.torrents()
-                    if (t.get("content_path") or "").startswith(str(old) + "/")
-                    or (t.get("save_path") or "").startswith(str(old))]
+                    if under(t.get("content_path") or "/\0", old)
+                    or under(t.get("save_path") or "/\0", old)]
 
         bid = a.args.get("bangumi_id")
         prev_savepath = ""
@@ -629,7 +631,7 @@ class Executor:
         moved_ok, move_failed = [], []
         for h, sp in affected:
             try:
-                self.ctx.qbit.set_location([h], sp.replace(str(old), str(new), 1))
+                self.ctx.qbit.set_location([h], repath(sp, old, new))
                 moved_ok.append(h)
             except Exception as e:
                 move_failed.append({"hash": h, "error": str(e)})
@@ -651,7 +653,8 @@ class Executor:
         if bid and self.ctx.abdb and prev_savepath:
             self.ctx.abdb.write([
                 ("UPDATE bangumi SET save_path=? WHERE id=?",
-                 (prev_savepath.replace(str(old), str(new), 1), bid))
+                 (repath(prev_savepath, old, new)
+                  if under(prev_savepath, old) else prev_savepath, bid))
             ])
 
         self._audit("applied", f, a,
@@ -1003,13 +1006,13 @@ class Executor:
                 for t in self.ctx.qbit.torrents():
                     sp = t.get("save_path") or ""
                     cp = t.get("content_path") or ""
-                    if not sp.startswith(str(old)):
+                    if not under(sp, old):
                         continue
                     if not Path(cp).exists():
                         continue          # 死链种子，setLocation 搬不动它
                     try:
                         self.ctx.qbit.set_location(
-                            [t["hash"]], sp.replace(str(old), str(new), 1))
+                            [t["hash"]], repath(sp, old, new))
                         via_qbit += 1
                     except Exception:
                         continue

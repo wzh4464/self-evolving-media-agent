@@ -49,12 +49,55 @@ class Finding:
     classified: bool = False
 
     def key(self) -> tuple:
-        """去重键：同一文件同一类问题只报一次。"""
-        return (self.kind, self.path or self.torrent_hash)
+        """去重键：同一文件同一类问题只报一次。
+
+        兜底到 `(show, summary)` 是必须的，不能让键退化成 `(kind, "")`：
+        **有些问题根本没有对应的文件**。抓取器报的"S04E20 可抓取"说的是
+        磁盘上还不存在的一集，既没有 path 也没有 torrent_hash，于是全库
+        每一条待抓记录都共享同一个键——`run_all` 认为它们是同一个问题，
+        除第一条外全部丢弃，而且不留任何日志。
+
+        后果是抓取模型上线后**每轮全库只补得了一集**。看起来完全正常：
+        每次 diagnose 都规规矩矩报一条待抓、apply 也成功，只是永远只有一条。
+        与"入间同学空转三天"是同一种形态——单条指标全部合格，
+        只有把多轮放在一起看才发现它在原地打转。
+        """
+        return (self.kind,
+                self.path or self.torrent_hash or (self.show, self.summary))
 
     def to_dict(self) -> dict:
         d = asdict(self)
         return d
+
+
+# --------------------------------------------------------------------------
+# 路径前缀：必须按目录边界比，不能按字符串比
+# --------------------------------------------------------------------------
+def under(path: str | Path, base: str | Path) -> bool:
+    """`path` 是否就是 `base`、或位于 `base` 之下。
+
+    **不要用 `str.startswith(str(base))` 代替它。** 那样比较时
+    `/Media/青春猪头` 会"包含" `/Media/青春猪头少年不会梦到兔女郎学姐`——
+    两个毫不相干的兄弟目录，只因为一个的名字是另一个的前缀。
+
+    这不是假想的风险，是本库已经发生的损坏：目录改名时用 startswith 圈定
+    "受影响的种子"，把兄弟目录的种子也圈了进来，接着 `sp.replace(old, new, 1)`
+    把它们 save_path 里的前缀也换掉，于是
+
+        /Media/青春猪头少年不会梦到兔女郎学姐
+        → /Media/青春猪头少年不会梦到兔女郎学姐少年不会梦到兔女郎学姐
+
+    每跑一轮叠一层，连叠三轮才被发现——因为每一轮的操作本身都"成功"了。
+    """
+    p, b = str(path), str(base)
+    return p == b or p.startswith(b.rstrip("/") + "/")
+
+
+def repath(path: str | Path, old_base: str | Path, new_base: str | Path) -> str:
+    """把 `path` 从 `old_base` 下重挂到 `new_base` 下。调用前须先过 `under()`。"""
+    p, o = str(path), str(old_base).rstrip("/")
+    assert under(p, o), f"{p!r} 不在 {o!r} 之下"
+    return str(new_base).rstrip("/") + p[len(o):]
 
 
 @dataclass
@@ -81,6 +124,19 @@ class MediaFile:
         return self.path.parent.name
 
     @property
+    def quarantined(self) -> bool:
+        """是否已被归置进隔离子目录（`.shorts` / `.extras` / `.other` / …）。
+
+        这些目录以 `.` 开头，Jellyfin/Infuse 不扫描——**东西放进去就等于
+        已经处理完了**。整理类规则再对它们提"应该改名""重复集号"，
+        就是在要求把已归档的东西重新按正片规范对待。
+
+        实测代价：吊带袜天使 48 个特典短片进了 `.shorts`，规则仍然每轮
+        报 48 条 unrenamed + 1 条 duplicate-episode，占全库告警的三分之一。
+        """
+        return self.season_dir.startswith(".")
+
+    @property
     def is_incomplete(self) -> bool:
         """是否尚未下载完成。
 
@@ -102,6 +158,15 @@ class Show:
     tmdb_title: str = ""
     tmdb_seasons: list[dict] = field(default_factory=list)
     files: list[MediaFile] = field(default_factory=list)
+    is_movie: bool = False        # 见 scan.py 的判定：电影没有"集号"可言
+
+    # 已归置进 `.shorts` / `.extras` / `.other` / `.trailers` 的文件。
+    # 单独放一个桶而不是混在 files 里，是因为**"放进隔离区"本身就是处置结果**：
+    # 那些目录以 `.` 开头，刮削器不扫描，东西进去就等于处理完了。
+    # 混在 files 里会让每一条整理规则都得记得自己跳过它们——漏一条就是
+    # 一批复发的告警（吊带袜天使 48 个特典短片曾占全库告警的三分之一）。
+    extras_files: list[MediaFile] = field(default_factory=list)
+
 
     @property
     def official_title(self) -> str:
@@ -112,6 +177,63 @@ class Show:
             return self.bangumi["official_title"]
         return self.dir_name
 
+
+
+def _episode_keys(show: "Show") -> set:
+    """这个目录里出现过的 (季, 集)。用来判断两个目录是不是装着同一批内容。"""
+    out = set()
+    for f in show.files:
+        m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
+        if m:
+            out.add((int(m.group(1)), int(m.group(2))))
+    return out
+
+
+def tmdb_groups(shows: list) -> dict:
+    """按 tmdb_id 把目录分组，并判定每组属于哪种情况。
+
+    多个目录指向同一个 TMDB 条目，有两种截然相反的成因，处置也相反：
+
+    | | 例 | 成因 | 该怎么办 |
+    |---|---|---|---|
+    | `duplicate` | 3年Z组银八老师（繁/简两个目录，各 12 集） | 同一批内容存了两份 | 合并 |
+    | `volumes` | 物语系列（化物语/倾物语/囮物语…共 14 个目录） | TMDB 把多部独立作品收成一个条目 | **原样不动** |
+
+    光看"几个目录共享 tmdb_id"分不开这两者，会把物语系列 14 个目录全改名成
+    "物语系列"、挤进同一个目录——那是在毁掉用户按作品分卷的组织方式。
+
+    判据不能用"是否有交集"，也不能用"是否为子集"：物语系列每部都从第 1 集
+    开始编号，倾物语的 S01E01–04 **正好是**化物语 S01E01–15 的子集——
+    这两条判据都会把它误判成重复（第一版就是这么错的）。
+
+    要看的是**重合的比例**（Jaccard）：同一批内容存两份会几乎完全重合
+    （银八老师两个目录都是 S01E01–E12，1.0），不同作品只是编号撞车
+    （倾物语 vs 化物语 = 4/15 ≈ 0.27）。空壳目录没有集号可比，
+    单独归入 duplicate——那正是"历史遗留的空目录"的形态。
+    """
+    def _overlap(a: set, b: set) -> float:
+        return len(a & b) / len(a | b) if (a or b) else 0.0
+
+    by_id: dict = {}
+    for s in shows:
+        if s.tmdb_id:
+            by_id.setdefault(s.tmdb_id, []).append(s)
+
+    out: dict = {}
+    for tid, group in by_id.items():
+        host = max(group, key=lambda s: len(s.files))
+        if len(group) == 1:
+            out[tid] = {"shows": group, "kind": "single", "host": host}
+            continue
+        keys = {id(s): _episode_keys(s) for s in group}
+        hk = keys[id(host)]
+        dup = [s for s in group
+               if s is not host
+               and (not keys[id(s)] or _overlap(keys[id(s)], hk) >= 0.8)]
+        out[tid] = {"shows": group, "host": host,
+                    "kind": "duplicate" if dup else "volumes",
+                    "duplicates": dup}
+    return out
 
 @dataclass
 class LibraryState:
@@ -125,6 +247,19 @@ class LibraryState:
     def all_files(self) -> Iterable[MediaFile]:
         for s in self.shows:
             yield from s.files
+
+    def episode_files(self) -> Iterable[MediaFile]:
+        """参与剧集整理的文件：排除电影，排除已归置进隔离区的。
+
+        默认用这个而不是 `all_files()`——"这个文件该叫 SxxExx 吗"这个问题
+        对电影和特典根本不成立，问了就只能得到噪音。
+        """
+        for s in self.shows:
+            if s.is_movie:
+                continue
+            for f in s.files:
+                if not f.quarantined:
+                    yield f
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +409,8 @@ class RuleSpec:
         if not self.enabled:
             return
         for show in state.shows:
+            if show.is_movie:
+                continue          # 演进规则清一色是集号/命名规范，对电影不成立
             for f in show.files:
                 if not _eval_clause(self.match, f, show):
                     continue

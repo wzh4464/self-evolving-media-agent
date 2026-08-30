@@ -25,12 +25,16 @@ from typing import Iterable
 
 from .. import preferences
 from ..cache import Cache
-from ..kernel import Action, Context, Finding, LibraryState
+from ..kernel import Action, Context, Finding, LibraryState, tmdb_groups
 from ..sidecar import load as load_sidecar, save as save_sidecar
 from .subscription import MIKAN, _http_get, _mikan_search_ids
 
 # 单轮为一部番最多提议抓几集，防止新订阅时一次刷屏
 MAX_PER_SHOW = 6
+
+# feed 条目的结构版本。**改动 `_feed_items` 返回的字段就必须 +1**，
+# 否则旧缓存会以缺字段的形态喂给新逻辑。
+FEED_SCHEMA = "v2"
 
 
 def _episode_of(title: str) -> int | None:
@@ -52,6 +56,34 @@ def _episode_of(title: str) -> int | None:
             if 1 <= n <= 200:
                 return n
     return None
+
+
+def _inflight(show, by_hash: dict, stale_after_h: float) -> dict[int, set[int]]:
+    """已经有种子在下、只是还没下完的集：`{季号: {集号…}}`。
+
+    `have` 只认下完的——这是对的，没下完就还有换源的余地。但**已经在下的
+    不该无条件重复抓**：新种子会写向同一个目标路径，两个种子抢同一个文件，
+    谁也校验不过（见 `colliding-torrent`，本库已发生三次）。
+
+    例外是停滞太久的：Re:Zero 的 E55–E58 卡在 42–92%、全网 seeds=0，
+    再等下去也没有意义，这时就该换源。所以用停滞时长（`dead_torrent_hours`）
+    作闸——还在动的别打扰，动不了的才换。
+    """
+    import time
+    now = time.time()
+    out: dict[int, set[int]] = {}
+    for f in show.files:
+        if not f.is_incomplete:
+            continue
+        m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
+        if not m:
+            continue
+        t = by_hash.get(f.torrent_hash) or {}
+        age_h = (now - (t.get("added_on") or now)) / 3600
+        if t.get("state") == "stalledDL" and age_h > stale_after_h:
+            continue        # 卡了太久，等下去没意义，放行让它换源
+        out.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    return out
 
 
 def _feed_items(bangumi_id: str) -> list[dict]:
@@ -104,7 +136,46 @@ def _plausible_for(item: dict, air: str) -> bool | None:
         return None
 
 
-def _resolve_mikan_id(sc, show, cache) -> str | None:
+def _season_fit(items: list[dict], air: list[str]) -> float:
+    """这个番组页的发布时间，和这一季的播出时间对得上吗？返回 0..1。
+
+    Mikan 的番组页**不区分季，命名还常年错位**：入间同学标"第三季"的页面
+    装的是第一季，标"第二季"的装第三季。所以既不能信页面名字，
+    也不能信标题里的"第 N 季"——桜都把 TMDB 的第四季叫"第3季"。
+
+    唯一可靠的锚点是时间：一季的发布集中在它播出的那几个月。
+    拿页面里条目的 pubDate 和 TMDB 给的播出日期比，对得上的比例就是分数。
+    """
+    if not items or not air:
+        return 0.0
+    try:
+        lo = min(date.fromisoformat(a) for a in air) - timedelta(days=PREAIR_SLACK_DAYS)
+        hi = max(date.fromisoformat(a) for a in air) + timedelta(days=365)
+    except ValueError:
+        return 0.0
+    ok = 0
+    for it in items:
+        pub = it.get("pub")
+        if not pub:
+            continue
+        try:
+            if lo <= date.fromisoformat(pub) <= hi:
+                ok += 1
+        except ValueError:
+            pass
+    return ok / len(items)
+
+
+def _feed_cached(mid: str, cache) -> list[dict]:
+    ck = f"mikanfeed:{FEED_SCHEMA}:{mid}"
+    got = cache.get_llm(ck)
+    if got is None:
+        got = {"items": _feed_items(mid)}
+        cache.put_llm(ck, got)
+    return got.get("items") or []
+
+
+def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None) -> str | None:
     """找这部番在 Mikan 上的番组 id，找到后**写回 sidecar**，省得每轮再搜。
 
     解析顺序是有讲究的：
@@ -118,36 +189,55 @@ def _resolve_mikan_id(sc, show, cache) -> str | None:
     落盘用 try 包住：sidecar 写不进去（只读挂载之类）不该让检测失败，
     大不了下一轮再搜一次。
     """
-    if getattr(sc, "mikan_id", None):
-        return str(sc.mikan_id)
+    stored = str(getattr(sc, "mikan_id", "") or "")
 
-    found = None
+    # 没有播出日期可比时，只能沿用存下来的（老番、TMDB 查不到的情况）
+    if stored and not air:
+        return stored
+
+    cands: list[str] = []
+    if stored:
+        cands.append(stored)
     for s in sc.sources:
         m = re.search(r"bangumiId=(\d+)", s.get("rss_link") or "")
-        if m:
-            found = m.group(1)
-            break
-    if found is None:
-        for kw in [sc.canonical_title, show.official_title, *sc.aliases]:
-            kw = (kw or "").strip()
-            if not kw:
+        if m and m.group(1) not in cands:
+            cands.append(m.group(1))
+    for kw in [sc.canonical_title, show.official_title, *sc.aliases]:
+        kw = (kw or "").strip()
+        if not kw:
+            continue
+        ck = f"mikansearch:{kw}"
+        hit = cache.get_llm(ck)
+        if hit is None:
+            try:
+                hit = {"ids": _mikan_search_ids(kw, 3)}
+            except Exception:
                 continue
-            ck = f"mikansearch:{kw}"
-            hit = cache.get_llm(ck)
-            if hit is None:
-                try:
-                    hit = {"ids": _mikan_search_ids(kw, 3)}
-                except Exception:
-                    continue
-                cache.put_llm(ck, hit)
-            ids = hit.get("ids") or []
-            if ids:
-                found = ids[0]
-                break
-    if found is None:
+            cache.put_llm(ck, hit)
+        for i in (hit.get("ids") or []):
+            if i not in cands:
+                cands.append(i)
+    if not cands:
         return None
 
-    sc.mikan_id = str(found)
+    # 用播出日期给每个候选页面打分，取最高的。
+    # 这一步是必要的：入间同学的 rss_link 是搜索式链接（没有 bangumiId），
+    # 于是只能按标题搜，搜到的 2839 是**第三季**的页面——它每一集都齐、
+    # 每个集号都对得上，唯独年份差了三年。不比时间就发现不了。
+    best, best_fit = None, 0.0
+    for mid in cands[:4]:
+        try:
+            fit = _season_fit(_feed_cached(mid, cache), air)
+        except Exception:
+            continue
+        if fit > best_fit:
+            best, best_fit = mid, fit
+    if best is None or best_fit < 0.15:
+        # 一个都对不上：宁可不抓，也不要从错的季里抓。
+        # 返回 None 会让上层报"找不到 Mikan 番组页"，那是准确的描述。
+        return None
+
+    sc.mikan_id = str(best)
     try:
         save_sidecar(show.dir_path, sc)
     except OSError:
@@ -171,44 +261,47 @@ class EpisodeAvailableDetector:
         rules = preferences.load_rules()
         today = date.today().isoformat()
 
-        # 多个目录解析到同一个 tmdb_id 时，只认"内容最多"的那个为宿主。
-        # 不加这道闸的话，每个空壳目录都会以为自己缺整季、轮流去抓同一集：
-        # 实测《入间同学入魔了！》的三个历史分季目录（！ / ！！ / ！！！）
-        # 都写着 tmdb_id=91801 且都认领 season 4，于是连续三天、每 6 小时
-        # 为其中一个抓一次 S04E19。qBittorrent 靠 infohash 挡住了重复下载，
-        # 所以没造成实际损害——但也正因如此，空转了三天没人发现。
-        owner: dict[int, object] = {}
-        for s in state.shows:
-            if not s.tmdb_id:
-                continue
-            cur = owner.get(s.tmdb_id)
-            if cur is None or len(s.files) > len(cur.files):
-                owner[s.tmdb_id] = s
+        # 多个目录解析到同一个 tmdb_id 时要先分清是哪一种，见 kernel.tmdb_groups：
+        #
+        #   duplicate —— 同一批内容存了两份（或一份是空壳）。只认宿主，
+        #                其余跳过并单独告警一次。不加这道闸的话，每个空壳目录
+        #                都会以为自己缺整季、轮流去抓同一集：实测《入间同学入魔了！》
+        #                的三个历史分季目录连续三天、每 6 小时抓一次 S04E19。
+        #                qBittorrent 靠 infohash 挡住了重复下载，所以没造成损害——
+        #                也正因如此，空转了三天没人发现。
+        #
+        #   volumes   —— TMDB 把多部独立作品收成一个条目（物语系列 14 个目录）。
+        #                这些目录各自是完整作品，**每个都要能独立补集**，
+        #                当成重复跳过就等于让其中 13 部永远不再更新。
+        groups = tmdb_groups(state.shows)
+        by_hash = {t["hash"]: t for t in state.torrents}
         dup_reported: set[int] = set()
 
         for show in state.shows:
             if not show.tmdb_id:
                 continue
-            host = owner.get(show.tmdb_id)
-            if host is not None and host is not show:
+            g = groups.get(show.tmdb_id) or {}
+            if g.get("kind") == "duplicate" and show in g.get("duplicates", []):
+                host = g["host"]
                 if show.tmdb_id not in dup_reported:
                     dup_reported.add(show.tmdb_id)
-                    sibs = [s.dir_name for s in state.shows
-                            if s.tmdb_id == show.tmdb_id]
+                    sibs = [s.dir_name for s in g["shows"]]
                     yield Finding(
                         rule=self.id, kind="duplicate_show_dir", severity="important",
-                        summary=(f"{len(sibs)} 个目录指向同一个 TMDB 条目 "
-                                 f"{show.tmdb_id}，抓取只认文件最多的"
+                        summary=(f"{len(sibs)} 个目录装着同一批内容（TMDB "
+                                 f"{show.tmdb_id}），抓取只认文件最多的"
                                  f"「{host.dir_name}」，其余会被跳过"),
                         show=host.dir_name,
                         evidence={"tmdb_id": show.tmdb_id, "dirs": sibs,
                                   "host": host.dir_name,
-                                  "hint": "多半是历史遗留的分季目录，应合并到一个"},
+                                  "duplicates": [d.dir_name for d in g["duplicates"]],
+                                  "hint": "多半是历史遗留的分季目录或繁简两版，应合并"},
                     )
                 continue
             sc = load_sidecar(show.dir_path)
             if not sc.seasons:
                 continue
+            inflight = _inflight(show, by_hash, ctx.config.dead_torrent_hours)
 
             for season_key, info in sc.seasons.items():
                 # 常年连载番（哆啦A梦之流）不参与——sidecar 扫描时已判好
@@ -222,11 +315,15 @@ class EpisodeAvailableDetector:
                 air_of = {e["episode_number"]: e["air_date"] for e in eps
                           if e.get("air_date")}
                 aired = {n for n, d in air_of.items() if d <= today}
-                missing = sorted(aired - have)
+                # 已经在下的不重复抓（除非停滞太久，见 _inflight 的注释）
+                busy = inflight.get(int(season_key), set())
+                missing = sorted(aired - have - busy)
                 if not missing:
                     continue
 
-                mid = _resolve_mikan_id(sc, show, cache)
+                mid = _resolve_mikan_id(
+                    sc, show, cache,
+                    air=[d for d in (air_of.get(n) for n in aired) if d])
                 if not mid:
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="minor",
@@ -237,16 +334,16 @@ class EpisodeAvailableDetector:
                     )
                     continue
 
-                ck = f"mikanfeed:{mid}"
-                got = cache.get_llm(ck)
-                if got is None:
-                    try:
-                        got = {"items": _feed_items(mid)}
-                    except Exception as e:
-                        ctx.log(f"[episode-available] 拉 feed 失败 {mid}: {e}")
-                        continue
-                    cache.put_llm(ck, got)
-                items = got.get("items") or []
+                # 缓存 key 必须带结构版本。加 `pub` 字段那次没带，于是旧缓存里
+                # 每个候选都没有 pub，`_plausible_for` 一律返回"无日期"，
+                # 整道日期校验静默退化成不设防——代码在跑、日志正常、
+                # 一条错误都不报，只是不再拦任何东西。实测因此抓了一集
+                # 2023 年的第三季内容进 Season 4。
+                try:
+                    items = _feed_cached(mid, cache)
+                except Exception as e:
+                    ctx.log(f"[episode-available] 拉 feed 失败 {mid}: {e}")
+                    continue
 
                 # 按集号归拢候选
                 by_ep: dict[int, list[dict]] = {}
