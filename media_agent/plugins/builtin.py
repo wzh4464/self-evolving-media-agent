@@ -323,6 +323,89 @@ class DeadTorrentDetector:
 
 
 # ---------------------------------------------------------------------------
+class CollidingTorrentDetector:
+    """两个种子盯着**同一个文件路径**——其中一个永远下不完。
+
+    出处：本 session 手工清理过两次，同一形态：
+
+    | 集 | 完成的 | 卡住的 |
+    |---|---|---|
+    | Re:Zero E54 | `- 54v2` 100% | `- 54` 卡住 |
+    | 穹庐下的魔女 E09 | `- 09v2` 100% | `- 09` 97.8% stalledDL |
+
+    v2 是修正版，与原版**输出同名文件、内容不同**。改名归位后两个种子的
+    content_path 撞到一起：v2 先下完把文件写成了它的版本，原版剩下的那几个
+    分片再怎么校验也过不去——它要的那几个字节已经不在那儿了。
+
+    所以这**不是种源问题**。当时的表象是"97.8% stalledDL、种子数很少"，
+    很容易顺着"换个源/等做种"查下去，但换多少源都没用。判据是路径撞车，
+    不是速度和 peer 数。
+
+    只认 content_path 指向**视频文件**的情况：多文件种子用 NoSubfolder 布局时
+    content_path 就是 Season 目录本身，一个季度目录下几十个种子共用它是常态，
+    拿来当撞车会全是误报。
+    """
+    id = "colliding-torrent"
+    kind = "torrent_path_collision"
+
+    def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
+        by_path: dict[str, list[dict]] = defaultdict(list)
+        for t in state.torrents:
+            cp = (t.get("content_path") or "").rstrip("/")
+            if cp and Path(cp).suffix.lower() in VIDEO_EXTS:
+                by_path[cp].append(t)
+
+        for cp, group in sorted(by_path.items()):
+            if len(group) < 2:
+                continue
+            stuck = [t for t in group if t.get("progress", 0) < 1.0]
+            if not stuck:
+                continue        # 都完成了：同一份数据两条记录，不影响任何人
+            done = [t for t in group if t.get("progress", 0) >= 1.0]
+            names = [t.get("name", "")[:70] for t in group]
+
+            if not done:
+                # 谁也没下完，纯粹在互相打架。留给人判断保哪个——
+                # 这里没有"哪个是对的"的依据，自动删任何一个都是瞎猜。
+                yield Finding(
+                    rule=self.id, kind=self.kind, severity="important",
+                    summary=(f"{len(group)} 个种子抢同一个文件且都没下完，"
+                             f"互相覆盖，谁也完不成：{Path(cp).name}"),
+                    path=cp,
+                    evidence={"torrents": names,
+                              "progress": [round(t.get("progress", 0), 3) for t in group],
+                              "hint": "多半是 v2 修正版与原版并存，留一个删其余"},
+                )
+                continue
+
+            keep = max(done, key=lambda t: t.get("size", 0))
+            for victim in stuck:
+                yield Finding(
+                    rule=self.id, kind=self.kind, severity="important",
+                    summary=(f"卡在 {victim.get('progress', 0) * 100:.1f}% 的种子与一个"
+                             f"已完成的种子指向同一文件，永远下不完："
+                             f"{victim.get('name', '')[:60]}"),
+                    path=cp, torrent_hash=victim.get("hash", ""),
+                    evidence={"stuck": victim.get("name", "")[:110],
+                              "stuck_progress": round(victim.get("progress", 0), 3),
+                              "stuck_state": victim.get("state"),
+                              "complete": keep.get("name", "")[:110],
+                              "shared_path": cp},
+                    action=Action(
+                        op="drop_torrent", reversible=True,
+                        args={"torrent_hash": victim.get("hash", ""),
+                              "name": victim.get("name", ""),
+                              "path": cp,
+                              "keep_hash": keep.get("hash", ""),
+                              "magnet": victim.get("magnet_uri", ""),
+                              "save_path": victim.get("save_path", ""),
+                              "category": victim.get("category", ""),
+                              "tags": victim.get("tags", "")},
+                        note="只删种子记录，文件留在磁盘（完整的那份由另一个种子做种）"),
+                )
+
+
+# ---------------------------------------------------------------------------
 class ExtrasDetector:
     """菜单 / PV / NCOP / NCED / 特典等周边内容。
 
@@ -626,6 +709,7 @@ BUILTIN = [
     DuplicateEpisodeDetector,
     UnrenamedDetector,
     DeadTorrentDetector,
+    CollidingTorrentDetector,
     TitleDriftDetector,
     CategoryConsolidationDetector,
     MissingNfoDetector,

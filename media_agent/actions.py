@@ -78,6 +78,8 @@ class Executor:
         "grab_episode": 0,       # 抓取只加种子、不碰已有文件，与下游动作互不干扰
         "write_sidecar": 10,     # 最后写档案，记录本轮结束后的最终状态
         "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
+        "drop_torrent": 1,       # 撞车的种子越早摘掉越好：它占着一条路径的
+                                 # 所有权，后面的改名/归位都要以此为前提
         "retag": 2, "recategorize": 3, "delete_category": 4,
         "write_nfo": 5,
         "rename": 6,            # 先改文件名（此时目录名还是旧的，路径有效）
@@ -441,6 +443,62 @@ class Executor:
                     undo={"op": "ungrab_episode", "show_dir": str(show_dir),
                           "season": season, "episode": ep,
                           "title": title})
+
+    def _op_drop_torrent(self, f: Finding, a: Action) -> None:
+        """把种子记录从 qBittorrent 摘掉，**文件一个字节都不动**。
+
+        用在"两个种子抢同一个文件"的场合：完整的那份数据已经在磁盘上了，
+        由另一个种子继续做种，被摘掉的这个只是个下不完的记录。
+
+        执行前重新查一次 qBittorrent，而不是信扫描时的快照：
+        检测到执行之间可能过了几分钟，卡住的那个也许已经自己完成了。
+        对不上就跳过——这是删除类操作，宁可白跑一趟。
+        """
+        h = a.args["torrent_hash"]
+        keep_hash = a.args.get("keep_hash", "")
+        if not h:
+            self._audit("skipped", f, a, {"reason": "缺 torrent_hash"})
+            return
+
+        cur = {t["hash"]: t for t in (self.ctx.qbit.torrents() if self.ctx.qbit else [])}
+        victim, keeper = cur.get(h), cur.get(keep_hash)
+        if victim is None:
+            self._audit("skipped", f, a, {"reason": "种子已不在 qBittorrent 里"})
+            return
+        if victim.get("progress", 0) >= 1.0:
+            self._audit("skipped", f, a,
+                        {"reason": "它自己已经下完了，不再是撞车的受害者"})
+            return
+        if keeper is None or keeper.get("progress", 0) < 1.0:
+            self._audit("skipped", f, a,
+                        {"reason": "作为保留方的那个种子已不完整，删了会丢内容"})
+            return
+
+        if self.dry_run:
+            self._audit("skipped", f, a,
+                        {"reason": "dry-run", "would_drop": victim.get("name", ""),
+                         "keep": keeper.get("name", "")})
+            return
+
+        # magnet 是唯一的回退凭据：删掉之后 .torrent 就没了，
+        # 只能靠 magnet 把这条记录重新加回来。取不到就明说不可回退。
+        magnet = victim.get("magnet_uri") or a.args.get("magnet") or ""
+        self.ctx.qbit.delete([h], delete_files=False)
+
+        undo = None
+        if magnet:
+            undo = {"op": "readd_torrent", "magnet": magnet,
+                    "save_path": victim.get("save_path", ""),
+                    "category": victim.get("category", ""),
+                    "tags": victim.get("tags", ""),
+                    "name": victim.get("name", "")}
+        self._audit("applied", f, a,
+                    {"dropped": victim.get("name", ""),
+                     "dropped_progress": round(victim.get("progress", 0), 3),
+                     "kept": keeper.get("name", ""),
+                     "files_untouched": True,
+                     **({} if magnet else {"note": "无 magnet_uri，此条不可回退"})},
+                    undo=undo)
 
     def _op_relink_torrent(self, f: Finding, a: Action) -> None:
         """把路径失效的种子重新关联到磁盘上的实际文件。
@@ -837,6 +895,26 @@ class Executor:
                 info["have"] = [x for x in (info.get("have") or [])
                                 if x != int(u["episode"])]
                 sc_mod.save(d, sc)
+            return True, ""
+
+        if op == "readd_torrent":
+            # 用 magnet 把种子加回来。加回来是 paused 的：撞车的那个文件
+            # 现在归另一个种子管，让它一上来就开跑等于重演当初的问题，
+            # 由人看过再决定要不要启动。
+            if self.dry_run:
+                return True, ""
+            data = {"urls": u["magnet"], "paused": "true", "stopped": "true",
+                    "autoTMM": "false"}
+            for k, arg in (("savepath", "save_path"), ("category", "category"),
+                           ("tags", "tags")):
+                if u.get(arg):
+                    data[k] = u[arg]
+            r = self.ctx.qbit._client.post(
+                f"{self.ctx.qbit.base}/api/v2/torrents/add", data=data)
+            if r.status_code == 409:
+                return True, ""      # 已经在了，等同于回退成功
+            if r.status_code != 200:
+                return False, f"重新加种失败 HTTP {r.status_code}"
             return True, ""
 
         if op == "restore_rss_link":
