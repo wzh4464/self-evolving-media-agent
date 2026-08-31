@@ -15,8 +15,7 @@ from .. import sidecar as sc_mod
 from ..cache import Cache
 from ..kernel import Action, Context, Finding, LibraryState
 from ..naming import VIDEO_EXTS
-from .subscription import SEASONAL_WINDOW_DAYS, _fetch_rss_titles, _patterns_of
-
+from .subscription import _fetch_rss_titles, _patterns_of, is_seasonal
 
 class SidecarSyncDetector:
     """维护 `.media-agent.json`。
@@ -30,7 +29,6 @@ class SidecarSyncDetector:
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         cache = Cache(ctx.config.cache_db)
         today = date.today()
-        cutoff = today - timedelta(days=SEASONAL_WINDOW_DAYS)
 
         # 订阅 → 目录：走 save_path，这是唯一被同步维护的关联
         b_by_dir: dict[str, dict] = {}
@@ -116,10 +114,21 @@ class SidecarSyncDetector:
                         entry["aired"] = len([n for d, n in dated if d <= today])
                         nxt = sorted(d for d, _ in dated if d > today)
                         entry["next_air"] = nxt[0].isoformat() if nxt else "已完结"
-                        entry["seasonal"] = min(d for d, _ in dated) >= cutoff
+                        entry["seasonal"] = is_seasonal(
+                            [d for d, _ in dated], len(eps), today)
                 if sc.seasons.get(key) != entry:
                     sc.seasons[key] = entry
                     changed.append(f"S{sn}进度")
+
+            # 剪掉幽灵季：磁盘上已经没有文件的季号。
+            # 这里只写不删的话，按 TMDB 重编排过的番会永远留着旧布局的记录——
+            # Re:Zero 压平进 Season 1 之后，sidecar 里 S2/S3 仍挂着 25 集和 11 集
+            # 的 `have`，让"库内季号 vs TMDB 季号"的比对得出错误结论。
+            stale = [k for k in sc.seasons
+                     if k.isdigit() and int(k) not in have and sc.seasons[k].get("have")]
+            for k in stale:
+                del sc.seasons[k]
+                changed.append(f"清理 S{k} 旧记录")
 
             if not changed:
                 continue

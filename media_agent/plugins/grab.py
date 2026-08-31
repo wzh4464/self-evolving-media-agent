@@ -26,8 +26,9 @@ from typing import Iterable
 from .. import preferences
 from ..cache import Cache
 from ..kernel import Action, Context, Finding, LibraryState, tmdb_groups
+from ..naming import declared_season
 from ..sidecar import load as load_sidecar, save as save_sidecar
-from .subscription import MIKAN, _http_get, _mikan_search_ids
+from .subscription import MIKAN, _http_get, _mikan_search_ids, is_seasonal
 
 # 单轮为一部番最多提议抓几集，防止新订阅时一次刷屏
 MAX_PER_SHOW = 6
@@ -75,14 +76,30 @@ def _inflight(show, by_hash: dict, stale_after_h: float) -> dict[int, set[int]]:
     for f in show.files:
         if not f.is_incomplete:
             continue
-        m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
-        if not m:
-            continue
         t = by_hash.get(f.torrent_hash) or {}
+
+        # 刚加进来的种子还叫着原始发布名，`SxxExx` 要等改名规则跑过才有。
+        # 只认改名后的名字，就等于"抓下来到改完名之间"这一整段时间里
+        # 这一集是不设防的——同一轮 run 里抓取比改名先跑，下一轮就会再抓一次。
+        # 所以退回去认种子上的 `ma:` 集号钉子，再退回去按发布名解析。
+        m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
+        if m:
+            sn, ep = int(m.group(1)), int(m.group(2))
+        else:
+            pin = re.search(r"\bma:S(\d{1,2})E(\d{1,3})\b", t.get("tags") or "")
+            if pin:
+                sn, ep = int(pin.group(1)), int(pin.group(2))
+            else:
+                ep = _episode_of(f.torrent_name or f.filename)
+                if ep is None:
+                    continue
+                sd = re.match(r"Season\s+(\d+)", f.season_dir or "", re.IGNORECASE)
+                sn = int(sd.group(1)) if sd else 1
+
         age_h = (now - (t.get("added_on") or now)) / 3600
         if t.get("state") == "stalledDL" and age_h > stale_after_h:
             continue        # 卡了太久，等下去没意义，放行让它换源
-        out.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+        out.setdefault(sn, set()).add(ep)
     return out
 
 
@@ -301,12 +318,40 @@ class EpisodeAvailableDetector:
             sc = load_sidecar(show.dir_path)
             if not sc.seasons:
                 continue
+
+            # 库内季号与 TMDB 季号对不上时，`have` 是按库内编号统计的，
+            # 而"缺哪几集"是按 TMDB 编号算的——两套编号一比，就会把已有的
+            # 内容判成缺失。
+            #
+            # 实测（2026-08-31）：TMDB 把《药屋少女的呢喃》压平成单季 49 集，
+            # 库里却是 S01E01-24 + S02E01-24 两个目录。key "1" 的 have 只有
+            # 1..24，于是 E25-E30 被判成缺失并抓了下来——它们就是磁盘上的
+            # S02E01-E06。《超超超超超喜欢你的100个女朋友》同样被重复抓了 6 集。
+            #
+            # 换算需要 sidecar 的 `season_offsets`（发布方季号 → 之前累计集数），
+            # 那是人或演进器该决定的事。在配好之前宁可不抓。
+            tmdb_sn = {int(x["season_number"]) for x in (show.tmdb_seasons or [])
+                       if x.get("season_number")}
+            lib_sn = {int(k) for k, v in sc.seasons.items()
+                      if k.isdigit() and int(k) > 0 and v.get("have")}
+            extra = sorted(lib_sn - tmdb_sn) if tmdb_sn else []
+            if extra:
+                yield Finding(
+                    rule=self.id, kind="season_layout_mismatch", severity="important",
+                    classified=True,
+                    summary=(f"库内有 Season {extra} 而 TMDB 只有 "
+                             f"Season {sorted(tmdb_sn)}——两套集号口径不一致，"
+                             f"已停止对这部番自动抓取，以免把已有的集数重下一遍。"
+                             f"按 TMDB 重编排目录，或在 sidecar 的 season_offsets "
+                             f"里登记换算关系"),
+                    show=show.dir_name,
+                    evidence={"library_seasons": sorted(lib_sn),
+                              "tmdb_seasons": sorted(tmdb_sn), "extra": extra},
+                )
+                continue
             inflight = _inflight(show, by_hash, ctx.config.dead_torrent_hours)
 
             for season_key, info in sc.seasons.items():
-                # 常年连载番（哆啦A梦之流）不参与——sidecar 扫描时已判好
-                if not info.get("seasonal", False):
-                    continue
                 have = set(info.get("have") or [])
                 try:
                     eps = ctx.tmdb.season_episodes(show.tmdb_id, int(season_key))
@@ -314,6 +359,24 @@ class EpisodeAvailableDetector:
                     continue
                 air_of = {e["episode_number"]: e["air_date"] for e in eps
                           if e.get("air_date")}
+
+                # 常年连载番（哆啦A梦之流）不参与。
+                #
+                # 这里**当场从 TMDB 数据算**，不读 sidecar 里那个 `seasonal` 标记。
+                # 一个 run 是"先全量诊断、再统一执行"：抓取检测器跑的时候，
+                # sidecar 还是上一轮写下的。2026-08-31 改了判定口径之后，
+                # 哆啦A梦的标记要到本轮 apply 才被改回 false，而抓取检测器在同一轮
+                # 更早的时候已经按旧标记提议了 6 集 2005 年的内容——两轮 run 抓了
+                # 两次。依赖会滞后一整轮的持久化状态，就是在给自己埋这种坑。
+                dates = []
+                for e in eps:
+                    if e.get("air_date"):
+                        try:
+                            dates.append(date.fromisoformat(e["air_date"]))
+                        except ValueError:
+                            pass
+                if not is_seasonal(dates, len(eps), date.today()):
+                    continue
                 aired = {n for n, d in air_of.items() if d <= today}
                 # 已经在下的不重复抓（除非停滞太久，见 _inflight 的注释）
                 busy = inflight.get(int(season_key), set())
@@ -345,12 +408,30 @@ class EpisodeAvailableDetector:
                     ctx.log(f"[episode-available] 拉 feed 失败 {mid}: {e}")
                     continue
 
-                # 按集号归拢候选
+                # 按集号归拢候选。
+                #
+                # 番组页按分季编号发布、而库内用 TMDB 连续编号时，同一集在两边
+                # 是两个数字：Re:Zero 第四季的番组页把 E80 发成「S04E14」，
+                # `by_ep[80]` 于是是空的，整集被静默跳过——既不抓也不报警。
+                #
+                # 换算必须以**候选自己声明的季号**为准，不能拿 `season_offsets`
+                # 里的偏移逐个去试：试探法会把 `S04E14`（偏移 66）也登记到
+                # `39 = 14 + 25` 上，而 S0E39 那条特典播于 2021 年，日期校验
+                # 只防"早于播出"、不防"晚于播出"（老番重新做种本来就晚），
+                # 拦不住它——实测差点把 2026 年的第四季第 14 集当成 2021 年的特典抓下来。
+                off_by_season = {int(k): int(v)
+                                 for k, v in (sc.season_offsets or {}).items()
+                                 if str(k).isdigit()}
                 by_ep: dict[int, list[dict]] = {}
                 for it in items:
                     n = _episode_of(it["title"])
-                    if n is not None:
-                        by_ep.setdefault(n, []).append(it)
+                    if n is None:
+                        continue
+                    by_ep.setdefault(n, []).append(it)
+                    ds = declared_season(it["title"])
+                    off = off_by_season.get(ds) if ds else None
+                    if off and n <= off:
+                        by_ep.setdefault(n + off, []).append(it)
 
                 for ep in missing[:MAX_PER_SHOW]:
                     raw = by_ep.get(ep) or []

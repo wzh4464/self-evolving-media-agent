@@ -59,6 +59,14 @@ class Sidecar:
                                     # 省得每轮重新搜。
     sources: list[dict] = field(default_factory=list)  # SourceRecord 列表，含历史
 
+    # --- 编号 ---
+    season_offsets: dict[str, int] = field(default_factory=dict)
+    # {"3": 50} = 发布方写的"第 3 季"，其之前累计 50 集。
+    # 用于 TMDB 把多季压平成单季连续编号、而发布组仍按分季编号的番。
+    # 同一部番里两种习惯可能并存（Fyy Raws 写 `3rd Season - 08` 指第 58 集，
+    # Dynamis One 写 `4th Season - 79` 就是第 79 集），所以偏移只在
+    # 集号 <= 偏移量时才加——两种解释的取值区间不重叠。
+
     # --- 进度 ---
     seasons: dict[str, dict] = field(default_factory=dict)
     # {"1": {"have": [1,2,3], "aired": 7, "total": 12, "next_air": "2026-08-22"}}

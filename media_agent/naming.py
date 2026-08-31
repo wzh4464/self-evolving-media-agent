@@ -110,6 +110,49 @@ def parse_episode(raw: str) -> tuple[int | None, int | None]:
     return None, None
 
 
+_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+_DECLARED_SEASON_RE = [
+    # `2nd Season` / `3rd Season` / `4th SEASON`
+    re.compile(r"\b(\d{1,2})\s*(?:st|nd|rd|th)\s+season\b", re.I),
+    # `Season 3` / `SEASON3`
+    re.compile(r"\bseason\s*0*(\d{1,2})\b", re.I),
+    # `S3 - 08` / `S01E58`（已归一化的名字也会命中，这正是我们要的：
+    # 它声明的季号与库内季号一致，不会被判成冲突）
+    re.compile(r"(?:^|[\s\[\]_.-])s0*(\d{1,2})(?=e\d|[\s\[\]_.-]|$)", re.I),
+    # `第三季` / `第 3 期`
+    re.compile(r"第\s*([0-9一二三四五六七八九十]{1,2})\s*[季期]"),
+]
+
+
+def declared_season(raw: str) -> int | None:
+    """发布名里**明写**的季号；没写则返回 None。
+
+    与 `parse_episode` 返回的 season 不同：那个是"能推出来的季号"，
+    推不出来就退回目录/AutoBangumi 记录；这个只认发布方自己写的字，
+    专门用来发现**发布方的季号与库内季号不一致**。
+
+    出处（2026-08-31）：Re:Zero 在 TMDB 上是压平的单季连续编号（S1+S2+S3
+    共 79 集），库内目录只有 `Season 1`。`[Fyy Raws] ... 3rd Season - 08`
+    这个发布的集号 `08` 是**该季内**的第 8 集，实为连续编号第 58 集。
+    改名规则拿 `08` 直接当季内集号，把它写成了 `S01E08`——正好撞上 2016 年
+    真正的第 8 集；随后 duplicate-episode 规则把 1.31GB 的原片当重复清进了
+    隔离区，只留下 487MB 的新文件。两条规则各自都"正确"，错在没人发现
+    发布方说的是第三季而库里算的是第一季。
+    """
+    base = raw.rsplit("/", 1)[-1]
+    for rx in _DECLARED_SEASON_RE:
+        m = rx.search(base)
+        if not m:
+            continue
+        tok = m.group(1)
+        n = _CN_NUM.get(tok) if tok in _CN_NUM else int(tok)
+        if n and 1 <= n <= 20:
+            return n
+    return None
+
+
 @dataclass(frozen=True)
 class Quality:
     """画质/字幕评分，用于重复集取舍。分数越高越优先保留。"""

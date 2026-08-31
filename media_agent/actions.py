@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .kernel import Action, Context, Finding, repath, under
+from .naming import parse_episode
 
 
 @dataclass
@@ -407,11 +408,22 @@ class Executor:
         req = urllib.request.Request(url, headers={"User-Agent": "media-agent/0.1"})
         blob = urllib.request.urlopen(req, timeout=60).read()
 
+        # 把抓取时算出的规范集号钉在标签上。抓取器是按番组页 + 播出日期定位的，
+        # 到了改名阶段这个信息就只剩发布名里那个数字——而它可能是分季编号。
+        tags = [f"ma:S{season:02d}E{ep:02d}"]
+
+        # `ab:` 标签把改名权交给 AutoBangumi。只有当 AB 会算出同一个集号时
+        # 才给——它的 episode_offset 是整条订阅一个值，表达不了"同一目录里
+        # 不同来源季用不同偏移"。给错了的代价是真实文件被覆盖：2026-08-31
+        # `[Fyy Raws] ... 3rd Season - 08` 被 AB 改成 S01E08，撞上 2016 年的
+        # 第 8 集，随后判重规则把 1.31GB 的原片清进了隔离区。
+        _, raw_ep = parse_episode(a.args.get("title") or "")
+        if bid and raw_ep == ep:
+            tags.append(f"ab:{bid}")
+
         data = {"savepath": str(save_path), "category": "Bangumi",
                 "paused": "false", "autoTMM": "false",
-                "contentLayout": "NoSubfolder"}
-        if bid:
-            data["tags"] = f"ab:{bid}"      # 没这个标签 AutoBangumi 永远不会改名
+                "contentLayout": "NoSubfolder", "tags": ",".join(tags)}
         resp = self.ctx.qbit._client.post(
             f"{self.ctx.qbit.base}/api/v2/torrents/add",
             data=data,
@@ -422,6 +434,18 @@ class Executor:
             self._audit("failed", f, a,
                         {"error": f"qBit 返回 HTTP {resp.status_code}: {resp.text[:120]}"})
             return
+
+        # 发布方的分季编号与库内连续编号不一致时，改写 qBittorrent 里的**种子名**。
+        #
+        # AutoBangumi 的改名线程按分类扫种子（摘掉 `ab:` 标签也拦不住它），
+        # 而且解析的是种子名而不是文件名。我们把文件改成 `S01E58.mkv`，它下一轮
+        # 又按种子名里的 `3rd Season - 08` 改回 `S01E08.mkv`——2026-08-31 就这么
+        # 来回拉锯，中间那次把 2016 年真正的第 8 集当重复清进了隔离区。
+        #
+        # 与其屏蔽 AB，不如让它算出同一个答案：种子名里的分季集号换成连续集号，
+        # 两边就永久一致了。种子名只是本地显示名，不影响 infohash 和做种。
+        if raw_ep is not None and raw_ep != ep:
+            self._retitle_torrent(blob, a.args.get("title") or "", raw_ep, ep)
 
         # 写 sidecar：加进 have，并把这个发布名记成别名（下次匹配用得上）
         sc = sc_mod.load(show_dir)
@@ -443,6 +467,62 @@ class Executor:
                     undo={"op": "ungrab_episode", "show_dir": str(show_dir),
                           "season": season, "episode": ep,
                           "title": title})
+
+    @staticmethod
+    def _infohash_v1(blob: bytes) -> str | None:
+        """从 .torrent 里算 v1 infohash（info 字典的 SHA-1）。
+
+        只为定位刚加进去的那个种子。qBittorrent 对重复 infohash 返回 409，
+        此时按名字反查是找不到的（库里那个可能已被改过名），所以要算哈希。
+        """
+        import hashlib
+
+        def parse(i: int):
+            c = blob[i:i + 1]
+            if c == b"d":
+                i += 1
+                start = i
+                while blob[i:i + 1] != b"e":
+                    _, i = parse(i)          # key
+                    _, i = parse(i)          # value
+                return (start, i), i + 1
+            if c == b"l":
+                i += 1
+                while blob[i:i + 1] != b"e":
+                    _, i = parse(i)
+                return None, i + 1
+            if c == b"i":
+                j = blob.index(b"e", i)
+                return None, j + 1
+            j = blob.index(b":", i)
+            n = int(blob[i:j])
+            return blob[j + 1:j + 1 + n], j + 1 + n
+
+        try:
+            i = blob.index(b"4:infod") + len(b"4:info")
+            _, end = parse(i)
+            return hashlib.sha1(blob[i:end]).hexdigest()
+        except Exception:
+            return None
+
+    def _retitle_torrent(self, blob: bytes, title: str, raw_ep: int, ep: int) -> None:
+        """把种子名里的分季集号改写成库内连续集号。失败只记日志，不影响抓取。"""
+        h = self._infohash_v1(blob)
+        if not h:
+            return
+        new = re.sub(
+            r"(\d{1,2})\s*(?:st|nd|rd|th)\s+season\s*[-–]\s*0*%d\b(?:\s+REV)?" % raw_ep,
+            "- %d" % ep, title, flags=re.I)
+        if new == title:                     # 没有"第 N 季"字样，就只换数字
+            new = re.sub(r"(?<![\d])0*%d(?![\d])" % raw_ep, str(ep), title, count=1)
+        if new == title:
+            return
+        try:
+            self.ctx.qbit._client.post(
+                f"{self.ctx.qbit.base}/api/v2/torrents/rename",
+                data={"hash": h, "name": new})
+        except Exception:
+            pass
 
     def _op_drop_torrent(self, f: Finding, a: Action) -> None:
         """把种子记录从 qBittorrent 摘掉，**文件一个字节都不动**。

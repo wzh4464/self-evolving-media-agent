@@ -26,6 +26,43 @@ from ..naming import VIDEO_EXTS
 # 开播于十几年前，靠这条自然排除；集数阈值则会被 TMDB "多 cour 合并成一季"骗到。
 SEASONAL_WINDOW_DAYS = 300
 
+_COUR_GAP_DAYS = 60      # 相邻两集间隔超过这个天数，视为跨了一档
+_MAX_SEASON_EPISODES = 150
+# 常年连载番（哆啦A梦 1464 集、柯南、海贼）的"季"本身是无界的，不参与季度番抓取。
+# 不能靠"当前连续档有多长"来认它们：TMDB 上哆啦A梦的老集数大多没有播出日期，
+# 按空档切出来的当前档只有 29 集，和一部两季连播的番没区别。真正的判别特征是
+# **整季集数**——季度番哪怕被 TMDB 压平（Re:Zero 85 集、药屋 49 集）也停在几十，
+# 常年连载番是四位数。
+
+
+def cour_start(dates: list) -> "date":
+    """本季当前这一档（cour）的起播日。
+
+    不能用"整季最早一集"来判断是不是季度番。TMDB 会把多档压平成一个 season：
+    Re:Zero 的 Season 1 装着 2016、2020、2024、2026 四档共 85 集，取最早一集
+    就得到 2016 年，于是被当成常年连载番排除出自动抓取——实测 E80 已播出
+    5 天却既不抓也不报警。
+
+    改成从最新一集往回走，遇到超过 `_COUR_GAP_DAYS` 的空档就断开，
+    断点之后那一段就是当前档。常年连载番每周都播、走到底都不断，
+    起点仍是它最早那一集，照样判为非季度番——两种情况都对。
+    """
+    ds = sorted(dates)
+    start = ds[-1]
+    for prev, cur in zip(reversed(ds[:-1]), reversed(ds[1:])):
+        if (cur - prev).days > _COUR_GAP_DAYS:
+            break
+        start = prev
+    return start
+
+
+def is_seasonal(dates: list, total: int, today: "date") -> bool:
+    """这一季是不是"当季在播/刚播完的季度番"，即值不值得自动补集。"""
+    if not dates or total > _MAX_SEASON_EPISODES:
+        return False
+    return cour_start(dates) >= today - timedelta(days=SEASONAL_WINDOW_DAYS)
+
+
 
 def _fetch_rss_titles(url: str) -> list[str]:
     """拉 RSS 并取出条目标题。

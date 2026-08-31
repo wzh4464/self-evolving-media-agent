@@ -14,7 +14,8 @@ from ..dedup import content_digest
 from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
 from ..naming import (
-    SUB_EXTS, VIDEO_EXTS, is_extra, is_normalized, normalize, parse_episode,
+    SUB_EXTS, VIDEO_EXTS, declared_season, is_extra, is_normalized, normalize,
+    parse_episode,
     parse_quality, subtitle_lang_tag, target_filename, target_subtitle_filename,
 )
 
@@ -44,19 +45,101 @@ def _apply_offset(ep: int, show: Show) -> int:
     return ep
 
 
+_PIN_RE = re.compile(r"\bma:S(\d{1,2})E(\d{1,3})\b")
+
+_OFFSET_CACHE: dict[str, dict] = {}
+
+
+def _pinned(f: MediaFile) -> tuple[int, int] | None:
+    """种子上钉死的集号标签 `ma:S01E58`。
+
+    抓取器在下种子的那一刻就知道该集在库内的规范编号（它是按番组页 + 播出
+    日期定位的）。这个信息到了改名阶段就丢了，只剩发布名里那个可能按分季
+    编号的数字。把它钉在 qBittorrent 标签上，改名和判重都优先认它。
+
+    带 `ma:` 的种子同时也被 OrphanTorrentDetector 豁免——它们不交给
+    AutoBangumi 改名，因为 AB 的 `episode_offset` 是整条订阅一个值，
+    表达不了"同一目录里不同来源季用不同偏移"。
+    """
+    m = _PIN_RE.search(f.torrent_tags or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _season_offsets(show: Show) -> dict:
+    """sidecar 里记的 `season_offsets`：发布方季号 → 该季之前的累计集数。"""
+    key = str(show.dir_path)
+    if key not in _OFFSET_CACHE:
+        from .. import sidecar as sc_mod
+        try:
+            _OFFSET_CACHE[key] = dict(sc_mod.load(show.dir_path).season_offsets or {})
+        except Exception:
+            _OFFSET_CACHE[key] = {}
+    return _OFFSET_CACHE[key]
+
+
+def _numbered_from(f: MediaFile, show: Show):
+    """返回 (用于解析的原始串, season, ep)。文件名优先，种子名兜底。"""
+    raw = f.filename
+    season, ep = parse_episode(raw)
+    if ep is None and f.torrent_name:
+        raw = f.torrent_name
+        season, ep = parse_episode(raw)
+    return raw, season, ep
+
+
+def _numbering_conflict(f: MediaFile, show: Show) -> tuple[int, int] | None:
+    """发布方声明的季号与库内季号不一致、且没有换算依据 → 返回 (发布季, 库内季)。
+
+    见 `naming.declared_season` 的注释：这是 2026-08-31 那次误删的根因。
+    注意只有**还没归一化**的文件名会命中——改成 `... S01E58.mkv` 之后，
+    名字里声明的就是 S01，与库内一致，不再报冲突。
+    """
+    if _pinned(f):
+        return None
+    raw, season, ep = _numbered_from(f, show)
+    if ep is None:
+        return None
+    target = _season_of(f, show, season)
+    dec = declared_season(raw)
+    if dec is None or dec == target:
+        return None
+    if str(dec) in _season_offsets(show):
+        return None
+    return dec, target
+
+
 def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
     """解析出 (season, episode)，失败返回 None。
 
     **文件名优先，种子名只作兜底。** 合集种子（一个种子含整季）的 `torrent_name`
     对所有成员文件都相同（形如 `- 01-12 -`），拿它做逐文件集号识别会把整季
     误判成同一集的重复——实测差点导致 12 集正片被当重复删掉。
+
+    **发布方声明的季号与库内季号不一致时，集号不可信。** 此时要么用 sidecar
+    的 `season_offsets` 换算，要么返回 None（宁可不处理，也不要把 `3rd Season
+    - 08` 写成 `S01E08` 去撞 2016 年真正的第 8 集）。
     """
-    season, ep = parse_episode(f.filename)
-    if ep is None and f.torrent_name:
-        season, ep = parse_episode(f.torrent_name)
+    pin = _pinned(f)
+    if pin:
+        return pin
+
+    raw, season, ep = _numbered_from(f, show)
     if ep is None:
         return None
-    return _season_of(f, show, season), _apply_offset(ep, show)
+    target = _season_of(f, show, season)
+
+    dec = declared_season(raw)
+    if dec is not None and dec != target:
+        off = _season_offsets(show).get(str(dec))
+        if off is None:
+            return None                  # 交给 SeasonNumberingConflictDetector 报警
+        # 同一部番里两种编号习惯并存：Fyy Raws 按分季编（3rd Season - 08），
+        # Dynamis One 按连续编（4th Season - 79）。用"该季之前的累计集数"
+        # 当阈值区分——两种解释的取值区间不重叠。
+        if int(ep) <= int(off):
+            ep = int(ep) + int(off)
+
+    return target, _apply_offset(ep, show)
 
 
 def _is_video(f: MediaFile) -> bool:
@@ -90,6 +173,11 @@ class OrphanTorrentDetector:
                 if not f.torrent_hash or f.torrent_hash in seen:
                     continue
                 if re.search(r"\bab:\d+", f.torrent_tags or ""):
+                    continue
+                if _pinned(f):
+                    # 集号已由 media-agent 钉死，交给 AutoBangumi 反而会被它
+                    # 按发布方的分季编号改回去（Re:Zero E58 → S01E08 就是这么
+                    # 丢了原片的）。这类种子由本项目自己改名。
                     continue
                 seen.add(f.torrent_hash)
                 yield Finding(
@@ -137,9 +225,34 @@ class UnrenamedDetector:
                 if is_extra(stem):
                     continue                       # 交给 ExtrasDetector
                 if is_normalized(stem, title):
-                    continue
+                    # `is_normalized` 只看形式（`标题 SxxExx.ext`），不看集号对不对。
+                    # 被别人按错口径改成 `S01E08.mkv` 的文件形式上完全合规，
+                    # 就这么永远卡在错误集号上——除非种子上钉了 `ma:` 集号，
+                    # 那它就是权威，跟文件名不一致时必须改回来。
+                    pin = _pinned(f)
+                    if not (pin and parse_episode(stem)[1] not in (None, pin[1])):
+                        continue
                 real_ext = Path(stem).suffix.lower()
                 if real_ext not in VIDEO_EXTS and real_ext not in SUB_EXTS:
+                    continue
+
+                conflict = _numbering_conflict(f, show)
+                if conflict:
+                    dec, tgt = conflict
+                    _r, _s, raw_ep = _numbered_from(f, show)
+                    yield Finding(
+                        rule=self.id, kind="season_numbering_conflict",
+                        severity="important", classified=True,
+                        summary=(f"发布方标的是第 {dec} 季第 {raw_ep} 集，库内却是 "
+                                 f"Season {tgt}——集号口径不一致，已拒绝改名。"
+                                 f"在该番 sidecar 的 season_offsets 里写 "
+                                 f'"{dec}": <第{dec}季之前的累计集数> 即可自动换算'),
+                        show=show.dir_name, path=str(f.path),
+                        torrent_hash=f.torrent_hash,
+                        evidence={"declared_season": dec, "library_season": tgt,
+                                  "raw_episode": raw_ep,
+                                  "torrent_name": f.torrent_name},
+                    )
                     continue
 
                 resolved = _resolve(f, show)
