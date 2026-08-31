@@ -310,6 +310,20 @@ class Registry:
                     out.append(f)
             except Exception as e:      # 单个规则崩溃不能拖垮整轮
                 ctx.log(f"[registry] 规则 {getattr(d, 'id', d)} 执行失败: {e}")
+
+        # `unparsable` 的字面意思是"看见了，但归不了类"。要是别的规则**已经**
+        # 把它归了类，这句话就不再成立，留着只是把同一个文件报两遍。
+        #
+        # 出处（2026-08-31）：演进器为 6 个 `.sup` 字幕立了条 classified 规则，
+        # 库内问题数从 15 涨到 21——`subtitle_unrenamed: 6` 是新增的，
+        # `unparsable: 6` 一条没少。演进循环那边确实收敛了（残留已被解释，
+        # 不会再重复提议），但用户看到的是凭空多出 6 条。照这个势头，
+        # 每上线一条归类规则，问题总数就永久虚高一截，最后没人再看这个数。
+        classified_paths = {f.path for f in out if f.classified and f.path}
+        if classified_paths:
+            out = [f for f in out
+                   if not (f.kind == "unparsable" and f.path in classified_paths)]
+
         order = {"critical": 0, "important": 1, "minor": 2}
         out.sort(key=lambda f: (order.get(f.severity, 9), f.kind, f.path))
         return out
