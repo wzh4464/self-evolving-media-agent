@@ -179,8 +179,22 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                     t = by_path.get(str(parent))
                     if t is not None:
                         break
-            if t is not None and Path(t.get("save_path") or "") == p.parent:
-                continue                          # 已由来源 1 覆盖
+
+            # 向上找父目录认领种子，对**多文件种子**是危险的：它的 `content_path`
+            # 就是季目录本身，于是该目录下每一个孤儿文件都会被认领给它。
+            #
+            # 来源 1 已经把 save_path 在本剧目录下的种子的文件全部登记进 `covered`，
+            # 能走到这里就说明这个文件**不在**那些种子的文件列表里——那它就不属于
+            # 它们，认领是错的。实测代价有二：
+            #   1. 带着错误 hash 去改名，执行器正确地拒绝（"种子文件列表里找不到
+            #      该文件"），《住在拔作岛上的我应该如何是好？》为此失败了 30 次；
+            #   2. 更糟的是下面那句 `save_path == p.parent` 的"已覆盖"短路，
+            #      把这些文件整个丢弃——8 个正片 + 6 个字幕对所有规则**不可见**，
+            #      既不报错也不处理，静静躺在库里。
+            if t is not None:
+                sp2 = (t.get("save_path") or "").rstrip("/")
+                if sp2 and under(sp2, show_dir):
+                    t = None                      # 不属于它，按纯本地文件处理
             try:
                 size = p.stat().st_size
             except OSError:

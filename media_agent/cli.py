@@ -240,7 +240,8 @@ def cmd_evolve(args, cfg) -> int:
     if failures:
         print("\n⚠️  反复失败的动作（可能是规则本身有问题）：")
         for f in failures:
-            print(f"  ×{f['count']} [{f['rule']}] {f['op']}: {f['error']}")
+            print(f"  {f['runs']} 个批次 / 共 {f['count']} 次 "
+                  f"[{f['rule']}] {f['op']}: {f['error']}")
     return 0
 
 

@@ -16,7 +16,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,7 @@ from .kernel import (
     Context, Finding, LibraryState, MediaFile, Registry, RuleSpec, Show,
     _FIELD_GETTERS, _OPS, load_rule_specs,
 )
-from .naming import VIDEO_EXTS, is_normalized, normalize
+from .naming import SUB_EXTS, VIDEO_EXTS, is_normalized, normalize
 
 NOTES_ROOT = Path(__file__).resolve().parent.parent / ".agents" / "notes"
 RULES_DIR = Path(__file__).resolve().parent.parent / ".agents" / "rules"
@@ -70,7 +70,11 @@ def find_residue(state: LibraryState, findings: list[Finding]) -> list[Residue]:
         for f in show.files:
             if str(f.path) in explained:
                 continue
-            if f.is_incomplete or f.ext not in VIDEO_EXTS:
+            # 字幕也要算。`unrenamed-file` 本来就同时管视频和字幕，残留扫描
+            # 却只看视频——于是"字幕解析不出集号"这一类会永远报 unparsable，
+            # 演进器却结构性地看不见它、立不了规则，成了修不好的死角。
+            # 实测《住在拔作岛上的我应该如何是好？》6 个 `.sup` 就卡在这里。
+            if f.is_incomplete or (f.ext not in VIDEO_EXTS and f.ext not in SUB_EXTS):
                 continue
             if is_normalized(f.filename, title):
                 continue
@@ -79,19 +83,32 @@ def find_residue(state: LibraryState, findings: list[Finding]) -> list[Residue]:
             r = clusters.setdefault(sig, Residue(signature=sig))
             r.count += 1
             if len(r.samples) < 6:       # 每簇留几个样本给模型看
-                r.samples.append({
-                    "filename": f.filename,
-                    "show_dir": f.show_dir,
-                    "season_dir": f.season_dir,
-                    "parent_dir": f.parent_dir,
-                    "official_title": title,
-                    "torrent_name": f.torrent_name,
-                    "torrent_tags": f.torrent_tags,
-                    "torrent_state": f.torrent_state,
-                    "size": f.size,
-                })
+                # 样本直接按 DSL 的字段表生成，不手写。
+                #
+                # 手写那版少了 `ext` / `has_torrent` / `torrent_progress` 等几个——
+                # 模型于是只能猜它们长什么样，而它猜的是 `"sup"`，真实值是 `".sup"`
+                # （带点）。规则语法完全正确、影子验证 0 命中被驳回，一次 LLM 调用
+                # 白烧，盲区照旧补不上。字段表是唯一事实来源，样本从它生成就不会再漂。
+                r.samples.append({k: g(f, show) for k, g in _FIELD_GETTERS.items()})
 
     return sorted(clusters.values(), key=lambda r: -r.count)
+
+
+_BRACKET_RE = re.compile(r"([\[【(（])([^\[\]【】()（）]*)([\]】)）])")
+
+
+def _abstract_brackets(m: "re.Match") -> str:
+    """括号内容抽象成 `…`，但纯数字的（多半是集号）保留成 `#`。
+
+    括号里装的正是"每个文件都不一样"的那部分：字幕组、画质、版本、语言。
+    原样保留会把明明同一类的文件切成一堆单例——`【全面限制 ver.】`
+    `【配信限定 ver.】`『【青蓝岛 ver.】』× `中文（简体）` `中文（繁體）`
+    产生 6 个各含 1 个文件的簇，而演进器有"单例不立规则"的闸，
+    于是这 6 个字幕永远评不上盲区。集号那种纯数字括号得留着，
+    它是结构里最有意义的一环。
+    """
+    open_, inner, close = m.group(1), m.group(2), m.group(3)
+    return f"{open_}#{close}" if inner.strip() == "#" else f"{open_}…{close}"
 
 
 def _signature(f: MediaFile, show: Show) -> str:
@@ -100,29 +117,49 @@ def _signature(f: MediaFile, show: Show) -> str:
     name = re.sub(r"\d+", "#", name)
     name = re.sub(r"\s+", " ", name)
     bracket_style = "".join(sorted(set(re.findall(r"[\[\]【】()（）]", name))))
+    name = _BRACKET_RE.sub(_abstract_brackets, name)
     return f"{f.ext}|{bracket_style}|{name[:60]}"
 
 
-def find_failure_patterns(audit_log: Path, min_count: int = 3) -> list[dict]:
-    """从审计日志里找反复失败的动作 —— 说明某条规则的判断有问题。"""
+def find_failure_patterns(audit_log: Path, min_runs: int = 2,
+                          within_days: int = 14) -> list[dict]:
+    """从审计日志里找**反复**失败的动作 —— 说明某条规则的判断有问题。
+
+    两个维度都不能少，缺一个就全是噪音：
+
+    **时间窗口。** 审计日志是只增不删的。不设窗口的话，一类失败只要历史上
+    出现过就会在此后每一次演进里被报出来——《住在拔作岛上的我应该如何是好？》
+    的 30 次改名失败发生在 2026-08-17，问题当天就修好了，之后两周零失败，
+    可它照样每轮都顶着"⚠️ 反复失败"出现。这种告警只会训练人忽略告警。
+
+    **按批次计数，不按条目。** 同一轮里 30 个文件因为同一个原因失败，是**一次**
+    事件，不是 30 次；而同一个原因在 5 个不同批次里反复出现，才是"这条规则
+    有问题"。计数单位必须是批次，否则一次大规模的一次性故障永远压过真正的顽疾。
+    """
     if not audit_log.exists():
         return []
-    counter: Counter = Counter()
+    cutoff = (datetime.now() - timedelta(days=within_days)).isoformat()
+    runs: dict[tuple, set] = defaultdict(set)
+    hits: Counter = Counter()
     detail: dict[tuple, dict] = {}
     for line in audit_log.read_text(encoding="utf-8").splitlines():
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if rec.get("status") != "failed":
+        if rec.get("status") != "failed" or (rec.get("ts") or "") < cutoff:
             continue
         key = (rec.get("rule"), rec.get("op"), (rec.get("error") or "")[:60])
-        counter[key] += 1
+        runs[key].add(rec.get("run_id") or rec.get("ts"))
+        hits[key] += 1
         detail[key] = rec
-    return [
-        {"rule": k[0], "op": k[1], "error": k[2], "count": c, "sample": detail[k]}
-        for k, c in counter.most_common() if c >= min_count
+    out = [
+        {"rule": k[0], "op": k[1], "error": k[2],
+         "runs": len(v), "count": hits[k], "sample": detail[k]}
+        for k, v in runs.items() if len(v) >= min_runs
     ]
+    out.sort(key=lambda d: (-d["runs"], -d["count"]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +290,10 @@ class Evolver:
             "未被解释的异常样本": residue.samples,
             "该簇总数": residue.count,
             "现有规则": existing,
-            "说明": "这些文件的命名不符合 `{official_title} SxxExx.ext` 规范，但现有规则都没命中。",
+            "说明": ("这些文件的命名不符合 `{official_title} SxxExx.ext` 规范，"
+                     "但现有规则都没命中。样本里每个键都是可用的匹配字段，"
+                     "值是它在该文件上的**真实取值**——照着它的形式写条件"
+                     "（例如 ext 是 `.mkv` 这样带点的）。"),
         }, ensure_ascii=False, indent=2)
 
         ans = self.ctx.llm.ask_json(system, user)
