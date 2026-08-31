@@ -56,8 +56,23 @@ uv run media-agent run                # 完整自治轮次
    同理，**每个改动状态的动作都必须记录逆操作**，否则 `rollback` 救不回来。
 5. **演进产物是声明式 DSL，永不 `exec()` 模型生成的代码。**
    见 [声明式规则 DSL](.agents/notes/implemented/architecture/2026-08-17-declarative-rule-dsl.md)。
-6. **订阅番剧必须走 AutoBangumi 自己的 API**，手动往 qBittorrent 加种子会丢
-   `ab:` 标签、永久脱离自动改名管辖。
+6. **qBittorrent 的「分类」是本项目与 AutoBangumi 的所有权边界。**
+   AB 的改名线程扫的是 `torrents_info(category="Bangumi", status_filter="completed")`，
+   **`tag=None`——标签它从不回读**（`ab:` 只是加种子时写下的来源标记，
+   不是控制开关；实测摘掉它拦不住 AB 改名）。因此：
+
+   | 分类 | 归谁 | 谁改名 |
+   |---|---|---|
+   | `Bangumi` | AutoBangumi | AB（每 60 秒扫一次已完成的） |
+   | `<剧名>` | 本项目 | 本项目（AB 查不到这个种子） |
+
+   `category-consolidation` 就是交接动作：AB 下载改名完，分类一改，
+   此后由本项目负责纠正。**本项目自己抓的种子直接落进剧名分类**，
+   全程不进 AB 的地盘。两边因此不会对同一个文件各改各的。
+
+   还没交接的文件（仍在 `Bangumi` 下）**不做不可逆的处置**——它此刻叫什么
+   只是"AB 认为的"，不是定论。见
+   [压平季误删](.agents/notes/implemented/bug-fix/2026-08-31-flattened-season-numbering.md)。
 7. **修订阅时三步顺序不能反**：先改 `title_aliases`/`rss_link` → 再清"已登记但
    不在 qBittorrent"的 torrent 记录 → 最后刷新。`pull_rss` 只处理 `check_new()`
    筛出的新条目，顺序反了会让 AutoBangumi 用**仍然失效**的规则把条目重新登记一遍。

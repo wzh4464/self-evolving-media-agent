@@ -317,6 +317,31 @@ class DuplicateEpisodeDetector:
                 if len(files) < 2:
                     continue
 
+                # 归属权还没交接完的，不做不可逆的删除。
+                #
+                # qBittorrent 的**分类**是本项目与 AutoBangumi 的所有权边界：
+                # AB 的改名线程扫的是 `category="Bangumi" 且已完成` 的种子
+                # （标签它不看），分类一旦改成剧名，它就再也看不见这个种子。
+                # 所以还挂在 `Bangumi` 下的文件，名字的最终裁量权仍在 AB 手上——
+                # 此刻它叫什么只是"AB 认为的"，不是定论。
+                #
+                # 2026-08-31：AB 把 `3rd Season - 08` 改成 `S01E08`，与 2016 年
+                # 真正的第 8 集撞进同一个桶，判重按画质把 1.31GB 的原片清进了隔离区。
+                # 等分类交接完再判，这一集就不会进桶。
+                pending = [f for f in files if f.torrent_category == "Bangumi"]
+                if pending:
+                    yield Finding(
+                        rule=self.id, kind="pending_ownership", severity="minor",
+                        classified=True,
+                        summary=(f"S{season:02d}E{ep:02d} 有 {len(files)} 个候选，但其中 "
+                                 f"{len(pending)} 个仍在 AutoBangumi 的分类下"
+                                 f"（改名权未交接），本轮不做取舍"),
+                        show=show.dir_name, path=str(files[0].path),
+                        evidence={"files": [f.filename for f in files],
+                                  "pending": [f.filename for f in pending]},
+                    )
+                    continue
+
                 # 安全闸：同一集出现 >3 个文件，几乎必然是集号解析错了
                 # （合集种子、`[S00E01]` 这类畸形命名都会造成整桶塌缩），
                 # 此时绝不产出删除动作，只报可疑，交给人或演进器去理解。

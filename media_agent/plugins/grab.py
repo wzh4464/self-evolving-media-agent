@@ -495,7 +495,8 @@ class EpisodeAvailableDetector:
                             args={"url": best["url"], "title": best["title"],
                                   "show_dir": str(show.dir_path),
                                   "season": int(season_key), "episode": ep,
-                                  "bangumi_id": sc.bangumi_id},
+                                  "bangumi_id": sc.bangumi_id,
+                                  "category": show.official_title},
                             note="加入 qBittorrent 并把该集写进 sidecar 的 have 清单",
                         ),
                     )

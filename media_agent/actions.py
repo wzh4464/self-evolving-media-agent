@@ -421,7 +421,16 @@ class Executor:
         if bid and raw_ep == ep:
             tags.append(f"ab:{bid}")
 
-        data = {"savepath": str(save_path), "category": "Bangumi",
+        # 分类就是所有权边界。AutoBangumi 的改名线程扫的是
+        # `torrents_info(category="Bangumi", status_filter="completed")`——
+        # 标签它压根不看（`tag=None`），所以摘 `ab:` 拦不住它，改分类才能。
+        #
+        # 自己抓的种子直接落进「每部番一个分类」，AB 从一开始就查不到它，
+        # 改名全程由本项目负责。2026-08-31 那次 Re:Zero E58 被改成 S01E08、
+        # 撞掉 2016 年真正第 8 集的事故，起点就是这里写死的 `"Bangumi"`——
+        # 等于把自己下的种子拱手放进了 AB 的地盘。
+        cat = a.args.get("category") or "Bangumi"
+        data = {"savepath": str(save_path), "category": cat,
                 "paused": "false", "autoTMM": "false",
                 "contentLayout": "NoSubfolder", "tags": ",".join(tags)}
         resp = self.ctx.qbit._client.post(
