@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .. import sidecar as sc_mod
-from ..cache import Cache
+from ..cache import Cache, EPISODES_TTL
 from ..kernel import Action, Context, Finding, LibraryState
 from ..naming import VIDEO_EXTS
 from .subscription import _fetch_rss_titles, _patterns_of, is_seasonal
@@ -99,7 +99,7 @@ class SidecarSyncDetector:
                 entry = {"have": sorted(got)}
                 if show.tmdb_id:
                     ck = f"tmdbeps:{show.tmdb_id}:{sn}"
-                    cached = cache.get_llm(ck)
+                    cached = cache.get_tmdb(ck, ttl=EPISODES_TTL)
                     eps = cached.get("eps", []) if cached else []
                     dated = []
                     for e in eps:

@@ -17,7 +17,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
-from ..cache import Cache
+from ..cache import Cache, EPISODES_TTL
 from ..kernel import Action, Context, Finding, LibraryState
 from ..naming import VIDEO_EXTS
 
@@ -367,7 +367,7 @@ class IncompleteSeasonDetector:
                 if sn == 0:
                     continue
                 ck = f"tmdbeps:{show.tmdb_id}:{sn}"
-                cached = cache.get_llm(ck)
+                cached = cache.get_tmdb(ck, ttl=EPISODES_TTL)
                 if cached is not None:
                     eps = cached.get("eps", [])
                 else:
@@ -375,7 +375,7 @@ class IncompleteSeasonDetector:
                         eps = ctx.tmdb.season_episodes(show.tmdb_id, sn)
                     except Exception:
                         continue
-                    cache.put_llm(ck, {"eps": eps})
+                    cache.put_tmdb(ck, {"eps": eps})
 
                 dated = []
                 for e in eps:
@@ -509,13 +509,13 @@ class SourceAbandonedDetector:
             season = int(b.get("season") or 1)
             disk = _disk_episodes(show).get(season, set())
             ck0 = f"tmdbeps:{show.tmdb_id}:{season}"
-            c0 = cache.get_llm(ck0)
+            c0 = cache.get_tmdb(ck0, ttl=EPISODES_TTL)
             if c0 is None:
                 try:
                     c0 = {"eps": ctx.tmdb.season_episodes(show.tmdb_id, season)}
                 except Exception:
                     c0 = {"eps": []}
-                cache.put_llm(ck0, c0)
+                cache.put_tmdb(ck0, c0)
             aired_eps = {e["episode_number"] for e in (c0.get("eps") or [])
                          if e.get("air_date") and e["air_date"] <= today.isoformat()}
             if aired_eps and not (aired_eps - disk):
@@ -549,7 +549,7 @@ class SourceAbandonedDetector:
 
             season = int(b.get("season") or 1)
             ck2 = f"tmdbeps:{show.tmdb_id}:{season}"
-            cached2 = cache.get_llm(ck2)
+            cached2 = cache.get_tmdb(ck2, ttl=EPISODES_TTL)
             if cached2 is not None:
                 eps = cached2.get("eps", [])
             else:
@@ -557,7 +557,7 @@ class SourceAbandonedDetector:
                     eps = ctx.tmdb.season_episodes(show.tmdb_id, season)
                 except Exception:
                     continue
-                cache.put_llm(ck2, {"eps": eps})
+                cache.put_tmdb(ck2, {"eps": eps})
 
             dated = []
             for e in eps:

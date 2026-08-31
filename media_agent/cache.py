@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS llm (key TEXT PRIMARY KEY, value TEXT, ts REAL);
 """
 
 TMDB_TTL = 30 * 24 * 3600   # TMDB 元数据 30 天
+EPISODES_TTL = 6 * 3600     # 分集表 6 小时。在播番每周新增一集，
+                            # 用元数据那套 30 天会让新集整整一个月看不见
 
 
 class Cache:
@@ -22,10 +24,10 @@ class Cache:
         self.conn.commit()
 
     # --- TMDB ---
-    def get_tmdb(self, key: str) -> dict | None:
+    def get_tmdb(self, key: str, ttl: float = TMDB_TTL) -> dict | None:
         row = self.conn.execute(
             "SELECT value, ts FROM tmdb WHERE key=?", (key,)).fetchone()
-        if not row or time.time() - row[1] > TMDB_TTL:
+        if not row or time.time() - row[1] > ttl:
             return None
         return json.loads(row[0])
 
