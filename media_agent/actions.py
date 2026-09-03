@@ -456,6 +456,21 @@ class Executor:
         if raw_ep is not None and raw_ep != ep:
             self._retitle_torrent(blob, a.args.get("title") or "", raw_ep, ep)
 
+        # 加种成功就立刻改名，别等下一轮。
+        #
+        # 分类改成剧名之后，AutoBangumi 再也看不到这个种子（它只扫
+        # `category="Bangumi"`），改名责任全在本项目。而本项目一轮 run 是
+        # "先全量诊断、再统一执行"——抓取发生在执行阶段，`unrenamed-file`
+        # 的检测早就跑完了，于是新抓的集要等**下一轮**（6 小时后）才改名。
+        #
+        # 2026-09-03 用户报"最新三集刮削失败"：文件躺在库里，名字还是
+        # `[Nekomoe kissaten][20 Seiki Denki Mokuroku][09][1080p][JPSC].mp4`，
+        # Jellyfin 认不出来。以前落在 Bangumi 分类时 AB 60 秒就改好了，
+        # 换成自己管之后反而慢了六小时——这是所有权改动带来的回归。
+        #
+        # 集号在这里是确定的（就是钉进 `ma:` 标签的那个），不需要再解析文件名。
+        self._rename_grabbed(blob, a.args.get("official_title") or cat, season, ep)
+
         # 写 sidecar：加进 have，并把这个发布名记成别名（下次匹配用得上）
         sc = sc_mod.load(show_dir)
         info = sc.seasons.setdefault(str(season), {})
@@ -532,6 +547,38 @@ class Executor:
                 data={"hash": h, "name": new})
         except Exception:
             pass
+
+    def _rename_grabbed(self, blob: bytes, title: str, season: int, ep: int) -> None:
+        """把刚加进去的种子里那个正片文件改成规范名。
+
+        只处理"恰好一个视频文件"的种子；合集或带特典的交给 `unrenamed-file`
+        按文件逐个判断，这里不猜。失败只记日志——改名没成功不该让抓取算失败，
+        下一轮的改名规则会兜底。
+        """
+        from .naming import VIDEO_EXTS, target_filename
+
+        h = self._infohash_v1(blob)
+        if not h:
+            return
+        try:
+            for _ in range(10):          # qBittorrent 解析元数据要一点时间
+                files = [f for f in self.ctx.qbit.files(h)
+                         if f.get("priority", 1) != 0]
+                if files:
+                    break
+                time.sleep(1)
+            else:
+                return
+            vids = [f for f in files
+                    if Path(f["name"]).suffix.lower() in VIDEO_EXTS]
+            if len(vids) != 1:
+                return
+            cur = vids[0]["name"]
+            want = target_filename(title, season, ep, Path(cur).suffix.lower())
+            if cur != want:
+                self.ctx.qbit.rename_file(h, cur, want)
+        except Exception as e:
+            self.ctx.log(f"[grab] 加种后改名失败（下一轮会补）: {e}")
 
     def _op_drop_torrent(self, f: Finding, a: Action) -> None:
         """把种子记录从 qBittorrent 摘掉，**文件一个字节都不动**。
