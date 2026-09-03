@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .. import sidecar as sc_mod
-from ..cache import Cache, EPISODES_TTL
+from ..cache import Cache, EPISODES_TTL, FEED_TTL
 from ..kernel import Action, Context, Finding, LibraryState
 from ..naming import VIDEO_EXTS
 from .subscription import _fetch_rss_titles, _patterns_of, is_seasonal
@@ -68,7 +68,7 @@ class SidecarSyncDetector:
                 # 把实际发布标题里见过的名字记下来，作为将来匹配失效时的备用别名
                 if link:
                     ck = f"rss:{link}"
-                    cached = cache.get_llm(ck)
+                    cached = cache.get_llm(ck, ttl=FEED_TTL)
                     titles = cached.get("titles", []) if cached else []
                     if titles:
                         eps = set()

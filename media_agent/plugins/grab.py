@@ -24,11 +24,12 @@ from datetime import date, timedelta
 from typing import Iterable
 
 from .. import preferences
-from ..cache import Cache
+from ..cache import Cache, FEED_TTL, LOOKUP_TTL
 from ..kernel import Action, Context, Finding, LibraryState, tmdb_groups
 from ..naming import declared_season
 from ..sidecar import load as load_sidecar, save as save_sidecar
-from .subscription import MIKAN, _http_get, _mikan_search_ids, is_seasonal
+from .subscription import (MIKAN, _disk_episodes, _http_get,
+                           _mikan_search_ids, is_seasonal)
 
 # 单轮为一部番最多提议抓几集，防止新订阅时一次刷屏
 MAX_PER_SHOW = 6
@@ -185,7 +186,7 @@ def _season_fit(items: list[dict], air: list[str]) -> float:
 
 def _feed_cached(mid: str, cache) -> list[dict]:
     ck = f"mikanfeed:{FEED_SCHEMA}:{mid}"
-    got = cache.get_llm(ck)
+    got = cache.get_llm(ck, ttl=FEED_TTL)
     if got is None:
         got = {"items": _feed_items(mid)}
         cache.put_llm(ck, got)
@@ -224,7 +225,7 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None) -> str | No
         if not kw:
             continue
         ck = f"mikansearch:{kw}"
-        hit = cache.get_llm(ck)
+        hit = cache.get_llm(ck, ttl=LOOKUP_TTL)
         if hit is None:
             try:
                 hit = {"ids": _mikan_search_ids(kw, 3)}
@@ -351,8 +352,20 @@ class EpisodeAvailableDetector:
                 continue
             inflight = _inflight(show, by_hash, ctx.config.dead_torrent_hours)
 
+            disk_eps = _disk_episodes(show)
+
             for season_key, info in sc.seasons.items():
-                have = set(info.get("have") or [])
+                # `have` 要并上磁盘实况，不能只信 sidecar。
+                #
+                # 一轮 run 是"先全量诊断、再统一执行"：抓取检测器跑的时候，
+                # sidecar 还是**上一轮**写的。AutoBangumi 在两轮之间下完的集，
+                # 磁盘上已经有了，sidecar 里却还没有——于是抓取器认为它缺，
+                # 再下一遍。2026-09-03 实测：《无职转生》S03E10 十六小时前
+                # 就由 AB 下完躺在磁盘上，sidecar 的 have 仍停在 9。
+                #
+                # 这跟 seasonal 标记那次是同一类问题：依赖会滞后一整轮的
+                # 持久化状态。凡是磁盘能直接回答的，就别问镜像。
+                have = set(info.get("have") or []) | disk_eps.get(int(season_key), set())
                 try:
                     eps = ctx.tmdb.season_episodes(show.tmdb_id, int(season_key))
                 except Exception:

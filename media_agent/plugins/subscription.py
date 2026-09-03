@@ -17,7 +17,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
-from ..cache import Cache, EPISODES_TTL
+from ..cache import Cache, EPISODES_TTL, FEED_TTL, LOOKUP_TTL
 from ..kernel import Action, Context, Finding, LibraryState
 from ..naming import VIDEO_EXTS
 
@@ -273,7 +273,7 @@ class TitleMatchBrokenDetector:
                 continue
 
             ck = f"rss:{url}"
-            cached = cache.get_llm(ck)          # 复用 llm 表做通用短期缓存
+            cached = cache.get_llm(ck, ttl=FEED_TTL)          # 复用 llm 表做通用短期缓存
             if cached is not None:
                 titles = cached.get("titles", [])
             else:
@@ -522,7 +522,7 @@ class SourceAbandonedDetector:
                 continue
 
             ck = f"rss:{b['rss_link']}"
-            cached = cache.get_llm(ck)
+            cached = cache.get_llm(ck, ttl=FEED_TTL)
             if cached is not None:
                 titles = cached.get("titles", [])
             else:
@@ -665,7 +665,7 @@ class SourceAbandonedDetector:
             if not kw:
                 continue
             ck = f"mikansearch:{kw}"
-            hit = cache.get_llm(ck)
+            hit = cache.get_llm(ck, ttl=LOOKUP_TTL)
             if hit is None:
                 try:
                     hit = {"ids": _mikan_search_ids(kw, self.MAX_CANDIDATES)}
@@ -681,7 +681,7 @@ class SourceAbandonedDetector:
         best: tuple[str, int, list[str]] | None = None
         for bid in candidates[:self.MAX_CANDIDATES]:
             ck = f"mikansub:{bid}"
-            subs = cache.get_llm(ck)
+            subs = cache.get_llm(ck, ttl=LOOKUP_TTL)
             if subs is None:
                 try:
                     subs = {"groups": _mikan_subgroups(bid)}
@@ -703,7 +703,7 @@ class SourceAbandonedDetector:
             if feed == (b.get("rss_link") or ""):
                 continue                 # 就是订阅现在用的那条，没有新信息
             ck2 = f"rss:{feed}"
-            got = cache.get_llm(ck2)
+            got = cache.get_llm(ck2, ttl=FEED_TTL)
             if got is None:
                 try:
                     got = {"titles": _fetch_rss_titles(feed)}
