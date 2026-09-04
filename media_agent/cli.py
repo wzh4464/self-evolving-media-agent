@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 from collections import Counter
+from pathlib import Path
 
 from .actions import Executor
 from .cache import Cache
@@ -212,7 +213,7 @@ def cmd_purge(args, cfg) -> int:
     from .purge import build_pool
 
     ctx = build_context(cfg)
-    pool = build_pool(cfg, ctx.qbit)
+    pool = build_pool(cfg, ctx.qbit, ctx.tmdb)
     ok = [c for c in pool if c.eligible]
     no = [c for c in pool if not c.eligible]
     free = sum(c.size for c in ok)
@@ -231,7 +232,21 @@ def cmd_purge(args, cfg) -> int:
     elif no:
         print(f"\n保留 {len(no)} 份（加 --verbose 看原因）")
 
+    def _sweep_empty_dirs() -> int:
+        """删完文件会留下空目录，顺手扫掉。与有没有可删文件无关，所以无条件跑。"""
+        root = Path(cfg.trash_dir)
+        n = 0
+        for d in sorted(root.rglob("*"), key=lambda x: -len(x.parts)):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+                n += 1
+        return n
+
     if not ok:
+        if args.apply:
+            n = _sweep_empty_dirs()
+            if n:
+                print(f"\n清掉 {n} 个空目录")
         return 0
     if not args.apply:
         print("\n【预演】未删除任何东西。确认无误后加 --apply 执行。")
@@ -244,12 +259,8 @@ def cmd_purge(args, cfg) -> int:
             gone += 1
         except OSError as e:
             print(f"  !! 删除失败 {c.trash_path.name}: {e}")
-    # 清掉因此变空的目录
-    root = Path(cfg.trash_dir)
-    for d in sorted(root.rglob("*"), key=lambda x: -len(x.parts)):
-        if d.is_dir() and not any(d.iterdir()):
-            d.rmdir()
-    print(f"\n已删除 {gone} 份，释放 {free / 2**30:.2f} GB")
+    n = _sweep_empty_dirs()
+    print(f"\n已删除 {gone} 份，释放 {free / 2**30:.2f} GB，清掉 {n} 个空目录")
     return 0
 
 

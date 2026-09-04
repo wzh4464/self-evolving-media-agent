@@ -90,7 +90,35 @@ def _torrent_size_index(qbit) -> dict:
     return idx
 
 
-def build_pool(cfg, qbit) -> list[Candidate]:
+def _identify_from_path(trash_file: Path, media_root: Path, tmdb, cfg):
+    """无审计记录时，从隔离路径 + TMDB 反推 (库内原路径, (季, 集))。
+
+    返回 None 表示推不出来——推不出来就留着，绝不猜。
+    """
+    slot = _slot_of(trash_file.name, "")
+    if not slot:
+        return None
+    shows = {d.name: d for d in media_root.iterdir()
+             if d.is_dir() and not d.name.startswith(".")}
+    show_dir = next((shows[part] for part in trash_file.parts if part in shows), None)
+    if show_dir is None:
+        return None
+    if tmdb is None:
+        return None
+    from . import sidecar as sc_mod
+    try:
+        tid = sc_mod.load(show_dir).tmdb_id
+        if not tid:
+            return None
+        eps = {e["episode_number"] for e in tmdb.season_episodes(tid, slot[0])}
+    except Exception:
+        return None
+    if slot[1] not in eps:
+        return None                      # TMDB 里没这一集，身份存疑
+    return str(show_dir / ("Season %d" % slot[0]) / trash_file.name), slot
+
+
+def build_pool(cfg, qbit, tmdb=None) -> list[Candidate]:
     """扫描隔离区，逐份判定能否安全删除。"""
     trash_root = Path(cfg.trash_dir)
     media_root = Path(cfg.media_root)
@@ -108,18 +136,32 @@ def build_pool(cfg, qbit) -> list[Candidate]:
         c = Candidate(trash_path=p, size=size)
         rec = audit.get(str(p))
         if not rec:
-            c.why = "没有审计记录，无从得知它当初代表哪一集"
-            out.append(c)
-            continue
-
-        c.rule = rec.get("rule") or ""
-        c.origin = (rec.get("args") or {}).get("path") or ""
-        if c.rule != "duplicate-episode":
+            # 没有审计记录时，改用**结果名单**反推身份：
+            #
+            # 文件名里的 SxxExx 加上路径里能对上的剧集目录，就唯一确定了一集；
+            # 再由 TMDB 确认"这部番确实有这一集"。TMDB 是这套系统里集数的
+            # 权威来源——它说该有 S01E01，那么隔离区里叫 S01E01 的那份
+            # 就只能对应它，不需要审计日志来告诉我们。
+            #
+            # 路径位置不可靠（批次目录形状不一，有 `2026-08-19/上伊那牡丹-残留目录/…`
+            # 这种把标签放在剧名位置的），所以是拿**每一段**去和库内目录名精确比对，
+            # 而不是取固定下标。
+            ident = _identify_from_path(p, media_root, tmdb, cfg)
+            if not ident:
+                c.why = "没有审计记录，且无法从路径与 TMDB 反推是哪一集"
+                out.append(c)
+                continue
+            c.rule, c.origin, c.slot = "（由路径+TMDB 反推）", ident[0], ident[1]
+        else:
+            c.rule = rec.get("rule") or ""
+            c.origin = (rec.get("args") or {}).get("path") or ""
+        if rec and c.rule != "duplicate-episode":
             c.why = f"清理原因是 {c.rule}，按定义不存在库内替代者"
             out.append(c)
             continue
 
-        c.slot = _slot_of(Path(c.origin).name, rec.get("summary") or "")
+        if rec:
+            c.slot = _slot_of(Path(c.origin).name, rec.get("summary") or "")
         if not c.slot:
             c.why = "解析不出集号"
             out.append(c)
