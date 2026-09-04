@@ -172,7 +172,15 @@ def build_pool(cfg, qbit, tmdb=None) -> list[Candidate]:
             c.rule = rec.get("rule") or ""
             c.origin = (rec.get("args") or {}).get("path") or ""
         if rec and c.rule != "duplicate-episode":
-            c.why = f"清理原因是 {c.rule}，按定义不存在库内替代者"
+            # 措辞不能写成"按定义不存在库内替代者"——2026-09-04 核对发现那是错的。
+            # `extras-in-library` 清掉的 120 份里，84 份确实是碟片菜单和无字幕
+            # OP/ED（TMDB 不收录），但另外 36 份是 BD 特典，而 TMDB 的 Season 0
+            # **有**对应条目——只是特典的文件名（`[Tokuten][01]`、`[SP03] … - 01`）
+            # 跟 TMDB 的中文标题（「URA-ON!～唯的好奇心系～」）毫无字面关联，
+            # 靠名字或集号都匹配不上，于是被一律判成"TMDB 里没有"。
+            # 结论（不删）是对的，理由是错的；错的理由会误导下一个读它的人。
+            c.why = (f"清理原因是 {c.rule}；这类是否真在 TMDB 无对应需要逐个核对，"
+                     f"不自动删")
             out.append(c)
             continue
 
