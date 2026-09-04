@@ -90,6 +90,22 @@ def _torrent_size_index(qbit) -> dict:
     return idx
 
 
+def _duration(path: Path) -> float | None:
+    """用 ffprobe 取时长（秒）。取不到返回 None。"""
+    import subprocess
+    for exe in ("/opt/homebrew/bin/ffprobe", "ffprobe"):
+        try:
+            r = subprocess.run(
+                [exe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=nw=1:nk=1", str(path)],
+                capture_output=True, text=True, timeout=30)
+            if r.returncode == 0 and r.stdout.strip():
+                return float(r.stdout.strip())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    return None
+
+
 def _identify_from_path(trash_file: Path, media_root: Path, tmdb, cfg):
     """无审计记录时，从隔离路径 + TMDB 反推 (库内原路径, (季, 集))。
 
@@ -221,6 +237,33 @@ def build_pool(cfg, qbit, tmdb=None) -> list[Candidate]:
             continue
         if actual != declared:
             c.why = (f"替代者大小与种子声明不符（磁盘 {actual}，种子 {declared}）")
+            out.append(c)
+            continue
+
+        # 没有审计记录时，"是不是重复"这件事没人判过——只知道集位被占。
+        # 万一隔离的那份其实是想留的另一个版本（NUKITASHI 的青蓝岛版那种），
+        # 光看集位是发现不了的。所以再用时长确认一次。
+        #
+        # **这道检查的能力边界要清楚**：同一部番每集时长都差不多
+        # （实测攻壳 E01 和 E02 都是 1444 秒），所以时长**分不出是哪一集**——
+        # 那由 SxxExx 的集位匹配来定。它挡的是另一类：截断的半成品、
+        # 混进来的特典或剧场版、时长明显不同的剪辑版本。
+        #
+        # 有审计记录的那条路径走的是 duplicate-episode 的判定，不必重做。
+        if not rec:
+            d1, d2 = _duration(p), _duration(surv)
+            if d1 is None or d2 is None:
+                c.why = "无审计记录且读不出时长，无法确认两者是同一集内容"
+                out.append(c)
+                continue
+            if abs(d1 - d2) > max(30.0, 0.05 * max(d1, d2)):
+                c.why = (f"时长差异过大（隔离 {d1:.0f}s vs 库内 {d2:.0f}s），"
+                         f"可能不是同一集内容或是想保留的另一版本")
+                out.append(c)
+                continue
+            c.why = (f"S{sn:02d}E{ep:02d} 由 {surv.name} 占位，大小与种子声明一致"
+                     f"（{declared} 字节）且已完成；时长 {d1:.0f}s≈{d2:.0f}s 确认同集")
+            c.eligible = True
             out.append(c)
             continue
 

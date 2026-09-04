@@ -252,13 +252,28 @@ def cmd_purge(args, cfg) -> int:
         print("\n【预演】未删除任何东西。确认无误后加 --apply 执行。")
         return 0
 
+    # 不可逆删除必须留痕。隔离区本身就是"删除"的可回退形态，从这里再删一次
+    # 就没有下一层保险了——至少要能事后回答"当时删了什么、凭什么判定安全"。
+    import time
+    log = Path(cfg.state_dir) / "purge.jsonl"
+    stamp = time.strftime("%Y%m%dT%H%M%S")
     gone = 0
-    for c in ok:
-        try:
-            c.trash_path.unlink()
-            gone += 1
-        except OSError as e:
-            print(f"  !! 删除失败 {c.trash_path.name}: {e}")
+    with log.open("a", encoding="utf-8") as fh:
+        for c in ok:
+            try:
+                c.trash_path.unlink()
+                gone += 1
+                fh.write(json.dumps({
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "run": stamp,
+                    "deleted": str(c.trash_path), "bytes": c.size,
+                    "rule": c.rule, "origin": c.origin,
+                    "slot": list(c.slot) if c.slot else None,
+                    "survivor": str(c.survivor) if c.survivor else None,
+                    "why": c.why,
+                }, ensure_ascii=False) + "\n")
+            except OSError as e:
+                print(f"  !! 删除失败 {c.trash_path.name}: {e}")
+    print(f"  记录写入 {log}")
     n = _sweep_empty_dirs()
     print(f"\n已删除 {gone} 份，释放 {free / 2**30:.2f} GB，清掉 {n} 个空目录")
     return 0
