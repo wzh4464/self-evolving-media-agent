@@ -83,10 +83,30 @@ class Executor:
                                  # 所有权，后面的改名/归位都要以此为前提
         "retag": 2, "recategorize": 3, "delete_category": 4,
         "write_nfo": 5,
+
+        # 腾空必须在命名之前 —— 这是改名唯一失败模式的解药。
+        #
+        # 改名只有一种失败方式：目标名被占。而目标名是 `{标题} SxxExx.ext`，
+        # 一个集位按定义只能有一个文件。所以"被占"永远意味着同一集有两个
+        # 文件，那是 `duplicate-episode` 的职责，不是命名问题。
+        #
+        # trash 原先排在最后（op 9），出于"破坏性操作放最后"的直觉。代价是：
+        # 同一批次里 rename 先跑、撞名跳过，trash 再把占位的清掉——赢家还留在
+        # 原始发布名上，要等**下一轮**（6 小时后）才改名。而"谁先出要谁"必然
+        # 产生重复（多个字幕组发同一集是常态），于是这不是边缘情况而是常态：
+        # 审计日志里 2657 次 rename/skipped，原因全部是「目标文件名已存在」。
+        #
+        # 2026-09-04 用户报"最新的入间同学没改名"：E20 有 Sakurato 和 Nix-Raws
+        # 两个版本，判重留下 Sakurato，但改名在腾空之前跑，连着两轮都跳过。
+        #
+        # 三个 trash 来源（duplicate-episode / dead-torrent / extras-in-library）
+        # 都不依赖改名先发生，提前执行是安全的；而且 trash 是移入隔离区加逆操作，
+        # 不是 rm，"放最后"保护的东西本来就不多。
+        "trash": 5,
+
         "rename": 6,            # 先改文件名（此时目录名还是旧的，路径有效）
         "relocate": 7,
         "rename_show_dir": 8,   # 再改目录名，一次性带走里面所有文件
-        "trash": 9,
     }
 
     # ---------------- 入口 ----------------
@@ -120,7 +140,14 @@ class Executor:
         target = path.parent / new_name
 
         if target.exists() and target != path:
-            self._audit("skipped", f, a, {"reason": "目标文件名已存在，避免覆盖"})
+            # 走到这里说明腾空没能发生：同一集位有两个文件，而 duplicate-episode
+            # 这一轮没有（或不能）判出赢家。不是命名问题，别当命名问题报。
+            self._audit("skipped", f, a, {
+                "reason": "集位被占：目标名已被另一个文件占用，且本轮没有腾空",
+                "occupant": target.name,
+                "hint": "同一集有多个版本，等 duplicate-episode 判出取舍；"
+                        "若它也判不了（画质无法比较等），需要人工介入",
+            })
             return
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run"})
