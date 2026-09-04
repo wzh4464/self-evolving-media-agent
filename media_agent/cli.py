@@ -207,6 +207,52 @@ def cmd_repair(args, cfg) -> int:
     return 0
 
 
+def cmd_purge(args, cfg) -> int:
+    """清理隔离区里「绝对没问题」的那些。判定条件见 purge.py 的模块注释。"""
+    from .purge import build_pool
+
+    ctx = build_context(cfg)
+    pool = build_pool(cfg, ctx.qbit)
+    ok = [c for c in pool if c.eligible]
+    no = [c for c in pool if not c.eligible]
+    free = sum(c.size for c in ok)
+
+    print(f"隔离区共 {len(pool)} 份文件，"
+          f"可安全删除 {len(ok)} 份（{free / 2**30:.2f} GB）\n")
+    for c in ok:
+        print(f"  ✓ {c.trash_path.name[:56]}")
+        print(f"      {c.why}")
+    if no and args.verbose:
+        print(f"\n保留 {len(no)} 份：")
+        import collections
+        by = collections.Counter(c.why.split("（")[0].split("——")[0] for c in no)
+        for why, n in by.most_common():
+            print(f"  ×{n:<4} {why}")
+    elif no:
+        print(f"\n保留 {len(no)} 份（加 --verbose 看原因）")
+
+    if not ok:
+        return 0
+    if not args.apply:
+        print("\n【预演】未删除任何东西。确认无误后加 --apply 执行。")
+        return 0
+
+    gone = 0
+    for c in ok:
+        try:
+            c.trash_path.unlink()
+            gone += 1
+        except OSError as e:
+            print(f"  !! 删除失败 {c.trash_path.name}: {e}")
+    # 清掉因此变空的目录
+    root = Path(cfg.trash_dir)
+    for d in sorted(root.rglob("*"), key=lambda x: -len(x.parts)):
+        if d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+    print(f"\n已删除 {gone} 份，释放 {free / 2**30:.2f} GB")
+    return 0
+
+
 def cmd_evolve(args, cfg) -> int:
     ctx = build_context(cfg, need_llm=True)
     if not ctx.llm.enabled:
@@ -311,6 +357,11 @@ def main() -> int:
     s.add_argument("--run", required=True, help="出问题的批次 ID")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_repair)
+
+    s = sub.add_parser("purge", help="清理隔离区里可验证为安全的文件")
+    s.add_argument("--apply", action="store_true", help="真正删除（默认只预演）")
+    s.add_argument("--verbose", action="store_true", help="列出保留原因")
+    s.set_defaults(func=cmd_purge)
 
     s = sub.add_parser("evolve", help="自演进：为规则盲区提议新规则")
     s.add_argument("--max-proposals", type=int, default=3)
