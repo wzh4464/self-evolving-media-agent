@@ -80,7 +80,23 @@ def _fetch_rss_titles(url: str) -> list[str]:
             urllib.parse.quote(parts.query, safe="=&+%"), ""))
     req = urllib.request.Request(safe, headers={"User-Agent": "media-agent/0.1"})
     body = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "replace")
-    return re.findall(r"<title>(.*?)</title>", body, re.S)[1:]
+    return rss_item_titles(body)
+
+
+def rss_item_titles(body: str) -> list[str]:
+    """RSS 正文 → 各 `<item>` 的标题。**RSS 标题提取的唯一实现。**
+
+    原先这里写的是 `re.findall(r"<title>…", body)[1:]`——靠"第一个 title
+    一定是 channel 标题"这个位置假设跳过它。频道少一个 title 就会吞掉一条
+    真条目，多一个就会混进非条目文本。按 `<item>` 分块没有这个脆点，
+    也和 `grab._feed_items` 的做法一致（那边还要顺带取 enclosure 和 pubDate）。
+    """
+    out = []
+    for it in re.findall(r"<item>(.*?)</item>", body, re.S):
+        m = re.search(r"<title>(.*?)</title>", it, re.S)
+        if m:
+            out.append(html.unescape(m.group(1)).strip())
+    return out
 
 
 def _longest_common(a: str, b: str) -> str:

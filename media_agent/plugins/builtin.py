@@ -13,6 +13,7 @@ from ..cache import Cache
 from ..dedup import content_digest
 from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
+from ..probe import probe, size_for_compare
 from ..naming import (
     SUB_EXTS, VIDEO_EXTS, declared_season, is_extra, is_normalized, normalize,
     parse_episode,
@@ -47,6 +48,34 @@ def _apply_offset(ep: int, show: Show) -> int:
 
 
 _OFFSET_CACHE: dict[str, dict] = {}
+
+
+
+def _rank_for_keep(f: MediaFile) -> tuple:
+    """重复集取舍的排序键。分数越高越该留。
+
+    在 `parse_quality`（只看名字）之上叠一层**文件内部的事实**：
+
+    - **字幕能力用探测的，不用猜的。** 2026-09-05 尼古喵喵 S01E08 两个候选，
+      带简繁双字幕轨的那份因为内部文件名只写 `SRTx2`（"简繁内封字幕"只在
+      Mikan 站点标题里）被判成"无简体"，与零字幕轨的生肉并列，最后按体积
+      判输被删。打开文件看轨道就没有这个问题。
+    - **体积跨编码折算。** 同画质下 HEVC/AV1 只要 AVC 六成，裸比体积等于
+      系统性偏向低效编码——上面那次正是 AVC 710MB 赢了 HEVC 566MB。
+
+    探不到（文件不在、没装 ffprobe）就原样退回纯名字判断，不制造新的失败模式。
+    """
+    q = parse_quality(f.torrent_name or f.filename, f.size)
+    info = probe(f.path)
+    if info is None:
+        return (q.height, 1 if q.simplified else 0, int(q.is_bdrip), float(f.size))
+    subs = info.subtitle_rank()
+    # 容器里没有字幕轨、但名字明说带中文字幕 —— 多半是内嵌硬字幕。
+    # 硬字幕看不见轨道，不能因此判它"没字幕"（用户：内封最好，内嵌也行）。
+    if subs == 0 and (q.simplified or q.traditional):
+        subs = 3 if q.simplified else 2
+    return (info.height or q.height, subs, int(q.is_bdrip),
+            size_for_compare(f.size, info.vcodec))
 
 
 def _pinned(f: MediaFile) -> tuple[int, int] | None:
@@ -372,11 +401,7 @@ class DuplicateEpisodeDetector:
                     )
                     continue
 
-                ranked = sorted(
-                    files,
-                    key=lambda f: parse_quality(f.torrent_name or f.filename, f.size).rank(),
-                    reverse=True,
-                )
+                ranked = sorted(files, key=_rank_for_keep, reverse=True)
                 keeper, losers = ranked[0], ranked[1:]
                 kd = content_digest(keeper.path, cache)
                 for loser in losers:

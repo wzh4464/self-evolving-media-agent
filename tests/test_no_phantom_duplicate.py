@@ -73,6 +73,29 @@ def main() -> int:
     check("duplicate-episode：同路径不产出删除动作", not dels,
           "共 %d 条 finding，删除类 %d 条" % (len(found), len(dels)))
 
+
+    # 3) 重复集取舍：字幕能力必须排在体积之前。
+    #    2026-09-05 尼古喵喵 S01E08：带简繁双字幕轨的 HEVC 566MB 输给了
+    #    零字幕轨的 AVC 710MB，因为排序键只看文件名、且裸比体积。
+    from media_agent.probe import MediaInfo, size_for_compare
+
+    sub_hevc = MediaInfo(vcodec="hevc", height=1080, sub_count=2,
+                         sub_marks=("chi 简体中文", "chi 繁體中文"))
+    raw_avc = MediaInfo(vcodec="h264", height=1080, sub_count=0, sub_marks=())
+    check("probe：带简繁双轨识别为简体", sub_hevc.has_simplified and sub_hevc.subtitle_rank() == 3,
+          "subtitle_rank=%d" % sub_hevc.subtitle_rank())
+    check("probe：零字幕轨得 0 分", raw_avc.subtitle_rank() == 0,
+          "subtitle_rank=%d" % raw_avc.subtitle_rank())
+    check("排序：字幕能力先于体积",
+          (1080, sub_hevc.subtitle_rank()) > (1080, raw_avc.subtitle_rank()),
+          "带字幕的 HEVC 必须排在无字幕的 AVC 之前")
+    # 跨编码体积折算：566MB HEVC 的等效画质应高于 710MB AVC
+    hevc_eq = size_for_compare(593601176, "hevc")
+    avc_eq = size_for_compare(745065995, "h264")
+    check("排序：跨编码体积折算后 HEVC 反超", hevc_eq > avc_eq,
+          "HEVC 566MB → %.0fMB 等效；AVC 710MB → %.0fMB 等效"
+          % (hevc_eq / 2 ** 20, avc_eq / 2 ** 20))
+
     print()
     if failures:
         print("失败 %d 项：%s" % (len(failures), ", ".join(failures)))

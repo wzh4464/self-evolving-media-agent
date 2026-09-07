@@ -54,6 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .naming import VIDEO_EXTS, parse_episode, season_of_dir
+from .probe import duration as _duration, tail_decodes as _tail_decodes
 
 _SXXEXX = re.compile(r"S(\d{1,2})E(\d{1,3})", re.IGNORECASE)
 
@@ -162,45 +163,6 @@ def _torrent_size_index(qbit) -> dict:
                 continue
             idx[str(Path(sp) / f["name"])] = (f.get("size", 0), t.get("progress", 0.0))
     return idx
-
-
-def _duration(path: Path) -> float | None:
-    """用 ffprobe 取时长（秒）。取不到返回 None。"""
-    import subprocess
-    for exe in ("/opt/homebrew/bin/ffprobe", "ffprobe"):
-        try:
-            r = subprocess.run(
-                [exe, "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=nw=1:nk=1", str(path)],
-                capture_output=True, text=True, timeout=30)
-            if r.returncode == 0 and r.stdout.strip():
-                return float(r.stdout.strip())
-        except (OSError, ValueError, subprocess.SubprocessError):
-            continue
-    return None
-
-
-def _tail_decodes(path: Path, dur: float) -> bool:
-    """尾部能否真正解出画面。
-
-    截断文件最阴险的一种：容器头里写着完整时长，`_duration` 读出来一切正常，
-    但后半段的数据根本不存在。只有真去解码末尾才能戳穿。
-    从 `dur - 8s` 起解 1 帧，解不出就当它是残的。
-    """
-    import subprocess
-    if dur is None or dur < 12:
-        return True                      # 太短的（菜单、PV）不适用这条，不拦
-    ss = max(0.0, dur - 8.0)
-    for exe in ("/opt/homebrew/bin/ffmpeg", "ffmpeg"):
-        try:
-            r = subprocess.run(
-                [exe, "-v", "error", "-ss", f"{ss:.2f}", "-i", str(path),
-                 "-frames:v", "1", "-f", "null", "-"],
-                capture_output=True, text=True, timeout=60)
-            return r.returncode == 0 and not r.stderr.strip()
-        except (OSError, subprocess.SubprocessError):
-            continue
-    return True                          # 没有 ffmpeg 就别拿它当否定证据
 
 
 def _season_median_duration(show_dir: Path, sn: int, exclude: Path,
