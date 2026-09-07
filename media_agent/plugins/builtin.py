@@ -16,7 +16,7 @@ from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
 from ..naming import (
     SUB_EXTS, VIDEO_EXTS, declared_season, is_extra, is_normalized, normalize,
     parse_episode,
-    parse_quality, season_of_dir, subtitle_lang_tag, target_filename,
+    parse_pin, parse_quality, season_of_dir, subtitle_lang_tag, target_filename,
     target_subtitle_filename,
 )
 
@@ -46,8 +46,6 @@ def _apply_offset(ep: int, show: Show) -> int:
     return ep
 
 
-_PIN_RE = re.compile(r"\bma:S(\d{1,2})E(\d{1,3})\b")
-
 _OFFSET_CACHE: dict[str, dict] = {}
 
 
@@ -62,8 +60,7 @@ def _pinned(f: MediaFile) -> tuple[int, int] | None:
     AutoBangumi 改名，因为 AB 的 `episode_offset` 是整条订阅一个值，
     表达不了"同一目录里不同来源季用不同偏移"。
     """
-    m = _PIN_RE.search(f.torrent_tags or "")
-    return (int(m.group(1)), int(m.group(2))) if m else None
+    return parse_pin(f.torrent_tags or "")
 
 
 def _season_offsets(show: Show) -> dict:

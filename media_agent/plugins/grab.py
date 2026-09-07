@@ -25,8 +25,9 @@ from typing import Iterable
 
 from .. import preferences
 from ..cache import Cache, FEED_TTL, LOOKUP_TTL
-from ..kernel import Action, Context, Finding, LibraryState, tmdb_groups
-from ..naming import declared_season, season_of_dir
+from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
+                      tmdb_groups)
+from ..naming import declared_season, parse_episode, parse_pin, season_of_dir
 from ..sidecar import load as load_sidecar, save as save_sidecar
 from .subscription import (MIKAN, _disk_episodes, _http_get,
                            _mikan_search_ids, is_seasonal)
@@ -40,24 +41,17 @@ FEED_SCHEMA = "v2"
 
 
 def _episode_of(title: str) -> int | None:
-    """从发布标题里取集号。
+    """从发布标题里取集号。薄封装，真正的解析在 `naming.parse_episode`。
 
-    只认有明确分隔符的形态，避免把分辨率/年份当集号：
-    `S01E08` / `- 08 ` / `[08]` / `第08集`。
-    另外排除紧跟 p 的数字（1080p）与四位数（年份）。
+    这里曾经是独立的第二实现（四条自己的正则）。2026-09-07 在 2785 个真实
+    名字上对比，两者分歧 15 处，**全是这份实现错**：
+      `20 Seiki Denki Mokuroku - 01` → 20（把片名里的 20 当集号）
+      `Isekai Quartet 3 - 08`        → 3（把季号当集号）
+      `NUKITASHI … - EP04`           → None（EP 前缀不认）
+      `Despicable Me 4 (2024).mp4`   → 4（电影凭空生出集号）
+    而抓取决策正是靠这个函数判断"这一集有没有"的。
     """
-    for pat in (r"S\d{1,2}E(\d{1,3})",
-                r"第\s*(\d{1,3})\s*[集话話]",
-                r"[\[【]\s*(\d{1,3})(?:v\d)?\s*[\]】]",
-                r"(?:\s|-)\s*(\d{1,3})(?:v\d)?\s*(?:\[|\(|$|\s)"):
-        for m in re.finditer(pat, title):
-            n = int(m.group(1))
-            tail = title[m.end(1):m.end(1) + 1]
-            if tail == "p":                 # 1080p / 720p
-                continue
-            if 1 <= n <= 200:
-                return n
-    return None
+    return parse_episode(title)[1]
 
 
 def _inflight(show, by_hash: dict, stale_after_h: float) -> dict[int, set[int]]:
@@ -83,13 +77,13 @@ def _inflight(show, by_hash: dict, stale_after_h: float) -> dict[int, set[int]]:
         # 只认改名后的名字，就等于"抓下来到改完名之间"这一整段时间里
         # 这一集是不设防的——同一轮 run 里抓取比改名先跑，下一轮就会再抓一次。
         # 所以退回去认种子上的 `ma:` 集号钉子，再退回去按发布名解析。
-        m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
-        if m:
-            sn, ep = int(m.group(1)), int(m.group(2))
+        key = episode_of_file(f, allow_release_name=False)
+        if key:
+            sn, ep = key
         else:
-            pin = re.search(r"\bma:S(\d{1,2})E(\d{1,3})\b", t.get("tags") or "")
+            pin = parse_pin(t.get("tags") or "")
             if pin:
-                sn, ep = int(pin.group(1)), int(pin.group(2))
+                sn, ep = pin
             else:
                 ep = _episode_of(f.torrent_name or f.filename)
                 if ep is None:

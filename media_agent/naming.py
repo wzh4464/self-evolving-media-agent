@@ -83,6 +83,23 @@ def parse_episode(raw: str) -> tuple[int | None, int | None]:
 
     cleaned = strip_noise(base)
 
+    # 1.5) `第08集` / `第08话` / `第08話` —— 中文命名的字幕组常用。
+    #      必须排在合集包判定之前：`第01-12集` 不是某一集。
+    if re.search(r"第\s*\d{1,3}[-–~]\d{1,3}\s*[集话話]", cleaned):
+        return None, None
+    m = re.search(r"第\s*(\d{1,3})\s*[集话話]", cleaned)
+    if m:
+        return None, int(m.group(1))
+
+    # 1.6) 合集包 `[01-12]` / `01-24TV全集` 不是"某一集"，明确返回未知。
+    #      交给调用方按合集语义处理（见 subscription._max_episode）。
+    #
+    #      判据要窄：破折号两侧**不许有空格**、且都是 2-3 位数。
+    #      放宽一点就会咬到 `Isekai Quartet 3 - 08`——那个 `3` 是片名里的
+    #      季号，不是区间起点，实测被误判成合集包后整部剧的集号全丢。
+    if re.search(r"[\[【\s](\d{2,3})[-–~](\d{2,3})", cleaned):
+        return None, None
+
     # 2) `Sxx - 12` / `第二季 - 12`
     m = re.search(r"[Ss](\d{1,2})\s*[-–]\s*(\d{1,3})(?!\d)", cleaned)
     if m:
@@ -124,6 +141,19 @@ _DECLARED_SEASON_RE = [
     # `第三季` / `第 3 期`
     re.compile(r"第\s*([0-9一二三四五六七八九十]{1,2})\s*[季期]"),
 ]
+
+
+_PIN_RE = re.compile(r"\bma:S(\d{1,2})E(\d{1,3})\b")
+
+
+def parse_pin(tags: str) -> tuple[int, int] | None:
+    """种子标签里的 `ma:SxxExx` 集号钉子 → (季, 集)。
+
+    钉子是抓取时打上去的，用来在"下完了但改名规则还没跑"那段窗口里
+    仍然认得出这一集。**唯一实现**，不要在别处再写一遍这个正则。
+    """
+    m = _PIN_RE.search(tags or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 _SEASON_DIR_RE = re.compile(r"\s*season\s*(\d{1,3})\s*", re.IGNORECASE)

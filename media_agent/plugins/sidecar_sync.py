@@ -13,8 +13,8 @@ from typing import Iterable
 
 from .. import sidecar as sc_mod
 from ..cache import Cache, EPISODES_TTL, FEED_TTL
-from ..kernel import Action, Context, Finding, LibraryState
-from ..naming import VIDEO_EXTS
+from ..kernel import Action, Context, Finding, LibraryState, have_episodes
+from ..naming import VIDEO_EXTS, parse_episode
 from .subscription import _fetch_rss_titles, _patterns_of, is_seasonal
 
 class SidecarSyncDetector:
@@ -73,9 +73,9 @@ class SidecarSyncDetector:
                     if titles:
                         eps = set()
                         for t in titles:
-                            m = re.search(r"[-\[]\s*(\d{1,3})(?:v\d)?\s*[\]\[（(]", t)
-                            if m:
-                                eps.add(int(m.group(1)))
+                            n = parse_episode(t)[1]
+                            if n is not None:
+                                eps.add(n)
                         if eps and sc.current_source:
                             hi = max(eps)
                             if sc.current_source.get("last_episode") != hi:
@@ -86,13 +86,7 @@ class SidecarSyncDetector:
                                 changed.append("别名")
 
             # 各季进度
-            have: dict[int, set[int]] = defaultdict(set)
-            for f in show.files:
-                if f.is_incomplete or f.path.suffix.lower() not in VIDEO_EXTS:
-                    continue
-                m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
-                if m:
-                    have[int(m.group(1))].add(int(m.group(2)))
+            have = have_episodes(show, allow_release_names=False)
 
             for sn, got in sorted(have.items()):
                 key = str(sn)

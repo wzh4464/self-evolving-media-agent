@@ -179,13 +179,77 @@ class Show:
 
 
 
+def episode_of_file(f: "MediaFile", *, allow_release_name: bool = True) -> tuple | None:
+    """一个文件对应哪一 (季, 集)；认不出返回 None。**集号解析的唯一入口。**
+
+    `allow_release_name=False` 时只认已改名成 `SxxExx` 的规范名。需要区分
+    "库里已经规整好的" 与 "下完了但还没改名的" 时用它。
+
+    2026-09-07 审计前，这段逻辑在 `kernel` / `sidecar_sync` / `subscription`
+    里各写了一遍 `re.search(r"[Ss](\\d{1,2})[Ee](\\d{1,3})")`，`grab` 还另有
+    一个 `_episode_of`。四份实现互不等价，实测在 2785 个真实名字上分歧 15 处，
+    而且**分歧处全是那几份自造实现错**：`20 Seiki Denki Mokuroku - 01` 被读成
+    第 20 集（片名里的 20），`Isekai Quartet 3 - 08` 被读成第 3 集（季号），
+    `Despicable Me 4` 这种电影还会凭空生出集号。
+    """
+    from .naming import parse_episode
+
+    sn, ep = parse_episode(f.filename)
+    if ep is not None and sn is not None:
+        return sn, ep
+    if ep is None or not allow_release_name:
+        return None
+    # 发布名里几乎不带季号，落到目录指示的那一季；目录也没有就算第 1 季。
+    from .naming import season_of_dir
+
+    sd = season_of_dir(f.season_dir or "")
+    return (sd if sd is not None else 1), ep
+
+
+def have_episodes(show: "Show", *, allow_release_names: bool = True) -> dict:
+    """这个目录里**已经拿到**的集：`{季: {集, …}}`。
+
+    电影目录直接返回空——电影没有"集号"可言，硬解析只会把片名里的数字
+    （`Despicable Me 4`、`Kizumonogatari Part 1`）当成集号。原先三处各自
+    实现的版本都漏了这道守卫，而 `is_movie` 在 kernel/evolution/builtin
+    里明明已经用了四处。
+
+    没下完的不算（`.!qB` 或种子进度 <1），否则会把"正在下"误当成"已有"。
+    """
+    out: dict = {}
+    if show.is_movie:
+        return out
+    from .naming import VIDEO_EXTS
+
+    for f in show.files:
+        if f.is_incomplete or f.path.suffix.lower() not in VIDEO_EXTS:
+            continue
+        key = episode_of_file(f, allow_release_name=allow_release_names)
+        if key:
+            out.setdefault(key[0], set()).add(key[1])
+    return out
+
+
 def _episode_keys(show: "Show") -> set:
-    """这个目录里出现过的 (季, 集)。用来判断两个目录是不是装着同一批内容。"""
+    """这个目录里出现过的 (季, 集)。用来判断两个目录是不是装着同一批内容。
+
+    **不要改用 `have_episodes`**——名字像，语义不同，换过去会出事：
+
+    - `have_episodes` 对电影返回空集（电影没有集号）。而 `tmdb_groups` 把
+      "集号集合为空"当作 `duplicate` 的判据（空壳目录的形态），于是共享
+      同一个 tmdb_id 的几部电影会互相判成重复去合并。
+    - 这里也不能认发布名。物语系列各部都从第 1 集编号，靠的正是 Jaccard
+      重合比例把它们和真重复区分开；多认一批集号会改变分母、动摇那个判据。
+
+    所以只认显式 `SxxExx`，不过滤未完成、不过滤扩展名——保持原样。
+    """
+    from .naming import parse_episode
+
     out = set()
     for f in show.files:
-        m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
-        if m:
-            out.add((int(m.group(1)), int(m.group(2))))
+        sn, ep = parse_episode(f.filename)
+        if sn is not None and ep is not None:
+            out.add((sn, ep))
     return out
 
 

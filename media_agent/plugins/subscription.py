@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Iterable
 
 from ..cache import Cache, EPISODES_TTL, FEED_TTL, LOOKUP_TTL
-from ..kernel import Action, Context, Finding, LibraryState
-from ..naming import VIDEO_EXTS, season_of_dir
+from ..kernel import Action, Context, Finding, LibraryState, have_episodes
+from ..naming import VIDEO_EXTS, parse_episode, season_of_dir
 
 # 季番判定：这一季本身开播于多少天内。
 # 用季的开播日期而不是集数阈值——常年连载番（哆啦A梦 1464 集）的第一季
@@ -117,20 +117,7 @@ def _disk_episodes(show) -> dict[int, set[int]]:
 
     未下载完的（`.!qB` 或种子进度 <1）不算，否则会把"正在下"误当成"已有"。
     """
-    have: dict[int, set[int]] = defaultdict(set)
-    for f in show.files:
-        if f.is_incomplete or f.path.suffix.lower() not in VIDEO_EXTS:
-            continue
-        m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
-        if m:
-            have[int(m.group(1))].add(int(m.group(2)))
-            continue
-        from .grab import _episode_of
-        n = _episode_of(f.filename)
-        if n is not None:
-            sm = season_of_dir(f.season_dir or "")
-            have[sm if sm is not None else 1].add(n)   # Season 0 是 0
-    return have
+    return have_episodes(show)
 
 
 def _patterns_of(b: dict) -> list[str]:
@@ -205,16 +192,16 @@ def _max_episode(titles: Iterable[str]) -> int | None:
     """
     best: int | None = None
     for t in titles:
-        for m in re.finditer(r"S\d{1,2}E(\d{1,3})", t):
-            n = int(m.group(1))
+        n = parse_episode(t)[1]
+        if n is not None:
             best = n if best is None else max(best, n)
-        for m in re.finditer(r"第\s*(\d{1,3})\s*集", t):
-            n = int(m.group(1))
-            best = n if best is None else max(best, n)
-        for m in re.finditer(r"[-\[]\s*(\d{1,3})(?:v\d)?\s*[\]\[（(]", t):
-            n = int(m.group(1))
-            if n <= 200:                     # 挡掉 1080/2160 这类分辨率数字
-                best = n if best is None else max(best, n)
+            continue
+        # `parse_episode` 对合集包 `[01-12]` 明确返回未知——那确实不是"某一集"。
+        # 但"源最新到第几集"要的正是区间上界，所以这里补上合集语义。
+        for m in re.finditer(r"[\[【\s](\d{2,3})[-–~](\d{2,3})", t):
+            hi = int(m.group(2))
+            if hi <= 200:
+                best = hi if best is None else max(best, hi)
     return best
 
 
@@ -353,15 +340,7 @@ class IncompleteSeasonDetector:
             if not show.tmdb_id:
                 continue
 
-            have: dict[int, set[int]] = defaultdict(set)
-            for f in show.files:
-                if f.is_incomplete:
-                    continue
-                if f.path.suffix.lower() not in VIDEO_EXTS:
-                    continue
-                m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", f.filename)
-                if m:
-                    have[int(m.group(1))].add(int(m.group(2)))
+            have = have_episodes(show, allow_release_names=False)
 
             for sn in sorted(have):
                 if sn == 0:
@@ -541,9 +520,9 @@ class SourceAbandonedDetector:
 
             rss_eps = set()
             for t in matched:
-                m = re.search(r"[-\[]\s*(\d{1,3})(?:v\d)?\s*[\]\[（(]", t)
-                if m:
-                    rss_eps.add(int(m.group(1)))
+                n = parse_episode(t)[1]
+                if n is not None:
+                    rss_eps.add(n)
             if not rss_eps:
                 continue
 
