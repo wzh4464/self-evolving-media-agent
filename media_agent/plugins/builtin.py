@@ -16,7 +16,8 @@ from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
 from ..naming import (
     SUB_EXTS, VIDEO_EXTS, declared_season, is_extra, is_normalized, normalize,
     parse_episode,
-    parse_quality, subtitle_lang_tag, target_filename, target_subtitle_filename,
+    parse_quality, season_of_dir, subtitle_lang_tag, target_filename,
+    target_subtitle_filename,
 )
 
 
@@ -24,9 +25,9 @@ def _season_of(f: MediaFile, show: Show, parsed_season: int | None) -> int:
     """确定季号。优先级：文件名显式 Sxx > 目录 `Season N` > AutoBangumi 记录 > 1。"""
     if parsed_season is not None:
         return parsed_season
-    m = re.match(r"Season\s+(\d+)", f.season_dir, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
+    sn = season_of_dir(f.season_dir)
+    if sn is not None:
+        return sn
     if show.bangumi and show.bangumi.get("season"):
         return int(show.bangumi["season"])
     return 1
@@ -314,6 +315,24 @@ class DuplicateEpisodeDetector:
                     buckets[r].append(f)
 
             for (season, ep), files in sorted(buckets.items()):
+                # 同一磁盘路径只能算一份。上游 `scan` 已经按路径收敛过，
+                # 这里是兜底：**删除是不可逆的，不能指望上游永远不出错。**
+                #
+                # 2026-09-06 尼古喵喵 S01E08 的教训——两个种子宣称同一路径，
+                # 桶里进了两条实为同一文件的条目，排序后"清理输的那个"
+                # 删掉的正是唯一的真文件，审计里留下 `保留 X，清理 X`。
+                # 只要 keeper 和 loser 可能指向同一个路径，这条规则就有能力
+                # 把一集彻底抹掉，所以护栏必须在产出删除动作之前。
+                seen: set[str] = set()
+                deduped = []
+                for f in files:
+                    key = str(f.path)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    deduped.append(f)
+                files = deduped
+
                 if len(files) < 2:
                     continue
 

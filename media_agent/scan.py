@@ -10,10 +10,9 @@ import re
 from pathlib import Path
 
 from .kernel import Context, LibraryState, MediaFile, Show, under
-from .naming import SUB_EXTS, VIDEO_EXTS
+from .naming import SUB_EXTS, VIDEO_EXTS, season_of_dir
 
 SKIP_DIRS = {".autobangumi", "@eaDir", ".Trash", "lost+found"}
-SEASON_DIR_RE = re.compile(r"Season \d+$")
 SKIP_FILES = {".DS_Store", "Thumbs.db"}
 
 
@@ -69,7 +68,7 @@ def _looks_like_movie(show_dir: Path, video_count: int) -> bool:
     靠年份会漏掉它们。
     """
     for x in show_dir.iterdir():
-        if x.is_dir() and SEASON_DIR_RE.match(x.name):
+        if x.is_dir() and season_of_dir(x.name) is not None:
             return False
     return video_count <= 2
 
@@ -139,7 +138,20 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
         #   那是种子显示名，两者不是一回事——早先混淆过这一点）
         # - 它包含尚未落盘的文件（0% 进度时磁盘上什么都没有）
         # - 下载中的文件磁盘上带 `.!qB` 后缀，这里给的是干净的目标名
+        # **一个路径只能产出一条 MediaFile。** 多个种子宣称同一路径是常态：
+        # 换版本时旧种子被停用、文件被移走，但种子还留在 qBittorrent 里，
+        # 它的 `torrents/files` 仍然报着那个路径；新种子 renameFile 到同一个
+        # 集位文件名后，两者就重合了。
+        #
+        # 2026-09-06 尼古喵喵 S01E08 就是这么丢的：扫描发出两条同路径条目，
+        # `duplicate-episode` 判定"这一集有 2 个文件"，排序后把"输的那个"
+        # 移进隔离区——而两条指的是同一个磁盘文件，于是唯一的真文件没了，
+        # 审计里留下一行自相矛盾的 `保留 X，清理 X`。
+        #
+        # 谁是真正的拥有者：磁盘大小和种子声明大小对得上的那个。对不上就退回
+        # 进度高的、再退回已存在于磁盘的。判不出来也没关系——重点是只留一条。
         covered: set[Path] = set()
+        claimed: dict[Path, tuple] = {}
         for h, t in torrent_by_hash.items():
             sp = (t.get("save_path") or "").rstrip("/")
             if not sp or not under(sp, show_dir):
@@ -153,19 +165,34 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                     continue
                 covered.add(abs_p)
                 covered.add(Path(str(abs_p) + ".!qB"))
-                _file_into(show, MediaFile(
-                    path=abs_p,
-                    size=entry.get("size", 0),
-                    show_dir=show_dir.name,
-                    season_dir=_season_dir_of(abs_p, show_dir),
-                    filename=abs_p.name,
-                    torrent_hash=h,
-                    torrent_name=t.get("name", ""),
-                    torrent_state=t.get("state", ""),
-                    torrent_progress=t.get("progress", 0.0),
-                    torrent_tags=t.get("tags", ""),
-                    torrent_category=t.get("category", ""),
-                ))
+                try:
+                    on_disk = abs_p.stat().st_size
+                except OSError:
+                    on_disk = None
+                declared = entry.get("size", 0)
+                score = (
+                    on_disk is not None and declared == on_disk,   # 大小对得上
+                    t.get("progress", 0.0),                        # 进度更高
+                    on_disk is not None,                           # 文件真的在
+                )
+                prev = claimed.get(abs_p)
+                if prev is None or score > prev[0]:
+                    claimed[abs_p] = (score, h, t, declared)
+
+        for abs_p, (_score, h, t, declared) in claimed.items():
+            _file_into(show, MediaFile(
+                path=abs_p,
+                size=declared,
+                show_dir=show_dir.name,
+                season_dir=_season_dir_of(abs_p, show_dir),
+                filename=abs_p.name,
+                torrent_hash=h,
+                torrent_name=t.get("name", ""),
+                torrent_state=t.get("state", ""),
+                torrent_progress=t.get("progress", 0.0),
+                torrent_tags=t.get("tags", ""),
+                torrent_category=t.get("category", ""),
+            ))
 
         # --- 来源 2：磁盘上没有种子覆盖的文件（纯本地内容）---
         for p in _iter_files(show_dir):

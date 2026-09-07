@@ -19,7 +19,7 @@ from typing import Iterable
 
 from ..cache import Cache, EPISODES_TTL, FEED_TTL, LOOKUP_TTL
 from ..kernel import Action, Context, Finding, LibraryState
-from ..naming import VIDEO_EXTS
+from ..naming import VIDEO_EXTS, season_of_dir
 
 # 季番判定：这一季本身开播于多少天内。
 # 用季的开播日期而不是集数阈值——常年连载番（哆啦A梦 1464 集）的第一季
@@ -128,8 +128,8 @@ def _disk_episodes(show) -> dict[int, set[int]]:
         from .grab import _episode_of
         n = _episode_of(f.filename)
         if n is not None:
-            sm = re.search(r"Season\s+(\d+)", f.season_dir or "")
-            have[int(sm.group(1)) if sm else 1].add(n)
+            sm = season_of_dir(f.season_dir or "")
+            have[sm if sm is not None else 1].add(n)   # Season 0 是 0
     return have
 
 

@@ -26,7 +26,7 @@ from typing import Iterable
 from .. import preferences
 from ..cache import Cache, FEED_TTL, LOOKUP_TTL
 from ..kernel import Action, Context, Finding, LibraryState, tmdb_groups
-from ..naming import declared_season
+from ..naming import declared_season, season_of_dir
 from ..sidecar import load as load_sidecar, save as save_sidecar
 from .subscription import (MIKAN, _disk_episodes, _http_get,
                            _mikan_search_ids, is_seasonal)
@@ -94,8 +94,8 @@ def _inflight(show, by_hash: dict, stale_after_h: float) -> dict[int, set[int]]:
                 ep = _episode_of(f.torrent_name or f.filename)
                 if ep is None:
                     continue
-                sd = re.match(r"Season\s+(\d+)", f.season_dir or "", re.IGNORECASE)
-                sn = int(sd.group(1)) if sd else 1
+                sd = season_of_dir(f.season_dir or "")
+                sn = sd if sd is not None else 1   # Season 0 是 0，不能用 `or 1`
 
         age_h = (now - (t.get("added_on") or now)) / 3600
         if t.get("state") == "stalledDL" and age_h > stale_after_h:

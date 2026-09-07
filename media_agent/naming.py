@@ -126,6 +126,25 @@ _DECLARED_SEASON_RE = [
 ]
 
 
+_SEASON_DIR_RE = re.compile(r"\s*season\s*(\d{1,3})\s*", re.IGNORECASE)
+
+
+def season_of_dir(name: str) -> int | None:
+    """季目录名 → 季号。`"Season 3"` → 3，`"Season 0"` → 0，不是季目录返回 None。
+
+    **这是季目录解析的唯一实现，不要在别处再写一遍。** 2026-09-07 审计发现
+    同一件事在 `scan` / `purge` / `grab` / `subscription` / `builtin` 里写了五遍、
+    四种行为：有的锚定行尾、有的不锚，有的 `re.I`、有的不；于是 `Season  2`
+    （双空格）和 `season 3`（小写）在扫描侧认不出、在抓取侧认得出，
+    同一个目录在两条链路上是两个答案。
+
+    这里取五者的并集并收紧尾部：大小写不敏感、容忍多余空白、但必须整名匹配
+    （`Seasonal 4` 不算季目录）。
+    """
+    m = _SEASON_DIR_RE.fullmatch(name or "")
+    return int(m.group(1)) if m else None
+
+
 def declared_season(raw: str) -> int | None:
     """发布名里**明写**的季号；没写则返回 None。
 
