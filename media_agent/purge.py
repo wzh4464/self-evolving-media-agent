@@ -419,9 +419,29 @@ def build_pool(cfg, qbit, tmdb=None) -> list[Candidate]:
                          f"（替代者 {d_surv:.0f}s）")
                 out.append(c)
                 continue
-            if abs(d_surv - med) > max(30.0, 0.02 * med):
-                c.why = (f"替代者时长 {d_surv:.0f}s 偏离同季中位数 {med:.0f}s，"
+            # 判据只卡两个方向的**大幅**偏离，不要求"和中位数差不多"。
+            #
+            # 原先是 `abs(d - med) > max(30s, 2%)` 双向紧卡，实测三处全是误报：
+            #   恶魔的破坏 S01 前八集 1430s、后五集 1450~1511s（后段片尾更长），
+            #     中位数落在 1430，于是后段每一集都被判"偏离"；
+            #   药屋按 TMDB 合并成 48 集后，E01-E24 是 1372s、E25-E48 是 1440s，
+            #     中位数卡在两者之间，两个季末集双双中枪。
+            # 「同季每集等长」这个假设，在分段规格和合并季面前都不成立。
+            #
+            # 真正要挡的是两类，都只在**大幅**偏离时才出现：
+            #   偏短——截断的半成品，或是 PV/菜单占了集位；
+            #   偏长——合集包占了集位（义妹生活 E01 那个 4307s 三集连播先行版
+            #          就是这个形态，1430s 的三倍）。
+            # 细微的正常波动（±10% 以内）不该拦。另有 `_tail_decodes` 专门
+            # 对付"容器头写着完整时长、数据其实没写完"那种偏短查不出来的截断。
+            if d_surv < med * 0.85:
+                c.why = (f"替代者时长 {d_surv:.0f}s 明显短于同季中位数 {med:.0f}s，"
                          f"疑似截断或并非正片")
+                out.append(c)
+                continue
+            if d_surv > med * 1.5:
+                c.why = (f"替代者时长 {d_surv:.0f}s 远长于同季中位数 {med:.0f}s，"
+                         f"疑似合集包占了集位")
                 out.append(c)
                 continue
             if not _tail_decodes(surv, d_surv):
