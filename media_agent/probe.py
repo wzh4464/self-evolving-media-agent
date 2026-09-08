@@ -28,14 +28,11 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .naming import looks_chinese, looks_simplified, looks_traditional
+
 _FFPROBE = ("/opt/homebrew/bin/ffprobe", "ffprobe")
 _FFMPEG = ("/opt/homebrew/bin/ffmpeg", "ffmpeg")
 
-# 字幕轨语言标记 → 是否中文。ffprobe 给的是 ISO 639-2（chi/zho），
-# 但不少压制组把 title 写成"简体中文"而 language 留空，所以两处都看。
-_CHS_RE = re.compile(r"简|chs|\bsc\b|gb|hans", re.IGNORECASE)
-_CHT_RE = re.compile(r"繁|cht|\btc\b|big5|hant", re.IGNORECASE)
-_CHI_RE = re.compile(r"\bchi\b|\bzho\b|中文|中字", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -49,28 +46,38 @@ class MediaInfo:
 
     @property
     def has_simplified(self) -> bool:
-        return any(_CHS_RE.search(m) for m in self.sub_marks)
+        return any(looks_simplified(m) for m in self.sub_marks)
 
     @property
     def has_traditional(self) -> bool:
-        return any(_CHT_RE.search(m) for m in self.sub_marks)
+        return any(looks_traditional(m) for m in self.sub_marks)
 
     @property
     def has_chinese(self) -> bool:
-        return self.has_simplified or self.has_traditional or any(
-            _CHI_RE.search(m) for m in self.sub_marks)
+        return any(looks_chinese(m) for m in self.sub_marks)
+
+    # 字幕能力分档。**探到的内封轨要压过靠名字猜的内嵌**——用户口径是
+    # 「内封最好，内嵌也行」，两者同分就等于把这个偏好抹平了。
+    # 2026-09-08 穹庐下的魔女 S01E11 正是这么丢的：探到简繁双内封轨的那份
+    # 只拿到和「名字里写着 CHT、疑似内嵌」同样的分，打平后按体积输掉。
+    SOFT_SIMPLIFIED = 5
+    SOFT_CHINESE = 4
+    HARD_SIMPLIFIED = 3
+    HARD_CHINESE = 2
+    SOFT_OTHER = 1
+    NONE = 0
 
     def subtitle_rank(self) -> int:
-        """字幕能力打分：简体 3 > 繁体 2 > 其它中文 2 > 有轨但非中文 1 > 无 0。
+        """按**实际探到的内封字幕轨**打分。
 
-        注意 0 分只代表"没有内封字幕轨"，**不代表没字幕**——内嵌硬字幕
-        在容器里是看不见的。所以这个分数只能用来**加分**，不能拿来判死刑。
+        0 分只代表"没有内封字幕轨"，**不代表没字幕**——内嵌硬字幕在容器里
+        看不见。所以调用方要用文件名证据把它抬到 HARD_* 档，而不是判死刑。
         """
         if self.has_simplified:
-            return 3
-        if self.has_traditional or self.has_chinese:
-            return 2
-        return 1 if self.sub_count else 0
+            return self.SOFT_SIMPLIFIED
+        if self.has_chinese:
+            return self.SOFT_CHINESE
+        return self.SOFT_OTHER if self.sub_count else self.NONE
 
 
 _CACHE: dict = {}

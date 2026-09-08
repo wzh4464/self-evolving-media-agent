@@ -82,10 +82,23 @@ def main() -> int:
     sub_hevc = MediaInfo(vcodec="hevc", height=1080, sub_count=2,
                          sub_marks=("chi 简体中文", "chi 繁體中文"))
     raw_avc = MediaInfo(vcodec="h264", height=1080, sub_count=0, sub_marks=())
-    check("probe：带简繁双轨识别为简体", sub_hevc.has_simplified and sub_hevc.subtitle_rank() == 3,
+    check("probe：带简繁双轨识别为简体",
+          sub_hevc.has_simplified and sub_hevc.subtitle_rank() == MediaInfo.SOFT_SIMPLIFIED,
           "subtitle_rank=%d" % sub_hevc.subtitle_rank())
-    check("probe：零字幕轨得 0 分", raw_avc.subtitle_rank() == 0,
+    check("probe：零字幕轨得 0 分", raw_avc.subtitle_rank() == MediaInfo.NONE,
           "subtitle_rank=%d" % raw_avc.subtitle_rank())
+
+    # 2026-09-08 穹庐下的魔女 S01E11：字幕轨 title 写的是 JPSC/JPTC，
+    # probe 自造的 `\bsc\b` 匹配不到（JP 和 SC 之间没有词边界），
+    # 于是简繁双内封轨只被当成"普通中文"，与靠名字猜的内嵌同分，按体积输掉。
+    jpsc = MediaInfo(vcodec="hevc", height=1080, sub_count=2,
+                     sub_marks=("chi JPSC", "chi JPTC"))
+    check("probe：JPSC/JPTC 轨识别为简体",
+          jpsc.has_simplified and jpsc.subtitle_rank() == MediaInfo.SOFT_SIMPLIFIED,
+          "sub_marks=%s rank=%d" % (jpsc.sub_marks, jpsc.subtitle_rank()))
+    check("排序：探到的内封轨压过靠名字猜的内嵌",
+          MediaInfo.SOFT_CHINESE > MediaInfo.HARD_SIMPLIFIED,
+          "内封最好、内嵌也行——同分就把这个偏好抹平了")
     check("排序：字幕能力先于体积",
           (1080, sub_hevc.subtitle_rank()) > (1080, raw_avc.subtitle_rank()),
           "带字幕的 HEVC 必须排在无字幕的 AVC 之前")

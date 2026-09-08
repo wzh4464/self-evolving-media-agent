@@ -202,6 +202,34 @@ def declared_season(raw: str) -> int | None:
     return None
 
 
+_SIMPLIFIED_RE = re.compile(
+    r"简|GB\b|CHS|SC\b|JPSC|scjp|\bsc\.|简日|简繁|Chs|hans", re.IGNORECASE)
+_TRADITIONAL_RE = re.compile(
+    r"繁|BIG5|CHT|TC\b|JPTC|tcjp|\btc\.|繁日|Cht|hant", re.IGNORECASE)
+_CHINESE_RE = re.compile(r"\bchi\b|\bzho\b|中文|中字", re.IGNORECASE)
+
+
+def looks_simplified(s: str) -> bool:
+    """这段文字是否指示简体中文。文件名、发布标题、字幕轨的 title 都用它。
+
+    **唯一实现。** 2026-09-08 在 probe.py 里另写了一版 `\bsc\b`，匹配不到
+    字幕轨 title 上的 `JPSC`（`JP` 和 `SC` 之间没有词边界），于是带简繁双轨的
+    穹庐下的魔女 S01E11 被判成"只是普通中文"，与靠名字猜出的硬字幕同分，
+    打平后按体积输给了零字幕轨的 h264 版本——而这一版正则里本来就写着 `JPSC`。
+    """
+    return bool(_SIMPLIFIED_RE.search(s or ""))
+
+
+def looks_traditional(s: str) -> bool:
+    return bool(_TRADITIONAL_RE.search(s or ""))
+
+
+def looks_chinese(s: str) -> bool:
+    """泛中文标记（`chi` / `zho` / 中文 / 中字），分不出简繁时用。"""
+    return (looks_simplified(s) or looks_traditional(s)
+            or bool(_CHINESE_RE.search(s or "")))
+
+
 @dataclass(frozen=True)
 class Quality:
     """画质/字幕评分，用于重复集取舍。分数越高越优先保留。"""
@@ -227,10 +255,8 @@ def parse_quality(filename: str, size: int = 0) -> Quality:
     elif re.search(r"\b720[pP]\b", f) or "1280x720" in f:
         height = 720
 
-    simplified = bool(re.search(
-        r"简|GB\b|CHS|SC\b|JPSC|scjp|\bsc\.|简日|简繁|Chs", f, re.IGNORECASE))
-    traditional = bool(re.search(
-        r"繁|BIG5|CHT|TC\b|JPTC|tcjp|\btc\.|繁日|Cht", f, re.IGNORECASE))
+    simplified = looks_simplified(f)
+    traditional = looks_traditional(f)
     is_bdrip = bool(re.search(r"BDRip|Blu-?Ray|BDBOX", f, re.IGNORECASE))
     return Quality(height, simplified, traditional, is_bdrip, size)
 

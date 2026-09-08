@@ -13,7 +13,7 @@ from ..cache import Cache
 from ..dedup import content_digest
 from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
-from ..probe import probe, size_for_compare
+from ..probe import MediaInfo, probe, size_for_compare
 from ..naming import (
     SUB_EXTS, VIDEO_EXTS, declared_season, is_extra, is_normalized, normalize,
     parse_episode,
@@ -71,9 +71,10 @@ def _rank_for_keep(f: MediaFile) -> tuple:
         return (q.height, 1 if q.simplified else 0, int(q.is_bdrip), float(f.size))
     subs = info.subtitle_rank()
     # 容器里没有字幕轨、但名字明说带中文字幕 —— 多半是内嵌硬字幕。
-    # 硬字幕看不见轨道，不能因此判它"没字幕"（用户：内封最好，内嵌也行）。
-    if subs == 0 and (q.simplified or q.traditional):
-        subs = 3 if q.simplified else 2
+    # 硬字幕看不见轨道，不能因此判它"没字幕"，但也**不能和探到的内封轨同分**：
+    # 用户口径是「内封最好，内嵌也行」，同分就把这个偏好抹平了。
+    if subs == MediaInfo.NONE and (q.simplified or q.traditional):
+        subs = MediaInfo.HARD_SIMPLIFIED if q.simplified else MediaInfo.HARD_CHINESE
     return (info.height or q.height, subs, int(q.is_bdrip),
             size_for_compare(f.size, info.vcodec))
 
