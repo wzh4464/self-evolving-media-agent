@@ -68,6 +68,50 @@ class QBitClient:
         return self._get("torrents/categories") or {}
 
     # --- 变更 ---
+    # --- 写入：加种子 / 改名 ---
+    def add_torrent(self, source: bytes | str, *, save_path: str = "",
+                    category: str = "", tags: str = "", paused: bool = False,
+                    no_subfolder: bool = True, **extra) -> bool:
+        """加一个种子。`source` 是 .torrent 内容（bytes）或 magnet/URL（str）。
+
+        返回 True=新加入，False=已存在（qBittorrent 对重复 infohash 返回 409）。
+        其余错误抛 QBitError。
+
+        **这是加种子的唯一入口。** 2026-09-15 审计发现 `actions.py` 里有两处
+        各自手写 `_client.post(f"{base}/api/v2/torrents/add", …)`，参数集不同、
+        各自处理 409；会话里临时脚本又抄了三四份。`_client` 前面的下划线
+        本来就是在说别在外面用它。
+        """
+        data = {"paused": "true" if paused else "false",
+                "stopped": "true" if paused else "false",
+                "autoTMM": "false"}
+        if save_path: data["savepath"] = save_path
+        if category: data["category"] = category
+        if tags: data["tags"] = tags
+        if no_subfolder: data["contentLayout"] = "NoSubfolder"
+        data.update({k: v for k, v in extra.items() if v})
+
+        if isinstance(source, bytes):
+            r = self._client.post(
+                f"{self.base}/api/v2/torrents/add", data=data,
+                files={"torrents": ("t.torrent", source, "application/x-bittorrent")})
+        else:
+            r = self._client.post(
+                f"{self.base}/api/v2/torrents/add", data={**data, "urls": source})
+        if r.status_code == 409:
+            return False
+        if r.status_code != 200:
+            raise QBitError("torrents/add -> HTTP %d: %s" % (r.status_code, r.text[:200]))
+        return True
+
+    def rename_torrent(self, torrent_hash: str, name: str) -> None:
+        """改种子的**显示名**（`torrents/info` 的 `name`）。
+
+        注意它和 `rename_file` 是两回事：显示名影响 AutoBangumi 的解析
+        （AB 读种子名而不是文件名），磁盘路径则由 `rename_file` 决定。
+        """
+        self._post("torrents/rename", {"hash": torrent_hash, "name": name})
+
     def rename_file(self, torrent_hash: str, old_path: str, new_path: str) -> None:
         self._post("torrents/renameFile",
                    {"hash": torrent_hash, "oldPath": old_path, "newPath": new_path})

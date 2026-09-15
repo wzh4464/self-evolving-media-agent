@@ -457,19 +457,13 @@ class Executor:
         # 撞掉 2016 年真正第 8 集的事故，起点就是这里写死的 `"Bangumi"`——
         # 等于把自己下的种子拱手放进了 AB 的地盘。
         cat = a.args.get("category") or "Bangumi"
-        data = {"savepath": str(save_path), "category": cat,
-                "paused": "false", "autoTMM": "false",
-                "contentLayout": "NoSubfolder", "tags": ",".join(tags)}
-        resp = self.ctx.qbit._client.post(
-            f"{self.ctx.qbit.base}/api/v2/torrents/add",
-            data=data,
-            files={"torrents": ("t.torrent", blob, "application/x-bittorrent")})
-
-        already = resp.status_code == 409
-        if resp.status_code not in (200, 409):
-            self._audit("failed", f, a,
-                        {"error": f"qBit 返回 HTTP {resp.status_code}: {resp.text[:120]}"})
+        try:
+            added = self.ctx.qbit.add_torrent(
+                blob, save_path=str(save_path), category=cat, tags=",".join(tags))
+        except Exception as e:
+            self._audit("failed", f, a, {"error": f"加种子失败: {e}"})
             return
+        already = not added
 
         # 发布方的分季编号与库内连续编号不一致时，改写 qBittorrent 里的**种子名**。
         #
@@ -569,9 +563,7 @@ class Executor:
         if new == title:
             return
         try:
-            self.ctx.qbit._client.post(
-                f"{self.ctx.qbit.base}/api/v2/torrents/rename",
-                data={"hash": h, "name": new})
+            self.ctx.qbit.rename_torrent(h, new)
         except Exception:
             pass
 
@@ -582,28 +574,17 @@ class Executor:
         按文件逐个判断，这里不猜。失败只记日志——改名没成功不该让抓取算失败，
         下一轮的改名规则会兜底。
         """
-        from .naming import VIDEO_EXTS, target_filename
+        from .grabber import rename_single_video, wait_metadata
 
         h = self._infohash_v1(blob)
         if not h:
             return
         try:
-            for _ in range(10):          # qBittorrent 解析元数据要一点时间
-                files = [f for f in self.ctx.qbit.files(h)
-                         if f.get("priority", 1) != 0]
-                if files:
-                    break
-                time.sleep(1)
-            else:
-                return
-            vids = [f for f in files
-                    if Path(f["name"]).suffix.lower() in VIDEO_EXTS]
-            if len(vids) != 1:
-                return
-            cur = vids[0]["name"]
-            want = target_filename(title, season, ep, Path(cur).suffix.lower())
-            if cur != want:
-                self.ctx.qbit.rename_file(h, cur, want)
+            files = wait_metadata(self.ctx.qbit, h, timeout=10.0)
+            if not files:
+                return           # 元数据还没到，交给 unrenamed-file 兜底
+            stem = "%s S%02dE%02d" % (title, season, ep)
+            rename_single_video(self.ctx.qbit, h, stem, files)
         except Exception as e:
             self.ctx.log(f"[grab] 加种后改名失败（下一轮会补）: {e}")
 
@@ -1069,18 +1050,15 @@ class Executor:
             # 由人看过再决定要不要启动。
             if self.dry_run:
                 return True, ""
-            data = {"urls": u["magnet"], "paused": "true", "stopped": "true",
-                    "autoTMM": "false"}
-            for k, arg in (("savepath", "save_path"), ("category", "category"),
-                           ("tags", "tags")):
-                if u.get(arg):
-                    data[k] = u[arg]
-            r = self.ctx.qbit._client.post(
-                f"{self.ctx.qbit.base}/api/v2/torrents/add", data=data)
-            if r.status_code == 409:
-                return True, ""      # 已经在了，等同于回退成功
-            if r.status_code != 200:
-                return False, f"重新加种失败 HTTP {r.status_code}"
+            try:
+                # 回滚重加要保持暂停：让人先确认再放行，别一回退就开跑。
+                # 已存在（409）等同于回退成功。
+                self.ctx.qbit.add_torrent(
+                    u["magnet"], paused=True, no_subfolder=False,
+                    save_path=u.get("save_path") or "",
+                    category=u.get("category") or "", tags=u.get("tags") or "")
+            except Exception as e:
+                return False, f"重新加种失败: {e}"
             return True, ""
 
         if op == "restore_rss_link":
