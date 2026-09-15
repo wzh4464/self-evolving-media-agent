@@ -203,9 +203,9 @@ def declared_season(raw: str) -> int | None:
 
 
 _SIMPLIFIED_RE = re.compile(
-    r"简|GB\b|CHS|SC\b|JPSC|scjp|\bsc\.|简日|简繁|Chs|hans", re.IGNORECASE)
+    r"简|GB\b|CHS|SC\b|JPSC|scjp|\bsc\.|简日|简繁|Chs|hans|simplified", re.IGNORECASE)
 _TRADITIONAL_RE = re.compile(
-    r"繁|BIG5|CHT|TC\b|JPTC|tcjp|\btc\.|繁日|Cht|hant", re.IGNORECASE)
+    r"繁|BIG5|CHT|TC\b|JPTC|tcjp|\btc\.|繁日|Cht|hant|traditional", re.IGNORECASE)
 _CHINESE_RE = re.compile(r"\bchi\b|\bzho\b|中文|中字", re.IGNORECASE)
 
 
@@ -216,6 +216,12 @@ def looks_simplified(s: str) -> bool:
     字幕轨 title 上的 `JPSC`（`JP` 和 `SC` 之间没有词边界），于是带简繁双轨的
     穹庐下的魔女 S01E11 被判成"只是普通中文"，与靠名字猜出的硬字幕同分，
     打平后按体积输给了零字幕轨的 h264 版本——而这一版正则里本来就写着 `JPSC`。
+
+    2026-09-15 又漏一次：Netflix/爱奇艺这类多语言片源的字幕轨 title 写的是
+    **英文全词** `Simplified Chinese` / `Traditional Chinese`，而这里原先只收
+    中文字与 `CHS`/`SC` 这类缩写，于是《抓娃娃》13 条字幕轨里明明有简繁中文，
+    却只被当成泛中文。教训同上：这个函数要吃的是"任何来源的语言标记"，
+    文件名、发布标题、字幕轨 title 三种写法都要覆盖。
     """
     return bool(_SIMPLIFIED_RE.search(s or ""))
 

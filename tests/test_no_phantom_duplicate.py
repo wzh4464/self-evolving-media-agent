@@ -96,6 +96,22 @@ def main() -> int:
     check("probe：JPSC/JPTC 轨识别为简体",
           jpsc.has_simplified and jpsc.subtitle_rank() == MediaInfo.SOFT_SIMPLIFIED,
           "sub_marks=%s rank=%d" % (jpsc.sub_marks, jpsc.subtitle_rank()))
+    # 2026-09-15《抓娃娃》：Netflix/爱奇艺多语言片源的轨道 title 是英文全词
+    # `Simplified Chinese`，原先的正则只收中文字和 CHS/SC 缩写，于是 13 条
+    # 字幕轨里明明有简繁中文，却只被当成泛中文、分档少一级。
+    from media_agent.naming import looks_simplified, looks_traditional
+    check("语言判定：英文全词 Simplified/Traditional",
+          looks_simplified("chi Simplified Chinese")
+          and looks_traditional("chi Traditional Chinese")
+          and not looks_simplified("eng English"),
+          "文件名、发布标题、字幕轨 title 三种写法都要覆盖")
+    multi = MediaInfo(vcodec="h264", height=752, sub_count=13,
+                      sub_marks=("chi Simplified Chinese", "chi Traditional Chinese",
+                                 "eng English", "jpn Japanese"))
+    check("probe：多语言片源识别出简体",
+          multi.subtitle_rank() == MediaInfo.SOFT_SIMPLIFIED,
+          "rank=%d" % multi.subtitle_rank())
+
     check("排序：探到的内封轨压过靠名字猜的内嵌",
           MediaInfo.SOFT_CHINESE > MediaInfo.HARD_SIMPLIFIED,
           "内封最好、内嵌也行——同分就把这个偏好抹平了")
