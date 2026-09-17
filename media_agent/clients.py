@@ -346,7 +346,15 @@ class AniListClient:
 
 
 class LLMClient:
-    """deepseek (openlux)，用于确定性规则覆盖不到的模糊判断。"""
+    """OpenLux 中转的 OpenAI 兼容端点，用于确定性规则覆盖不到的模糊判断。
+
+    模型由 `LLM_MODEL` 指定，**必须写带日期的完整 id**（如
+    `gpt-5.6-luna-2026-07-09`）：OpenLux 对短别名常报「分组 default 下
+    无可用渠道」503。项目里所有大模型调用都经过这一个客户端。
+
+    `response_format: json_object` 要求 messages 里出现 "json" 字样，
+    否则 OpenLux 直接 400——各处 system prompt 都得带上这个词。
+    """
 
     def __init__(self, base: str, key: str, model: str, timeout: float = 120.0):
         self.base = base.rstrip("/")

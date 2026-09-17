@@ -47,6 +47,7 @@ class Config:
     max_delete_per_run: int
     max_delete_gb_per_run: float
     dead_torrent_hours: int
+    ab_grace_hours: float
 
     @property
     def state_dir(self) -> Path:
@@ -87,10 +88,11 @@ def load_config(env_file: Path | None = None) -> Config:
         tmdb_lang=g("TMDB_LANG", "zh-CN"),
         llm_base=g("LLM_BASE", "https://api.openlux.ai").rstrip("/"),
         llm_key=g("LLM_KEY", ""),
-        llm_model=g("LLM_MODEL", "deepseek-v4-pro-0813"),
+        llm_model=g("LLM_MODEL", "gpt-5.6-luna-2026-07-09"),
         auto_apply=_bool(g("AUTO_APPLY", "false")),
         trash_retention_days=int(g("TRASH_RETENTION_DAYS", "30")),
         max_delete_per_run=int(g("MAX_DELETE_PER_RUN", "50")),
         max_delete_gb_per_run=float(g("MAX_DELETE_GB_PER_RUN", "200")),
         dead_torrent_hours=int(g("DEAD_TORRENT_HOURS", "48")),
+        ab_grace_hours=float(g("AB_GRACE_HOURS", "24")),
     )
