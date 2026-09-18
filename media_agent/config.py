@@ -47,7 +47,6 @@ class Config:
     max_delete_per_run: int
     max_delete_gb_per_run: float
     dead_torrent_hours: int
-    ab_grace_hours: float
 
     @property
     def state_dir(self) -> Path:
@@ -94,5 +93,4 @@ def load_config(env_file: Path | None = None) -> Config:
         max_delete_per_run=int(g("MAX_DELETE_PER_RUN", "50")),
         max_delete_gb_per_run=float(g("MAX_DELETE_GB_PER_RUN", "200")),
         dead_torrent_hours=int(g("DEAD_TORRENT_HOURS", "48")),
-        ab_grace_hours=float(g("AB_GRACE_HOURS", "24")),
     )

@@ -9,6 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from .. import preferences
 from ..cache import Cache
 from ..dedup import content_digest
 from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
@@ -91,6 +92,66 @@ def _pinned(f: MediaFile) -> tuple[int, int] | None:
     表达不了"同一目录里不同来源季用不同偏移"。
     """
     return parse_pin(f.torrent_tags or "")
+
+
+def meets_requirements(f: MediaFile) -> tuple[bool, str]:
+    """这一份**真的**符合偏好要求吗？返回 (结论, 理由)。
+
+    抓取时的挑选只看发布标题（`preferences.evaluate`）——下载前那是唯一
+    可得的信息。下载完之后事实就在文件里了，必须再核实一次：名字写着
+    「简繁内封」而容器里一条字幕轨都没有的情况真实发生过
+    （2026-09-05 尼古喵喵 S01E08，ABEMA 转载版 711MB 零字幕轨）。
+
+    **内封探得到，内嵌探不到。** 硬字幕烧在画面里，容器里看不见轨道，
+    所以「零字幕轨」不等于「没字幕」：此时退回名字证据判断，
+    不能因为探不到就判它不合格。
+    """
+    title = f.torrent_name or f.filename
+    info = probe(f.path)
+
+    # **先看文件，再看名字。** 反过来写会把 LoliHouse 整个组判死：它的种子内部
+    # 名只写 `[WebRip 1080p HEVC-10bit AAC ASSx2]`，「简繁内封字幕」只出现在
+    # Mikan 的站点标题里，硬门槛的关键词一个都不命中——而文件里实实在在躺着
+    # 两条中文字幕轨。2026-09-18 初版就是这么写的，36 个钉子里误判了 12 个。
+    if info is not None and info.has_chinese:
+        return True, "已探到中文内封字幕轨（%d 条）" % info.sub_count
+
+    # 探不到中文轨，才轮到发布名说话。
+    v = preferences.evaluate(title)
+    if not v.acceptable:
+        return False, v.why() + (
+            "，文件里也没有中文内封轨" if info is not None else "（文件探测不可用）")
+    if info is None:
+        return True, v.why() + "（探测不可用，仅凭发布名）"
+
+    # 名字说有中文字幕但容器里没有 —— 多半是内嵌硬字幕，烧在画面里看不见轨道。
+    q = parse_quality(title, f.size)
+    if "内嵌" in title or (info.sub_count == 0 and (q.simplified or q.traditional)):
+        return True, v.why() + "，无内封轨但名字标中文，按内嵌硬字幕计"
+    return False, "发布名标了中文字幕，文件里却有 %d 条轨且都不是中文" % info.sub_count
+
+
+def _release_agrees(f: MediaFile, show: Show, season: int, ep: int) -> bool:
+    """种子的**发布名**是否也认这个集位。
+
+    发布名是 AutoBangumi 改不动的那一个——`torrents/renameFile` 只改文件名，
+    显示名原封不动。所以当 AB 已经把文件改成某个 SxxExx、而那个编号是错的
+    时候，只看文件名就会把无关的一集算进这个桶：2026-08-31 正是这样把
+    2016 年真正的 S01E08 当成重复清进了隔离区（AB 把 `3rd Season - 08`
+    改成了 `S01E08`）。
+
+    「封存集位、当轮清理其余」是一条绕过所有权让位的快车道，走这条道之前
+    必须让发布名独立确认一次。确认不了就走原来的慢车道，不急这一轮。
+    """
+    raw = (f.torrent_name or "").strip()
+    if not raw:
+        return False
+    if parse_episode(raw)[1] != ep:
+        return False
+    dec = declared_season(raw)
+    if dec is not None and dec != season and str(dec) not in _season_offsets(show):
+        return False
+    return True
 
 
 def _season_offsets(show: Show) -> dict:
@@ -374,8 +435,36 @@ class DuplicateEpisodeDetector:
                 # 2026-08-31：AB 把 `3rd Season - 08` 改成 `S01E08`，与 2016 年
                 # 真正的第 8 集撞进同一个桶，判重按画质把 1.31GB 的原片清进了隔离区。
                 # 等分类交接完再判，这一集就不会进桶。
+                # 集位封存：这一集是 media-agent 自己按 preferences 挑的，
+                # 而且复核过确实符合要求 —— 那它就是定论，不再拿画质/体积
+                # 跟后来的候选比。
+                #
+                # 不封存会怎样：2026-09-11 抓取按 `+150 +无删减/简中` 选了
+                # 尼古喵喵 S01E10 的邪竜解放版，判重随后按画质规则把它换成了
+                # AutoBangumi 抓来的 TV 版——**整整十集，一集无删减都没留下**。
+                # 择源想要的东西（无删减、特定字幕组）画质规则根本表达不了，
+                # 让它去覆盖择源的结论，等于择源白做。
+                sealed = None
+                for f in files:
+                    if _pinned(f) != (season, ep):
+                        continue
+                    ok, why = meets_requirements(f)
+                    if ok:
+                        sealed = (f, why)
+                        break
+                    yield Finding(
+                        rule=self.id, kind="seal_failed", severity="important",
+                        classified=True,
+                        summary=(f"S{season:02d}E{ep:02d} 抓来的这份没通过复核"
+                                 f"（{why}），集位不封存，交回画质规则取舍"),
+                        show=show.dir_name, path=str(f.path),
+                        torrent_hash=f.torrent_hash,
+                        evidence={"file": f.filename, "torrent_name": f.torrent_name,
+                                  "reason": why},
+                    )
+
                 pending = [f for f in files if f.torrent_category == "Bangumi"]
-                if pending:
+                if pending and not sealed:
                     yield Finding(
                         rule=self.id, kind="pending_ownership", severity="minor",
                         classified=True,
@@ -402,16 +491,43 @@ class DuplicateEpisodeDetector:
                     )
                     continue
 
-                ranked = sorted(files, key=_rank_for_keep, reverse=True)
-                keeper, losers = ranked[0], ranked[1:]
+                if sealed:
+                    keeper, seal_why = sealed
+                    losers = [f for f in files if f is not keeper]
+                    # 封存能绕过所有权让位，但绕不过集号可信度。还挂在
+                    # `Bangumi` 下的文件，此刻叫什么只是"AB 认为的"；
+                    # 要在本轮就清理它，得让它的**发布名**独立确认集位。
+                    holdback = [f for f in losers
+                                if f.torrent_category == "Bangumi"
+                                and not _release_agrees(f, show, season, ep)]
+                    if holdback:
+                        yield Finding(
+                            rule=self.id, kind="pending_ownership", severity="minor",
+                            classified=True,
+                            summary=(f"S{season:02d}E{ep:02d} 已封存 {keeper.filename}，"
+                                     f"但另 {len(holdback)} 个候选的发布名认不出这个集位，"
+                                     f"本轮不清理它们"),
+                            show=show.dir_name, path=str(keeper.path),
+                            evidence={"keep": keeper.filename, "seal": seal_why,
+                                      "holdback": [f.torrent_name or f.filename
+                                                   for f in holdback]},
+                        )
+                        losers = [f for f in losers if f not in holdback]
+                    reason = "集位已封存：%s" % seal_why
+                else:
+                    ranked = sorted(files, key=_rank_for_keep, reverse=True)
+                    keeper, losers = ranked[0], ranked[1:]
+                    reason = ""
+
                 kd = content_digest(keeper.path, cache)
                 for loser in losers:
                     ld = content_digest(loser.path, cache)
                     identical = bool(kd and ld and kd == ld)
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="important",
-                        summary=(f"S{season:02d}E{ep:02d} 重复：保留 {keeper.filename}，"
-                                 f"清理 {loser.filename}"),
+                        summary=(f"S{season:02d}E{ep:02d} 重复："
+                                 f"{'集位已封存，' if sealed else ''}"
+                                 f"保留 {keeper.filename}，清理 {loser.filename}"),
                         show=show.dir_name, path=str(loser.path),
                         torrent_hash=loser.torrent_hash,
                         evidence={
@@ -419,7 +535,8 @@ class DuplicateEpisodeDetector:
                             "drop_size": loser.size,
                             "keep_digest": kd, "drop_digest": ld,
                             "byte_identical": identical,
-                            "reason": "字节完全相同" if identical else "同集不同版本，按画质取舍",
+                            "reason": ("字节完全相同" if identical
+                                       else reason or "同集不同版本，按画质取舍"),
                         },
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(loser.path),

@@ -40,37 +40,6 @@ MAX_PER_SHOW = 6
 FEED_SCHEMA = "v2"
 
 
-def ab_holds_episode(bangumi: dict | None, air_date: str | None,
-                     today: date, grace_h: float) -> bool:
-    """这一集是否该让给 AutoBangumi，本轮不抓。
-
-    **为什么需要它**：本项目和 AutoBangumi 是两套互不知情的抓取器，
-    却盯着同一批番。2026-09-17 实测：35 部活跃 AB 订阅里，media-agent 近
-    12 天抓过的 15 部有 14 部同时也在 AB 订阅中。新集播出后谁先抓是随机的
-    （实测 AB 比我们晚 6 小时到 8 天），但集位只有一个，于是每集都要走一遍
-    「两份撞名 → AB 每 60 秒重试改名并每次记成功 → 我们报『集位被占』→
-    下一轮判重删掉输家」。9 月以来判重删了 31 份，一半的下载量直接扔掉，
-    而每轮诊断都能看到在途的那一条「未改名」。
-
-    `_inflight` 挡不住这个——我们抓的那一刻 AB 的种子还不存在。能挡住的
-    只有时间：让出一个宽限窗口，窗口内相信 AB 会抓到。
-
-    窗口不能无限长：AB 可能压根匹配不上（字幕组改了发布名、`filter`
-    误杀），那时得由我们补位。`grace_h` 设 0 即退回抢跑模式。
-
-    拿不到播出日期时**不让**——宁可偶尔重复，也不能让一集永远没人抓。
-    """
-    if not bangumi or bangumi.get("deleted"):
-        return False                     # AB 不管这部番，行为不变
-    if grace_h <= 0 or not air_date:
-        return False
-    try:
-        aired = date.fromisoformat(str(air_date)[:10])
-    except ValueError:
-        return False                     # 日期格式不认，别瞎让
-    return (today - aired) < timedelta(hours=grace_h)
-
-
 def _episode_of(title: str) -> int | None:
     """从发布标题里取集号。薄封装，真正的解析在 `naming.parse_episode`。
 
@@ -418,17 +387,7 @@ class EpisodeAvailableDetector:
                 aired = {n for n, d in air_of.items() if d <= today}
                 # 已经在下的不重复抓（除非停滞太久，见 _inflight 的注释）
                 busy = inflight.get(int(season_key), set())
-                # AutoBangumi 订阅着的番，刚播的集先让给它，见 ab_holds_episode。
-                held = {n for n in aired - have - busy
-                        if ab_holds_episode(show.bangumi, air_of.get(n),
-                                            date.today(), ctx.config.ab_grace_hours)}
-                missing = sorted(aired - have - busy - held)
-                if held:
-                    ctx.log("[episode-available] 「%s」S%s 第 %s 集刚播出，"
-                            "让给 AutoBangumi（%.0fh 宽限内）"
-                            % (show.official_title, season_key,
-                               "、".join(str(n) for n in sorted(held)),
-                               ctx.config.ab_grace_hours))
+                missing = sorted(aired - have - busy)
                 if not missing:
                     continue
 
