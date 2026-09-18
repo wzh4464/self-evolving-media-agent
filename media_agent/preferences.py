@@ -115,6 +115,32 @@ def evaluate(title: str, rules: dict | None = None) -> Verdict:
     return v
 
 
+def score_only(title: str, rules: dict | None = None) -> int:
+    """只算偏好分，**不过硬门槛**。
+
+    用来在同一个种子的多个文件之间分高下。硬门槛（必须有中文字幕）是整个
+    发布的属性，写在种子标题里；单个文件名通常只写版本差异。
+    2026-09-18《尼古喵喵》EP11 的合并发布就是这样：
+
+        [TV版&无修版] 尼古喵喵 - EP11 [简／繁] (1080p H.264 AAC SRTx2)
+          ├─ 【7月】尼古喵喵 11【TV版】.mp4
+          └─ 【7月】尼古喵喵 11【邪龙解放版】.mp4
+
+    两个文件名都不含任何中文字幕关键词，拿 `evaluate` 去比会双双卡在硬门槛
+    上、并列 0 分，于是"留哪个"变成随机——实测选中了 TV 版，正好是用户
+    不要的那个。
+    """
+    r = rules or load_rules()
+    s = 0
+    for pref in r.get("prefer", []):
+        if _hits(title, pref.get("any", [])):
+            s += int(pref.get("weight", 0))
+    for av in r.get("avoid", []):
+        if _hits(title, av.get("any", [])):
+            s -= int(av.get("weight", 0))
+    return s
+
+
 def pick_best(candidates: list[dict], rules: dict | None = None) -> tuple[dict | None, list[tuple[dict, Verdict]]]:
     """从候选里挑一个。candidates 每项需有 `title` 键。
 

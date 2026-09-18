@@ -23,7 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from media_agent.kernel import MediaFile
-from media_agent.plugins.builtin import _release_agrees, meets_requirements
+from media_agent.plugins.builtin import (_prefer_score, _release_agrees,
+                                        meets_requirements)
 
 failures = []
 
@@ -107,6 +108,24 @@ def main() -> int:
     f = mkfile("尼古喵喵 S01E10.mkv")
     f.torrent_name = ""
     check("无发布名 → 拒绝确认", _release_agrees(f, show, 1, 10) is False)
+
+    # 10) 合并发布：一个种子里装着 TV 版 + 邪龙解放版，两个文件共用同一个
+    #     torrent_name。必须靠**文件名**分高下，否则并列、随机留下 TV 版——
+    #     2026-09-18 EP11 实测就是这么选错的。
+    bundle = "[TV版&无修版] 尼古喵喵 - EP11 [简／繁] (1080p H.264 AAC SRTx2)"
+    tv = mkfile("【7月】尼古喵喵 11【TV版】.mp4", bundle, size=738434422,
+                tags="ab:32, ma:S01E11")
+    xie = mkfile("【7月】尼古喵喵 11【邪龙解放版】.mp4", bundle, size=738563085,
+                 tags="ab:32, ma:S01E11")
+    check("合并发布：邪龙解放版排在 TV 版之前",
+          _prefer_score(xie) > _prefer_score(tv),
+          "邪龙版 %s  vs  TV版 %s" % (_prefer_score(xie)[:2], _prefer_score(tv)[:2]))
+    check("两者复核结论一致（硬门槛看的是种子标题）",
+          meets_requirements(tv)[0] == meets_requirements(xie)[0] is True)
+    # 体积几乎一样（738.4MB vs 738.6MB），靠体积分不出来——这正是必须
+    # 用偏好分的原因。
+    check("体积几乎相等，分不出高下",
+          abs(tv.size - xie.size) / tv.size < 0.001)
 
     print()
     if failures:

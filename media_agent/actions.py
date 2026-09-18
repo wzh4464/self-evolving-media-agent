@@ -103,6 +103,9 @@ class Executor:
         # 都不依赖改名先发生，提前执行是安全的；而且 trash 是移入隔离区加逆操作，
         # 不是 rm，"放最后"保护的东西本来就不多。
         "trash": 5,
+        # 归置要排在 rename 之前：被挪走的那一份就不该再进改名流程了，
+        # 否则同一轮里两个文件会双双被改成同一个规范名，撞在一起。
+        "sidestep": 5,
 
         "rename": 6,            # 先改文件名（此时目录名还是旧的，路径有效）
         "relocate": 7,
@@ -163,11 +166,24 @@ class Executor:
                 self._audit("failed", f, a,
                             {"error": "种子文件列表里找不到该文件，拒绝绕过 qBittorrent 改名"})
                 return
+            # 本轮已经被 `sidestep` 归置进隐藏目录的，就别再按正片规范改名了。
+            # 诊断是一次性全量产出的：合并发布种子里的两个文件都会被提「改成
+            # 规范名」，而其中一个同时被提「归置」。归置排在改名之前，等轮到
+            # 它改名时文件已在 `.other/` 下——再改就会在隐藏目录里留下一个
+            # 叫着规范名、却谁也不知道是哪一版的文件。
+            if any(part.startswith(".") for part in Path(old_rel).parent.parts):
+                self._audit("skipped", f, a,
+                            {"reason": "已归置到隐藏目录，不再按正片规范改名",
+                             "at": old_rel})
+                return
             new_rel = str(Path(old_rel).parent / new_name) if "/" in old_rel else new_name
             self.ctx.qbit.rename_file(h, old_rel, new_rel)
             via = "qbittorrent"
         else:
             # 确认无种子关联才允许文件系统改名（纯本地文件，无从同步）
+            if not path.exists():
+                self._audit("skipped", f, a, {"reason": "文件已不在原位（多半本轮已被归置）"})
+                return
             path.rename(target)
         self._audit("applied", f, a, {"new_path": str(target), "via": via},
                     undo={"op": "rename", "path": str(target),
@@ -230,6 +246,60 @@ class Executor:
             if Path(entry["name"]).name == abs_path.name:
                 return entry["name"]
         return None
+
+    def _op_sidestep(self, f: Finding, a: Action) -> None:
+        """把文件挪进同目录下的隐藏子目录，**不删除、不打断做种**。
+
+        用在「一个种子里装着同一集的多个版本」这种合并发布上。2026-09-18
+        《尼古喵喵》EP11：
+
+            [TV版&无修版] 尼古喵喵 - EP11 …
+              ├─ 【7月】尼古喵喵 11【TV版】.mp4
+              └─ 【7月】尼古喵喵 11【邪龙解放版】.mp4
+
+        两份都摊在 `Season 1` 里，刮削器会看见两个第 11 集；而把其中一份
+        `trash` 掉，种子立刻变成 `missingFiles`、做种中断——它们本来就是
+        同一个种子的两个组成部分。
+
+        `torrents/renameFile` 的目标名允许带子路径，改完 qBittorrent 自己
+        把文件挪过去并更新映射，做种一秒不断。隐藏目录以 `.` 开头，
+        Jellyfin/Infuse 不扫描，于是集位干净、种子完整、文件也没丢。
+
+        **只能在种子根之下移动**：种子的 save_path 就是 `Season 1`，
+        renameFile 出不去这个根，所以隐藏目录落在 `Season 1/.other/`
+        而不是番剧根目录下的 `.other/`（见 `MediaFile.quarantined`）。
+        """
+        path = Path(a.args["path"])
+        subdir = (a.args.get("subdir") or ".other").strip().strip("/")
+        if not subdir.startswith(".") or "/" in subdir or subdir in (".", ".."):
+            self._audit("skipped", f, a, {"reason": f"非法归置目录 {subdir!r}"})
+            return
+        target = path.parent / subdir / path.name
+        if target.exists():
+            self._audit("skipped", f, a, {"reason": f"{subdir}/ 下已有同名文件"})
+            return
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run"})
+            return
+
+        h = a.args.get("torrent_hash")
+        if h and self.ctx.qbit:
+            old_rel = self._torrent_rel_path(h, path)
+            if old_rel is None:
+                self._audit("failed", f, a,
+                            {"error": "种子文件列表里找不到该文件，拒绝绕过 qBittorrent 移动"})
+                return
+            new_rel = str(Path(old_rel).parent / subdir / path.name)
+            self.ctx.qbit.rename_file(h, old_rel, new_rel)
+            self._audit("applied", f, a, {"via": "qbittorrent", "to": new_rel},
+                        undo={"op": "rename_file", "torrent_hash": h,
+                              "old": new_rel, "new": old_rel})
+            return
+        # 确认无种子关联才允许文件系统移动
+        target.parent.mkdir(parents=True, exist_ok=True)
+        path.rename(target)
+        self._audit("applied", f, a, {"via": "filesystem", "to": str(target)},
+                    undo={"op": "move", "from": str(target), "to": str(path)})
 
     def _op_retag(self, f: Finding, a: Action) -> None:
         if self.dry_run:

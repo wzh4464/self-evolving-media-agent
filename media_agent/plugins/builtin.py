@@ -131,6 +131,22 @@ def meets_requirements(f: MediaFile) -> tuple[bool, str]:
     return False, "发布名标了中文字幕，文件里却有 %d 条轨且都不是中文" % info.sub_count
 
 
+def _prefer_score(f: MediaFile) -> tuple:
+    """同一集的多个候选之间，按用户偏好排出该留哪个。分数越高越该留。
+
+    **文件名优先于种子名。** 合并发布的种子（一个种子装 TV 版 + 无删减版）
+    里，两个文件共用同一个 `torrent_name`，差别只写在文件名里；拿种子名
+    打分会并列，于是"留哪个"变成随机。
+
+    用 `score_only` 而不是 `evaluate`：硬门槛（必须有中文字幕）是整个发布
+    的属性，写在种子标题里，单个文件名通常不含那些关键词，走 `evaluate`
+    会双双卡在硬门槛上并列 0 分。硬门槛由 `meets_requirements` 单独把关。
+    """
+    own = preferences.score_only(f.filename)
+    joint = preferences.score_only(f.torrent_name or f.filename)
+    return (own, joint, f.size)
+
+
 def _release_agrees(f: MediaFile, show: Show, season: int, ep: int) -> bool:
     """种子的**发布名**是否也认这个集位。
 
@@ -444,10 +460,13 @@ class DuplicateEpisodeDetector:
                 # AutoBangumi 抓来的 TV 版——**整整十集，一集无删减都没留下**。
                 # 择源想要的东西（无删减、特定字幕组）画质规则根本表达不了，
                 # 让它去覆盖择源的结论，等于择源白做。
+                # 候选之间**按用户偏好排序再挑**，不能取"第一个通过复核的"。
+                # 2026-09-18 EP11 的合并发布种子里装着 TV 版和邪龙解放版两个
+                # 文件，共用同一个 torrent_name、复核结果完全一样，取第一个
+                # 就是随机——实测选中了 TV 版，正好是用户不要的那份。
                 sealed = None
-                for f in files:
-                    if _pinned(f) != (season, ep):
-                        continue
+                for f in sorted((f for f in files if _pinned(f) == (season, ep)),
+                                key=_prefer_score, reverse=True):
                     ok, why = meets_requirements(f)
                     if ok:
                         sealed = (f, why)
@@ -518,6 +537,31 @@ class DuplicateEpisodeDetector:
                     ranked = sorted(files, key=_rank_for_keep, reverse=True)
                     keeper, losers = ranked[0], ranked[1:]
                     reason = ""
+
+                # 同一个种子里的兄弟文件**绝不删除**。合并发布（一个种子装
+                # TV 版 + 无删减版）里两份都是这个种子的组成部分，删掉任意
+                # 一份，种子立刻变成 missingFiles、做种中断。改为挪进同目录
+                # 下的隐藏子目录：集位干净、种子完整、文件也没丢。
+                siblings = [l for l in losers
+                            if l.torrent_hash and l.torrent_hash == keeper.torrent_hash]
+                losers = [l for l in losers if l not in siblings]
+                for sib in siblings:
+                    yield Finding(
+                        rule=self.id, kind="bundled_version", severity="important",
+                        summary=(f"S{season:02d}E{ep:02d} 同一个种子里还装着 "
+                                 f"{sib.filename}，与保留的 {keeper.filename} 同集；"
+                                 f"归置到 .other/ 让出集位（不删，不断种）"),
+                        show=show.dir_name, path=str(sib.path),
+                        torrent_hash=sib.torrent_hash,
+                        evidence={"keep": keeper.filename, "torrent": sib.torrent_name,
+                                  "keep_score": _prefer_score(keeper)[0],
+                                  "drop_score": _prefer_score(sib)[0]},
+                        action=Action(op="sidestep", reversible=True,
+                                      args={"path": str(sib.path),
+                                            "torrent_hash": sib.torrent_hash,
+                                            "subdir": ".other"},
+                                      note="合并发布的另一版本，移出刮削范围"),
+                    )
 
                 kd = content_digest(keeper.path, cache)
                 for loser in losers:
