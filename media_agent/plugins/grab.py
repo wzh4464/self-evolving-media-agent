@@ -470,13 +470,18 @@ class EpisodeAvailableDetector:
                                                for c in wrong_season][:6]},
                             )
                         continue
-                    best, scored = preferences.pick_best(cands, rules)
+                    best, scored = preferences.pick_best(
+                        cands, preferences.with_requirement(
+                            rules, sc.require_any,
+                            name="只保留" + "/".join(sc.require_any)))
                     if best is None:
                         # 有人发了但没一个合格——报出来，别悄悄跳过
                         yield Finding(
                             rule=self.id, kind=self.kind, severity="minor",
                             summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
-                                     f"已有 {len(cands)} 个发布，但都不含中文字幕，暂不抓取"),
+                                     f"已有 {len(cands)} 个发布，但都未通过硬门槛"
+                                     f"（{'、'.join(sorted({v.blocked_by for _c, v in scored}))}），"
+                                     f"暂不抓取"),
                             show=show.dir_name,
                             evidence={"season": season_key, "episode": ep,
                                       "candidates": [c["title"][:110] for c in cands],

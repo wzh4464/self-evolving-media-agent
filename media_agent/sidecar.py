@@ -67,6 +67,14 @@ class Sidecar:
     # Dynamis One 写 `4th Season - 79` 就是第 79 集），所以偏移只在
     # 集号 <= 偏移量时才加——两种解释的取值区间不重叠。
 
+    # --- 版本 ---
+    require_any: list[str] = field(default_factory=list)
+    # 这部番**只要**发布标题含其中任一词的版本（用户口径「只保留 X 版」）。
+    # 叠加在全局 preferences 的硬门槛之上，**只在抓取选源时把关**——那时手里
+    # 有 Mikan 的完整发布标题。下载之后就认不出来了：种子内部名常常不标版本，
+    # LoliHouse 的邪竜解放版内部名就是 `[LoliHouse] Yani Neko - 11 [...]`，
+    # 2026-09-18 我正是凭这个把库里十集邪竜解放版错认成了 TV 版。
+
     # --- 进度 ---
     seasons: dict[str, dict] = field(default_factory=dict)
     # {"1": {"have": [1,2,3], "aired": 7, "total": 12, "next_air": "2026-08-22"}}

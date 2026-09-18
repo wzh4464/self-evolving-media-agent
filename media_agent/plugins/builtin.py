@@ -456,8 +456,8 @@ class DuplicateEpisodeDetector:
                 # 跟后来的候选比。
                 #
                 # 不封存会怎样：2026-09-11 抓取按 `+150 +无删减/简中` 选了
-                # 尼古喵喵 S01E10 的邪竜解放版，判重随后按画质规则把它换成了
-                # AutoBangumi 抓来的 TV 版——**整整十集，一集无删减都没留下**。
+                # 尼古喵喵 S01E10 的合并发布（TV 版 + 邪龙解放版同一个种子），
+                # 判重随后按画质规则删掉了其中的邪龙解放版、留下 TV 版。
                 # 择源想要的东西（无删减、特定字幕组）画质规则根本表达不了，
                 # 让它去覆盖择源的结论，等于择源白做。
                 # 候选之间**按用户偏好排序再挑**，不能取"第一个通过复核的"。
@@ -538,10 +538,16 @@ class DuplicateEpisodeDetector:
                     keeper, losers = ranked[0], ranked[1:]
                     reason = ""
 
-                # 同一个种子里的兄弟文件**绝不删除**。合并发布（一个种子装
-                # TV 版 + 无删减版）里两份都是这个种子的组成部分，删掉任意
-                # 一份，种子立刻变成 missingFiles、做种中断。改为挪进同目录
-                # 下的隐藏子目录：集位干净、种子完整、文件也没丢。
+                # 同一个种子里的兄弟文件**只作废这一个文件，不动种子**。
+                # 合并发布（一个种子装 TV 版 + 无删减版）里两份都是这个种子的
+                # 组成部分：按整种子作废会连保留的那份一起摘掉，做种中断。
+                # `file_only` 把它设为不下载再移进隔离区，种子继续为保留的那份
+                # 做种——这类发布在两个文件之间垫了 padding 文件，分片不跨文件，
+                # 摘掉一个不影响另一个的校验。
+                #
+                # 用户口径是「只保留」（NUKITASHI 只留青蓝岛版、尼古喵喵只留
+                # 邪竜解放版），所以不是挪进隐藏目录留着，而是进隔离区，
+                # 保留期内仍可恢复。
                 siblings = [l for l in losers
                             if l.torrent_hash and l.torrent_hash == keeper.torrent_hash]
                 losers = [l for l in losers if l not in siblings]
@@ -550,17 +556,17 @@ class DuplicateEpisodeDetector:
                         rule=self.id, kind="bundled_version", severity="important",
                         summary=(f"S{season:02d}E{ep:02d} 同一个种子里还装着 "
                                  f"{sib.filename}，与保留的 {keeper.filename} 同集；"
-                                 f"归置到 .other/ 让出集位（不删，不断种）"),
+                                 f"只作废这一个文件，种子继续做种"),
                         show=show.dir_name, path=str(sib.path),
                         torrent_hash=sib.torrent_hash,
                         evidence={"keep": keeper.filename, "torrent": sib.torrent_name,
                                   "keep_score": _prefer_score(keeper)[0],
                                   "drop_score": _prefer_score(sib)[0]},
-                        action=Action(op="sidestep", reversible=True,
+                        action=Action(op="trash", reversible=True,
                                       args={"path": str(sib.path),
                                             "torrent_hash": sib.torrent_hash,
-                                            "subdir": ".other"},
-                                      note="合并发布的另一版本，移出刮削范围"),
+                                            "file_only": True},
+                                      note="合并发布的另一版本：设为不下载并移入隔离区"),
                     )
 
                 kd = content_digest(keeper.path, cache)

@@ -134,9 +134,10 @@ class MediaFile:
         实测代价：吊带袜天使 48 个特典短片进了 `.shorts`，规则仍然每轮
         报 48 条 unrenamed + 1 条 duplicate-episode，占全库告警的三分之一。
 
-        **任意一层**以 `.` 开头就算。合并发布种子里被挪开的那一份落在
-        `Season 1/.other/` 下（种子的 save_path 就在 `Season 1`，
-        renameFile 出不去这个根），只看 season_dir 会漏掉它。
+        **任意一层**以 `.` 开头就算。种子的 save_path 常常就是 `Season N`，
+        renameFile 出不去这个根，于是被挪开的文件只能落在 `Season N/.xxx/`
+        下（qBittorrent 自己的 `.unwanted/` 也是这个位置），只看 season_dir
+        会漏掉它们。
         """
         return self.season_dir.startswith(".") or self.path.parent.name.startswith(".")
 

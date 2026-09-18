@@ -141,6 +141,22 @@ def score_only(title: str, rules: dict | None = None) -> int:
     return s
 
 
+def with_requirement(rules: dict, any_of: list[str],
+                     name: str = "按番指定版本") -> dict:
+    """在全局规则上叠加一条按番的硬门槛，返回新规则（不改原对象）。
+
+    用于「这部番只保留某个版本」：候选标题里必须出现 `any_of` 中任一词，
+    否则不管分数多高都不抓。只加在 `require` 上，不碰加减分——版本是
+    门槛问题，不是偏好问题：NEST 的 NF 版 +70 分，但它是删减版，
+    分数再高也不该进这部番的库。
+    """
+    if not any_of:
+        return rules
+    out = dict(rules)
+    out["require"] = list(rules.get("require", [])) + [{"name": name, "any": list(any_of)}]
+    return out
+
+
 def pick_best(candidates: list[dict], rules: dict | None = None) -> tuple[dict | None, list[tuple[dict, Verdict]]]:
     """从候选里挑一个。candidates 每项需有 `title` 键。
 

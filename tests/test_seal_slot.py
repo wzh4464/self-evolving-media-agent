@@ -1,14 +1,15 @@
 """回归测试：media-agent 自己挑中并复核通过的那一份，判重不得再换掉。
 
 2026-09-11 的真实误删——抓取器按 preferences 为《尼古喵喵》S01E10 选了
-邪竜解放版（`无删减` weight=100 + `简中` 50），判重随后按画质/体积规则
-把它换成了 AutoBangumi 抓来的 TV 版。审计里留下：
+一个合并发布（TV 版 + 邪龙解放版装在同一个种子里，`无修` 命中 +100），
+判重随后按画质/体积规则删掉了其中的邪龙解放版。审计里留下：
 
     保留: 【7月】尼古喵喵 10【TV版】.mp4
     清理: 【7月】尼古喵喵 10【邪龙解放版】.mp4
 
-同样的事发生了十集，到 2026-09-17 查库时 E01–E10 **全是 TV 版，
-一集无删减都没留下**。
+（更正：2026-09-18 一度以为 E01–E10 因此全成了 TV 版。按 infohash 核对，
+库里那十集就是 LoliHouse 的邪竜解放版——它的种子内部名不标版本，
+`[LoliHouse] Yani Neko - 08 [...]`，凭名字认不出来。）
 
 根因不是排序写错了：`_rank_for_keep` 比的是画质、字幕轨、体积，
 而「无删减」「特定字幕组」这类择源诉求它根本表达不了。让画质规则去
@@ -22,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from media_agent import preferences
 from media_agent.kernel import MediaFile
 from media_agent.plugins.builtin import (_prefer_score, _release_agrees,
                                         meets_requirements)
@@ -126,6 +128,30 @@ def main() -> int:
     # 用偏好分的原因。
     check("体积几乎相等，分不出高下",
           abs(tv.size - xie.size) / tv.size < 0.001)
+
+    # 11) 按番指定版本（「只保留邪竜解放版」）。只在抓取选源时把关——那时
+    #     手里有 Mikan 的完整标题；下载后种子内部名不标版本，认不出来。
+    rules = preferences.with_requirement(
+        preferences.load_rules(), ["邪竜解放版", "邪龙解放版"], name="只保留邪竜解放版")
+    loli_xie = {"title": "[LoliHouse] 尼古喵喵 (邪竜解放版) / ヤニねこ / Yani Neko / "
+                         "Chainsmoker Cat - 12 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"}
+    nest = {"title": "[NEST] 尼古喵喵 / ヤニねこ / Chainsmoker Cat - 12 "
+                     "[NF WEB-DL 1080p AVC AAC][简繁日内封]"}
+    bundle12 = {"title": "[TV版&无修版] 尼古喵喵 - EP12 [简／繁] (1080p H.264 AAC SRTx2)"}
+    sfb = {"title": "[SFBgm] 尼古喵喵 / Yani Neko - 12 [WebRip 1080p AVC AAC CHT MP4]"}
+    check("NF 删减版分数不低，但过不了按番门槛",
+          not preferences.evaluate(nest["title"], rules).acceptable
+          and preferences.evaluate(nest["title"]).acceptable)
+    check("合并发布也不收（里面带着 TV 版）",
+          not preferences.evaluate(bundle12["title"], rules).acceptable)
+    best, _ = preferences.pick_best([nest, sfb, bundle12, loli_xie], rules)
+    check("四选一只会选 LoliHouse 邪竜解放版", best is loli_xie)
+    best, _ = preferences.pick_best([nest, sfb, bundle12], rules)
+    check("邪竜版还没出时宁可不抓", best is None)
+    check("没设按番门槛的番不受影响",
+          preferences.with_requirement(preferences.load_rules(), []) is not None
+          and preferences.pick_best([nest], preferences.with_requirement(
+              preferences.load_rules(), []))[0] is nest)
 
     print()
     if failures:
