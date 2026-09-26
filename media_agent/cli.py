@@ -236,6 +236,11 @@ def cmd_rollback(args, cfg) -> int:
     if res["torrent_records_lost"]:
         print(f"  ⚠️  种子记录已丢失: {res['torrent_records_lost']} 项"
               f"（文件可还原，但需重新添加种子才能继续做种）")
+    if res.get("priority_not_restored"):
+        print(f"  ⚠️  文件已搬回、合集条目的下载没恢复: {res['priority_not_restored']} 项"
+              f"（它此刻没有种子做种）")
+        for n in res.get("notes") or []:
+            print(f"    ⚠️  {n}")
     for d in res["skipped_detail"]:
         print(f"    ⏭️  {d.get('skip_reason','')}")
     for d in res["failed_detail"]:

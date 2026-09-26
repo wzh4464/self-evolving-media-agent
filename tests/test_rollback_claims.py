@@ -269,3 +269,59 @@ def test_restore_priority_is_refused_when_another_torrent_now_claims_the_entry(l
     assert res["reverted"] == 0 and res["skipped"] == 1
     assert newcomer.hash[:8] in res["skipped_detail"][0]["skip_reason"]
     assert [f["priority"] for f in lib.qbit.raw(pack.hash)["_files"]] == [1, 0]
+
+
+# ------------------------------------------------------------------ 合集里被判输的一集：回退连优先级一起恢复
+def _ginpachi(lib):
+    """3年Z组银八老师：720p 生肉合集里的第 2 集输给 1080p 带中文字幕的单集（D1 + I3：只作废这一个条目）。"""
+    from harness import video
+    from media_agent.plugins.builtin import DuplicateEpisodeDetector
+
+    s1 = lib.show("3年Z组银八老师").season(1)
+    pack = s1.torrent({f"[G] Ginpachi-sensei - {n:02d} [720p].mkv": 600_000_000 for n in (1, 2, 3)},
+                      name="[G] Ginpachi-sensei [01-03][720p]", layout="nosub",
+                      probe=video("h264", height=720))
+    s1.single("[H] Ginpachi-sensei - 02 [1080p].mkv", size=900_000_000,
+              probe=video("hevc", subs=["chi 简体中文"]))
+    c = lib.cycle(detectors=[DuplicateEpisodeDetector])
+    [rec] = c.applied("trash")
+    assert rec["undo"]["file_priority"]["priority"] == 1
+    return s1, pack, c
+
+
+def _pri(lib, h):
+    return [f["priority"] for f in lib.qbit.raw(h)["_files"]]
+
+
+def test_rollback_of_a_pack_member_trash_also_restores_its_download(lib):
+    """2026-09-26 审查（复现）：D1 让每个判重输家都 `file_only`，I3 把合集成员降级成只把那一集设为不下载；
+    逆操作只有 `restore_from_trash`，回退把文件搬回来、报「已还原 1」，条目却一直是优先级 0——
+    搬回来的是一个没有种子做种的"本地文件"，下一轮 scan 就这么当它。"""
+    s1, pack, c = _ginpachi(lib)
+    assert _pri(lib, pack.hash) == [1, 0, 1]
+
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 1 and res["priority_not_restored"] == 0, res
+    assert _pri(lib, pack.hash) == [1, 1, 1]
+    assert (s1.path / "[G] Ginpachi-sensei - 02 [720p].mkv").exists()
+
+
+@pytest.mark.allow("qbit_error", match="404")
+def test_rollback_says_so_when_the_file_came_back_but_the_download_did_not(lib, monkeypatch,
+                                                                            capsys):
+    """合集此后被人从 qBittorrent 里删了：文件照样搬回（它是主体），但报告里写明条目没恢复，不假装干净。"""
+    import argparse
+
+    from media_agent import cli
+
+    s1, pack, c = _ginpachi(lib)
+    lib.qbit.delete([pack.hash], delete_files=False)
+    monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
+
+    rc = cli.cmd_rollback(argparse.Namespace(run=c.run_id, last=False, dry_run=False), lib.cfg)
+
+    out = capsys.readouterr().out
+    assert rc == 0 and "已还原: 1" in out
+    assert "合集条目的下载没恢复: 1" in out and "不在" in out
+    assert (s1.path / "[G] Ginpachi-sensei - 02 [720p].mkv").exists()

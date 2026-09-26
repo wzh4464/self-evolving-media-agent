@@ -157,6 +157,8 @@ class Executor:
         # 路径占用索引（`claims.ClaimIndex`），一批次一份、按需建。每做完一次改动
         # （任何不是 skipped 的审计，见 `_audit`）就作废，下一次查询重新问 qBittorrent。
         self._claim_index: ClaimIndex | None = None
+        # 回退里做成了、但没做全的逆操作（文件搬回了、合集条目的下载没恢复），`rollback` 汇报
+        self._undo_notes: list[str] = []
 
     def _claims(self) -> ClaimIndex:
         """本批次共用的占用索引。**任何往媒体库里落一个名字的动作，落笔前都问它**
@@ -1407,9 +1409,15 @@ class Executor:
         self._deleted_bytes += size
         self._trashed_paths.add(str(path))
 
-        # 文件可从隔离区还原；但被删掉的种子记录还原不了（种子文件本身已不在）
+        # 文件可从隔离区还原；但被删掉的种子记录还原不了（种子文件本身已不在）。
+        # 只作废了合集里的这一个条目时，回退要连它的下载一起恢复（2026-09-26 审查：以前只搬回文件、
+        # 报「已还原」，条目却一直是优先级 0——搬回来的成了没有种子做种的"本地文件"）。
         undo = {"op": "restore_from_trash", "path": str(path),
                 "trash_path": str(dest), "torrent_record_lost": record_lost}
+        if zeroed:
+            undo["file_priority"] = {"torrent_hash": h, "index": v.entry["index"],
+                                     "name": v.entry["name"],
+                                     "priority": v.entry.get("priority", 1)}
         self._audit("applied", f, a, {"trashed_to": str(dest), "freed_bytes": size, **extra},
                     undo=undo)
 
@@ -1557,6 +1565,7 @@ class Executor:
                    if r.get("status") == "applied" and not r.get("undo")]
 
         done, skipped, failed, lost = [], [], [], []
+        self._undo_notes = []
 
         # qBittorrent 不在就整批拒绝（critic N3）：逆改名会退化成 `mv`，
         # 目录改名的逆操作无从得知哪些文件归活种子，其余逆操作
@@ -1569,6 +1578,7 @@ class Executor:
             return {"run_id": run_id, "refused": refused, "total": len(records),
                     "reverted": 0, "skipped": 0, "failed": 0,
                     "irreversible": len(no_undo), "torrent_records_lost": 0,
+                    "priority_not_restored": 0, "notes": [],
                     "skipped_detail": [], "failed_detail": []}
 
         for rec in reversed(undoable):        # LIFO
@@ -1595,6 +1605,8 @@ class Executor:
             "failed": len(failed),
             "irreversible": len(no_undo),
             "torrent_records_lost": len(lost),
+            "priority_not_restored": len(self._undo_notes),
+            "notes": self._undo_notes[:10],
             "skipped_detail": skipped[:10],
             "failed_detail": failed[:10],
             "refused": "",
@@ -1637,8 +1649,14 @@ class Executor:
             return _inside(u.get(key), media, key)[1]
 
         if op == "restore_from_trash":
-            return (_inside(u.get("trash_path"), self.cfg.trash_dir, "trash_path")[1]
-                    or lib_path("path"))
+            why = (_inside(u.get("trash_path"), self.cfg.trash_dir, "trash_path")[1]
+                   or lib_path("path"))
+            fp = u.get("file_priority")
+            if why or fp is None:
+                return why
+            if not isinstance(fp, dict):
+                return f"file_priority 不是对象：{fp!r}"
+            return self._priority_problem(fp)
         if op == "rename":
             return lib_path("path") or _bad_name(u.get("new_name"), "new_name")
         if op == "rename_show_dir":
@@ -1705,14 +1723,19 @@ class Executor:
                 return "缺 tags"
             return None
         if op == "restore_file_priority":
-            if not u.get("torrent_hash"):
-                return "缺 torrent_hash"
-            idx, pri = u.get("index"), u.get("priority")
-            if not (isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0):
-                return f"index 不是非负整数：{idx!r}"
-            if not (isinstance(pri, int) and not isinstance(pri, bool) and 1 <= pri <= 7):
-                return f"priority 不是 1–7 的整数：{pri!r}"
-            return None
+            return self._priority_problem(u)
+        return None
+
+    @staticmethod
+    def _priority_problem(u: dict) -> str | None:
+        """恢复某个条目优先级的参数（`restore_file_priority`，或 `restore_from_trash` 的 `file_priority`）。"""
+        if not u.get("torrent_hash"):
+            return "缺 torrent_hash"
+        idx, pri = u.get("index"), u.get("priority")
+        if not (isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0):
+            return f"index 不是非负整数：{idx!r}"
+        if not (isinstance(pri, int) and not isinstance(pri, bool) and 1 <= pri <= 7):
+            return f"priority 不是 1–7 的整数：{pri!r}"
         return None
 
     def _readd_paths(self, u: dict, args: dict) -> list[Path]:
@@ -1975,34 +1998,7 @@ class Executor:
             return True, ""
 
         if op == "restore_file_priority":
-            h = u["torrent_hash"]
-            try:
-                entries = self.ctx.qbit.files(h)
-            except Exception as e:
-                if "404" in str(e):
-                    return False, "所属种子已不在 qBittorrent 里"
-                raise
-            entry = next((e for e in entries if e.get("index") == u["index"]), None)
-            if entry is None:
-                return False, f"种子里已没有第 {u['index']} 个条目"
-            if entry.get("priority", 1) != 0:
-                return False, f"该条目的优先级已被改成 {entry.get('priority')}，不覆盖"
-            # 优先级恢复成非 0，qBittorrent 就又要往这个路径写（critic N6）：此后若另一个
-            # 种子映射到了同一个名字，恢复就是两个种子争一个文件。盘上不看——条目自己的
-            # 文件（或半成品）本来就可能还在那里，分不出是谁的。
-            t = self._claims().torrent(h)
-            if t is None:
-                return False, "所属种子已不在 qBittorrent 里"
-            at = Path((t.get("save_path") or "").rstrip("/") or "/") / entry["name"]
-            chk = self._claims().check(at, own_hash=h, own_path=at, disk=False)
-            if chk.unknown:
-                return False, f"无法确认这个条目路径的占用情况，未做任何改动：{chk.unknown}"
-            if chk.claimants:
-                return False, f"恢复下载会与活种子争同一路径：{chk.describe()}"
-            if self.dry_run:
-                return True, ""
-            self.ctx.qbit.set_file_priority(h, [u["index"]], u["priority"])
-            return True, ""
+            return self._restore_priority(u)
 
         if op == "restore_from_trash":
             # 路径形状已由 _undo_problem 核过（绝对、规范、分别在隔离区 / 媒体库之下）
@@ -2044,13 +2040,56 @@ class Executor:
             room = disposal.room_problem(self.cfg.media_root, src.stat().st_size, "媒体库")
             if room:
                 return False, room
+            fp = u.get("file_priority")
             if self.dry_run:
+                if fp:
+                    ok, why = self._restore_priority(fp)
+                    if not ok:
+                        self._undo_notes.append(f"{dst.name}：文件会搬回，但合集条目的下载恢复不了（{why}）")
                 return True, ""
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dst))
+            # 文件先回来、再恢复下载：反过来 qBittorrent 会先开始往这个名字写半成品
+            if fp:
+                if self._claim_index is not None:
+                    self._claim_index.invalidate()
+                ok, why = self._restore_priority(fp)
+                if not ok:
+                    self._undo_notes.append(f"{dst.name}：文件已搬回，但合集条目的下载没恢复（{why}）")
             return True, ""
 
         return False, f"未知逆操作 {op}"
+
+    def _restore_priority(self, u: dict) -> tuple[bool, str]:
+        """把种子里第 `index` 个条目的优先级恢复成 `priority`（它此刻必须仍是 0）。返回 (是否成功, 理由)。"""
+        h = u["torrent_hash"]
+        try:
+            entries = self.ctx.qbit.files(h)
+        except Exception as e:
+            if "404" in str(e):
+                return False, "所属种子已不在 qBittorrent 里"
+            raise
+        entry = next((e for e in entries if e.get("index") == u["index"]), None)
+        if entry is None:
+            return False, f"种子里已没有第 {u['index']} 个条目"
+        if entry.get("priority", 1) != 0:
+            return False, f"该条目的优先级已被改成 {entry.get('priority')}，不覆盖"
+        # 优先级恢复成非 0，qBittorrent 就又要往这个路径写（critic N6）：此后若另一个
+        # 种子映射到了同一个名字，恢复就是两个种子争一个文件。盘上不看——条目自己的
+        # 文件（或半成品）本来就可能还在那里，分不出是谁的。
+        t = self._claims().torrent(h)
+        if t is None:
+            return False, "所属种子已不在 qBittorrent 里"
+        at = Path((t.get("save_path") or "").rstrip("/") or "/") / entry["name"]
+        chk = self._claims().check(at, own_hash=h, own_path=at, disk=False)
+        if chk.unknown:
+            return False, f"无法确认这个条目路径的占用情况，未做任何改动：{chk.unknown}"
+        if chk.claimants:
+            return False, f"恢复下载会与活种子争同一路径：{chk.describe()}"
+        if self.dry_run:
+            return True, ""
+        self.ctx.qbit.set_file_priority(h, [u["index"]], u["priority"])
+        return True, ""
 
     def repair_split_dirs(self, run_id: str) -> dict:
         """修复目录改名后新旧并存的分裂状态。

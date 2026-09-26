@@ -260,3 +260,22 @@ purge 要判断"隔离区里的这个能不能真删"，需要删除那一刻的
 **测试**：`tests/test_deletion_gate.py`「I3」——已是优先级 0 的 E05 被删：合集还在、E06 仍是 1、qBittorrent 上
 没有 `delete` / `set_file_priority` 调用；审查的整条链（媒体根下的 Original 布局种子 + 更好的 E05）跑一轮，
 种子还在。改前两条红。
+
+## 9. 回退 I3 的"只作废这一个条目"：连下载一起恢复
+
+2026-09-26 审查（复现）：D1 让每个判重输家都 `file_only`，I3 把多文件种子的成员降级成只把那一集设为不下载。
+逆操作却只有 `restore_from_trash`（`torrent_record_lost: False`，没记"哪个条目被设成了 0"）：回退把文件搬回、
+计 `reverted`、`torrent_records_lost 0`，CLI 只打印「已还原: 1」——而合集里那个条目一直是优先级 0，搬回来的是
+一个没有种子做种的"本地文件"，下一轮 scan 就这么当它。main 上同样的回退至少报了"种子记录已丢失"（它当时整个
+合集都摘了，比现在糟，但报告是诚实的）。
+
+现在：
+- `_op_trash` 设过优先级时，逆操作多一个 `file_priority: {torrent_hash, index, name, priority}`（原优先级）；
+  `_undo_problem` 按 `restore_file_priority` 同一口径校验它。
+- `restore_from_trash` 先搬回文件、再恢复条目的优先级（反过来 qBittorrent 会先往这个名字写半成品）——走与
+  `restore_file_priority` 同一个 `_restore_priority`：条目此刻必须仍是 0、种子还在、路径没被别的种子声明。
+- 恢复不了时文件照样回来（它是主体），`rollback` 的结果多 `priority_not_restored` 计数与 `notes`，`cmd_rollback`
+  打印「⚠️ 文件已搬回、合集条目的下载没恢复」并逐条说明。
+
+**测试**：`tests/test_rollback_claims.py` 末尾——银八合集 [01-03] 的第 2 集输给 1080p 单集：回退后优先级回到
+[1, 1, 1]；合集此后被删：文件照样搬回、CLI 写明没恢复、理由是种子不在。改前两条红。
