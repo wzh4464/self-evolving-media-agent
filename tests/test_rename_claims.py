@@ -179,3 +179,47 @@ def test_rename_of_a_path_the_torrent_does_not_list_is_still_refused(lib):
 test_rename_of_a_path_the_torrent_does_not_list_is_still_refused = pytest.mark.allow(
     "failed_record", match="找不到该文件")(
     test_rename_of_a_path_the_torrent_does_not_list_is_still_refused)
+
+
+# ------------------------------------------------------------------ 执行器的占用索引：一批次一份、改完就作废
+# 2026-09-26 审查：唯一的相关测试（test_path_claims 的 stale index）直接测 ClaimIndex，执行器怎么接的
+# 没人测——`_audit` 不再作废索引（A31）、索引拷一份而不是按引用拿本批次摘掉的种子（A34），全套照样全绿。
+def test_two_renames_onto_one_name_in_one_batch_the_second_is_refused(lib):
+    """两个都是 0% 的种子（盘上什么都没有），同一批里都要改到同一个集位名：第一个改完，只有
+    qBittorrent 知道这个名字已经有主——第二个要看到它，就得用一份新的索引（以前缓存的文件列表
+    里还是旧名字：2026-08-29 / 2026-09-06 两个种子争一个路径的形态）。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    t1 = s1.single("[A] Yani Neko - 05.mkv", size=GB, progress=0.0, state="downloading",
+                   on_disk=False)
+    t2 = s1.single("[B] Yani Neko - 05.mkv", size=GB, progress=0.0, state="downloading",
+                   on_disk=False)
+    x = "尼古喵喵 S01E05.mkv"
+
+    rep = lib.apply([_rename(t1.path, x, t1.hash), _rename(t2.path, x, t2.hash)])
+
+    assert len(rep.applied) == 1 and len(rep.skipped) == 1, (rep.applied, rep.skipped)
+    assert "集位被占" in rep.skipped[0]["reason"]
+    names = [n for h in (t1.hash, t2.hash) for n in lib.qbit.file_names(h)]
+    assert names.count(x) == 1, names
+
+
+def test_a_torrent_dropped_earlier_in_the_batch_does_not_claim_while_qbit_still_lists_it(lib):
+    """qBittorrent 的删除是异步的：死种摘掉之后，它还会在列表里出现一会儿、仍"声明"着集位名。
+    占用索引按引用拿执行器的 `_removed_torrents`，同一批后面的动作（隔离它的半成品、把新文件
+    改到这个名字上）不能被一个已经摘掉的种子挡住。"""
+    from media_agent.plugins.builtin import DeadTorrentDetector
+
+    lib.qbit.async_deletes = True
+    s1 = lib.show("尼古喵喵").season(1)
+    dead = s1.torrent({SLOT: GB}, name="[Old] Yani Neko - 08.mkv", layout="single",
+                      progress=0.4, state="stalledDL", added_hours_ago=24 * 30,
+                      availability=0, num_complete=0)
+    me = s1.local(RAW, size=GB)
+    findings = lib.diagnose(detectors=[DeadTorrentDetector]) + [_rename(me, SLOT)]
+
+    rep = lib.apply(findings)
+
+    assert lib.qbit.has(dead.hash)                         # 还在列表里（删除没落地）
+    assert sorted(r["op"] for r in rep.applied) == ["drop_torrent", "rename", "trash"], \
+        (rep.applied, rep.skipped)
+    assert (s1.path / SLOT).exists()

@@ -249,3 +249,22 @@ def test_grab_rename_skip_without_a_race_never_happens_in_a_plain_cycle(lib):
     [grab] = c.applied("grab_episode")
     assert grab["rename"] == {"renamed": SLOT}
     assert lib.qbit.file_names(item.infohash) == [SLOT]
+
+
+def test_the_grab_sees_its_own_torrent_even_if_the_batch_index_was_built_before(lib):
+    """加种之后要作废本批次的占用索引（`_op_grab_episode`）：此前任何一次查询（跳过的动作不作废
+    索引）留下的种子列表里没有这个新种子，即时改名会以为它"不在 qBittorrent 里"而作罢——
+    又回到 2026-09-03 那样等 6 小时才改名。"""
+    from media_agent.actions import Executor
+
+    sh = lib.show(SHOW)
+    sh.season(1)
+    url, h = lib.web.torrent(TITLE)
+    ex = Executor(lib.context(), dry_run=False, run_id="g1")
+    ex._claims().torrents()                               # 这一批早先问过一次
+
+    ex.apply([grab_finding(sh.path, url)])
+
+    [rec] = ex.report.applied
+    assert rec["rename"]["renamed"] == SLOT
+    assert lib.qbit.file_names(h) == [SLOT]

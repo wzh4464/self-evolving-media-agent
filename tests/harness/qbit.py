@@ -57,15 +57,21 @@ class FakeQbit:
       **未经生产实测**，所以每次覆盖都记 `qbit_overwrite`）或 `"raise"`（报 409）。
     - `async_moves`：True 时 `set_location` 只登记，`drain()` 才真正搬文件——
       近似 qBittorrent 的异步 moveStorage，用来暴露"setLocation 后立刻 _merge_tree"的竞态。
+    - `async_deletes`：True 时 `delete` 只登记，种子（连同它的条目）照样出现在 `torrents()` /
+      `files()` 里，`drain()` 才真正删——qBittorrent 的删除同样是异步的，刚删完的种子还会在
+      列表里出现一会儿（`claims.ClaimIndex` 按引用拿执行器的 `_removed_torrents` 正是为此）。
     """
 
     def __init__(self, tripwire=None, *, default_save_path: str | Path = "",
-                 rename_collision: str = "overwrite", async_moves: bool = False):
+                 rename_collision: str = "overwrite", async_moves: bool = False,
+                 async_deletes: bool = False):
         assert rename_collision in ("overwrite", "raise")
         self.tripwire = tripwire
         self.default_save_path = str(default_save_path)
         self.rename_collision = rename_collision
         self.async_moves = async_moves
+        self.async_deletes = async_deletes
+        self._pending_deletes: list[tuple[str, bool]] = []
         self._t: dict[str, dict] = {}
         self._catalog: dict[str, dict] = {}     # hash → {"name", "files", "multi"}：磁力重加时恢复元数据
         self._faults: list[_Fault] = []
@@ -316,11 +322,14 @@ class FakeQbit:
                                    exc or httpx.ReadTimeout("timed out (injected)"), times))
 
     def drain(self) -> None:
-        """`async_moves=True` 时，完成所有挂起的 setLocation。"""
+        """完成所有挂起的 setLocation（`async_moves`）与删除（`async_deletes`）。"""
         pending, self._pending_moves = self._pending_moves, []
         for h, loc in pending:
             if h in self._t:
                 self._do_move(self._t[h], loc)
+        deletes, self._pending_deletes = self._pending_deletes, []
+        for h, delete_files in deletes:
+            self._do_delete(h, delete_files)
 
     def snapshot(self) -> dict:
         """规范化的全量状态，便于 `assert before == after`。"""
@@ -490,25 +499,31 @@ class FakeQbit:
         self.calls.append(("delete", tuple(hs), bool(delete_files)))
         for h in hs:
             self._maybe_fail("delete", h)
-            t = self._t.pop(h, None)
-            if t is None or not delete_files:
+            if self.async_deletes:
+                self._pending_deletes.append((h, bool(delete_files)))
                 continue
-            sp = Path(t["save_path"])
-            for f in t["_files"]:
-                for suffix in ("", ".!qB"):
-                    Path(str(sp / f["name"]) + suffix).unlink(missing_ok=True)
-            root = self._root_path(t)
-            if root:
-                for d in sorted((p for p in Path(root).rglob("*") if p.is_dir()),
-                                key=lambda p: len(p.parts), reverse=True):
-                    try:
-                        d.rmdir()
-                    except OSError:
-                        pass
+            self._do_delete(h, delete_files)
+
+    def _do_delete(self, h: str, delete_files: bool) -> None:
+        t = self._t.pop(h, None)
+        if t is None or not delete_files:
+            return
+        sp = Path(t["save_path"])
+        for f in t["_files"]:
+            for suffix in ("", ".!qB"):
+                Path(str(sp / f["name"]) + suffix).unlink(missing_ok=True)
+        root = self._root_path(t)
+        if root:
+            for d in sorted((p for p in Path(root).rglob("*") if p.is_dir()),
+                            key=lambda p: len(p.parts), reverse=True):
                 try:
-                    Path(root).rmdir()
+                    d.rmdir()
                 except OSError:
                     pass
+            try:
+                Path(root).rmdir()
+            except OSError:
+                pass
 
     # ================================================================ 未建模
     def __getattr__(self, name: str):
