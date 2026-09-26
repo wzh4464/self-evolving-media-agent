@@ -234,3 +234,12 @@ def test_brief_keeps_the_status_and_drops_the_url():
     odd = RuntimeError("GET https://api.themoviedb.org/3/search/tv?api_key=SECRETKEY123&query=x failed")
     assert "SECRETKEY123" not in cache_mod._brief(odd) and "RuntimeError" in cache_mod._brief(odd)
     assert cache_mod._brief(httpx.ConnectTimeout("connect timed out")) == "ConnectTimeout: connect timed out"
+
+
+def test_rate_limiting_counts_as_an_outage_but_a_missing_season_does_not():
+    """429（限流）与 5xx、超时一样是"TMDB 此刻不行"——同一轮里别的季也别再问；404 只是这一季的答案
+    （2026-09-27 审查：把 429 当成这一季答案的变异存活）。"""
+    assert cache_mod._outage(_http_error(429))
+    assert cache_mod._outage(_http_error(503))
+    assert cache_mod._outage(httpx.ConnectTimeout("connect timed out"))
+    assert not cache_mod._outage(_http_error(404))

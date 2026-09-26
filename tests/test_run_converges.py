@@ -245,6 +245,40 @@ def test_a_degraded_cap_pass_still_exits_3_when_the_health_report_breaks(offline
     assert cli.cmd_run(_args(), lib.cfg) == cli.EXIT_DEGRADED
 
 
+class _CrashOnce:
+    """第一次诊断时崩、之后好好的（比如 `database is locked` 这种一过性的）。"""
+    id = "crash-once"
+    kind = "x"
+
+    def __init__(self):
+        self.calls = 0
+
+    def detect(self, ctx, state):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("database is locked")
+        return []
+
+
+@pytest.mark.allow("detector_error", match="crash-once")
+def test_a_detector_that_crashed_in_an_earlier_iteration_is_still_reported(offline_cli, monkeypatch):
+    """健康报告的检测器崩溃按各次迭代合起来：第一次迭代崩了、最后一次好好的，照样报 `detector_crash`
+    （2026-09-27 审查：只报最后一次迭代的变异存活）。"""
+    lib = offline_cli
+    s1 = lib.show(SHOW).season(1)
+    s1.single(f"{SHOW} S01E01.mkv")
+    s1.local("x1.mkv")
+    monkeypatch.setattr(cli, "build_registry", lambda: lib.registry([_Chain(), _CrashOnce()]))
+    lib.configure(max_iterations=2)
+
+    cli.cmd_run(_args(), lib.cfg)
+
+    rep = _latest(lib)
+    assert len(rep["loop"]["iterations"]) >= 2
+    assert [e["rule"] for e in rep["detectors"]["errors"]] == ["crash-once"]
+    assert "detector_crash" in [r["code"] for r in rep["reasons"]]
+
+
 def test_two_rules_fighting_is_a_warning_and_a_finding(offline_cli, monkeypatch):
     lib = offline_cli
     s1 = lib.show(SHOW).season(1)

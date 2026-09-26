@@ -569,6 +569,38 @@ def test_a_grabbed_release_with_an_extra_is_cleaned_without_a_false_oscillation(
     assert all(it.reversed == 0 for it in c.iterations)
 
 
+def test_key_of_tells_episodes_of_the_same_season_apart():
+    """抓第 9 集与抓第 10 集是两件事：`grab_episode` 按番目录 + 季 + **集**认。只按季认的话，第二次迭代里另一集的
+    抓取会被当成"本轮已试过"（2026-09-27 审查：变异存活）。"""
+    a = {"show_dir": "/m/尼古喵喵", "season": 1, "episode": 9, "url": "u9"}
+    assert converge.key_of("grab_episode", a) != converge.key_of("grab_episode", {**a, "episode": 10})
+    assert converge.key_of("grab_episode", a) == converge.key_of("grab_episode", {**a, "url": "另一个发布"})
+
+
+def test_the_claims_index_is_rebuilt_for_every_iteration(lib):
+    """占用索引按迭代作废（`Executor.new_iteration`）：两次迭代之间 qBittorrent 里的变化（别的动作摘掉的种子、AB 新加的）
+    下一次迭代要看得见。第一次迭代建好索引之后再没有执行过动作时（索引不会因为写审计而作废），不清就一直用旧的
+    （2026-09-27 审查：变异存活）。"""
+    from media_agent.actions import Executor
+    from media_agent.scan import build_state
+    s1 = lib.show(SHOW).season(1)
+    s1.single("a.mkv", category="旧分类")
+    b = s1.single("b.mkv", progress=0.0)                          # 0%：盘上没有，但种子声明着这个路径
+    ctx = lib.context()
+    ex = Executor(ctx, dry_run=False, run_id="t001")
+
+    def scan(n):
+        if n == 2:
+            lib.qbit.delete([b.hash], False)                     # 两次迭代之间，占着的种子没了
+        return build_state(ctx)
+
+    reg = lib.registry([_Recat("recat", "旧分类", SHOW), _Flip("blocked", "a.mkv", "b.mkv")])
+    converge.run(ctx, reg, ex, scan=scan, max_iterations=3)
+
+    renames = [(r["status"], converge.retryable(r)) for r in lib.audit("t001") if r["op"] == "rename"]
+    assert renames == [("skipped", True), ("applied", False)]
+
+
 def test_iteration_line_is_one_compact_line():
     it = converge.Iteration(2, findings=5, actionable=3, attempted=2, memo=1, applied=2, scan_s=1.2)
     line = it.line(3)
@@ -801,6 +833,31 @@ def test_a_torrent_relinked_this_run_is_not_dropped_as_dead_in_the_same_run(lib)
 
 
 # ------------------------------------------------------------------ 整轮仍是一个回退单元
+def test_title_decisions_from_every_iteration_are_kept(lib):
+    """标题稳定闸一轮只记一次、按各次迭代的决定合起来记（`Outcome.title_decisions`）。只留最后一次迭代的，前面迭代里
+    问过、后面迭代没再出现的条目（那部番的目录被改走、第二次扫描认不出它）就没记下来（2026-09-27 审查：变异存活）。"""
+    from media_agent.actions import Executor
+    from media_agent.scan import build_state
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(77, "某番", seasons={1: weekly(2, first_days_ago=900)})
+    sh = lib.show("某番")
+    sh.season(1).local("某番 S01E01.mkv")
+    sh.sidecar(tmdb_id=77, tmdb_title="某番", tmdb_source="human")
+    lib.show(SHOW).season(1).local("x1.mkv")                      # 让这一轮迭代不止一次
+    ctx = lib.context()
+
+    def scan(n):
+        state = build_state(ctx)
+        if n > 1:
+            state.title_decisions = {}                           # 后面的迭代这个条目没出现
+        return state
+
+    out = converge.run(ctx, lib.registry([_Upto3()]), Executor(ctx, dry_run=False, run_id="t001"),
+                       scan=scan, max_iterations=3)
+
+    assert len(out.iterations) >= 2 and 77 in out.title_decisions
+
+
 def test_a_run_that_iterated_rolls_back_as_one_unit(lib):
     """一轮一个批次 ID：`rollback` 按审计序号倒着撤——先撤第二次迭代的改名与隔离，再撤第一次迭代的分类交接。"""
     s1, raw, sub = _ab_duplicate(lib)

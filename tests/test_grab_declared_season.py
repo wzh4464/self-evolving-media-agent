@@ -173,3 +173,17 @@ def test_flattened_numbering_only_lands_on_the_mapped_episode(lib):
     g = _grabs(lib.diagnose(detectors=[EpisodeAvailableDetector]))
 
     assert set(g) == {"S01E58"}
+
+
+def test_the_remembered_mikan_page_is_keyed_by_tmdb_id_and_season():
+    """记住的番组页（`mikanpick:`）按 TMDB id + 季：目录改了名照样认得（按目录名的键一改名就丢），同一部番的不同季
+    常在不同的番组页——没有播出日期可比时，记住的那一页不再打分直接用（2026-09-27 审查：两个变异都存活）。"""
+    from types import SimpleNamespace
+
+    from media_agent.plugins.grab import _pick_key
+    before = SimpleNamespace(tmdb_id=1102, dir_name="入间同学入魔了")
+    after = SimpleNamespace(tmdb_id=1102, dir_name="入间同学入魔了！")
+    assert _pick_key(before, 4) == _pick_key(after, 4)
+    assert _pick_key(before, 3) != _pick_key(before, 4)
+    assert _pick_key(SimpleNamespace(tmdb_id=None, dir_name="X"), 1) != _pick_key(
+        SimpleNamespace(tmdb_id=None, dir_name="Y"), 1)
