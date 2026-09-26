@@ -482,7 +482,7 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
     if surv.torrent_hash:
         # 路径 a：种子校验。最强的证据——种子声明多少字节就该有多少字节。
         declared, progress = surv.size, float(surv.torrent_progress or 0)
-        if progress < 1.0:
+        if progress < 1.0:              # 纵深防御：`_holders` 已经不收没下完的，这里只在它改了之后才会走到
             c.why = f"替代者的种子只下到 {progress*100:.1f}%"
             return
         if actual != declared:

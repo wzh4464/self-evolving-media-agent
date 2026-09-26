@@ -763,3 +763,90 @@ def test_run_with_room_does_not_rescan_for_duplicates_it_would_keep_anyway(lib, 
 
     assert calls == [1] and [c.trash_path for c in rep.deleted] == [moved]
 
+
+
+# ------------------------------------------------------------------ 每道判断单独的现场
+# 变异验证（逐个关掉判断）时，下面这些判断被相邻的判断掩护着、没有测试能单独拦住它们。
+def test_an_ab_owned_survivor_whose_release_names_another_episode_does_not_vouch(lib, no_rmtree):
+    """发布名没写季号（与"声明了另一季"那条分开），只是集号对不上，而文件仍在 AB 名下。"""
+    moved = legacy(lib, "朱音落语 S01E08.mp4", show="朱音落语", rule="duplicate-episode",
+                   kind="duplicate", days_ago=40, summary="S01E08 重复：…")
+    lib.show("朱音落语").season(1).single("朱音落语 S01E08.mp4", category="Bangumi",
+                                         name="[Group] Akane-banashi - 09 [1080p].mp4")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert "AutoBangumi" in c.why
+
+
+def test_two_files_in_the_slot_hold_it(lib, no_rmtree):
+    moved = legacy(lib, "[Raw] Yani Neko - 05.mkv", rule="duplicate-episode", kind="duplicate",
+                   days_ago=40, summary="S01E05 重复：…")
+    s1 = lib.show("尼古喵喵").season(1)
+    s1.single("尼古喵喵 S01E05.mkv", name="[A] Yani Neko - 05 [1080p].mkv", probe=CHI)
+    s1.single("[B] Yani Neko - 05 [1080p].mkv", probe=CHI)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert "2 个文件" in c.why
+
+
+def test_a_truncated_survivor_does_not_vouch(lib, no_rmtree):
+    """种子说下完了（进度 1），盘上的文件却比声明的小：截断或被替换。"""
+    from harness import write_sparse
+
+    moved = legacy(lib, "[Raw] Yani Neko - 05.mkv", rule="duplicate-episode", kind="duplicate",
+                   days_ago=40, summary="S01E05 重复：…")
+    surv = lib.show("尼古喵喵").season(1).single("尼古喵喵 S01E05.mkv", tags="ma:S01E05",
+                                                 name="[A] Yani Neko - 05 [1080p].mkv", probe=CHI)
+    write_sparse(surv.path, GB // 2, "truncated")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert "不符" in c.why
+
+
+def test_survivor_resized_after_planning_means_no_delete(lib, monkeypatch, no_rmtree):
+    from harness import write_sparse
+
+    s1, good, moved = _trash_the_raw_one(lib)
+    _after_planning(monkeypatch, lambda: write_sparse(_survivor_path(s1), GB // 2, "truncated"))
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
+
+    assert moved.exists() and not rep.deleted
+    [(c, why)] = rep.changed
+    assert "变了" in why
+
+
+def test_survivor_torrent_rechecking_after_planning_means_no_delete(lib, monkeypatch, no_rmtree):
+    """评估之后替代者的种子掉回了未完成（重新校验、文件被动过）。"""
+    s1, good, moved = _trash_the_raw_one(lib)
+
+    def regress():
+        lib.qbit.raw(good.hash)["progress"] = 0.5
+
+    _after_planning(monkeypatch, regress)
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
+
+    assert moved.exists() and not rep.deleted
+    [(c, why)] = rep.changed
+    assert "没下完" in why
+
+
+def test_survivor_unwanted_after_planning_means_no_delete(lib, monkeypatch, no_rmtree):
+    s1, good, moved = _trash_the_raw_one(lib)
+    _after_planning(monkeypatch, lambda: lib.qbit.set_file_priority(good.hash, [0], 0))
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
+
+    assert moved.exists() and not rep.deleted
+    [(c, why)] = rep.changed
+    assert "不再声明" in why

@@ -248,7 +248,16 @@ APFS 容器（critic N8：`/System/Volumes/Data` 与 `/Volumes/Backup` 共用约
 **测试**：`tests/test_quarantine_disposal.py` 末条——空间充足时 `run` 对保留期内的判重一次 `build_state` 都不调、
 不删；空间不足时调一次并提前删。第 2 节那条"等满保留期"的用例改用 `purge` 预演看"证明得了"。改前红。
 
-## 11. 写进约束
+## 11. 变异验证
+
+逐个关掉处置器 / 判据 / 空间检查里的判断（`if 条件:` → `if False:`、先删后记、`rmdir` → `rmtree`……），跑
+`tests/test_quarantine_disposal.py`、`test_purge_log.py`、`test_trash_space.py`：38 个变异，第一轮 7 个存活——
+都是被相邻判断掩护的：AB 名下替代者的那条被"发布名声明了另一季"那条一起拦住（Re:Zero 的发布名两条都中）；
+集位里两个文件、替代者被截断、评估之后替代者变了大小 / 掉回未完成 / 被设为不下载，都没有单独的现场。
+补上只有那一道能拦住的现场（发布名没写季号、只是集号对不上；…）后 37/38 被杀。剩下的一个是等价变异：
+替代者"种子没下完"那条，`_holders` 已经不收没下完的文件，走不到——留作纵深防御并注明。变异脚本不入库。
+
+## 12. 写进约束
 
 AGENTS.md「不可动摇的约束」第 10 条：隔离区的硬删除只经 `disposal.hard_delete`（先写意图、逐个文件、永不
 `rmtree`），删不删由 `purge.build_pool` 按处置类别判，unlink 前 `purge.recheck`，容量闸只在已证明可删的里面
