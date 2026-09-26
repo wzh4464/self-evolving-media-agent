@@ -1010,3 +1010,56 @@ def test_finder_junk_is_not_a_quarantined_file(lib, no_rmtree):
 
     assert [c.trash_path for c in rep.pool] == [extra]
     assert [c.trash_path for c in rep.deleted] == [extra] and not rep.overdue
+
+
+# ------------------------------------------------------------------ 无种子替代者：时长自证（路径 b）
+# 替代者没有种子（BD 合集、手工导入）时，"完整"只能靠同季时长的中位数与尾部解码自证。第 2 阶段把
+# 这条证明从人看的 `purge --apply` 挪进了每 6 小时一轮、无人值守的 run——以前没有任何测试走到它
+# （2026-09-26 审查：把入口换成 raise 全绿；三条判据各自关掉也全绿）。
+@pytest.mark.parametrize("spec,why", [
+    (video("hevc", duration=1000.0, subs=["chi 简体中文"]), "明显短于"),       # 截断 / PV 占了集位
+    (video("hevc", duration=4307.0, subs=["chi 简体中文"]), "远长于"),         # 三集连播的先行版
+    (video("hevc", duration=1440.0, subs=["chi 简体中文"], truncated=True), "尾部解不出"),
+    (video("hevc", duration=None, subs=["chi 简体中文"]), "读不出时长"),
+], ids=["short", "long", "tail-undecodable", "no-duration"])
+def test_a_torrentless_survivor_must_prove_it_is_complete(lib, no_rmtree, spec, why):
+    s1 = lib.show("朱音落语").season(1)
+    surv = s1.local("朱音落语 S01E05.mkv", size=1_300_000_000, probe=spec)
+    _episodes(s1, "朱音落语", (1, 2, 3), EP_LEN)
+    moved = _keeper_record(lib, surv)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = [c for c in rep.pool if c.trash_path == moved]
+    assert not c.eligible and why in c.why
+
+
+def test_a_torrentless_survivor_needs_two_same_season_references(lib, no_rmtree):
+    s1 = lib.show("朱音落语").season(1)
+    surv = s1.local("朱音落语 S01E05.mkv", size=1_300_000_000, probe=EP_LEN)
+    _episodes(s1, "朱音落语", (1,), EP_LEN)
+    lib.show("朱音落语").season(2).local("朱音落语 S02E01.mkv", probe=EP_LEN)   # 别的季不算参照
+    moved = _keeper_record(lib, surv)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = [c for c in rep.pool if c.trash_path == moved]
+    assert "不足 2 集" in c.why
+
+
+def test_a_modest_duration_difference_is_normal(lib, no_rmtree):
+    """后段片尾更长（恶魔的破坏 1430s → 1511s）、合并季两段规格（药屋 1372s / 1440s）：±10% 的
+    正常波动不拦——只卡截断与合集包那两种大幅偏离。"""
+    s1 = lib.show("朱音落语").season(1)
+    surv = s1.local("朱音落语 S01E05.mkv", size=1_300_000_000,
+                    probe=video("hevc", duration=1300.0, subs=["chi 简体中文"]))
+    _episodes(s1, "朱音落语", (1, 2, 3), EP_LEN)
+    moved = _keeper_record(lib, surv)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.deleted] == [moved]
+    [intent] = [r for r in _wal(lib) if r.get("phase") == "intent"]
+    assert "时长自证" in intent["reason"]
