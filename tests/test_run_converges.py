@@ -192,6 +192,59 @@ def test_reaching_the_cap_is_a_warning_listing_what_is_left(offline_cli, monkeyp
     assert "迭代    2 次 · 到上限" in out                                  # 健康一节
 
 
+@pytest.mark.allow("log_failure", match="数据不完整")
+def test_a_degraded_cap_pass_is_a_critical_rescan_with_exit_3(offline_cli, monkeypatch, capsys):
+    """到顶之后的收尾诊断读 qBittorrent 不完整：修复已经做了、处置照跑，但这一轮最后看到的是残缺的视图——与演进重扫
+    读不全同一个口径：`degraded.rescan`、critical、退出码 3（2026-09-27 审查：这一支没有测试，把退出码改成 0、或
+    不记 `rescan_degraded` 的变异全套存活）。"""
+    lib = offline_cli
+    _degraded_cap_pass(lib, monkeypatch)
+
+    rc = cli.cmd_run(_args(), lib.cfg)
+
+    rep = _latest(lib)
+    assert rc == cli.EXIT_DEGRADED == rep["exit_code"]
+    assert rep["status"] == "critical" and rep["degraded"]["rescan"]
+    assert rep["loop"]["stop"] == converge.CAP and rep["loop"]["final_degraded"]
+    assert rep["loop"]["pending_count"] == 0                           # 残缺的视图里列不出待做
+    assert rep["actions"]["applied"] == 2                              # 修复做了
+    assert rep["trash"] and rep["trash"]["disposal"] is not None       # 处置照跑
+    assert "收尾诊断：qBittorrent 数据不完整" in capsys.readouterr().out
+
+
+def _degraded_cap_pass(lib, monkeypatch) -> None:
+    """两次迭代到顶（`_Chain`），之后的收尾诊断读某个种子的文件列表失败。"""
+    lib.configure(max_iterations=2)
+    s1 = lib.show(SHOW).season(1)
+    t = s1.single(f"{SHOW} S01E01.mkv")
+    s1.local("x1.mkv")
+    monkeypatch.setattr(cli, "build_registry", lambda: lib.registry([_Chain()]))
+    real, scans = cli.build_state, []
+
+    def scan(ctx, **kw):
+        scans.append(1)
+        if len(scans) == 3:                                     # 两次迭代之后的收尾诊断
+            lib.qbit.fail("files", hash=t.hash, times=None)
+        return real(ctx, **kw)
+
+    monkeypatch.setattr(cli, "build_state", scan)
+
+
+@pytest.mark.allow("log_failure", match="数据不完整")
+def test_a_degraded_cap_pass_still_exits_3_when_the_health_report_breaks(offline_cli, monkeypatch):
+    """健康报告自己出错时退出码按 `_run` 给的原样返回（`_finish_run`）：那时只剩它说"这一轮最后看到的是残缺的视图"。
+    平时退出码由健康报告的 critical 原因定（`health.exit_code_for`），所以只有这条路能看出 `_run` 给的对不对。"""
+    lib = offline_cli
+    _degraded_cap_pass(lib, monkeypatch)
+
+    def broken(*a, **k):
+        raise OSError("state/health 写不进去")
+
+    monkeypatch.setattr(cli.health, "write_report", broken)
+
+    assert cli.cmd_run(_args(), lib.cfg) == cli.EXIT_DEGRADED
+
+
 def test_two_rules_fighting_is_a_warning_and_a_finding(offline_cli, monkeypatch):
     lib = offline_cli
     s1 = lib.show(SHOW).season(1)
