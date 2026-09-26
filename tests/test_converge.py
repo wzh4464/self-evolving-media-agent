@@ -515,3 +515,45 @@ def test_a_run_that_iterated_rolls_back_as_one_unit(lib):
     assert lib.disk() == before
     assert lib.qbit.torrent(sub.hash)["category"] == "Bangumi"
     assert lib.qbit.file_names(sub.hash) == [LOLI_08]
+
+
+# ------------------------------------------------------------------ 第二次迭代起不打网络（F2）
+def test_iterations_after_the_first_diagnose_without_any_network_call(lib):
+    """迭代的代价要可控：第二次迭代起的扫描 + 诊断一次网络都不打——TMDB 身份 / 标题 / 分集表、番组页、RSS、Mikan 搜索
+    都走缓存，本地动作改变不了其中任何一样。所以每次迭代都跑全部检测器，不必按迭代挑（`converge` 模块文档）。"""
+    from media_agent.actions import Executor
+    from media_agent.scan import build_state
+    sh = lib.show(SHOW)
+    s1 = sh.season(1)
+    for n in range(1, 8):
+        s1.local(f"{SHOW} S01E{n:02d}.mkv")
+    _ab_duplicate(lib)                                               # 第 8 集：让这一轮迭代三次
+    schedule = weekly(12, first_days_ago=60)
+    sh.tmdb(1234, seasons={1: schedule})
+    sh.sidecar(tmdb_id=1234, tmdb_title=SHOW, mikan_id="3500", seasons={"1": {"have": list(range(1, 9))}})
+    item = MikanItem(title="[LoliHouse] 尼古喵喵 / Yani Neko - 09 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+                     pub=dict(schedule)[9])
+    lib.mikan("3500", [item], search=[SHOW])
+    rss = "https://mikanani.me/RSS/Bangumi?bangumiId=3500&subgroupid=583"
+    sh.bangumi(7, title_raw="Yani Neko", rss_link=rss, group_name="LoliHouse")
+    lib.web.rss(rss, [f"[LoliHouse] Yani Neko - {n:02d} [WebRip 1080p]" for n in range(1, 10)])
+    ctx = lib.context()
+    ex = Executor(ctx, dry_run=False, run_id="t001")
+
+    def calls():
+        return len(lib.tmdb.calls) + len(lib.web.calls) + len(lib.llm.prompts)
+
+    start: dict[int, int] = {}
+    spent: dict[int, int] = {}
+
+    def scan(n):
+        start[n] = calls()
+        return build_state(ctx)
+
+    out = converge.run(ctx, lib.registry(), ex, scan=scan, max_iterations=3,
+                       on_diagnose=lambda n, st, fs: spent.__setitem__(n, calls() - start[n]))
+
+    assert out.stop == converge.FIXED_POINT and len(out.iterations) == 3
+    assert "grab_episode" in [r["op"] for r in ex.report.applied]
+    assert spent[1] > 0
+    assert [spent[n] for n in (2, 3)] == [0, 0]
