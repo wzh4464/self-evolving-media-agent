@@ -17,9 +17,9 @@
 | N1 | 回退 `restore_from_trash` 把空的 `trash_path` 变成 `Path('.')`，`shutil.move('.', dst)` 退回 `copytree(当前目录 → 媒体库)` 再 `rmtree(当前目录)`。根因：`_op_trash` 先删种子记录、后查文件是否存在。生产上 6 条这样的记录：20260830T132317、20260908T022758 ×3、20260908T143348、20260920T170126 | 8f66cab（回退校验参数）、bc8d5a3（隔离前先核对文件） |
 | N2 | qBittorrent **部分**读取失败：`files()` 的任何错误被缓存成空列表，那个种子的文件变成"纯本地文件"，改名走文件系统、隔离跳过种子，而且无声无息 | 5fde004 |
 | N3 | `rollback` / `repair` / `purge --apply` 不看 qBittorrent 在不在：逆改名退化成 `mv`，`repair` 用文件系统搬活种子的文件，purge 丢掉种子证据 | 5fde004；qBit 在线时的目录级搬运见 0fe98b2 |
-| N5 | 演进规则（LLM 提议、影子验证后上线的 DSL）可以带 `trash` / `retag` 等动作、参数由模型选，上线后不再复核——一条未经人审的"LLM → 改名 / 删除"通路 | ae4a8bb |
+| N5 | 演进规则（LLM 提议、影子验证后上线的 DSL）可以带 `trash` / `retag` 等动作、参数由模型选，上线后不再复核——一条未经人审的"LLM → 改名 / 删除"通路 | ae4a8bb；删除的执法点并入删除关口 680962b（`gate.screen`，trash 与 drop_torrent） |
 | N6 | "这个路径是否已被另一个活种子声明"应当是所有写路径共用的一道闸；`relink_torrent` 只按大小匹配，可能造出两个种子争一个文件 | 第 1 阶段 2577c43 给改名加了 `_claimants`；第 2 阶段换成共用原语 1e7897d，接到改名 9dcf436、抓取后改名 8a0dec9、relink f2c9be8、回退 be0eae6 / 1726d3d、目录改名 4be6339 / 64a2f5b |
-| N7 | `Finding.key()` = `(kind, path)`：同一目录两个死种的 `content_path` 相同，第二条被去重吞掉 | 3ef6825 |
+| N7 | `Finding.key()` = `(kind, path)`：同一目录两个死种的 `content_path` 相同，第二条被去重吞掉 | 3ef6825；删除关口按目标（路径 + hash）复核、不按 key，680962b 起 |
 | N8 | 隔离区与媒体在同一个 APFS 容器（约 94% 满）：隔离不腾空间，跨卷搬运是先拷后删，磁盘满时搬到一半失败 | 仅作为风险引用；未改动 |
 | N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒） | 0b5a02e |
 | N15 | 抓取后的即时改名 `rename_single_video` 算目标名时丢掉条目的文件夹层（`_op_rename` 保留）：409 撞上一个已有的 Original 布局种子时，文件被挪到 save_path 根下 | 8a0dec9，见 `architecture/2026-09-26-path-claims.md` 第 4 节 |

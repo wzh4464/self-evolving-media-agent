@@ -95,6 +95,14 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
    并写明占用者，**看不全（qBittorrent 读失败）就拒绝**。新加的写路径同样要接，改完东西
    要让索引作废（执行器在写非 skipped 审计时自动作废）。见
    [路径占用](.agents/notes/implemented/architecture/2026-09-26-path-claims.md)。
+9. **删除之前过删除关口**（`media_agent/gate.py`）。每一次 `trash` / `drop_torrent` 在动手前、
+   按**此刻**的 qBittorrent 与磁盘、按目标本身（路径 + hash）复核，与产出它的规则无关：
+   I1 不让任何集位变成零个可播文件（点名的保留方此刻真在、下完了、没被截断、同批没被删）；
+   I2 不删别的种子仍声明的路径；I3 多文件种子只作废这一个条目（自动降级）；I4 不删封存的文件，
+   **探测不可用当作封存**；演进规则的删除一律不执行。拒绝记 skipped「删除关口：Ix …」，看不全记
+   failed。新加删除类动作必须接关口；判重类检测器要在动作里给保留方与集位（`keep_path` /
+   `keep_hash` / `keep_size` / `keep_digest` / `slot`）。每条隔离记录带 `deletion`（给 purge）。见
+   [删除关口](.agents/notes/implemented/architecture/2026-09-26-deletion-gate.md)。
 
 ## 自演进的闭环
 
