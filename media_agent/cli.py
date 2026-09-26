@@ -1048,6 +1048,31 @@ def main() -> int:
     except ValueError as e:
         _log(f"配置错误：{e}")
         return 2
+    # 所有子命令的输出（print、_log、ctx.log、run 的时间戳层）先过打码：日志里不许出现密钥
+    # （2026-09-27：TMDB 报错把 api_key 明文带进了 run.log，见 runlog.Redacting）。
+    with runlog.redacting(lambda s: notify.redact(cfg, s)):
+        warn_short_secrets(cfg)
+        return _dispatch(args, cfg)
+
+
+_SECRET_ENV = {"qbit_pass": "QBIT_PASS", "ab_pass": "AB_PASS", "tmdb_api_key": "TMDB_API_KEY",
+               "llm_key": "LLM_KEY", "notify_smtp_pass": "NOTIFY_SMTP_PASS"}
+
+
+def warn_short_secrets(cfg) -> None:
+    """短于字面遮挡下限的密钥遮不了（替换短串会误伤正常输出），启动时点名告警、不打印值。
+
+    输出打码（`runlog.Redacting`）对已配置的密钥按字面替换；太短的只能靠 URL / 请求头模式认，
+    出现在普通文本里就会漏过。与其默默漏，不如让人知道该换一个更长的（PR #1 审查意见）。
+    """
+    for attr, env in _SECRET_ENV.items():
+        v = str(getattr(cfg, attr, "") or "")
+        if 0 < len(v) < notify._LITERAL_MIN:
+            _log(f"⚠️  {env} 只有 {len(v)} 位，短于输出打码的字面下限 {notify._LITERAL_MIN} 位："
+                 f"它若出现在普通报错文本里不会被遮掉，建议换一个更长的")
+
+
+def _dispatch(args, cfg) -> int:
     paused = pause.reason(cfg) if getattr(args, "pause", False) else ""
     if args.cmd == "run":
         # launchd 把这些输出追加进 state/run.log / run.err.log：每一行带时间与批次 ID（`runlog`）
