@@ -84,3 +84,12 @@ save_path 看得到。`download_path`（生产 `temp_path_enabled=False`）不�
 `files()` 读失败都 failed 且没有 renameFile；合集按完整路径改对条目、逆改名也改对；找不到
 条目仍然报失败、不退化成 mv。`tests/test_harness.py` 的 failed 审计样例把超时从 `files()`
 挪到 `torrents()`：那个 hash 本就不在种子列表里，如今直接认作"已不在"。
+
+## 3. 删掉零调用方的 `grabber.add_and_name`
+
+`add_and_name`（加种 → 等元数据 30 秒 → 改名 → 无条件改显示名）零调用方：本地两份克隆、
+tests / tools / deploy、生产机上全部 `*.py` / `*.sh` 都查过（grab 调研 §2）。在用的是
+`_op_grab_episode` → `_rename_grabbed`（等 10 秒、只在分季集号与库内不一致时改显示名）。
+`grabber.py` 的模块文档却说它是"加种子的唯一入口"。两条路径并存，占用闸门只接一条
+等于没接，所以删掉，并把文档改成实情：加种的唯一 HTTP 入口是 `QBitClient.add_torrent`
+（调用方 `_op_grab_episode` 与回退的 `readd_torrent`），`grabber` 只放加种之后的两步。

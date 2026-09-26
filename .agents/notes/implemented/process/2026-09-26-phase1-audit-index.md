@@ -63,6 +63,7 @@
 
 | 编号 | 是什么 |
 |---|---|
+| §2 | 调用关系核查：`grabber.add_and_name` 零调用方（本地两份克隆、tests / tools / deploy、生产机全部 `*.py` / `*.sh`），它的模块文档却自称"加种子的唯一入口"；真正的入口是 `QBitClient.add_torrent` |
 | §5 | "两个种子一个路径"的闸门规格：盘上 `X` / `X.!qB` + qBittorrent 里别的种子的条目，NFC + casefold 比较，豁免问的人自己；接到抓取后改名、`_op_rename`、relink 等所有写路径。实现见 `architecture/2026-09-26-path-claims.md` |
 | S1 | 停滞放行换源：旧种子停滞超过 `DEAD_TORRENT_HOURS`，抓取放行新源；抓取（op 0）早于死种摘除（op 1），新种子被即时改名到旧种子仍声明、盘上还有它 `X.!qB` 的集位名上 |
 | S3 | 与 AutoBangumi 赛跑：诊断之后、加种之前 AB 下完并改名到 X；新种子被映射到 X，完成时 `X.!qB → X` 撞 EEXIST，偏好的版本（如邪竜解放版）作为孤儿 `.!qB` 静默留下 |

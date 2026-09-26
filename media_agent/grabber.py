@@ -1,4 +1,4 @@
-"""加种子并在**下载过程中**就把它改成规范名。
+"""抓取加种之后的两步：等元数据、在**下载过程中**就把正片改成规范名。
 
 **为什么必须在下载中改，而不是下完再改**：从加种子到下载完成这段时间里，
 文件在磁盘上叫的是发布名。这段时间内——
@@ -13,10 +13,13 @@
 `torrents/files` 有内容的那一刻就能 `renameFile`，此时文件可能一个字节
 都还没下。qBittorrent 会把后续分片直接写进新名字。
 
-**这是加种子的唯一入口。** 2026-09-15 审计发现同一件事散落在三处手写
-HTTP（`actions.py` 两处 `torrents/add`、一处 `torrents/rename`），
-会话里的临时脚本又抄了四五份，各自的等待时长、409 处理、是否改显示名
-都不一样。
+**加种子本身不在这里。** 唯一的 HTTP 入口是 `QBitClient.add_torrent`
+（2026-09-15 把 `actions.py` 里两处手写的 `torrents/add` 收了进去），调用方只有
+`Executor._op_grab_episode` 与回退的 `readd_torrent`。这里原先还有一个
+"加种 → 等元数据 → 改名 → 改显示名"一条龙的 `add_and_name`，模块文档称它是
+"加种子的唯一入口"——实际零调用方（本地两份克隆、tests / tools / deploy、生产机
+全部 `*.py` / `*.sh` 都查过），与在用的路径还各有一套等待时长与改显示名的规则。
+2026-09-26 删除：两条路径并存，闸门只接一条等于没接。
 """
 from __future__ import annotations
 
@@ -70,44 +73,3 @@ def rename_single_video(qbit, torrent_hash: str, target_stem: str,
         return None
     qbit.rename_file(torrent_hash, cur, want)
     return want
-
-
-def add_and_name(qbit, source: bytes | str, *, torrent_hash: str,
-                 target_stem: str, save_path: str, category: str = "",
-                 tags: str = "", metadata_timeout: float = 30.0,
-                 rename_torrent: bool = True, log=None) -> dict:
-    """加种子 → 等元数据 → 改文件名 → 改种子显示名。一条龙，失败不致命。
-
-    `torrent_hash` 必须由调用方给出（.torrent 可以算 infohash，磁力链里带着），
-    因为 `torrents/add` 不返回 hash。
-
-    `rename_torrent` 控制是否同时改**显示名**。改它是为了让 AutoBangumi
-    对这个种子的解析结果和我们一致——AB 读种子名不读文件名。自己抓的种子
-    已经落在独立分类里、AB 看不见，但改了没坏处；由别的渠道加进来的就必须改。
-
-    返回 `{"added", "renamed", "torrent_renamed", "error"}`，不抛异常：
-    改名失败不该让"已经下起来了"这件事算失败，下一轮规则会兜底。
-    """
-    out = {"added": False, "renamed": None, "torrent_renamed": False, "error": ""}
-    try:
-        out["added"] = qbit.add_torrent(
-            source, save_path=save_path, category=category, tags=tags)
-    except Exception as e:
-        out["error"] = "加种子失败: %s" % e
-        return out
-
-    try:
-        files = wait_metadata(qbit, torrent_hash, timeout=metadata_timeout)
-        if not files:
-            out["error"] = ("元数据未在 %.0f 秒内到达（多半是连不上 peer），"
-                            "改名交给 unrenamed-file 兜底" % metadata_timeout)
-            return out
-        out["renamed"] = rename_single_video(qbit, torrent_hash, target_stem, files)
-        if rename_torrent:
-            qbit.rename_torrent(torrent_hash, target_stem)
-            out["torrent_renamed"] = True
-    except Exception as e:
-        out["error"] = "改名失败（下一轮会补）: %s" % e
-        if log:
-            log("[grab] %s" % out["error"])
-    return out
