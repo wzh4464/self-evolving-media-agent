@@ -203,11 +203,13 @@ def find_stuck(state_dir, run_id: str, *, min_runs: int, acks: dict | None = Non
     today = today or datetime.now().date()
     history_ = runs[:idx + 1]
     current = {r["fp"]: r for r in history_[-1].findings if r.get("fp") and qualifies(r)}
+    # 每份快照里"算数"的指纹先收成集合：逐条比会是 发现数² × 轮数，库里一乱（几千条）就是上亿次比较
+    present = [{r.get("fp") for r in snap.findings if qualifies(r)} for snap in history_]
     out: list[Stuck] = []
     for fp, rec in current.items():
         streak, first = 0, history_[-1]
-        for snap in reversed(history_):
-            if not any(r.get("fp") == fp and qualifies(r) for r in snap.findings):
+        for snap, fps in zip(reversed(history_), reversed(present)):
+            if fp not in fps:
                 break
             streak, first = streak + 1, snap
         if streak < min_runs:
