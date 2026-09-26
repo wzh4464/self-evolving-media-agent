@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import time
@@ -17,6 +18,57 @@ from pathlib import Path
 
 from .kernel import Action, Context, Finding, repath, under
 from .naming import parse_episode
+
+
+# ---------------- 路径参数校验（逆操作 / 删除类动作共用）----------------
+#
+# 出处：critic N1 / LAT-02。`restore_from_trash` 曾写成
+# `Path(u.get("trash_path") or "")`——空串变成 `Path('.')`，它是真值、
+# 而且"存在"，于是 `shutil.move('.', dst)`：`os.rename('.')` 报 EINVAL，
+# shutil 退回 `copytree(当前目录 → 媒体库)` 再 `rmtree(当前目录)`。
+# 2026-09-26 在 scratchpad 复现：cwd 里的 state/audit.jsonl、源码全部被拷进
+# 一个叫 `… S01E12.mp4` 的目录，cwd 被清空。生产上 6 条审计记录的
+# `trashed_to` 是 null（20260830T132317、20260908T022758 ×3、
+# 20260908T143348、20260920T170126），离一次手动 rollback 只差一步——
+# 而手动 rollback 的 cwd 正是项目目录（.venv、.env、14GB 隔离区）。
+#
+# 所以任何从审计记录里读回来的路径，动手前一律过这里：非空、绝对、
+# 已规范化（不含 `.`/`..`）、落在允许的根之下且不是根本身。
+def _inside(value, root: Path, what: str) -> tuple[Path | None, str | None]:
+    """`value` 必须是 `root` 之下（不含 `root` 本身）的规范绝对路径。
+
+    返回 `(规范化后的路径, None)`，或 `(None, 拒绝原因)`。
+    """
+    s = value if isinstance(value, str) else ("" if value is None else str(value))
+    if not s:
+        return None, f"{what} 为空"
+    if "\0" in s or not os.path.isabs(s):
+        return None, f"{what} 不是绝对路径：{s!r}"
+    norm = os.path.normpath(s)
+    if norm != s.rstrip("/"):
+        return None, f"{what} 含 . 或 .. 等未规范化的部分：{s!r}"
+    p, r = Path(norm), Path(os.path.normpath(str(root)))
+    if p == r or not under(p, r):
+        return None, f"{what} 不在允许的根 {r} 之下：{s!r}"
+    return p, None
+
+
+def _bad_name(name, what: str) -> str | None:
+    """单个路径分量（文件名 / 目录名）是否合法；合法返回 None。"""
+    if not isinstance(name, str) or not name.strip():
+        return f"{what} 为空"
+    if "/" in name or "\0" in name or name in (".", ".."):
+        return f"{what} 不是单个路径分量：{name!r}"
+    return None
+
+
+def _bad_rel(rel, what: str) -> str | None:
+    """种子内相对路径（renameFile 的参数）是否合法；合法返回 None。"""
+    if not isinstance(rel, str) or not rel.strip() or "\0" in rel:
+        return f"{what} 为空"
+    if rel.startswith("/") or ".." in Path(rel).parts:
+        return f"{what} 越出种子根目录：{rel!r}"
+    return None
 
 
 @dataclass
@@ -987,14 +1039,95 @@ class Executor:
                 out.append(rec)
         return out
 
+    def _undo_problem(self, u: dict) -> str | None:
+        """逆操作的参数是否合法；合法返回 None，否则返回拒绝原因。
+
+        审计记录是**历史数据**：写它的代码可能有 bug（6 条 `trash_path` 为空
+        的记录就是 `_op_trash` 先删种子、后查文件留下的），也可能被手工改过。
+        回退又是最危险的时刻——它照着记录去搬文件、改种子。所以每个逆操作
+        都先核对自己的输入，形状不对就拒绝并说明原因，绝不"尽力而为"。
+        """
+        op = u.get("op")
+        media = Path(self.cfg.media_root)
+
+        def lib_path(key: str) -> str | None:
+            return _inside(u.get(key), media, key)[1]
+
+        if op == "restore_from_trash":
+            return (_inside(u.get("trash_path"), self.cfg.trash_dir, "trash_path")[1]
+                    or lib_path("path"))
+        if op == "rename":
+            return lib_path("path") or _bad_name(u.get("new_name"), "new_name")
+        if op == "rename_show_dir":
+            why = lib_path("path") or _bad_name(u.get("new_name"), "new_name")
+            if why:
+                return why
+            for pair in u.get("torrent_savepaths") or []:
+                if not (isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0]):
+                    return f"torrent_savepaths 条目不合法：{pair!r}"
+                why = _inside(pair[1], media, "torrent_savepaths 的 save_path")[1]
+                if why:
+                    return why
+            prev = u.get("prev_savepath")
+            if prev and not os.path.isabs(str(prev)):
+                return f"prev_savepath 不是绝对路径：{prev!r}"
+            return None
+        if op in ("restore_sidecar", "ungrab_episode"):
+            why = lib_path("show_dir")
+            if why:
+                return why
+            if op == "ungrab_episode":
+                try:
+                    int(u["season"]), int(u["episode"])
+                except (KeyError, TypeError, ValueError):
+                    return "season / episode 缺失或不是整数"
+            return None
+        if op in ("restore_title_aliases", "restore_rss_link"):
+            if not u.get("bangumi_id"):
+                return "缺 bangumi_id"
+            if not self.ctx.abdb:
+                return "AutoBangumi 数据库不可用"
+            return None
+        if op == "readd_torrent":
+            magnet = u.get("magnet") or ""
+            if not (isinstance(magnet, str) and magnet.startswith("magnet:?")
+                    and "xt=urn:btih:" in magnet):
+                return f"magnet 不合法：{magnet!r}"
+            if u.get("save_path"):
+                return lib_path("save_path")
+            return None
+        if op == "relink_torrent":
+            if not u.get("torrent_hash"):
+                return "缺 torrent_hash"
+            for m in u.get("mapping") or []:
+                why = (_bad_rel((m or {}).get("old"), "mapping.old")
+                       or _bad_rel((m or {}).get("new"), "mapping.new"))
+                if why:
+                    return why
+            if u.get("new_save_path"):
+                return lib_path("new_save_path")
+            return None
+        if op in ("recategorize", "remove_tags"):
+            if not u.get("torrent_hash"):
+                return "缺 torrent_hash"
+            if op == "remove_tags" and not u.get("tags"):
+                return "缺 tags"
+            return None
+        return None
+
     def _apply_undo(self, u: dict) -> tuple[bool, str]:
         """执行一条逆操作。返回 (是否成功, 跳过原因)。"""
-        op = u["op"]
+        op = u.get("op")
+        bad = self._undo_problem(u)
+        if bad:
+            return False, f"逆操作参数不合法，拒绝执行（{op}）：{bad}"
 
         if op == "rename":
             cur = Path(u["path"])
             if not cur.exists():
                 return False, f"当前文件不存在，可能已被再次改名：{cur.name}"
+            if cur.is_dir():
+                return False, f"逆改名的对象是目录而不是文件，拒绝：{cur}"
             back = cur.parent / u["new_name"]
             if back.exists():
                 return False, f"还原目标已存在：{back.name}"
@@ -1143,11 +1276,17 @@ class Executor:
             return True, ""
 
         if op == "restore_from_trash":
-            src = Path(u.get("trash_path") or "")
-            dst = Path(u.get("path") or "")
-            if not src or not src.exists():
+            # 路径形状已由 _undo_problem 核过（绝对、规范、分别在隔离区 / 媒体库之下）
+            src = Path(os.path.normpath(u["trash_path"]))
+            dst = Path(os.path.normpath(u["path"]))
+            if not os.path.lexists(src):
                 return False, "隔离区文件已不存在（可能已过保留期被清理）"
-            if dst.exists():
+            if src.is_dir() or not src.is_file():
+                # 隔离区里只该有单个文件。是目录就说明当初移进来的是整个目录
+                # （死种按 content_path 删过整季目录的形态），整体搬回会和
+                # 此后长出来的新内容搅在一起，交给人看。
+                return False, f"隔离区里的不是普通文件，拒绝整体搬回：{src}"
+            if os.path.lexists(dst):
                 return False, f"原位置已被占用：{dst.name}"
             if self.dry_run:
                 return True, ""
@@ -1173,9 +1312,13 @@ class Executor:
             if rec.get("status") != "applied" or rec.get("op") != "rename_show_dir":
                 continue
             u = rec.get("undo") or {}
-            new = Path(u.get("path", ""))
-            old = new.parent / u.get("new_name", "")
-            if old.exists() and new.exists() and old != new:
+            # 与回退同一道闸（critic N1）：空 path 会让 new = Path('.')、
+            # old = cwd 下的相对目录，_merge_tree 就在运维者的当前目录里搬文件。
+            new, why = _inside(u.get("path"), Path(self.cfg.media_root), "path")
+            if why or _bad_name(u.get("new_name"), "new_name"):
+                continue
+            old = new.parent / u["new_name"]
+            if old.is_dir() and new.is_dir() and old != new:
                 pairs.append((old, new))
 
         results = []
