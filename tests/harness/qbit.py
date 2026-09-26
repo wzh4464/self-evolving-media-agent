@@ -40,8 +40,9 @@ _BTIH = re.compile(r"xt=urn:btih:([0-9A-Za-z]+)")
 
 class _Fault:
     def __init__(self, method: str, torrent_hash: str | None, exc: BaseException,
-                 times: int | None):
+                 times: int | None, after: bool = False):
         self.method, self.hash, self.exc, self.times = method, torrent_hash, exc, times
+        self.after = after
 
 
 def _qb_path_ok(rel: str) -> bool:
@@ -91,9 +92,11 @@ class FakeQbit:
         self._trip("qbit_error", str(e))
         return e
 
-    def _maybe_fail(self, method: str, torrent_hash: str | None = None) -> None:
+    def _maybe_fail(self, method: str, torrent_hash: str | None = None, *,
+                    after: bool = False) -> None:
         for f in list(self._faults):
-            if f.method != method or (f.hash is not None and f.hash != torrent_hash):
+            if (f.method != method or f.after != after
+                    or (f.hash is not None and f.hash != torrent_hash)):
                 continue
             if f.times is not None:
                 f.times -= 1
@@ -312,14 +315,19 @@ class FakeQbit:
         self._set_progress(t, 1.0)
 
     def fail(self, method: str, *, hash: str | None = None,
-             exc: BaseException | None = None, times: int | None = 1) -> None:
+             exc: BaseException | None = None, times: int | None = 1,
+             after: bool = False) -> None:
         """故障注入：下 `times` 次（None = 一直）调用 `method`（可限定某个 hash）时抛 `exc`。
 
         默认异常是 `httpx.ReadTimeout`——生产上 qBit WebUI 超时就是这个形态
         （2026-09-19/20 三次登录超时，run.err.log）。
+
+        `after=True`：**改动照常生效之后**再抛——qBittorrent 已经处理了请求、响应却没回来
+        （2026-09-14 run 20260914T100214 的 `renameFile` 读超时就是这样：qBit 其实改了名）。
+        只对写方法有意义。
         """
         self._faults.append(_Fault(method, hash.lower() if hash else None,
-                                   exc or httpx.ReadTimeout("timed out (injected)"), times))
+                                   exc or httpx.ReadTimeout("timed out (injected)"), times, after))
 
     def drain(self) -> None:
         """完成所有挂起的 setLocation（`async_moves`）与删除（`async_deletes`）。"""
@@ -392,6 +400,7 @@ class FakeQbit:
                       magnet_uri=f"magnet:?xt=urn:btih:{h}&dn={name}")
         # libtorrent 加种时会检查已存在的文件（没有 resume data 就查盘）
         self._set_progress(t, self._disk_progress(t) if files else 0.0, paused=paused)
+        self._maybe_fail("add_torrent", after=True)
         return True
 
     def rename_torrent(self, torrent_hash: str, name: str) -> None:
@@ -399,6 +408,7 @@ class FakeQbit:
         self.calls.append(("rename_torrent", h, name))
         self._maybe_fail("rename_torrent", h)
         self._get(h, "torrents/rename")["name"] = name
+        self._maybe_fail("rename_torrent", h, after=True)
 
     def rename_file(self, torrent_hash: str, old_path: str, new_path: str) -> None:
         h = torrent_hash.lower()
@@ -415,6 +425,7 @@ class FakeQbit:
         self._move(src, dst)
         self._move(Path(str(src) + ".!qB"), Path(str(dst) + ".!qB"))
         entry["name"] = new_path                   # 注意：t["name"] 不变
+        self._maybe_fail("rename_file", h, after=True)
 
     def _do_move(self, t: dict, location: str) -> None:
         old = Path(t["save_path"])
@@ -438,6 +449,7 @@ class FakeQbit:
                 self._pending_moves.append((h, location))
             else:
                 self._do_move(t, location)
+            self._maybe_fail("set_location", h, after=True)
 
     def set_category(self, hashes: list[str], category: str) -> None:
         hs = [h.lower() for h in hashes]
@@ -449,6 +461,8 @@ class FakeQbit:
         for h in hs:
             if h in self._t:
                 self._t[h]["category"] = category
+        for h in hs:
+            self._maybe_fail("set_category", h, after=True)
 
     def remove_categories(self, categories: list[str]) -> None:
         self.calls.append(("remove_categories", tuple(categories)))
@@ -457,6 +471,7 @@ class FakeQbit:
             if t["category"] in categories:
                 t["category"] = ""                  # 分类没了，种子变"无分类"而非被删
         self.categories -= set(categories)
+        self._maybe_fail("remove_categories", after=True)
 
     def add_tags(self, hashes: list[str], tags: str) -> None:
         hs = [h.lower() for h in hashes]
@@ -465,6 +480,7 @@ class FakeQbit:
             self._maybe_fail("add_tags", h)
             if h in self._t:
                 self._t[h]["tags"] |= self._norm_tags(tags)
+            self._maybe_fail("add_tags", h, after=True)
 
     def remove_tags(self, hashes: list[str], tags: str) -> None:
         hs = [h.lower() for h in hashes]
@@ -473,6 +489,7 @@ class FakeQbit:
             self._maybe_fail("remove_tags", h)
             if h in self._t:
                 self._t[h]["tags"] -= self._norm_tags(tags)
+            self._maybe_fail("remove_tags", h, after=True)
 
     def set_file_priority(self, torrent_hash: str, ids: list[int], priority: int) -> None:
         h = torrent_hash.lower()
@@ -484,6 +501,7 @@ class FakeQbit:
             raise self._err(409, "torrents/filePrio", "File IDs are not valid")
         for i in ids:
             idx[i]["priority"] = int(priority)     # use_unwanted_folder=False：文件留在原地
+        self._maybe_fail("set_file_priority", h, after=True)
 
     def recheck(self, hashes: list[str]) -> None:
         hs = [h.lower() for h in hashes]
@@ -493,6 +511,7 @@ class FakeQbit:
             t = self._t.get(h)
             if t is not None:
                 self._set_progress(t, self._disk_progress(t))
+            self._maybe_fail("recheck", h, after=True)
 
     def delete(self, hashes: list[str], delete_files: bool) -> None:
         hs = [h.lower() for h in hashes]
@@ -501,8 +520,9 @@ class FakeQbit:
             self._maybe_fail("delete", h)
             if self.async_deletes:
                 self._pending_deletes.append((h, bool(delete_files)))
-                continue
-            self._do_delete(h, delete_files)
+            else:
+                self._do_delete(h, delete_files)
+            self._maybe_fail("delete", h, after=True)
 
     def _do_delete(self, h: str, delete_files: bool) -> None:
         t = self._t.pop(h, None)

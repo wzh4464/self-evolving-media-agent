@@ -99,3 +99,31 @@ rollback；574 行（2026-08-17 上午）没有 `run_id` 也没有 `undo`；4 �
 `rollback --last` / `find_failure_patterns` / `_read_audit`；抓取 `add_torrent` 之后 NameError 记 unknown、
 之前抛异常仍是 failed；回退带逆操作的 unknown（生效了的还原、没生效的不动）；unknown 的隔离交给人；
 unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
+
+## 4. 改动调用出错之后按此刻状态核实（`_settle`）：改名、标签、分类
+
+**现场**：生产 2026-09-14 run 20260914T100214，`Enticing.Circuit…mkv → 二十世纪电气目录 S01E11.mkv` 的
+`renameFile` 读超时——qBittorrent 其实改了名。审计记 failed、没有逆操作：这次改名回退不了，那个集位此后
+一直"被占"，2026-09-20 起每轮一条「集位被占」。qBittorrent WebUI 的超时（2026-09-19/20 又三次）常常就发生在
+它处理完请求之后。
+
+**修法**：`Executor._settle(f, a, err, probe, what=, undo=, extra=)`——改动调用抛了异常，问一次此刻的状态：
+
+| `probe()` | 记什么 |
+|---|---|
+| True：生效了 | 照常走完、记 `applied`，带逆操作；那个异常进 `confirmed_after_error` |
+| False：与动手前一致 | `failed`，`effect` 写明"按此刻状态核实：没有生效"，不带逆操作 |
+| None：对不上（部分生效 / 被别人同时改了） | `unknown`，带"如果生效了该怎么撤" |
+| 自己抛异常：读不到 | `unknown`，`reason` 写明复核也失败 |
+
+这一节接上的核实（都读**此刻**的 qBittorrent，不走占用索引的缓存）：
+
+- 改名（`renameFile`）：种子条目里是新名字 / 原名（`_rename_landed`）；纯本地文件的 `Path.rename`：
+  盘上源 / 目标谁在（`_fs_moved`）。
+- `retag`：标签都在 / 都不在（`_tags_landed`）；`recategorize`：分类是新的 / 原来的（`_category_landed`）。
+- `relocate`（只有演进规则会产出，分派处已拦）：`save_path` 是目标、或 `state == moving`（qBittorrent 5.2.3
+  对有元数据的种子排异步搬运，`save_path` 搬完才变，`moving` 在处理请求时就置上——与正常返回同一口径）。
+
+**测试**：`tests/test_effect_recheck.py`。FakeQbit 新增 `fail(..., after=True)`：改动照常生效之后再抛
+（"响应丢了"）；默认仍是"请求没到"。生产那次改名原样：记 applied、带逆操作、能回退；请求没到：failed；
+改完之后 qBittorrent 读不到：unknown、带逆操作，回退照样还原；状态对不上：unknown。
