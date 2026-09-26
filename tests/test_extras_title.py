@@ -119,3 +119,54 @@ def test_extra_inside_a_pinned_pack_is_still_an_extra(lib):
     [f] = lib.diagnose(detectors=[ExtrasDetector])
 
     assert f.path == str(ncop)
+
+
+# ------------------------------------------------------------------ 标题判据在每个检测器里都要起作用
+# 2026-09-26 审查：把 `is_extra_of` 的剧名剥离关掉、去掉词边界、或让任一检测器回到整名匹配，全套测试
+# 照样全绿（D09 / D10 / D14–D16b）——上面的现场每集只有一份，特典规则的"唯一一份"兜底把它们都掩护了。
+def test_two_copies_of_an_episode_in_a_marker_titled_show_are_a_duplicate_not_extras(lib):
+    """同一集两份：兜底不再掩护（另一份就在那），整名匹配的特典规则会把真正的一集当特典隔离，
+    整名匹配的判重则看不见这对重复。"""
+    s1, eps = _menu_show(lib)
+    v2 = s1.local(f"{TITLE} S01E01 [v2].mkv", size=GB)
+
+    c = lib.cycle()
+
+    assert [r for r in c.applied("trash") if r["rule"] == "extras-in-library"] == []
+    [dup] = [r for r in c.applied("trash") if r["rule"] == "duplicate-episode"]
+    assert dup["args"]["path"] in (str(eps[0].path), str(v2))
+    assert len([p for p in s1.path.glob(f"{TITLE} S01E01*.mkv")]) == 1
+    assert all((s1.path / f"{TITLE} S01E{n:02d}.mkv").exists() for n in (2, 3))
+
+
+def test_a_release_carrying_the_marked_title_is_still_renamed(lib):
+    from media_agent.plugins.builtin import UnrenamedDetector
+
+    s1 = lib.show(TITLE).season(1)
+    t = s1.single(f"[G] {TITLE} - 04 [1080p].mkv", size=GB)
+
+    [f] = lib.diagnose(detectors=[UnrenamedDetector])
+
+    assert f.path == str(t.path) and f.action.args["new_name"] == f"{TITLE} S01E04.mkv"
+
+
+def test_two_releases_of_a_marker_titled_show_racing_for_one_name_are_reported(lib):
+    from media_agent.plugins.builtin import RenameCollisionDetector
+
+    s1 = lib.show(TITLE).season(1)
+    s1.single(f"[A] {TITLE} - 04 [1080p].mkv", size=GB)
+    s1.single(f"[B] {TITLE} - 04 [720p].mkv", size=GB)
+
+    [f] = lib.diagnose(detectors=[RenameCollisionDetector])
+
+    assert f.evidence["target"] == f"{TITLE} S01E04.mkv"
+
+
+@pytest.mark.parametrize("name,title", [
+    ("NCOP.mkv", "OP"),                     # 标题 `OP` 不能把 NCOP 里的 OP 拿掉
+    ("K [Tokuten][01].mkv", "K"),           # 标题 `K` 不能把 tokuten / mkv 里的 k 拿掉
+])
+def test_the_title_is_only_removed_on_word_boundaries(name, title):
+    from media_agent.naming import is_extra_of
+
+    assert is_extra_of(name, [title]) is True
