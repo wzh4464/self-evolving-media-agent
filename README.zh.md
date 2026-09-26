@@ -194,9 +194,11 @@ media_agent/
   naming.py       集号解析、归一化、画质排序——每一行都是踩出来的
   dedup.py        内容哈希（大小 + 头尾 8MB）
   scan.py         磁盘 + qBittorrent + AutoBangumi → 统一的 LibraryState
-  plugins/        九条内置检测器
+  plugins/        内置检测器
   actions.py      执行器 + 隔离区 + 配额 + 审计日志
   converge.py     一轮之内收敛：扫描 → 诊断 → 执行到不动点，不重试、不来回改
+  grabmode.py     每 30 分钟的抓取模式：同一套机器，只抓取、接手 AB 订阅、给自己抓的收尾
+  subscribe.py    media-agent subscribe：不经 AutoBangumi 订阅一季
   titles.py       TMDB 标题稳定闸：新标题连看两轮才采用，30 天内不改回去
   evolution.py    残留 → 提议 → 影子验证 → 提升
 .agents/

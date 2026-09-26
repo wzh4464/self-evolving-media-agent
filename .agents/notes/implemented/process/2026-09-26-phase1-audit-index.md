@@ -23,7 +23,7 @@
 | N7 | `Finding.key()` = `(kind, path)`：同一目录两个死种的 `content_path` 相同，第二条被去重吞掉 | 3ef6825；删除关口按目标（路径 + hash）复核、不按 key，680962b 起 |
 | N8 | 隔离区与媒体在同一个 APFS 容器（约 94% 满）：隔离不腾空间，跨卷搬运是先拷后删，磁盘满时搬到一半失败 | 第 2 阶段：容量闸 `MIN_FREE_GB` 86b1cc5；搬进 / 搬出隔离区先看放不放得下 1a3e5c6。见 `architecture/2026-09-26-quarantine-disposal.md`。余项（写审计本身在磁盘满时抛异常，冲出 `apply()`、整轮连隔离区处置一起中止）：第 3 阶段 105aeee；搬到一半失败的结局按盘上状态认 d6d7d6b |
 | N9 | 每个检测器各开一个 sqlite 连接（默认 5 秒忙等）：第二个进程并发时"database is locked"在检测器里抛出、被 Registry 吞掉，诊断静默地少一截（判重在出错之后的桶全丢） | 第 3 阶段：`Registry.errors` 记下每个被吞的异常，见 `architecture/2026-09-26-run-health.md` 第 4 节；并发本身由运行锁 0b5a02e 排除 |
-| N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒） | 0b5a02e |
+| N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒）；以后每 1800 秒的抓取会每 6 小时与 `run` 对齐 | 0b5a02e；第 5 阶段的抓取与 `run` 同一秒起来时，`run` 等锁 300 秒（`runlock.RUN_WAIT`），见 `architecture/2026-09-27-grab-mode.md` |
 | N11 | 没有结构化的发现历史：无动作的发现只以文字进 run.log；没有路径的发现去重键退回 `(show, summary)`，摘要里嵌着计数，跨轮认不出同一个问题——"卡住"检测无从谈起 | 第 3 阶段：发现历史与稳定指纹（`history.py`），见 `architecture/2026-09-26-run-health.md` 第 1 节 |
 | N12 | 回退只写一条汇总：逐步还原了什么没有审计，健康摘要看不见回退改了什么 | 第 3 阶段 8c901f5（逐步记录；回退记录不带逆操作，回退不能再回退）。见 `architecture/2026-09-26-honest-audit.md` 第 8 节 |
 | N13 | 抓取对 AB 带 `episode_offset` 的番无能为力而且不出声：候选按发布的原始集号归拢，只换算声明了季号的偏移；目标集在归拢表里没有时直接 `continue`，不报任何发现。生产上只影响一条有效订阅：AB 37《超超超超超喜欢你的100个女朋友》第三季（`-24`）；退役 AB 会让这部番无声地停抓 | 第 5 阶段：集号偏移记进 sidecar 的 `episode_offsets`、一处口径（`builtin.episode_offset_for`），抓取按它换算、归拢表里什么都没有的集报 `episode_numbering_mismatch` / `episode_not_released`，见 `architecture/2026-09-27-episode-offsets.md` |
@@ -38,6 +38,7 @@
 | §3.2 | 任何定点循环之前先保证快照新鲜：清 `ctx._tfile_cache` 与 `builtin._OFFSET_CACHE`、扫描读 qBittorrent 按种子 fail closed（N2）——否则第二次诊断把改名前的条目名当成幻影、改名后的真文件当成本地文件 | 第 1 阶段 d40e506、5fde004；第 4 阶段的循环依赖它，见 `architecture/2026-09-27-converge-within-a-run.md` |
 | §3.3 | 定点循环之前先处理死种：不再隔离 `content_path`（NoSubfolder 种子就是整季目录）、停滞按最后一次活动算而不是加入时间；否则循环会把"relink → recheck → stalledDL → 死种"从 6 小时缩到几秒 | 3ef6825（只摘记录、按停滞时长判死）；第 4 阶段 `converge` 对本轮刚 relink / 搬存储过的种子暂缓死种处置，见 `architecture/2026-09-27-converge-within-a-run.md` |
 | §3.12 | 定点循环的前提：一个执行器（配额、`_grabbed`、批次 ID）、反向动作闸、一轮之内"失败过的不再试"的备忘——否则每次迭代都再撞一次 B2 的 404 与「集位被占」、多写一条审计 | 第 4 阶段 `media_agent/converge.py`，见同一篇 |
+| §4 | 会打破用户依赖的计划项：用户**通过 AutoBangumi 订阅**（`autobangumi-subscribe-verify` 流程，生产 35 条有效订阅、38 个启用的 RSS），退役 AB 的下载而没有 `media-agent subscribe`，新番与新季就不再来；另外失去的是集号偏移的番（N13）、AB 15 分钟的 RSS 与 60 秒的改名、sidecar 里还没有季键的季 | 第 5 阶段：AB 仍是订阅前端，`ab-adoption` 接手它的每条订阅（建目录、登记订阅、迁偏移，`architecture/2026-09-27-ab-adoption.md`）；`subscriptions` 与 `media-agent subscribe`、开播的新一季自动登记（`architecture/2026-09-27-subscriptions.md`）；每 30 分钟的抓取模式（`architecture/2026-09-27-grab-mode.md`） |
 
 ## testinfra：离线测试基座的调研（原型发现的 bug）
 
@@ -69,7 +70,7 @@
 | B5 | TMDB 解析失败造成的跨轮来回改名（鬼物语，即 LAT-04）。跨轮的由身份钉住 + 标题稳定闸处理；一轮之内的来回由 `converge` 的反向动作闸拒绝、报 `oscillation` |
 | §8a | 定点循环的设想里对"永远被跳过的动作"的统计：`rename_show_dir`「目标目录已存在」连续 53 轮、「集位被占」28 轮（到 2026-09-24）、`delete_category`「仍有种子」反复出现——每轮单独看都只是一条 skipped |
 | §8b | 每轮健康摘要该收的信号：客户端状况、检测器崩溃数、发现按严重度、执行结果、演进与处置结果、`find_failure_patterns`（当时只在 `cmd_evolve` 里调用）；外加 try/finally 让崩溃的一轮也有摘要。第 3 阶段的健康报告，见 `architecture/2026-09-26-run-health.md` 第 6 节 |
-| §8c | 设想中的"每 30 分钟只抓取"模式：必须与 `run` 共用一把锁，否则落在 `run` 诊断与执行之间的抓取会被诊断期的 sidecar 快照盖掉，同一集再抓一遍 |
+| §8c | 设想中的"每 30 分钟只抓取"模式：必须与 `run` 共用一把锁，否则落在 `run` 诊断与执行之间的抓取会被诊断期的 sidecar 快照盖掉，同一集再抓一遍——第 5 阶段 `media-agent grab`，见 `architecture/2026-09-27-grab-mode.md` |
 
 ## deploy 调研
 
@@ -83,6 +84,15 @@
 | 编号 | 是什么 | 处理 |
 |---|---|---|
 | §10b | 让演进规则留在版本控制里、又不破坏加载：`load_rule_specs` 对读不了 / 格式不对的规则文件 `except Exception: continue`，一声不吭地少挂一条，应当报出来并补一个"每条规则都能加载"的测试 | 报出来：第 3 阶段 `load_rule_specs(errors=…)` / `Registry.load_errors`，见 `architecture/2026-09-26-run-health.md` 第 7 节；加载测试未做 |
+
+## ab 调研：AutoBangumi 的接触面与怎么安全地停掉它（第 5 阶段引用）
+
+| 编号 | 是什么 |
+|---|---|
+| §0 | 生产事实（2026-09-26 只读核对）：AB 3.2.6，35 条有效订阅（`deleted=0`）、2 条停用；只有 id 37（《超超超超超喜欢你的100个女朋友》第三季）有非 0 的 `episode_offset`（-24）；35 条都对得上一个有 sidecar、sidecar 里有 `tmdb_id` 与这一季的番目录，其中 14 份没有 `mikan_id` |
+| §5.1 | AB 每 15 分钟拉一次全部 RSS（`rss_time=900`），media-agent 每 6 小时一轮、番组页 feed 缓存 1 小时：AB 退役之后新集最坏晚 6 小时才抓 |
+| §5.2 | AB 每 60 秒改一次名（`Bangumi` 分类里下完的）；media-agent 只在抓取当场给单视频、10 秒内拿到元数据的发布改名，其余等下一轮（6 小时） |
+| §5.3 | 新番与新季的起点（"the biggest gap"）：media-agent 没有订阅命令，扫描只登记有文件的目录，抓取要 `tmdb_id` 与非空的 `seasons`、只迭代已有的季键——在别的什么（今天是 AB）放进第一个文件之前，新番 / 新一季永远不会被抓 |
 
 ## grab 调研：抓取链路（第 2 阶段引用）
 

@@ -229,9 +229,11 @@ media_agent/
   naming.py       Episode parsing, normalization, quality ranking — every line earned
   dedup.py        Content hashing (size + first/last 8 MB)
   scan.py         Disk + qBittorrent + AutoBangumi → one LibraryState
-  plugins/        The nine built-in detectors
+  plugins/        The built-in detectors
   actions.py      Executor + quarantine + caps + audit log
   converge.py     One run to a fixed point: scan → diagnose → execute, no retries, no flip-flops
+  grabmode.py     The 30-minute grab pass: same machinery, only grab / adopt AB subscriptions / finish its own grabs
+  subscribe.py    `media-agent subscribe`: subscribe to a season without AutoBangumi
   history.py      Findings history, fingerprints, stuck detection, acknowledgements
   titles.py       TMDB title stability: a new title needs two consecutive runs, no flip-back within 30 days
   health.py       Per-run health report, torrent-count plausibility
