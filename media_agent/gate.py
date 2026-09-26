@@ -38,7 +38,7 @@
 - 另外：**演进规则产出的删除一律不执行**（critic N5）。第 1 阶段在 `Executor._dispatch` 拦下
   所有演进动作，那道保留作纵深防御；删除的唯一执法点在这里（`screen`）。
 
-（施工中：I2、I3 与演进规则已接线；I1、I4 尚未接线。）
+（施工中：I1、I2、I3 与演进规则已接线；I4 尚未接线。）
 
 **看不全就拒绝**：qBittorrent 读失败（`ClaimsUnknown`）记 failed「无法确认…占用情况，未做任何
 改动」，与占用闸门同口径。
@@ -59,12 +59,14 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .claims import PARTIAL, ClaimsUnknown
+from .claims import PARTIAL, ClaimsUnknown, fold
 from .kernel import DSL_ORIGIN, Finding
-from .naming import VIDEO_EXTS, parse_episode, parse_pin, season_of_dir
+from .naming import (VIDEO_EXTS, explicit_slot, is_extra, parse_episode, parse_pin,
+                     season_of_dir)
 
 PREFIX = "删除关口："
 
@@ -145,14 +147,30 @@ def _is_video(p: Path) -> bool:
 
 
 def name_slot(p: Path, season_dir: str = "") -> tuple[int, int] | None:
-    """只凭名字（与所在季目录）认出的集位；认不出返回 None。不看偏移——关口宁可认少。"""
+    """只凭名字（与所在季目录——剧目录下的第一层）认出的集位；认不出返回 None。
+    不看集号偏移：关口宁可认少（认少了 I1 更严，不会更松）。"""
     sn, ep = parse_episode(_base(p).name)
     if ep is None:
         return None
     if sn is None:
-        sd = season_of_dir(season_dir or p.parent.name)
+        sd = season_of_dir(season_dir)
         sn = sd if sd is not None else 1
     return sn, ep
+
+
+def _show_dir(media_root: Path, p: Path) -> tuple[Path | None, str]:
+    """`p` 所在的剧目录与季目录名（剧目录下的第一层；直接在剧目录下为空串）。"""
+    try:
+        rel = p.relative_to(media_root)
+    except ValueError:
+        return None, ""
+    if len(rel.parts) < 2:
+        return None, ""
+    return media_root / rel.parts[0], (rel.parts[1] if len(rel.parts) > 2 else "")
+
+
+def _fmt(slot) -> str:
+    return "S%02dE%02d" % tuple(slot)
 
 
 def _slot_arg(v) -> tuple[int, int] | None:
@@ -191,7 +209,8 @@ def check_trash(ex, f: Finding, path: Path) -> Verdict:
     except ClaimsUnknown as e:
         return v.fail(f"无法确认种子文件列表与路径占用情况，未做任何改动：{e}")
     wanted = [e for e in entries if e.get("priority", 1) != 0]
-    describe(v, f, path, h, t, wanted)
+    media_root = Path(ex.cfg.media_root)
+    pin = describe(v, f, path, h, t, wanted, media_root)
 
     # ---- I3：种子的形状决定怎么处置它（先算出来，后面的检查都按它来）
     if t is not None:
@@ -219,18 +238,170 @@ def check_trash(ex, f: Finding, path: Path) -> Verdict:
     if chk.claimants:
         return v.refuse("I2", "另一个保留着的种子仍声明这个路径（" + chk.describe()
                         + "），删了它就少一个文件")
+
+    # ---- I1：不让任何集位变成零个可播文件（半成品、字幕不是可播的正片）
+    if _is_video(path) and not _is_partial(path):
+        try:
+            if v.keeper is not None:
+                why = _keeper_problem(ex, v, f, path, pin, media_root)
+            else:
+                why = _last_copy_problem(ex, v, path, pin, media_root)
+        except ClaimsUnknown as e:
+            return v.fail(f"无法确认保留方 / 同集其它文件的占用情况，未做任何改动：{e}")
+        if why:
+            return v.refuse("I1", why)
     return v
 
 
+def _keeper_problem(ex, v: Verdict, f: Finding, path: Path, pin, media_root: Path) -> str:
+    """点名了保留方（判重）：它此刻还替这个集位作保吗？返回拒绝理由，没问题返回空串。"""
+    from .actions import _inside
+    args = f.action.args
+    slot = v.slot
+    # 要删的这个此刻仍归这个集位（钉子、显式 SxxEyy 没变）
+    mine = pin or explicit_slot(path.name)
+    if slot and mine and tuple(mine) != tuple(slot):
+        return (f"要删的文件此刻归 {_fmt(mine)}，不是 {_fmt(slot)}——它已不是这一集的重复"
+                f"（诊断之后钉子或名字变了）")
+    kp, bad = _inside(args.get("keep_path"), media_root, "keep_path")
+    if bad:
+        return f"保留方路径不合法：{bad}"
+    if fold(kp) == fold(path):
+        return (f"保留方与要删的是同一个文件（{path.name}）——「保留 X，清理 X」："
+                f"两个种子声明同一路径时判重会把唯一的真文件当输家")
+    if fold(kp) in {fold(p) for p in ex._trashed_paths}:
+        return f"保留方 {kp.name} 本批次已被移进隔离区，{_fmt(slot) if slot else '这一集'} 会一个不剩"
+    kh = (args.get("keep_hash") or "").lower()
+    if kh and kh in ex._removed_torrents:
+        return f"保留方的种子 {kh[:8]} 本批次已被摘掉，它不再替这一集作保"
+    if not os.path.lexists(kp) or kp.is_symlink() or not kp.is_file():
+        return f"保留方 {kp.name} 此刻不在盘上（幻影，或诊断之后被挪走）"
+    if _is_partial(kp):
+        return f"保留方 {kp.name} 是半成品"
+    size = kp.stat().st_size
+    kpin = None
+    claims = ex._claims()
+    if kh:
+        kt = claims.torrent(kh)
+        if kt is None:
+            return f"保留方的种子 {kh[:8]} 已不在 qBittorrent 里"
+        prog = float(kt.get("progress") or 0)
+        if prog < 1:
+            return f"保留方的种子 {kh[:8]} 还没下完（{prog * 100:.1f}%）"
+        ke = _entry_at(kt, claims.entries(kh), kp)
+        if ke is None or ke.get("priority", 1) == 0:
+            return f"保留方的种子 {kh[:8]} 已不再声明 {kp.name}（改过名或设为不下载）"
+        if float(ke.get("progress", 1) or 0) < 1:
+            return f"保留方 {kp.name} 在种子里还没下完"
+        if size < int(ke.get("size") or 0):
+            return (f"保留方 {kp.name} 盘上只有 {size} 字节，比种子声明的 {ke['size']} 少"
+                    f"（截断或被替换）")
+        kpin = parse_pin(kt.get("tags") or "")
+    else:
+        want = int(args.get("keep_size") or 0)
+        if size <= 0 or size < want:
+            return (f"保留方 {kp.name} 盘上只有 {size} 字节，比诊断时的 {want} 少"
+                    f"（截断或被替换）")
+    ks = kpin or explicit_slot(kp.name)
+    if slot and ks and tuple(ks) != tuple(slot):
+        return f"保留方此刻归 {_fmt(ks)}，不是 {_fmt(slot)}（诊断之后钉子或名字变了）"
+    return ""
+
+
+def _last_copy_problem(ex, v: Verdict, path: Path, pin, media_root: Path) -> str:
+    """没点名保留方（特典、半成品、手写的删除）：要删的是不是某个集位唯一的可播文件。"""
+    slot = v.slot
+    if not slot:
+        return ""                             # 认不出集位：不是某一集的正片
+    if v.disposition in ("extras", "dead_partial") and not pin:
+        return ""                             # 明确的特典 / 半成品处置，且没钉 ma:
+    if other_holders(ex, path, slot, media_root):
+        return ""
+    why = f"{_fmt(slot)} 此刻只剩这一个可播文件"
+    if pin:
+        why += f"（种子钉着 ma:{_fmt(pin)}，是抓取器认定的正片）"
+    return why + "，删了这一集就没了"
+
+
+def other_holders(ex, path: Path, slot, media_root: Path) -> list[str]:
+    """同一部番里，除 `path` 之外此刻还能播 `slot` 这一集的文件。
+
+    算数的：剧目录下（不在 `.xxx` 隐藏目录里）的视频文件、不是半成品、不是特典、本批次没进
+    隔离区；有种子声明的要那个条目下完了、盘上大小不小于声明的（种子本批次已摘的按纯本地算）；
+    集位按种子的 `ma:` 钉子，没有就按名字。认不出集位的不算——宁可少算。
+    """
+    show_dir, _ = _show_dir(media_root, path)
+    if show_dir is None or not show_dir.is_dir():
+        return []
+    claims = ex._claims()
+    owners = _owners_under(claims, show_dir, ex._removed_torrents)
+    trashed = {fold(p) for p in ex._trashed_paths}
+    me = fold(path)
+    out = []
+    for p in sorted(show_dir.rglob("*")):
+        rel = p.relative_to(show_dir)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if p.is_symlink() or not p.is_file() or not _is_video(p) or _is_partial(p):
+            continue
+        fp = fold(p)
+        if fp == me or fp in trashed or is_extra(p.name):
+            continue
+        size = p.stat().st_size
+        hpin = None
+        claimers = owners.get(fp, [])
+        if claimers:
+            done = [(t, e) for t, e in claimers
+                    if float(e.get("progress", 0) or 0) >= 1 and size >= int(e.get("size") or 0)]
+            if not done:
+                continue
+            hpin = next((parse_pin(t.get("tags") or "") for t, _ in done
+                         if parse_pin(t.get("tags") or "")), None)
+        elif size <= 0:
+            continue
+        s = hpin or name_slot(p, rel.parts[0] if len(rel.parts) > 1 else "")
+        if s and tuple(s) == tuple(slot):
+            out.append(str(p))
+    return out
+
+
+def _owners_under(claims, show_dir: Path, removed) -> dict[str, list[tuple[dict, dict]]]:
+    """`{fold(路径): [(种子视图, 条目), …]}`：此刻在 `show_dir` 之下有优先级非 0 条目的种子。"""
+    fd = fold(show_dir)
+    out: dict[str, list[tuple[dict, dict]]] = {}
+    for h, t in claims.torrents().items():
+        if h in removed:
+            continue
+        sp = (t.get("save_path") or "").rstrip("/")
+        if not sp:
+            continue
+        fsp = fold(sp)
+        if not (fsp == fd or fsp.startswith(fd + "/") or fd.startswith(fsp + "/")):
+            continue
+        for e in claims.entries(h):
+            if e.get("priority", 1) == 0:
+                continue
+            out.setdefault(fold(Path(sp) / e["name"]), []).append((t, e))
+    return out
+
+
 def describe(v: Verdict, f: Finding, path: Path, h: str, t: dict | None,
-             wanted: list[dict]) -> tuple[int, int] | None:
-    """把审计要的事实填进 `v`（`subject` 与 `slot`），返回此刻种子上的 `ma:` 钉子。"""
+             wanted: list[dict], media_root: Path | None = None) -> tuple[int, int] | None:
+    """把审计要的事实填进 `v`（`subject`、`slot`、`keeper`），返回此刻种子上的 `ma:` 钉子。
+
+    集位：动作给的 `slot`（检测器解析过偏移、钉子）> 此刻的钉子 > 名字。"""
+    args = f.action.args
     pin = parse_pin((t or {}).get("tags") or "")
     v.subject = {"torrent_hash": h, "name": (t or {}).get("name", ""),
-                 "pin": ("S%02dE%02d" % pin) if pin else None,
+                 "pin": _fmt(pin) if pin else None,
                  "tags": (t or {}).get("tags", ""), "category": (t or {}).get("category", ""),
                  "torrent_files": len(wanted) if t is not None else None}
-    v.slot = _slot_arg(f.action.args.get("slot")) or pin or name_slot(path)
+    season_dir = _show_dir(media_root, path)[1] if media_root else path.parent.name
+    v.slot = _slot_arg(args.get("slot")) or pin or name_slot(path, season_dir)
+    if args.get("keep_path"):
+        v.keeper = {"path": str(args["keep_path"]),
+                    "hash": (args.get("keep_hash") or "").lower(),
+                    "digest": args.get("keep_digest") or None}
     return pin
 
 

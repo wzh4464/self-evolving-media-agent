@@ -228,3 +228,212 @@ def test_disposition_comes_from_the_producing_rule_not_from_args(rule, kind, exp
     f = Finding(rule=rule, kind=kind, severity="minor", summary="",
                 action=Action(op="trash", args={"disposition": "extras"}))
     assert gate.disposition_of(f) == expected
+
+
+# ------------------------------------------------------------------ I1：点名了保留方
+def _dup(loser, keeper, *, slot=(1, 8), keeper_hash=None, h=None, **kw):
+    """判重输家的动作参数（D1 之后 duplicate-episode 就这么给）。"""
+    k_path = keeper if not hasattr(keeper, "hash") else keeper.path
+    k_hash = keeper_hash if keeper_hash is not None else getattr(keeper, "hash", "")
+    l_path = loser if not hasattr(loser, "hash") else loser.path
+    l_hash = h if h is not None else getattr(loser, "hash", "")
+    return _trash(l_path, l_hash, keep_path=str(k_path), keep_hash=k_hash,
+                  slot=list(slot), **kw)
+
+
+def _pair(lib, **keeper_kw):
+    s1 = lib.show("尼古喵喵").season(1)
+    loser = s1.single("[Z] Yani Neko - 08 [1080p].mkv", size=GB)
+    keeper = s1.single("尼古喵喵 S01E08.mkv", size=GB, name="[K] Yani Neko - 08.mkv",
+                       **keeper_kw)
+    return s1, loser, keeper
+
+
+def test_i1_keeper_that_is_a_phantom_does_not_license_the_delete(lib):
+    """保留方的种子说已下完、盘上却没有（LAT-01 之后留下的那种幻影）：以前输家照删，
+    这一集从库里消失，30 天后隔离区到期就是永久丢失。"""
+    s1, loser, keeper = _pair(lib, on_disk=False)
+    before = lib.snapshot()
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "不在盘上" in skip["reason"]
+    assert skip["deletion"]["keeper"]["path"] == str(keeper.path)
+    assert lib.snapshot() == before
+
+
+def test_i1_keeper_trashed_earlier_in_the_batch(lib):
+    """同一批里保留方先被别的动作移进了隔离区，输家就不能再删。
+    （执行顺序按 (动作, 剧, 路径) 排：保留方的路径排在输家前面。）"""
+    s1 = lib.show("尼古喵喵").season(1)
+    keeper = s1.single("[A] Yani Neko - 08 [1080p].mkv", size=GB)
+    loser = s1.single("[Z] Yani Neko - 08 [1080p].mkv", size=GB)
+    third = s1.local("尼古喵喵 S01E08 [third].mkv", size=GB)   # 让第一条删除本身合法
+    first = _trash(keeper.path, keeper.hash, rule="manual", kind="manual")
+
+    rep = lib.apply([first, _dup(loser, keeper)])
+
+    assert [r["args"]["path"] for r in rep.applied] == [str(keeper.path)]
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "本批次" in skip["reason"]
+    assert loser.path.exists() and third.exists()
+
+
+def test_i1_keeper_torrent_dropped_earlier_in_the_batch(lib):
+    s1, loser, keeper = _pair(lib)
+    ex = Executor(lib.context(), dry_run=False, run_id="u")
+    ex._removed_torrents.add(keeper.hash)
+
+    v = gate.check_trash(ex, _dup(loser, keeper), loser.path)
+
+    assert v.gate == "I1" and "摘" in v.refused
+
+
+def test_i1_keeper_still_downloading_is_not_a_keeper(lib):
+    s1, loser, keeper = _pair(lib)
+    raw = lib.qbit.raw(keeper.hash)                     # recheck 之后回到 99.8%
+    raw["progress"] = 0.998
+    raw["_files"][0]["progress"] = 0.998
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "没下完" in skip["reason"]
+
+
+def test_i1_truncated_keeper_is_not_a_keeper(lib):
+    """种子说下完了，盘上的文件却比声明的小：scan 的 `size` 是声明大小，排名看不出来。"""
+    s1, loser, keeper = _pair(lib)
+    with open(keeper.path, "r+b") as fp:
+        fp.truncate(GB // 3)
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "截断" in skip["reason"]
+
+
+def test_i1_local_keeper_smaller_than_at_diagnose_time(lib):
+    s1 = lib.show("尼古喵喵").season(1)
+    loser = s1.single("[Z] Yani Neko - 08 [1080p].mkv", size=GB)
+    keeper = s1.local("尼古喵喵 S01E08.mkv", size=GB // 3)
+
+    rep = lib.apply([_dup(loser, keeper, keeper_hash="", keep_size=GB)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "截断" in skip["reason"]
+
+
+def test_i1_keeper_and_target_are_the_same_file(lib):
+    """审计里 6 行「保留 X，清理 X」：两个种子声明同一路径，判重把唯一的真文件当输家。"""
+    s1, loser, keeper = _pair(lib)
+
+    rep = lib.apply([_dup(keeper, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "同一个文件" in skip["reason"]
+    assert keeper.path.exists()
+
+
+def test_i1_keeper_now_pinned_to_another_slot(lib):
+    """诊断之后保留方的钉子变了（别的流程重打了 `ma:`）：它不再替这个集位作保。"""
+    s1, loser, keeper = _pair(lib, tags="ma:S01E09")
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "S01E09" in skip["reason"]
+
+
+def test_i1_target_no_longer_in_the_slot(lib):
+    """要删的那个此刻钉着另一集：它不是这个集位的重复了。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    loser = s1.single("[Z] Yani Neko - 08 [1080p].mkv", size=GB, tags="ma:S01E58")
+    keeper = s1.single("尼古喵喵 S01E08.mkv", size=GB)
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "S01E58" in skip["reason"]
+
+
+def test_i1_sound_keeper_lets_the_loser_go(lib):
+    s1, loser, keeper = _pair(lib)
+    ident = lib.ident(loser.path)
+
+    rep = lib.apply([_dup(loser, keeper, keep_digest="abc")])
+
+    [rec] = rep.applied
+    assert rec["deletion"]["keeper"] == {"path": str(keeper.path), "hash": keeper.hash,
+                                         "digest": "abc"}
+    assert rec["deletion"]["slot"] == [1, 8]
+    assert lib.ident(lib.trash_files()[0]) == ident
+
+
+# ------------------------------------------------------------------ I1：没点名保留方
+def test_i1_only_playable_file_of_a_slot_is_not_trashed(lib):
+    s1 = lib.show("朱音落语").season(1)
+    t = s1.single("朱音落语 S01E12.mp4", size=GB)
+    before = lib.snapshot()
+
+    rep = lib.apply([_trash(t.path, t.hash, rule="manual", kind="manual", show="朱音落语")])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "S01E12" in skip["reason"]
+    assert lib.snapshot() == before
+
+
+@pytest.mark.parametrize("holder", ["partial", "dot_dir", "subtitle"])
+def test_i1_things_that_are_not_a_playable_copy_do_not_count(lib, holder):
+    s1 = lib.show("朱音落语").season(1)
+    t = s1.single("朱音落语 S01E12.mp4", size=GB)
+    if holder == "partial":
+        s1.single("[B] Akane-banashi - 12.mp4", size=GB, progress=0.5)
+    elif holder == "dot_dir":
+        lib.show("朱音落语").folder("Season 1/.extras").local("朱音落语 S01E12.mp4", size=GB)
+    else:
+        s1.local("朱音落语 S01E12.ass", size=50_000)
+
+    rep = lib.apply([_trash(t.path, t.hash, rule="manual", kind="manual", show="朱音落语")])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1")
+
+
+def test_i1_another_copy_trashed_earlier_in_the_batch_does_not_count(lib):
+    s1 = lib.show("朱音落语").season(1)
+    a = s1.single("朱音落语 S01E12.mp4", size=GB)
+    b = s1.local("朱音落语 S01E12 [b].mp4", size=GB)
+
+    rep = lib.apply([_trash(b, "", rule="manual", kind="manual", show="朱音落语"),
+                     _trash(a.path, a.hash, rule="manual", kind="manual", show="朱音落语")])
+
+    assert [r["args"]["path"] for r in rep.applied] == [str(b)]
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1")
+    assert a.path.exists()
+
+
+def test_i1_extras_disposition_of_an_unpinned_file_is_allowed(lib):
+    """特典处置是明确的"它不是正片"：名字碰巧认得出集号也可以删（没钉 `ma:`）。"""
+    s1 = lib.show("朱音落语").season(1)
+    t = s1.single("朱音落语 S01E12 [NCOP].mp4", size=GB)
+
+    rep = lib.apply([_trash(t.path, t.hash, rule="extras-in-library", kind="extra_content",
+                            show="朱音落语", file_only=True)])
+
+    assert len(rep.applied) == 1 and not t.path.exists()
+
+
+def test_i1_extras_disposition_of_a_pinned_only_copy_is_refused(lib):
+    """钉了 `ma:` 的是抓取器认定的正片：特典规则误判了（标题里带 trailer / 菜单 …）也不能删。"""
+    s1 = lib.show("朱音落语").season(1)
+    t = s1.single("朱音落语 S01E12.mp4", size=GB, tags="ma:S01E12")
+
+    rep = lib.apply([_trash(t.path, t.hash, rule="extras-in-library", kind="extra_content",
+                            show="朱音落语", file_only=True)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "ma:" in skip["reason"]
+    assert t.path.exists()

@@ -71,6 +71,12 @@ def is_extra(filename: str) -> bool:
 _SXXEYY_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
 
 
+def explicit_slot(raw: str) -> tuple[int, int] | None:
+    """名字里显式写着的 `SxxEyy`（改过名的规范名）→ (季, 集)；没有返回 None。"""
+    m = _SXXEYY_RE.search(raw.rsplit("/", 1)[-1])
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def apply_episode_offset(raw: str, ep: int, offset: int) -> int | None:
     """AutoBangumi 的 `episode_offset`（整条订阅一个值）换算成季内集号。
 
