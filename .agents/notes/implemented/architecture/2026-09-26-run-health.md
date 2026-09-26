@@ -360,11 +360,21 @@ URL / Bearer / userinfo 里的）不进信也不进健康报告；发送失败�
   日志记 `SKIP` 与持有者；media-agent 的 state 目录不在就记 `WARN`、不拿锁直接重建（隧道要紧）。顺带：docker 路径读
   `DOCKER_BIN`（deploy/README 的配置表一直这么写，脚本却写死了），重建后查健康的间隔读 `WATCHDOG_POLL`（测试用 0）。
 - 等锁上限 900 秒：一轮 run 约 2 分钟（runloop §6），deploy.sh 的 `DEPLOY_LOCK_WAIT` 也是 900。
+- **拿着锁时说清是谁、也不无限期拿着**（复审时补）：这一节让看门狗在锁里跑 `docker compose up`——以前它挂住只害自己，
+  现在挡住的是每一轮 `run`（每轮等 10 秒、75、ok → warn 发一封信之后 warn → warn 不再发；launchd 也不会再起第二个
+  看门狗），直到有人杀掉它。而且锁文件是空的（`lockf` 不写内容，上一个 media-agent 释放时清空了），`run` 与健康
+  报告说「持有者未知，可能是部署脚本」，把人引到 deploy.sh。现在：锁里的那一遍先像 deploy.sh 一样写
+  `pid=… cmd=vpn-watchdog.sh … since=…`、`trap` 在退出时清掉；docker 的每次调用经 `bounded`（后台跑 + 看守进程
+  超时 TERM、5 秒后 KILL；bash 3.2 没有 `timeout(1)`），compose 180 秒（`WATCHDOG_COMPOSE_TIMEOUT`，与 rescue.py
+  的 `timeout=180` 一致）、inspect / info / logs 30 秒，超时记 `ERROR … 超时`、退出码 1。复审建议的
+  `perl -e 'alarm …; exec docker …'` 不行：Go 程序默认接住 SIGALRM、什么都不做。
 - **生产上跑的是 `~/gluetun/` 下的拷贝**，`deploy.sh` 不碰它们：deploy/README「生产上的副本要手动同步」写了 diff → cp →
   `bash -n` 的步骤。本阶段没有动生产。
 
 **测试**：`tests/test_rescue_scripts_lock.py`——`rescue.py`（按文件导入，docker / qBit 换成替身）：start 只在拿着锁时重建、
 用完即放；media-agent 占着锁时 75、没暂停做种、没写标记、说清持有者；stop 在锁里重建并删标记；start 失败回滚时同一个
 锁里重入。`vpn-watchdog.sh`（真 `/bin/bash` 跑，替身 docker 在 compose 那一刻用 `flock(LOCK_NB)` 看锁有没有被拿着）：
-重建时锁被拿着、恢复；media-agent 占着锁时 75、没重建、日志记 SKIP 与持有者；隧道健康时什么都不做；读 `DOCKER_BIN`。
+重建时锁被拿着、恢复；media-agent 占着锁时 75、没重建、日志记 SKIP 与持有者；隧道健康时什么都不做；读 `DOCKER_BIN`；
+重建期间锁文件里是看门狗的自述、退出后清空；compose 挂住（替身 `exec sleep 30`、上限 1 秒）时十几秒内以 1 结束、
+日志记超时、锁放了（这两个改之前红）。`rescue.py auto` 等不到锁时 75、不进入等待。
 `test_deploy_scripts` 的 bash 3.2 解析与"变量名后紧跟中文"检查照样覆盖 watchdog。

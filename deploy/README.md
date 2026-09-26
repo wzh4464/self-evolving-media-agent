@@ -240,6 +240,7 @@ bash 3.2 会把多字节字符当成变量名的一部分（`$APP，` → `APP\x
 | `MEDIA_AGENT_HOME` | `~/media-agent` | media-agent 仓库位置（运行锁在它的 `state/run.lock`） |
 | `DOCKER_BIN` | `/usr/local/bin/docker` | docker 可执行文件（`vpn-watchdog.sh` 以前写死，现在也读它） |
 | `RUNLOCK_WAIT` | `900` | `vpn-watchdog.sh` 重建前等 media-agent 运行锁的秒数，等不到这一轮不重建（退出码 75） |
+| `WATCHDOG_COMPOSE_TIMEOUT` | `180` | `vpn-watchdog.sh` 的 `docker compose up` 最多等几秒，超时中止、记 `ERROR`、退出码 1（与 `rescue.py` 一致） |
 | `RESCUE_LOCK_WAIT` | `900` | `rescue.py start` / `stop` 切换前等运行锁的秒数，等不到不切换（退出码 75） |
 | `~/gluetun/.env.vps` 里的 `WIREGUARD_ENDPOINT_IP` | — | 救援隧道对端，`rescue.py` 用来核对出口 IP |
 
@@ -254,7 +255,9 @@ bash 3.2 会把多字节字符当成变量名的一部分（`$APP，` → `APP\x
 - **重建之前拿 media-agent 的运行锁**（`state/run.lock`，与 media-agent、`deploy.sh` 同一把 flock）：一轮 `run` 正在跑
   就等它结束（一轮约 2 分钟），最多等 900 秒；等不到就这次不重建 / 不切换，退出码 75。`vpn-watchdog.sh` 在锁里把自己
   重跑一遍（等锁期间隧道可能自己好了，重跑会先重新看健康状态），`vpn-watchdog.log` 里记 `WAIT` / `SKIP`。
-  `rescue.py` 只在切换的那几分钟里拿锁（`auto` 等下载的几个小时不拿）。
+  拿着锁时往 `run.lock` 里写一句自述（`pid=… cmd=vpn-watchdog.sh … since=…`，退出时清掉），被挡住的 `run` 与健康报告
+  打印的就是它；docker 的每次调用都有上限（compose 180 秒、inspect / info 30 秒），Docker / OrbStack 卡住时不会无限期
+  拿着锁把每一轮 `run` 挡成 75。`rescue.py` 只在切换的那几分钟里拿锁（`auto` 等下载的几个小时不拿）。
 - **救援期间 media-agent 自己暂停**：`rescue.py start` 写下的 `~/gluetun/.rescue-active` 在，`run` / `apply` 就以 75 结束、
   健康报告 warn（`media_agent/pause.py`）；`stop` 删掉它之后自动恢复。`stop` 拿不到锁时标记留着——安全一侧，稍后再跑
   一次 `rescue.py stop`。

@@ -15,6 +15,13 @@
 # 退出码 75，下一轮（6 小时后）再来。拿锁的办法是在锁里把本脚本重新跑一遍（MA_RUNLOCK_HELD=1）：
 # 等锁的那几分钟里隧道可能自己好了，重跑会先重新看健康状态。
 #
+# 拿着锁的时候（2026-09-26 复审补上）：
+# - 往锁文件里写一句自述（pid / 命令 / 从什么时候起），退出时清掉——与 deploy.sh 一样。被挡住的 run 会把它
+#   打印出来、写进健康报告；以前锁文件是空的，run 报「持有者未知，可能是部署脚本」，把人引到 deploy.sh 去。
+# - docker 的每一次调用都有上限（`bounded`）：compose 180 秒（WATCHDOG_COMPOSE_TIMEOUT，与 rescue.py 一致），
+#   inspect / info 30 秒。Docker / OrbStack 卡住时，以前看门狗无限期拿着运行锁，每一轮 run 都被挡成 75，
+#   直到有人手动杀掉它；launchd 也不会再起第二个看门狗。
+#
 # ---------------------------------------------------------------------------
 # 检测手段为什么不用 `docker exec ... wget`：
 # 隧道断开时 gluetun 的 killswitch 会拦掉容器内所有出网流量，wget 卡死在
@@ -33,6 +40,8 @@ DIR="${HOME}/gluetun"
 RUNLOCK="${MEDIA_AGENT_HOME:-${HOME}/media-agent}/state/run.lock"
 RUNLOCK_WAIT="${RUNLOCK_WAIT:-900}"
 POLL="${WATCHDOG_POLL:-5}"          # 重建后查健康的间隔（秒）；测试里设 0
+COMPOSE_TIMEOUT="${WATCHDOG_COMPOSE_TIMEOUT:-180}"   # compose 重建的上限（秒），与 rescue.py 的 timeout=180 一致
+DOCKER_TIMEOUT=30                   # inspect / info / logs 的上限（秒）
 OVPN="${DIR}/expressvpn.ovpn"
 HOSTFILE="${DIR}/.vpn-hostname"      # 存原始域名，解析的唯一可靠来源
 LOG="${DIR}/vpn-watchdog.log"
@@ -47,7 +56,37 @@ if [ -f "${LOG}" ] && [ "$(/usr/bin/stat -f%z "${LOG}" 2>/dev/null || echo 0)" -
     log "-- 日志超过 2MB，已截断 --"
 fi
 
-health() { ${DOCKER} inspect --format '{{.State.Health.Status}}' "${GLUETUN}" 2>/dev/null; }
+# bounded <秒> <命令...>：超时就 TERM（5 秒后还在就 KILL），返回它的退出码（被杀是 143 / 137）。
+# bash 3.2 没有 timeout(1)；`perl -e 'alarm …; exec'` 也不行：alarm 跟着 exec 过去，而 Go 程序（docker CLI）
+# 默认接住 SIGALRM、什么都不做（os/signal 文档："Other signals will be caught but no action will be taken"）。
+# 看守进程的输出接到 /dev/null：在 $(…) 里用时，命令替换不必等它退出。
+bounded() {
+    local secs=$1
+    shift
+    "$@" &
+    local pid=$!
+    (
+        t=0
+        while kill -0 "${pid}" 2>/dev/null; do
+            if [ "${t}" -ge "${secs}" ]; then
+                kill -TERM "${pid}" 2>/dev/null
+                sleep 5
+                kill -KILL "${pid}" 2>/dev/null
+                exit 0
+            fi
+            sleep 1
+            t=$((t + 1))
+        done
+    ) >/dev/null 2>&1 &
+    local watcher=$!
+    wait "${pid}"
+    local rc=$?
+    kill "${watcher}" 2>/dev/null
+    wait "${watcher}" 2>/dev/null
+    return "${rc}"
+}
+
+health() { bounded "${DOCKER_TIMEOUT}" ${DOCKER} inspect --format '{{.State.Health.Status}}' "${GLUETUN}" 2>/dev/null; }
 
 # with_runlock <锁文件> <最多等几秒> <命令...>：拿不到返回 75。与 media_agent/runlock.py、deploy.sh 的
 # with_lock 是同一种锁（flock）；锁文件一律保留（删了它，下一个按路径打开的人会拿到另一把锁）。
@@ -79,13 +118,13 @@ sys.exit(subprocess.call(cmd))
 
 # 出口 IP 从 gluetun 自己的日志里读，不发网络请求——同样是为了不可能卡住
 exit_ip() {
-    ${DOCKER} logs --tail 400 "${GLUETUN}" 2>&1 \
+    bounded "${DOCKER_TIMEOUT}" ${DOCKER} logs --tail 400 "${GLUETUN}" 2>&1 \
         | /usr/bin/grep -a 'Public IP address is' | /usr/bin/tail -1 \
         | /usr/bin/sed -E 's/.*Public IP address is ([0-9.]+).*/\1/'
 }
 
 # Docker 没起来（OrbStack 未运行）就退出，不反复折腾
-if ! ${DOCKER} info >/dev/null 2>&1; then
+if ! bounded "${DOCKER_TIMEOUT}" ${DOCKER} info >/dev/null 2>&1; then
     log "SKIP Docker 未运行（OrbStack 可能没启动）"
     exit 0
 fi
@@ -125,6 +164,11 @@ if [ -z "${MA_RUNLOCK_HELD:-}" ]; then
         exit "${rc}"
     fi
     log "WARN 找不到 media-agent 的 state 目录（${RUNLOCK} 所在），不拿锁直接重建"
+else
+    # 拿着锁：写一句自述，被挡住的 run 与健康报告会打印它（见文件头）。退出时清掉，锁文件本身保留。
+    printf 'pid=%s cmd=vpn-watchdog.sh（重建 gluetun / qBittorrent 容器）since=%s\n' "$$" \
+        "$(/bin/date '+%Y-%m-%dT%H:%M:%S')" > "${RUNLOCK}"
+    trap ': > "${RUNLOCK}"' EXIT
 fi
 
 # --- 重新解析域名，拿当前有效 IP ---
@@ -148,8 +192,14 @@ fi
 # --- 重建。qbit-vpn 共用 gluetun 的 network namespace，必须一起重建；
 #     只重建 gluetun 会让 qbit 永久失去网络。---
 cd "${DIR}" || { log "ERROR 进不去 ${DIR}"; exit 1; }
-if ! ${DOCKER} compose up -d --force-recreate >>"${LOG}" 2>&1; then
-    log "ERROR compose 重建失败"
+bounded "${COMPOSE_TIMEOUT}" ${DOCKER} compose up -d --force-recreate >>"${LOG}" 2>&1
+rc=$?
+if [ "${rc}" -ne 0 ]; then
+    if [ "${rc}" -eq 143 ] || [ "${rc}" -eq 137 ]; then
+        log "ERROR compose 重建超时（${COMPOSE_TIMEOUT}s 没返回，已中止）：Docker / OrbStack 可能卡住了，需人工介入"
+    else
+        log "ERROR compose 重建失败（退出码 ${rc}）"
+    fi
     exit 1
 fi
 log "容器已重建，等待隧道建立"

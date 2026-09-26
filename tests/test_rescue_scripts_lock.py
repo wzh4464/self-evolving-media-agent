@@ -152,6 +152,8 @@ case "$1" in
   inspect) cat "$D/health" ;;
   logs) echo "Public IP address is ?" ;;
   compose)
+    cat "$RUNLOCK_PATH" > "$D/holder_during_compose" 2>/dev/null
+    if [ -n "${FAKE_COMPOSE_HANG:-}" ]; then exec sleep "$FAKE_COMPOSE_HANG"; fi
     if "$PYTHON" -c 'import fcntl,os,sys
 fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT)
 try:
@@ -196,7 +198,7 @@ def watchdog(tmp_path):
         p = d / "calls"
         return p.read_text().split("\n")[:-1] if p.exists() else []
 
-    return SimpleNamespace(run=run, calls=calls, lock=lock,
+    return SimpleNamespace(run=run, calls=calls, lock=lock, env=env, docker_dir=d,
                            log=home / "gluetun" / "vpn-watchdog.log")
 
 
@@ -230,6 +232,37 @@ def test_watchdog_healthy_tunnel_touches_nothing(watchdog, tmp_path):
     (tmp_path / "docker" / "health").write_text("healthy\n")
     r = watchdog.run()
     assert r.returncode == 0 and watchdog.calls() == []
+
+
+@pytestmark_bash
+def test_watchdog_says_who_holds_the_run_lock_while_recreating(watchdog):
+    """重建期间 media-agent 的 run 等不到锁时要打印持有者：以前看门狗拿着锁却什么都不写（lockf 不写内容、上一个
+    media-agent 释放时又清空了），run 与健康报告说「持有者未知，可能是部署脚本」——把人引到 deploy.sh 去
+    （2026-09-26 复审）。与 deploy.sh 一样写一句自述，退出时清掉。"""
+    r = watchdog.run()
+
+    assert r.returncode == 0, r.stderr
+    holder = (watchdog.docker_dir / "holder_during_compose").read_text()
+    assert "cmd=vpn-watchdog.sh" in holder and "pid=" in holder and "since=" in holder
+    assert watchdog.lock.read_text() == ""                          # 退出时清掉，锁文件本身保留
+
+
+@pytestmark_bash
+def test_watchdog_gives_up_on_a_hung_compose_and_releases_the_lock(watchdog):
+    """Docker / OrbStack 卡在 compose 上：以前看门狗无限期拿着运行锁，每一轮 run 都被挡在外面（75），直到有人
+    手动杀掉它。现在 compose 有上限（`WATCHDOG_COMPOSE_TIMEOUT`，默认 180 秒，与 rescue.py 一致）。"""
+    import time
+    watchdog.env.update(FAKE_COMPOSE_HANG="30", WATCHDOG_COMPOSE_TIMEOUT="1")
+    t0 = time.monotonic()
+
+    r = watchdog.run()
+
+    assert time.monotonic() - t0 < 20
+    assert r.returncode == 1, r.stderr
+    assert "超时" in watchdog.log.read_text()
+    probe = RunLock(watchdog.lock, "after")
+    assert probe.acquire(wait=0)                                    # 锁放了
+    probe.release()
 
 
 def test_watchdog_reads_docker_from_the_environment():
