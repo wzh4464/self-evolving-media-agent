@@ -6,13 +6,13 @@
   <key>Label</key>
   <string>com.zihan.media-agent</string>
 
+  <!-- 直接跑 venv 里的入口，不经 `uv run`：uv run 每轮都会按 uv.lock 同步环境，
+       锁文件一变就在凌晨联网装依赖（生产 uv 0.7.2），PyPI 不通这一轮就起不来。
+       依赖只在部署时由 deploy.sh 按锁文件原样装好（uv sync 的 frozen 模式，critic §3.7）。
+       运行锁由 media-agent 自己在 state/run.lock 上拿，不需要外层包装。 -->
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/zihan/.local/bin/uv</string>
-    <string>run</string>
-    <string>--directory</string>
-    <string>/Users/zihan/media-agent</string>
-    <string>media-agent</string>
+    <string>/Users/zihan/media-agent/.venv/bin/media-agent</string>
     <string>run</string>
   </array>
 

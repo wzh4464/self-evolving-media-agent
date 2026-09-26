@@ -41,6 +41,11 @@
   `20260926T131502.123-<pid>`。以前同一秒里起的两个执行器共用一个 ID，
   回退其中一批会把另一批一起撤掉（launchd 上 media-agent 与 vpn-watchdog 的
   周期同为 6 小时）。前缀仍是定宽时间戳、字典序即时间序；旧 ID 照常可列、可回退。
+- **launchd 不再经 `uv run` 启动**（critic §3.7）：`deploy/com.zihan.media-agent.plist`
+  改为直接执行 `~/media-agent/.venv/bin/media-agent run`。`uv run` 每轮都按 uv.lock
+  同步环境，锁文件一变（引入 pytest 那次就变了）凌晨那轮就得联网装依赖，PyPI 不通
+  就起不来；现在依赖只在部署时装。周期 21600 秒、Nice 10、LowPriorityIO、日志路径不变。
+  需要重新 `launchctl bootstrap` 才生效（`deploy.sh` 发现 plist 变了会自动重装）。
 - `media-agent run` 等命令在 qBittorrent 不可用或数据不完整时以退出码 3 结束
   （`cli.EXIT_DEGRADED`），launchd 的 last exit code 由此可见降级。
 - 生产机上运行时生成的 28 条演进规则原样纳入版本库（`.agents/rules/`），
