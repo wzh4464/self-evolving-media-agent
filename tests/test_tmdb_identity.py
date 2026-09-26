@@ -228,6 +228,56 @@ def test_a_gap_restarts_the_count(lib):
     assert not _renamed_to(c)
 
 
+@pytest.mark.allow("log_failure", match="TMDB")
+def test_a_run_where_tmdb_could_not_be_read_breaks_the_streak(lib):
+    """"连续两轮"：中间一轮 TMDB 取不到（unresolved）也算断了——重新从第 1 轮数（`pending.seq` 对不上 `Book.seq`）。
+    `test_a_gap_restarts_the_count` 的中间一轮给回了已采用的标题，pending 自己就清掉了，`seq` 的检查从没被用到
+    （2026-09-27 审查：去掉它的变异全套存活）。"""
+    import httpx
+    _kusuriya(lib)
+    _run(lib)
+    _retitle(lib, 1, "药屋少女的独语")
+    assert _run(lib).state.title_decisions[1].status == "pending"         # 看到 1 轮
+    real = lib.tmdb.tv_detail
+
+    def down(tv_id):
+        raise httpx.ConnectTimeout("connect timed out")
+
+    lib.tmdb.tv_detail = down
+    _age_cache(lib, "tmdbshow:1", 31)
+    assert _run(lib).state.title_decisions[1].status == "unresolved"      # 这一轮取不到：断了
+    lib.tmdb.tv_detail = real
+
+    c = _run(lib)
+
+    d = c.state.title_decisions[1]
+    assert (d.status, d.runs) == ("pending", 1)
+    assert not _renamed_to(c)
+
+
+def test_one_tmdb_search_error_stops_searching_for_the_rest_of_the_scan(lib):
+    """扫描的断路器：一轮里 TMDB 出过一次错，其余没钉住的番不再搜、不再取详情（用缓存兜底）。以前只有 `tv_detail`
+    那条路有测试，`search_tv` 出错不设断路器的变异全套存活（2026-09-27 审查）。"""
+    import httpx
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.enabled = True
+    for name in ("甲番", "乙番", "丙番"):
+        lib.show(name).season(1).local(f"{name} S01E01.mkv")
+    calls = []
+
+    def down(q):
+        calls.append(q)
+        raise httpx.ConnectTimeout("connect timed out")
+
+    lib.tmdb.search_tv = down
+    lib.tripwire.allow("log_failure", match="TMDB 查询失败")
+
+    lib.scan()
+
+    assert len(calls) == 1
+    assert [c for c in lib.tmdb.calls if c[0] in ("search_tv", "tv_detail")] == []
+
+
 def test_a_title_does_not_flip_back_within_30_days(lib):
     sh = _kusuriya(lib)
     _run(lib)
