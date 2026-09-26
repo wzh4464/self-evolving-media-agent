@@ -54,7 +54,7 @@ def _episode_of(title: str) -> int | None:
     return parse_episode(title)[1]
 
 
-def _inflight(show, by_hash: dict, stale_after_h: float) -> dict[int, set[int]]:
+def _inflight(ctx: Context, show, by_hash: dict) -> dict[int, set[int]]:
     """已经有种子在下、只是还没下完的集：`{季号: {集号…}}`。
 
     `have` 只认下完的——这是对的，没下完就还有换源的余地。但**已经在下的
@@ -64,8 +64,16 @@ def _inflight(show, by_hash: dict, stale_after_h: float) -> dict[int, set[int]]:
     例外是停滞太久的：Re:Zero 的 E55–E58 卡在 42–92%、全网 seeds=0，
     再等下去也没有意义，这时就该换源。所以用停滞时长（`dead_torrent_hours`）
     作闸——还在动的别打扰，动不了的才换。
+
+    "动不了"的判据与 dead-torrent **完全同一个**（`builtin.droppable_dead`）：
+    放行换源的这一轮，旧种子必须同批被摘掉，否则新种子被改到同一个集位名上，
+    两个种子抢一个文件。以前这里看 `now - added_on`，而死种已改按"最后一次活着"
+    计时：72 小时前加入、10 小时前还在收数据的种子被放行、却不算死，新旧并存，
+    旧种子只要还在给别人传分片就永远等不到被摘（2026-09-26 审查复现）。
     """
     import time
+
+    from .builtin import droppable_dead
     now = time.time()
     out: dict[int, set[int]] = {}
     for f in show.files:
@@ -91,9 +99,8 @@ def _inflight(show, by_hash: dict, stale_after_h: float) -> dict[int, set[int]]:
                 sd = season_of_dir(f.season_dir or "")
                 sn = sd if sd is not None else 1   # Season 0 是 0，不能用 `or 1`
 
-        age_h = (now - (t.get("added_on") or now)) / 3600
-        if t.get("state") == "stalledDL" and age_h > stale_after_h:
-            continue        # 卡了太久，等下去没意义，放行让它换源
+        if t and droppable_dead(ctx, t, now):
+            continue        # 死种：本轮 dead-torrent 会摘掉它，放行换源
         out.setdefault(sn, set()).add(ep)
     return out
 
@@ -344,7 +351,7 @@ class EpisodeAvailableDetector:
                               "tmdb_seasons": sorted(tmdb_sn), "extra": extra},
                 )
                 continue
-            inflight = _inflight(show, by_hash, ctx.config.dead_torrent_hours)
+            inflight = _inflight(ctx, show, by_hash)
 
             disk_eps = _disk_episodes(show)
 

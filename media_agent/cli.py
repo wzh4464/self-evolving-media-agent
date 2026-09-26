@@ -3,8 +3,9 @@
     media-agent scan      # 只扫描，看看库里现在什么样
     media-agent diagnose  # 跑全部规则，出问题清单（不改动任何东西）
     media-agent apply     # 执行修复（--dry-run 预演）
-    media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升
-    media-agent run       # 一轮完整自治：diagnose → apply → evolve → 清理隔离区
+    media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升（需 EVOLVE_MODE=propose）
+    media-agent run       # 一轮完整自治：diagnose → apply → [evolve] → 清理隔离区
+                          # evolve 只在 EVOLVE_MODE=propose 时跑，默认 off（见 config.py）
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from . import __version__, runlock
 from .actions import Executor
 from .cache import Cache
 from .clients import (
@@ -23,11 +25,54 @@ from .config import load_config
 from .evolution import Evolver, find_failure_patterns, find_residue, load_evolved
 from .kernel import Context, Registry
 from .plugins import register_builtins
+from .runlock import LOCK_NAME, RunLock
 from .scan import build_state
 
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+# qBittorrent 不可用或本轮读不全、因此整批拒绝改动时的退出码。
+# 以前 `run` 永远返回 0：2026-09-19 那轮登录超时照样执行、删错了东西，
+# launchd 上看 last exit code 仍是 0。非零才会被看见。
+EXIT_DEGRADED = 3
+
+# 另一个进程持有运行锁、本次什么都没做时的退出码。取 sysexits 的 EX_TEMPFAIL，
+# 与 /usr/bin/lockf 等锁超时的退出码一致：launchd 的 last exit code 75 = "被挡住了，下轮再来"。
+EXIT_LOCKED = 75
+
+
+def _needs_lock(args) -> bool:
+    """会改动媒体库 / qBittorrent / 状态的子命令才拿运行锁（见 runlock.py）。
+
+    声明在各子命令的 `set_defaults(lock=...)` 上；将来的抓取模式同样要声明。
+    """
+    lock = getattr(args, "lock", False)
+    return bool(lock(args) if callable(lock) else lock)
+
+
+def _locked_out(holder: str) -> int:
+    msg = (f"⏳ 另一个 media-agent 进程正持有运行锁（{holder or '持有者未知，可能是部署脚本'}），"
+           "本次不执行任何操作")
+    print(f"\n═══ {msg} ═══")
+    _log(msg)
+    return EXIT_LOCKED
+
+
+def _refuse(why: str) -> int:
+    """大声报告"本轮拒绝改动"，stdout（进 run.log）与 stderr 各一份。"""
+    msg = f"⛔ 拒绝执行任何改动：{why}"
+    print(f"\n═══ {msg} ═══")
+    _log(msg)
+    return EXIT_DEGRADED
+
+
+def _warn_degraded(state) -> None:
+    """只读命令也要提醒：种子视图不完整时，下面的结论里有种子的文件会被当成本地文件。"""
+    if state.qbit_errors:
+        print(f"⚠️  qBittorrent 数据不完整（{len(state.qbit_errors)} 处）：{state.qbit_errors[0]}"
+              "——以下结论不可作为改动依据")
 
 
 def build_context(cfg, need_llm: bool = False) -> Context:
@@ -90,6 +135,7 @@ def _print_findings(findings, as_json: bool) -> None:
 def cmd_scan(args, cfg) -> int:
     ctx = build_context(cfg)
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
+    _warn_degraded(state)
     print(f"番剧目录: {len(state.shows)}")
     print(f"文件总数: {sum(len(s.files) for s in state.shows)}")
     print(f"qBittorrent 种子: {len(state.torrents)}")
@@ -107,6 +153,8 @@ def cmd_diagnose(args, cfg) -> int:
     ctx = build_context(cfg)
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
     findings = build_registry().run_all(ctx, state)
+    if not args.json:
+        _warn_degraded(state)
     _print_findings(findings, args.json)
 
     residue = find_residue(state, findings)
@@ -133,6 +181,8 @@ def cmd_apply(args, cfg) -> int:
     dry = args.dry_run or not cfg.auto_apply
     ex = Executor(ctx, dry_run=dry)
     report = ex.apply(findings)
+    if report.refused:
+        return _refuse(report.refused)
 
     print(("【预演】" if dry else "【已执行】") + report.summary()
           + (f"   批次 ID: {ex.run_id}" if not dry else ""))
@@ -152,10 +202,10 @@ def cmd_runs(args, cfg) -> int:
     if not runs:
         print("还没有任何已执行的批次")
         return 0
-    print(f"{'批次 ID':<20} {'时间':<20} {'已执行':>6} {'可回退':>6}  类型")
+    print(f"{'批次 ID':<26} {'时间':<20} {'已执行':>6} {'可回退':>6}  类型")
     for r in runs:
         mark = " ↩已回退" if r.get("rolled_back") else ""
-        print(f"{r['run_id']:<20} {r['ts']:<20} {r['applied']:>6} {r['undoable']:>6}  "
+        print(f"{r['run_id']:<26} {r['ts']:<20} {r['applied']:>6} {r['undoable']:>6}  "
               f"{','.join(r['kinds'][:3])}{mark}")
     print(f"\n回退最近一次： media-agent rollback --last")
     return 0
@@ -175,6 +225,8 @@ def cmd_rollback(args, cfg) -> int:
 
     print(("【预演回退】" if args.dry_run else "【回退】") + f"批次 {run_id}")
     res = ex.rollback(run_id)
+    if res.get("refused"):
+        return _refuse(res["refused"])
     print(f"  已还原: {res['reverted']}")
     print(f"  跳过:   {res['skipped']}")
     print(f"  失败:   {res['failed']}")
@@ -195,17 +247,25 @@ def cmd_repair(args, cfg) -> int:
     ctx = build_context(cfg)
     ex = Executor(ctx, dry_run=args.dry_run)
     res = ex.repair_split_dirs(args.run)
+    if res.get("refused"):
+        return _refuse(res["refused"])
     print(("【预演】" if args.dry_run else "【修复】") + f"分裂目录 {res['pairs']} 对")
+    errors = 0
     for d in res["detail"]:
         if args.dry_run:
             print(f"  {d['old']} → {d['new']}: "
                   f"qBit 搬 {d['would_move_via_qbit']}，文件系统搬 {d['would_move_via_fs']}")
+        elif d.get("error"):
+            errors += 1
+            print(f"  ❌ {d['old']} → {d['new']}: {d['error']}")
         else:
             mark = "✅" if d["old_removed"] else "⚠️ 旧目录未清空"
             print(f"  {mark} {d['old']} → {d['new']}: "
                   f"qBit {d['moved_via_qbit']} + 文件系统 {d['moved_via_fs']}"
-                  + (f"，{d['stranded']} 个同名滞留" if d["stranded"] else ""))
-    return 0
+                  + (f"，{d['stranded']} 个同名滞留" if d["stranded"] else "")
+                  + (f"，{d['left_for_torrents']} 个文件仍归种子、没用文件系统搬"
+                     if d.get("left_for_torrents") else ""))
+    return 1 if errors else 0
 
 
 def cmd_purge(args, cfg) -> int:
@@ -213,6 +273,12 @@ def cmd_purge(args, cfg) -> int:
     from .purge import build_pool
 
     ctx = build_context(cfg)
+    if ctx.qbit is None:
+        # 没有 qBit，build_pool 拿不到任何"种子声明大小 / 进度"的证据（critic N3），
+        # 幸存者只能退回时长旁证，判定会偏松。硬删除没有下一层保险，拒绝。
+        if args.apply:
+            return _refuse("qBittorrent 不可用：拿不到种子证据，不做不可逆删除")
+        print("⚠️  qBittorrent 不可用：缺种子证据，以下判定偏松，仅供参考\n")
     pool = build_pool(cfg, ctx.qbit, ctx.tmdb)
     ok = [c for c in pool if c.eligible]
     no = [c for c in pool if not c.eligible]
@@ -280,12 +346,20 @@ def cmd_purge(args, cfg) -> int:
 
 
 def cmd_evolve(args, cfg) -> int:
+    if cfg.evolve_mode != "propose":
+        # 手动 evolve 同样往 .agents/ 写规则和笔记——冻结期间工作区要与部署的 tag 一致
+        print(f"演进已冻结（EVOLVE_MODE={cfg.evolve_mode}）。确要手动演进："
+              "EVOLVE_MODE=propose media-agent evolve，产出的规则须提交入库再部署")
+        return 1
     ctx = build_context(cfg, need_llm=True)
     if not ctx.llm.enabled:
         print("未配置 LLM_KEY，无法演进")
         return 1
 
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
+    if state.qbit_errors:
+        # 与 run 的演进重扫同理：残缺快照里的"盲区"是假的，规则上线却是永久的
+        return _refuse(f"qBittorrent 数据不完整，不据此演进规则：{state.qbit_errors[0]}")
     reg = build_registry()
     findings = reg.run_all(ctx, state)
 
@@ -325,33 +399,51 @@ def cmd_run(args, cfg) -> int:
 
     findings = reg.run_all(ctx, state)
     print(f"═══ 诊断：{len(findings)} 个问题 ═══")
+    _warn_degraded(state)
     _print_findings(findings, False)
 
     dry = args.dry_run or not cfg.auto_apply
     ex = Executor(ctx, dry_run=dry)
     report = ex.apply(findings)
+    if report.refused:
+        # fail closed：不修、不演进（演进器会拿这份残缺快照去立规则）、
+        # 也不做隔离区的时间清理——降级的一轮不改动任何东西。
+        return _refuse(report.refused)
     print(f"\n═══ 修复：{report.summary()} ═══")
 
-    if ctx.llm.enabled and not args.no_evolve:
+    rc = 0
+    if cfg.evolve_mode != "propose":
+        # 冻结：不重扫、不调 LLM、不构造 Evolver（它的 __init__ 就会建 .agents/rules）
+        print(f"\n═══ 演进：已冻结（EVOLVE_MODE={cfg.evolve_mode}） ═══")
+    elif ctx.llm.enabled and not args.no_evolve:
         # 修复后重新扫描，残留才是真盲区
         state2 = build_state(ctx, resolve_tmdb=False)
-        findings2 = reg.run_all(ctx, state2)
-        results = Evolver(ctx, reg).evolve(state2, findings2,
-                                           max_proposals=args.max_proposals)
-        promoted = [r for r in results if r["outcome"] == "promoted"]
-        print(f"\n═══ 演进：提议 {len(results)} 条，上线 {len(promoted)} 条 ═══")
-        for r in promoted:
-            print(f"  🎉 {r['rule_id']}")
+        if state2.qbit_errors:
+            # 种子视图残缺时，有种子的文件全变成"无主文件"，演进器会拿它们当
+            # 盲区去立规则——规则一旦上线就是永久的。宁可这轮不演进。
+            print(f"\n═══ 演进：跳过——重扫时 qBittorrent 数据不完整："
+                  f"{state2.qbit_errors[0]} ═══")
+            rc = EXIT_DEGRADED
+        else:
+            findings2 = reg.run_all(ctx, state2)
+            results = Evolver(ctx, reg).evolve(state2, findings2,
+                                               max_proposals=args.max_proposals)
+            promoted = [r for r in results if r["outcome"] == "promoted"]
+            print(f"\n═══ 演进：提议 {len(results)} 条，上线 {len(promoted)} 条 ═══")
+            for r in promoted:
+                print(f"  🎉 {r['rule_id']}")
 
     purge = ex.purge_trash()
     if purge["purged_files"]:
         print(f"\n═══ 隔离区：清理 {purge['purged_files']} 个过期文件，"
               f"释放 {purge['freed_bytes']/1e9:.1f}GB ═══")
-    return 0
+    return rc
 
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="media-agent", description="番剧媒体库自治 agent")
+    # deploy.sh 切换完用它确认"磁盘上这份代码"是哪个版本
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--no-tmdb", action="store_true", help="跳过 TMDB 查询（省时/离线）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -368,7 +460,7 @@ def main() -> int:
     s.add_argument("--kind", nargs="*", help="只处理指定类型的问题")
     s.add_argument("--show", nargs="*", help="只处理指定番剧（目录名）")
     s.add_argument("--limit", type=int, help="最多处理多少条（受控试跑用）")
-    s.set_defaults(func=cmd_apply)
+    s.set_defaults(func=cmd_apply, lock=True)
 
     s = sub.add_parser("runs", help="列出历史批次（回退用）")
     s.set_defaults(func=cmd_runs)
@@ -377,31 +469,46 @@ def main() -> int:
     s.add_argument("--run", help="批次 ID，省略则回退最近一次")
     s.add_argument("--last", action="store_true", help="回退最近一次未回退的批次")
     s.add_argument("--dry-run", action="store_true", help="只预演回退，不实际还原")
-    s.set_defaults(func=cmd_rollback)
+    s.set_defaults(func=cmd_rollback, lock=True)
 
     s = sub.add_parser("repair", help="修复目录改名后新旧并存的分裂状态")
     s.add_argument("--run", required=True, help="出问题的批次 ID")
     s.add_argument("--dry-run", action="store_true")
-    s.set_defaults(func=cmd_repair)
+    s.set_defaults(func=cmd_repair, lock=True)
 
     s = sub.add_parser("purge", help="清理隔离区里可验证为安全的文件")
     s.add_argument("--apply", action="store_true", help="真正删除（默认只预演）")
     s.add_argument("--verbose", action="store_true", help="列出保留原因")
-    s.set_defaults(func=cmd_purge)
+    # 预演只读隔离区；真删（--apply）才要锁
+    s.set_defaults(func=cmd_purge, lock=lambda a: a.apply)
 
     s = sub.add_parser("evolve", help="自演进：为规则盲区提议新规则")
     s.add_argument("--max-proposals", type=int, default=3)
-    s.set_defaults(func=cmd_evolve)
+    # 会写 .agents/，影子验证还会跑全部检测器（含写 sidecar 的抓取规则）
+    s.set_defaults(func=cmd_evolve, lock=True)
 
     s = sub.add_parser("run", help="完整自治轮次")
     s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--no-evolve", action="store_true")
+    s.add_argument("--no-evolve", action="store_true",
+                   help="本轮不演进（EVOLVE_MODE=propose 时才有意义，默认 off 本来就不跑）")
     s.add_argument("--max-proposals", type=int, default=3)
-    s.set_defaults(func=cmd_run)
+    s.set_defaults(func=cmd_run, lock=True)
 
     args = p.parse_args()
-    cfg = load_config()
-    return args.func(args, cfg)
+    try:
+        cfg = load_config()
+    except ValueError as e:
+        _log(f"配置错误：{e}")
+        return 2
+    if not _needs_lock(args):
+        return args.func(args, cfg)
+    lock = RunLock(cfg.state_dir / LOCK_NAME, label=" ".join(["media-agent", *sys.argv[1:]]))
+    if not lock.acquire(wait=runlock.DEFAULT_WAIT):
+        return _locked_out(lock.holder())
+    try:
+        return args.func(args, cfg)
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 [project]
 name = "media-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "自治的番剧媒体库管理 agent：查重、改名、TMDB 对齐、死种清理"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,3 +16,22 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["media_agent"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+# tests/harness 是测试基座（假对象 + LibraryBuilder），按顶层包导入
+pythonpath = ["tests"]
+# live 默认不跑：它们连生产库（只读）。命令行再给 `-m live` 会覆盖这里的 -m。
+addopts = ["-ra", "--strict-markers", "--strict-config", "-p", "pytester", "-m", "not live"]
+xfail_strict = true
+markers = [
+    "live: 只读核对生产库；需在 zihan_air 上 MEDIA_AGENT_LIVE=1 uv run pytest -m live",
+    "ffmpeg: 需要真实的 ffprobe/ffmpeg（没有就自动跳过）",
+    "allow(*kinds, match=None): 声明本测试预期会触发的 tripwire 事件种类",
+]

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import time
@@ -15,8 +16,86 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .kernel import Action, Context, Finding, repath, under
+from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
+
+
+# ---------------- 路径参数校验（逆操作 / 删除类动作共用）----------------
+#
+# 出处：critic N1 / LAT-02。`restore_from_trash` 曾写成
+# `Path(u.get("trash_path") or "")`——空串变成 `Path('.')`，它是真值、
+# 而且"存在"，于是 `shutil.move('.', dst)`：`os.rename('.')` 报 EINVAL，
+# shutil 退回 `copytree(当前目录 → 媒体库)` 再 `rmtree(当前目录)`。
+# 2026-09-26 在 scratchpad 复现：cwd 里的 state/audit.jsonl、源码全部被拷进
+# 一个叫 `… S01E12.mp4` 的目录，cwd 被清空。生产上 6 条审计记录的
+# `trashed_to` 是 null（20260830T132317、20260908T022758 ×3、
+# 20260908T143348、20260920T170126），离一次手动 rollback 只差一步——
+# 而手动 rollback 的 cwd 正是项目目录（.venv、.env、14GB 隔离区）。
+#
+# 所以任何从审计记录里读回来的路径，动手前一律过这里：非空、绝对、
+# 已规范化（不含 `.`/`..`）、落在允许的根之下且不是根本身。
+def _inside(value, root: Path, what: str) -> tuple[Path | None, str | None]:
+    """`value` 必须是 `root` 之下（不含 `root` 本身）的规范绝对路径。
+
+    返回 `(规范化后的路径, None)`，或 `(None, 拒绝原因)`。
+    """
+    s = value if isinstance(value, str) else ("" if value is None else str(value))
+    if not s:
+        return None, f"{what} 为空"
+    if "\0" in s or not os.path.isabs(s):
+        return None, f"{what} 不是绝对路径：{s!r}"
+    norm = os.path.normpath(s)
+    if norm != s.rstrip("/"):
+        return None, f"{what} 含 . 或 .. 等未规范化的部分：{s!r}"
+    p, r = Path(norm), Path(os.path.normpath(str(root)))
+    if p == r or not under(p, r):
+        return None, f"{what} 不在允许的根 {r} 之下：{s!r}"
+    return p, None
+
+
+def _bad_name(name, what: str) -> str | None:
+    """单个路径分量（文件名 / 目录名）是否合法；合法返回 None。"""
+    if not isinstance(name, str) or not name.strip():
+        return f"{what} 为空"
+    if "/" in name or "\0" in name or name in (".", ".."):
+        return f"{what} 不是单个路径分量：{name!r}"
+    return None
+
+
+def _bad_rel(rel, what: str) -> str | None:
+    """种子内相对路径（renameFile 的参数）是否合法；合法返回 None。"""
+    if not isinstance(rel, str) or not rel.strip() or "\0" in rel:
+        return f"{what} 为空"
+    if rel.startswith("/") or ".." in Path(rel).parts:
+        return f"{what} 越出种子根目录：{rel!r}"
+    return None
+
+
+_last_run_at: datetime | None = None
+
+
+def new_run_id() -> str:
+    """批次 ID：`YYYYMMDDTHHMMSS.mmm-<pid>`，例如 `20260926T131502.123-48213`。
+
+    以前只精确到秒（`20260926T131502`）。批次 ID 是回退的单元——两个进程在同一秒
+    各起一个 Executor，两批改动就会被 `rollback` 当成一批一起撤掉（critic N10）：
+    launchd 上 media-agent 与 vpn-watchdog 的 `StartInterval` 同为 21600，将来 1800 秒
+    一次的抓取也会每 6 小时与 `run` 对齐一次。
+
+    - **跨进程不撞**：带 pid——同一时刻活着的两个进程 pid 不同，拿不拿运行锁都一样。
+    - **进程内不撞**：同一毫秒（或时钟回拨）时顺延到上一个 ID 的下一毫秒，
+      进程内严格递增；不忙等，冻结的时钟下也不会卡死。
+    - **仍可排序、兼容旧 ID**：前 15 位还是定宽的秒级时间戳，字典序即时间序；
+      旧 ID 是新 ID 的前缀形态，`list_runs` 按记录的 `ts` 排序、`rollback --run`
+      按整串精确匹配，两种 ID 混在同一份 audit.jsonl 里都照常工作。
+    """
+    global _last_run_at
+    now = datetime.now()
+    now = now.replace(microsecond=now.microsecond // 1000 * 1000)
+    if _last_run_at is not None and now <= _last_run_at:
+        now = _last_run_at + timedelta(milliseconds=1)
+    _last_run_at = now
+    return f"{now:%Y%m%dT%H%M%S}.{now.microsecond // 1000:03d}-{os.getpid()}"
 
 
 @dataclass
@@ -24,8 +103,12 @@ class ExecReport:
     applied: list[dict] = field(default_factory=list)
     skipped: list[dict] = field(default_factory=list)
     failed: list[dict] = field(default_factory=list)
+    # 非空 = 整批被拒绝执行（qBittorrent 不可用或本轮扫描读不全），值是原因
+    refused: str = ""
 
     def summary(self) -> str:
+        if self.refused:
+            return f"⛔ 拒绝执行本批次：{self.refused}"
         return f"执行 {len(self.applied)} 项，跳过 {len(self.skipped)} 项，失败 {len(self.failed)} 项"
 
 
@@ -35,7 +118,7 @@ class Executor:
         self.cfg = ctx.config
         self.dry_run = dry_run
         # 一次 apply = 一个 run_id，回退以 run 为单位，这就是"一键回退"的单元
-        self.run_id = run_id or datetime.now().strftime("%Y%m%dT%H%M%S")
+        self.run_id = run_id or new_run_id()
         self.report = ExecReport()
         self._deleted_count = 0
         self._deleted_bytes = 0
@@ -43,6 +126,12 @@ class Executor:
         # `write_sidecar` 排在最后、且是整份覆盖，而它的 payload 是**诊断阶段**
         # 算出来的快照——不带上这些，本轮刚抓的集会被旧快照盖掉。
         self._grabbed: dict[str, set] = {}
+        # 本批次已经处置掉的种子记录与已搬进隔离区的路径。诊断是一次性全量产出的，
+        # 同一个输家常常同时挂着 trash（op 5）和 rename（op 6）：种子删了之后
+        # 再去 `files()` 就是 404，记成 failed 还会污染 `find_failure_patterns`
+        # （testinfra B2，生产 5 次）。后面的动作要先认一认这里。
+        self._removed_torrents: set[str] = set()
+        self._trashed_paths: set[str] = set()
 
     # ---------------- 审计 ----------------
     def _audit(self, status: str, finding: Finding, action: Action,
@@ -114,7 +203,31 @@ class Executor:
     }
 
     # ---------------- 入口 ----------------
+    def qbit_blocker(self) -> str:
+        """qBittorrent 这一侧是否可信到足以改东西；可信返回空串，否则返回原因。
+
+        本项目的每一个改动都以种子视图为前提（AGENTS.md 第 2、3 条）：
+        有种子的文件改名必须走 renameFile，隔离必须先处理种子。视图缺了，
+        有种子的文件就会被当成纯本地文件——改名退化成 `mv`、隔离跳过种子。
+        LAT-01：2026-09-19 run 20260919T225410 登录超时仍照常执行，把归种子
+        d08f05a7 的 `朱音落语 S01E12.mp4` 以 `torrent_hash ""` 移进隔离区，
+        下一轮又删了那个种子的记录。所以这里 fail closed：整批拒绝。
+        """
+        if self.ctx.qbit is None:
+            return "qBittorrent 不可用（登录失败或未配置），没有种子视图不能改动任何东西"
+        errs = getattr(self.ctx, "qbit_errors", None) or []
+        if errs:
+            return (f"本轮扫描读 qBittorrent 不完整（{len(errs)} 处失败，首条：{errs[0]}），"
+                    f"种子视图有缺口时不能改动任何东西")
+        return ""
+
     def apply(self, findings: list[Finding]) -> ExecReport:
+        blocked = self.qbit_blocker()
+        if blocked:
+            # 不逐条写审计：这些动作一个都没有尝试。拒绝本身由调用方大声报告
+            # （cli 打印到 stdout/stderr 并以 EXIT_DEGRADED 退出）。
+            self.report.refused = blocked
+            return self.report
         ordered = sorted(
             (f for f in findings if f.action),
             key=lambda f: (self._OP_ORDER.get(f.action.op, 99), f.show, f.path),
@@ -127,6 +240,16 @@ class Executor:
         return self.report
 
     def _dispatch(self, f: Finding, a: Action) -> None:
+        if (f.evidence or {}).get("origin") == DSL_ORIGIN:
+            # critic N5：演进规则由 LLM 提议、影子验证只在上线那一刻跑一次，此后
+            # 不再复核；它的动作参数也由模型选（甚至可以自带 path 覆盖）。一条
+            # `retag ma:SxxExx` 就能决定改名目标与判重去留——这是未经人审的
+            # "LLM → 改名 / 删除"通路。在人工确认放行的流程落地之前，一律不执行。
+            # 生产上 30 条演进规则的 action 全是 null，这道闸今天行为中立。
+            self._audit("skipped", f, a, {
+                "reason": "演进规则未经人工确认，不自动执行其动作",
+                "rule_source": f.evidence.get("source", "")})
+            return
         handler = getattr(self, f"_op_{a.op}", None)
         if handler is None:
             self._audit("skipped", f, a, {"reason": f"未知动作 {a.op}"})
@@ -142,6 +265,22 @@ class Executor:
             self._audit("skipped", f, a, {"reason": f"非法目标文件名 {new_name!r}"})
             return
         target = path.parent / new_name
+        h = a.args.get("torrent_hash")
+
+        # 先认"本批次已经处置掉的"，再谈别的（testinfra B2）。以前这里先查
+        # 目标名被占：输家被搬走、赢家刚改好名，于是报一条误导的「集位被占」
+        # （20260924T173911 / T234117）；有种子的输家则去问已删种子的 `files()`，
+        # 404 记成 failed（生产 5 次），还被当成"规则本身有问题"。
+        if h and h in self._removed_torrents:
+            self._audit("skipped", f, a, {
+                "reason": "所属种子已在本批次被移除（判重作废 / 死种 / 撞车），不再改名"})
+            return
+        if str(path) in self._trashed_paths:
+            self._audit("skipped", f, a, {"reason": "文件本批次已移入隔离区，不再改名"})
+            return
+        if not h and not os.path.lexists(path):
+            self._audit("skipped", f, a, {"reason": "文件已不在原位，不再改名"})
+            return
 
         if target.exists() and target != path:
             # 走到这里说明腾空没能发生：同一集位有两个文件，而 duplicate-episode
@@ -153,39 +292,75 @@ class Executor:
                         "若它也判不了（画质无法比较等），需要人工介入",
             })
             return
+        # 盘上没有不等于没人占：另一个活种子的 `torrents/files` 可能还声明着这个路径
+        # （幻影、或还没落盘的下载）。改过去就是两个种子宣称同一个文件——scan 每个
+        # 路径只出一条、colliding-torrent 不管两个都 100% 的，此后每轮都看不见；
+        # 那个种子一旦 recheck，还会把这份文件当成它自己的来校验、覆盖
+        # （2026-09-26 审查复现：幻影输家没摘，赢家就被改到了它的名字上）。
+        others = self._claimants(target, exclude=h or "") if self.ctx.qbit else []
+        if others and target != path:
+            self._audit("skipped", f, a, {
+                "reason": ("集位被占：目标路径仍被另一个种子声明（"
+                           + "、".join(f"{t['hash'][:8]} {t.get('name', '')[:40]}"
+                                      for t in others[:2])
+                           + "），改过去就是两个种子争同一个文件"),
+                "occupant": target.name,
+                "hint": "多半是幻影（种子说已下完、盘上没有）；判重会摘掉幻影输家，"
+                        "其余情形需要人工核对",
+            })
+            return
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
 
-        h = a.args.get("torrent_hash")
         via = "filesystem"
-        if h and self.ctx.qbit:
+        if h and not self.ctx.qbit:
+            # AGENTS.md 第 3 条：有种子的文件绝不走文件系统改名。以前 qBit 不在时
+            # 这里直接落到下面的 `path.rename`（apply 的总闸之外的纵深防御）。
+            self._audit("skipped", f, a, {
+                "reason": "有种子的文件，但 qBittorrent 不可用：拒绝绕过它改名"})
+            return
+        if h:
             # 有种子的一律走 qBittorrent API。找不到对应条目就报失败，
             # **绝不退化成文件系统改名**——那会让种子路径失效、做种中断。
-            old_rel = self._torrent_rel_path(h, path)
-            if old_rel is None:
+            try:
+                entries = self.ctx.qbit.files(h)
+            except Exception as e:
+                if "404" in str(e):
+                    # 诊断之后、本批次之外被删的（手动删种等）：状态变了，不是规则错
+                    self._audit("skipped", f, a,
+                                {"reason": "所属种子已不在 qBittorrent 里，不再改名"})
+                    return
+                raise
+            entry = next((e for e in entries if Path(e["name"]).name == path.name), None)
+            if entry is None:
                 self._audit("failed", f, a,
                             {"error": "种子文件列表里找不到该文件，拒绝绕过 qBittorrent 改名"})
                 return
+            old_rel = entry["name"]
             # 本轮已经被作废（设为不下载、移进隔离区）的，就别再改名了。
             # 诊断是一次性全量产出的：合并发布种子里的两个文件都会被提「改成
             # 规范名」，而其中一个同时被提「只作废这一个文件」。作废排在改名
             # 之前，等轮到它改名时文件已不在盘上，qBittorrent 却仍列着这个条目
             # （优先级 0）——照改会把一个不存在的文件映射到规范名上。
-            prio = next((e.get("priority", 1) for e in self.ctx.qbit.files(h)
-                         if e["name"] == old_rel), 1)
-            if prio == 0:
+            if entry.get("priority", 1) == 0:
                 self._audit("skipped", f, a,
                             {"reason": "该文件已设为不下载（本轮已作废）", "at": old_rel})
+                return
+            # 种子说这个文件已下完，盘上（连 `.!qB` 都）没有：它是幻影，改名只会把
+            # 一个不存在的文件映射到集位名上，此后它就"宣称"那个集位。
+            # 下载中的文件盘上本来就可能还没有——那种照改，是支持的功能。
+            if (entry.get("progress", 0) >= 1 and not os.path.lexists(path)
+                    and not os.path.lexists(str(path) + ".!qB")):
+                self._audit("skipped", f, a, {
+                    "reason": "种子说已下完、文件却不在原位（幻影或被挪走），不改名",
+                    "at": old_rel})
                 return
             new_rel = str(Path(old_rel).parent / new_name) if "/" in old_rel else new_name
             self.ctx.qbit.rename_file(h, old_rel, new_rel)
             via = "qbittorrent"
         else:
             # 确认无种子关联才允许文件系统改名（纯本地文件，无从同步）
-            if not path.exists():
-                self._audit("skipped", f, a, {"reason": "文件已不在原位（多半本轮已被作废）"})
-                return
             path.rename(target)
         self._audit("applied", f, a, {"new_path": str(target), "via": via},
                     undo={"op": "rename", "path": str(target),
@@ -200,12 +375,18 @@ class Executor:
     def _is_junk(cls, name: str) -> bool:
         return name in cls._JUNK_NAMES or name.startswith(cls._JUNK_PREFIXES)
 
-    def _merge_tree(self, old: Path, new: Path) -> tuple[int, int]:
+    def _merge_tree(self, old: Path, new: Path,
+                    skip: set[Path] | frozenset = frozenset()) -> tuple[int, int]:
         """把 old 目录树递归合并进 new，逐**文件**移动并保持相对结构。
 
         必须递归：早先的实现只遍历顶层，遇到 `Season 1` 这种子目录时，
         若 new 下已存在同名子目录就整个跳过，导致里面的文件全部滞留在旧目录，
         造成新旧两个目录并存的分裂状态（实测 19 个目录、50 个文件中招）。
+
+        `skip` 里的路径一个都不碰——调用方传入**此刻有种子声明**的路径
+        （见 `_live_claims_under`）。文件系统搬走种子的文件就是 AGENTS.md 第 3 条
+        说的死链；它们要么已由 setLocation 交给 qBittorrent 搬（异步，可能还没搬完），
+        要么根本不该由这里搬。
 
         返回 (已移动文件数, 因目标已存在而滞留的文件数)。
         """
@@ -215,7 +396,7 @@ class Executor:
         new.mkdir(parents=True, exist_ok=True)
 
         for src in sorted(old.rglob("*")):
-            if not src.is_file():
+            if not src.is_file() or src in skip:
                 continue
             rel = src.relative_to(old)
             if self._is_junk(src.name):
@@ -241,6 +422,54 @@ class Executor:
         except OSError:
             pass
         return moved, stranded
+
+    def _claimants(self, target: Path, exclude: str = "") -> list[dict]:
+        """此刻有哪些活种子（`exclude` 之外）在 `torrents/files` 里声明着 `target`。
+
+        优先级 0 的条目不算：qBittorrent 不会往那里写，scan 也不把它当成种子的文件。
+        只问 save_path 是 target 祖先的种子——别的种子的条目不可能落到 target 上。
+        """
+        out = []
+        for t in self.ctx.qbit.torrents():
+            if t["hash"] == exclude or t["hash"] in self._removed_torrents:
+                continue
+            sp = (t.get("save_path") or "").rstrip("/")
+            if not sp or not under(target, sp):
+                continue
+            if any(e.get("priority", 1) != 0 and Path(sp) / e["name"] == target
+                   for e in self.ctx.qbit.files(t["hash"])):
+                out.append(t)
+        return out
+
+    def _live_claims_under(self, root: Path) -> tuple[dict[str, dict], set[Path]]:
+        """此刻 qBittorrent 里谁在 `root` 之下有文件——问活的，不信审计记录。
+
+        返回 `({hash: 种子视图}, {被声明的绝对路径（含 .!qB）})`。一个种子算"在
+        root 之下"：save_path 或 content_path 在 root 下，或者它的某个文件条目落在
+        root 下（save_path 在更上层、Original 布局的根目录恰好就是剧名那种）。
+        save_path 与 root 互不包含的种子，文件不可能落在 root 下，不必问 `files()`。
+        优先级 0 的条目也算：setLocation 会连盘上已有的未勾选文件一起搬。
+
+        `files()` 读失败直接抛——看不全就不能动，调用方此时还什么都没改。
+        """
+        owners: dict[str, dict] = {}
+        claimed: set[Path] = set()
+        for t in self.ctx.qbit.torrents():
+            sp = (t.get("save_path") or "").rstrip("/")
+            cp = (t.get("content_path") or "").rstrip("/")
+            if not sp:
+                continue
+            inside = under(sp, root) or bool(cp and under(cp, root))
+            if not (inside or under(root, sp)):
+                continue
+            for e in self.ctx.qbit.files(t["hash"]):
+                p = Path(sp) / e["name"]
+                if under(p, root):
+                    claimed.update((p, Path(str(p) + ".!qB")))
+                    inside = True
+            if inside:
+                owners[t["hash"]] = t
+        return owners, claimed
 
     def _torrent_rel_path(self, torrent_hash: str, abs_path: Path) -> str | None:
         """qBittorrent 的 renameFile 用的是种子内相对路径，不是绝对路径。"""
@@ -636,9 +865,13 @@ class Executor:
         执行前重新查一次 qBittorrent，而不是信扫描时的快照：
         检测到执行之间可能过了几分钟，卡住的那个也许已经自己完成了。
         对不上就跳过——这是删除类操作，宁可白跑一趟。
+
+        `dead=True` 是死种（dead-torrent）的用法：没有保留方，改为复核它此刻
+        **仍然是死的**，且没有已下完的成员文件（那是可播的正片，还在做种）。
         """
         h = a.args["torrent_hash"]
         keep_hash = a.args.get("keep_hash", "")
+        dead = bool(a.args.get("dead"))
         if not h:
             self._audit("skipped", f, a, {"reason": "缺 torrent_hash"})
             return
@@ -652,7 +885,19 @@ class Executor:
             self._audit("skipped", f, a,
                         {"reason": "它自己已经下完了，不再是撞车的受害者"})
             return
-        if keeper is None or keeper.get("progress", 0) < 1.0:
+        if dead:
+            from .plugins.builtin import is_dead_now
+            if not is_dead_now(victim):
+                self._audit("skipped", f, a,
+                            {"reason": "它又有做种或可用副本了，不再是死种"})
+                return
+            done = [e["name"] for e in self.ctx.qbit.files(h)
+                    if e.get("priority", 1) != 0 and e.get("progress", 0) >= 1]
+            if done:
+                self._audit("skipped", f, a,
+                            {"reason": f"死种里有 {len(done)} 个已下完的文件，不自动摘"})
+                return
+        elif keeper is None or keeper.get("progress", 0) < 1.0:
             self._audit("skipped", f, a,
                         {"reason": "作为保留方的那个种子已不完整，删了会丢内容"})
             return
@@ -660,28 +905,39 @@ class Executor:
         if self.dry_run:
             self._audit("skipped", f, a,
                         {"reason": "dry-run", "would_drop": victim.get("name", ""),
-                         "keep": keeper.get("name", "")})
+                         "keep": (keeper or {}).get("name", "")})
             return
 
-        # magnet 是唯一的回退凭据：删掉之后 .torrent 就没了，
-        # 只能靠 magnet 把这条记录重新加回来。取不到就明说不可回退。
         magnet = victim.get("magnet_uri") or a.args.get("magnet") or ""
         self.ctx.qbit.delete([h], delete_files=False)
+        self._removed_torrents.add(h)
 
-        undo = None
-        if magnet:
-            undo = {"op": "readd_torrent", "magnet": magnet,
-                    "save_path": victim.get("save_path", ""),
-                    "category": victim.get("category", ""),
-                    "tags": victim.get("tags", ""),
-                    "name": victim.get("name", "")}
         self._audit("applied", f, a,
                     {"dropped": victim.get("name", ""),
                      "dropped_progress": round(victim.get("progress", 0), 3),
-                     "kept": keeper.get("name", ""),
+                     "kept": (keeper or {}).get("name", ""),
                      "files_untouched": True,
                      **({} if magnet else {"note": "无 magnet_uri，此条不可回退"})},
-                    undo=undo)
+                    undo=self._readd_undo(victim, magnet))
+
+    @staticmethod
+    def _readd_undo(victim: dict, magnet: str) -> dict | None:
+        """摘掉一条种子记录的逆操作：凭 magnet 按原布局加回来。
+
+        magnet 是唯一的回退凭据：删掉之后 .torrent 就没了，只能靠 magnet
+        把这条记录重新加回来。取不到就返回 None，调用方要明说不可回退。
+        """
+        if not magnet:
+            return None
+        return {"op": "readd_torrent", "magnet": magnet,
+                "save_path": victim.get("save_path", ""),
+                "category": victim.get("category", ""),
+                "tags": victim.get("tags", ""),
+                "name": victim.get("name", ""),
+                # 没有根目录（`root_path` 为空）= NoSubfolder 或单文件。
+                # 按原布局加回来，已下的半成品才对得上；Original 重加会
+                # 多长一层根目录，半成品全部失联。
+                "no_subfolder": not victim.get("root_path")}
 
     def _op_relink_torrent(self, f: Finding, a: Action) -> None:
         """把路径失效的种子重新关联到磁盘上的实际文件。
@@ -851,9 +1107,39 @@ class Executor:
                           "torrent_savepaths": affected})
 
     def _op_trash(self, f: Finding, a: Action) -> None:
-        """删除 = 移入隔离区。受配额上限保护。"""
-        path = Path(a.args["path"]) if a.args.get("path") else None
-        size = path.stat().st_size if path and path.exists() else 0
+        """删除 = 移入隔离区。受配额上限保护。
+
+        **顺序就是这个动作的安全性所在**，每一步都只在前一步确定成功后才走：
+
+        1. 要搬的必须是媒体库里一个**真实存在的普通文件**——在碰 qBittorrent 之前核对。
+           以前先 `qbit.delete` 后看 `path.exists()`：路径是幻影（种子声明了、
+           盘上没有）或诊断后被挪走时，种子记录丢了、文件一个没搬，还写下一条
+           `trash_path: ""` 的逆操作（critic N1）。生产实例：20260920T170126
+           删掉朱音落语 S01E12 所属种子 d08f05a7 的记录，`freed 0`。
+           目录一律拒绝：死种的 content_path 对 NoSubfolder 多文件种子就是整个
+           Season 目录（生产 10 个），`st_size` 还只有目录项那点大，体积配额拦不住。
+        2. 配额、dry-run。
+        3. 处理种子：整种子摘记录，或只把这一个文件设为不下载。**失败就停手**——
+           以前只记一行日志照样搬文件，结果是种子还在、文件没了（qBittorrent
+           会把它重新下回来），或种子记录的状态与审计对不上。
+        4. 最后搬文件。搬失败时如实记下种子记录是否已经删掉。
+        """
+        path, why = _inside(a.args.get("path"), Path(self.cfg.media_root), "path")
+        if why:
+            self._audit("failed", f, a,
+                        {"error": f"拒绝移入隔离区：{why}（只处置媒体库里的文件）"})
+            return
+        if not os.path.lexists(path):
+            self._trash_absent(f, a, path)
+            return
+        if path.is_dir():
+            self._audit("failed", f, a, {
+                "error": f"拒绝整目录移入隔离区：{path} 是目录——隔离只处置单个文件"})
+            return
+        if not path.is_file():
+            self._audit("failed", f, a, {"error": f"拒绝移入隔离区：{path} 不是普通文件"})
+            return
+        size = path.stat().st_size
 
         # 配额检查
         if self._deleted_count >= self.cfg.max_delete_per_run:
@@ -877,51 +1163,195 @@ class Executor:
         # 报成"路径失效且无法自动定位"——攻壳机动队实测留下 6 个，全都修不了，
         # 因为磁盘上根本没有对应体积的文件可供重新关联。
         # 所以在这里按种子的**实际文件数**复核，只含一个就退化成整种子作废。
-        if h and self.ctx.qbit and file_only:
-            try:
-                wanted = [e for e in self.ctx.qbit.files(h)
-                          if e.get("priority", 1) != 0]
-                if len(wanted) <= 1:
+        record_lost = zeroed = False
+        if h and not self.ctx.qbit:
+            # 纵深防御（apply 的总闸之外）：种子不处理就搬文件，qBittorrent 会
+            # 继续宣称这个路径，下一轮 scan 把它当成幻影、或重新下回来。
+            self._audit("skipped", f, a, {
+                "reason": "有种子的文件，但 qBittorrent 不可用：拒绝只搬文件、不处理种子"})
+            return
+        if h and h in self._removed_torrents:
+            # 本批次早先已经整种子作废（比如合集里另一集判重输了）：种子已经没了，
+            # 再问它的文件列表只会 404。文件照常进隔离区，丢记录只算那一次。
+            h = ""
+        if h:
+            entry = None
+            if file_only:
+                try:
+                    entries = self.ctx.qbit.files(h)
+                except Exception as e:
+                    self._audit("failed", f, a, {
+                        "error": f"读取种子文件列表失败，未做任何改动：{type(e).__name__}: {e}"})
+                    return
+                if len([e for e in entries if e.get("priority", 1) != 0]) <= 1:
                     file_only = False
-            except Exception as e:
-                self.ctx.log(f"[trash] 读取种子文件列表失败 {h}: {e}")
+                else:
+                    # 按完整相对路径认条目，不按文件名：合集里不同子目录下
+                    # 同名的文件（NCOP.mkv）会被认错。认不出就不搬——文件搬走了
+                    # qBittorrent 却仍要它，下一次校验就会把它重新下回来。
+                    hits = [e for e in entries if str(path).endswith("/" + e["name"])]
+                    if len(hits) != 1:
+                        self._audit("failed", f, a, {
+                            "error": "种子文件列表里找不到该文件（或不止一条匹配），"
+                                     "拒绝只搬文件、不改种子"})
+                        return
+                    entry = hits[0]
 
-        if h and self.ctx.qbit and not file_only:
-            # 整个种子作废：先删种子记录（不删文件），文件再单独进隔离区
-            try:
-                self.ctx.qbit.delete([h], delete_files=False)
-            except Exception as e:
-                self.ctx.log(f"[trash] 删除种子记录失败 {h}: {e}")
-        elif h and self.ctx.qbit and file_only:
-            # 只作废种子里的某个文件：设为不下载，保留其余部分
-            try:
-                rel = self._torrent_rel_path(h, path) if path else None
-                if rel is not None:
-                    idx = next(e["index"] for e in self.ctx.qbit.files(h)
-                               if e["name"] == rel)
-                    self.ctx.qbit.set_file_priority(h, [idx], 0)
-            except Exception as e:
-                self.ctx.log(f"[trash] 设置文件不下载失败 {h}: {e}")
+            if not file_only:
+                # 整个种子作废：先删种子记录（不删文件），文件再单独进隔离区
+                try:
+                    self.ctx.qbit.delete([h], delete_files=False)
+                except Exception as e:
+                    self._audit("failed", f, a, {
+                        "error": f"删除种子记录失败，文件未动：{type(e).__name__}: {e}"})
+                    return
+                record_lost = True
+                self._removed_torrents.add(h)
+            else:
+                # 只作废种子里的某个文件：设为不下载，保留其余部分
+                try:
+                    self.ctx.qbit.set_file_priority(h, [entry["index"]], 0)
+                except Exception as e:
+                    self._audit("failed", f, a, {
+                        "error": f"设为不下载失败，文件未动：{type(e).__name__}: {e}"})
+                    return
+                zeroed = True
 
-        moved = None
-        if path and path.exists():
-            day = datetime.now().strftime("%Y-%m-%d")
-            dest_dir = self.cfg.trash_dir / day / f.show / (path.parent.name or "")
+        day = datetime.now().strftime("%Y-%m-%d")
+        dest_dir = self.cfg.trash_dir / day / f.show / (path.parent.name or "")
+        dest = dest_dir / path.name
+        if os.path.lexists(dest):
+            dest = dest_dir / f"{path.stem}.{int(time.time())}{path.suffix}"
+        try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / path.name
-            if dest.exists():
-                dest = dest_dir / f"{path.stem}.{int(time.time())}{path.suffix}"
             shutil.move(str(path), str(dest))
-            moved = str(dest)
-            self._deleted_count += 1
-            self._deleted_bytes += size
+        except Exception as e:
+            # 种子那一步已经做了、文件没搬走：如实记下，别只剩一句异常
+            # （跨卷搬运是先拷后删，磁盘满时就会在这里失败，critic N8）。
+            self._audit("failed", f, a, {
+                "error": f"搬入隔离区失败：{type(e).__name__}: {e}",
+                "torrent_record_lost": record_lost, "priority_zeroed": zeroed,
+                "path_still_at": str(path)})
+            return
+        self._deleted_count += 1
+        self._deleted_bytes += size
+        self._trashed_paths.add(str(path))
 
         # 文件可从隔离区还原；但被删掉的种子记录还原不了（种子文件本身已不在）
-        undo = {"op": "restore_from_trash", "path": str(path) if path else "",
-                "trash_path": moved or "",
-                "torrent_record_lost": bool(h and not file_only)}
-        self._audit("applied", f, a, {"trashed_to": moved, "freed_bytes": size},
+        undo = {"op": "restore_from_trash", "path": str(path),
+                "trash_path": str(dest), "torrent_record_lost": record_lost}
+        self._audit("applied", f, a, {"trashed_to": str(dest), "freed_bytes": size},
                     undo=undo)
+
+    _GONE = ("文件已不在原位（种子声明了但盘上没有，或诊断后被挪走），种子与文件都不动")
+
+    def _trash_absent(self, f: Finding, a: Action, path: Path) -> None:
+        """要隔离的文件不在盘上：没有文件可搬，能处置的只剩种子那一侧。
+
+        **幻影**（诊断时就是"种子说已下完、盘上没有"，由检测器标 `phantom`，
+        此刻复核仍然如此）：摘掉这条种子记录，或合集里只把这个条目设为不下载。
+        只跳过是不够的——第 2 条修复之后幻影输家"种子与文件都不动"，同一批里
+        `_op_rename` 就把赢家改到幻影仍在声明的名字上，两个种子宣称同一路径，
+        此后每轮都无声无息（2026-09-26 审查复现；main 在同一轮会摘掉它的记录）。
+        逆操作是 magnet 重加 / 恢复优先级，**绝不**写 `restore_from_trash`——
+        隔离区里没有东西，那正是 LAT-02 空 `trash_path` 的来源。
+
+        **还没下完的 `file_only` 条目**（extras-in-library 对合集里的 NCOP / PV，
+        判重对合并发布的另一版本）：盘上只有 `.!qB` 或什么都没有，本来就不该"在"。
+        立刻设为不下载——main 一直是这么做的；第 2 条修复之后它被当成"文件不在"
+        跳过，特典照下不误（占带宽、占 94% 满的容器，critic N8），下完下一轮才隔离，
+        停滞的合集则每轮写一条误导的跳过记录。种子只剩这一个要下的文件时（单文件
+        PV / CM 种子）摘掉记录，半成品留在原地（与 main 相同）。
+
+        其余情形一律跳过、种子与文件都不动：诊断之后才被挪走的（种子多半该
+        relink 而不是摘）、种子已不再声明这个路径的、又开始下载的幻影。
+        """
+        h = a.args.get("torrent_hash") or ""
+        file_only = bool(a.args.get("file_only"))
+        if (not h or not (a.args.get("phantom") or file_only)
+                or h in self._removed_torrents):
+            self._audit("skipped", f, a, {"reason": self._GONE})
+            return
+        if not self.ctx.qbit:
+            self._audit("skipped", f, a, {
+                "reason": "有种子的文件不在盘上，而 qBittorrent 不可用：拒绝处置种子"})
+            return
+        victim = next((t for t in self.ctx.qbit.torrents() if t["hash"] == h), None)
+        if victim is None:
+            self._audit("skipped", f, a, {"reason": "所属种子已不在 qBittorrent 里"})
+            return
+        try:
+            entries = self.ctx.qbit.files(h)
+        except Exception as e:
+            self._audit("failed", f, a, {
+                "error": f"读取种子文件列表失败，未做任何改动：{type(e).__name__}: {e}"})
+            return
+        sp = Path(victim.get("save_path") or "")
+        entry = next((e for e in entries if sp / e["name"] == path), None)
+        if entry is None or entry.get("priority", 1) == 0:
+            self._audit("skipped", f, a, {
+                "reason": "种子已不再声明这个路径（改过名或已设为不下载），不用再处置"})
+            return
+        wanted = [e for e in entries if e.get("priority", 1) != 0]
+        if file_only and entry.get("progress", 0) < 1:
+            if len(wanted) > 1:
+                self._zero_priority(f, a, h, entry,
+                                    "还没下完：设为不下载，不必等它下完再隔离")
+            else:
+                self._drop_record(f, a, victim,
+                                  "种子只剩这一个要下的文件且还没下完：摘掉记录，"
+                                  "半成品留在原地")
+            return
+        if not a.args.get("phantom"):
+            self._audit("skipped", f, a, {"reason": self._GONE})
+            return
+        if entry.get("progress", 0) < 1 or os.path.lexists(str(path) + ".!qB"):
+            self._audit("skipped", f, a, {"reason": "种子又在下载这个文件，不是幻影了"})
+            return
+        if file_only and len(wanted) > 1:
+            self._zero_priority(f, a, h, entry,
+                                "幻影：盘上没有这个文件，只把这个条目设为不下载，种子其余部分照常做种")
+        else:
+            self._drop_record(f, a, victim,
+                              "幻影：盘上没有可搬的文件，只摘种子记录（可凭 magnet 回退）")
+
+    def _zero_priority(self, f: Finding, a: Action, h: str, entry: dict, note: str) -> None:
+        """只把种子里的一个条目设为不下载，盘上一个字节都不动。"""
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run", "would_zero": entry["name"]})
+            return
+        try:
+            self.ctx.qbit.set_file_priority(h, [entry["index"]], 0)
+        except Exception as e:
+            self._audit("failed", f, a, {
+                "error": f"设为不下载失败，未做任何改动：{type(e).__name__}: {e}"})
+            return
+        self._audit("applied", f, a,
+                    {"priority_zeroed": True, "at": entry["name"], "files_untouched": True,
+                     "note": note},
+                    undo={"op": "restore_file_priority", "torrent_hash": h,
+                          "index": entry["index"], "name": entry["name"],
+                          "priority": entry.get("priority", 1)})
+
+    def _drop_record(self, f: Finding, a: Action, victim: dict, note: str) -> None:
+        """只摘种子记录（`delete_files=False`），盘上一个字节都不动。"""
+        h = victim["hash"]
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run",
+                                          "would_drop": victim.get("name", "")})
+            return
+        magnet = victim.get("magnet_uri") or ""
+        try:
+            self.ctx.qbit.delete([h], delete_files=False)
+        except Exception as e:
+            self._audit("failed", f, a, {
+                "error": f"删除种子记录失败，未做任何改动：{type(e).__name__}: {e}"})
+            return
+        self._removed_torrents.add(h)
+        self._audit("applied", f, a,
+                    {"dropped": victim.get("name", ""), "files_untouched": True, "note": note,
+                     **({} if magnet else {"irreversible": "无 magnet_uri，此条不可回退"})},
+                    undo=self._readd_undo(victim, magnet))
 
     # ---------------- 回退 ----------------
     def rollback(self, run_id: str) -> dict:
@@ -939,6 +1369,19 @@ class Executor:
                    if r.get("status") == "applied" and not r.get("undo")]
 
         done, skipped, failed, lost = [], [], [], []
+
+        # qBittorrent 不在就整批拒绝（critic N3）：逆改名会退化成 `mv`，
+        # 目录改名的逆操作无从得知哪些文件归活种子，其余逆操作
+        # 各自 AttributeError 记成 failed——半截回退比不回退更难收拾。
+        # （qBit 在线时，目录改名的逆操作另有一道：先问活的种子视图，有不在记录里
+        # 的种子就不动；setLocation 失败记 failed、残留一个不搬。）
+        # 也**不写** rollback 汇总记录：写了 `list_runs` 就会把这批标成已回退。
+        refused = self.qbit_blocker()
+        if refused:
+            return {"run_id": run_id, "refused": refused, "total": len(records),
+                    "reverted": 0, "skipped": 0, "failed": 0,
+                    "irreversible": len(no_undo), "torrent_records_lost": 0,
+                    "skipped_detail": [], "failed_detail": []}
 
         for rec in reversed(undoable):        # LIFO
             u = rec["undo"]
@@ -963,6 +1406,7 @@ class Executor:
             "torrent_records_lost": len(lost),
             "skipped_detail": skipped[:10],
             "failed_detail": failed[:10],
+            "refused": "",
         }
         if not self.dry_run:
             with self.cfg.audit_log.open("a", encoding="utf-8") as fp:
@@ -987,28 +1431,123 @@ class Executor:
                 out.append(rec)
         return out
 
+    def _undo_problem(self, u: dict) -> str | None:
+        """逆操作的参数是否合法；合法返回 None，否则返回拒绝原因。
+
+        审计记录是**历史数据**：写它的代码可能有 bug（6 条 `trash_path` 为空
+        的记录就是 `_op_trash` 先删种子、后查文件留下的），也可能被手工改过。
+        回退又是最危险的时刻——它照着记录去搬文件、改种子。所以每个逆操作
+        都先核对自己的输入，形状不对就拒绝并说明原因，绝不"尽力而为"。
+        """
+        op = u.get("op")
+        media = Path(self.cfg.media_root)
+
+        def lib_path(key: str) -> str | None:
+            return _inside(u.get(key), media, key)[1]
+
+        if op == "restore_from_trash":
+            return (_inside(u.get("trash_path"), self.cfg.trash_dir, "trash_path")[1]
+                    or lib_path("path"))
+        if op == "rename":
+            return lib_path("path") or _bad_name(u.get("new_name"), "new_name")
+        if op == "rename_show_dir":
+            why = lib_path("path") or _bad_name(u.get("new_name"), "new_name")
+            if why:
+                return why
+            for pair in u.get("torrent_savepaths") or []:
+                if not (isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0]):
+                    return f"torrent_savepaths 条目不合法：{pair!r}"
+                why = _inside(pair[1], media, "torrent_savepaths 的 save_path")[1]
+                if why:
+                    return why
+            prev = u.get("prev_savepath")
+            if prev and not os.path.isabs(str(prev)):
+                return f"prev_savepath 不是绝对路径：{prev!r}"
+            return None
+        if op in ("restore_sidecar", "ungrab_episode"):
+            why = lib_path("show_dir")
+            if why:
+                return why
+            if op == "ungrab_episode":
+                try:
+                    int(u["season"]), int(u["episode"])
+                except (KeyError, TypeError, ValueError):
+                    return "season / episode 缺失或不是整数"
+            return None
+        if op in ("restore_title_aliases", "restore_rss_link"):
+            if not u.get("bangumi_id"):
+                return "缺 bangumi_id"
+            if not self.ctx.abdb:
+                return "AutoBangumi 数据库不可用"
+            return None
+        if op == "readd_torrent":
+            magnet = u.get("magnet") or ""
+            if not (isinstance(magnet, str) and magnet.startswith("magnet:?")
+                    and "xt=urn:btih:" in magnet):
+                return f"magnet 不合法：{magnet!r}"
+            if u.get("save_path"):
+                return lib_path("save_path")
+            return None
+        if op == "relink_torrent":
+            if not u.get("torrent_hash"):
+                return "缺 torrent_hash"
+            for m in u.get("mapping") or []:
+                why = (_bad_rel((m or {}).get("old"), "mapping.old")
+                       or _bad_rel((m or {}).get("new"), "mapping.new"))
+                if why:
+                    return why
+            if u.get("new_save_path"):
+                return lib_path("new_save_path")
+            return None
+        if op in ("recategorize", "remove_tags"):
+            if not u.get("torrent_hash"):
+                return "缺 torrent_hash"
+            if op == "remove_tags" and not u.get("tags"):
+                return "缺 tags"
+            return None
+        if op == "restore_file_priority":
+            if not u.get("torrent_hash"):
+                return "缺 torrent_hash"
+            idx, pri = u.get("index"), u.get("priority")
+            if not (isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0):
+                return f"index 不是非负整数：{idx!r}"
+            if not (isinstance(pri, int) and not isinstance(pri, bool) and 1 <= pri <= 7):
+                return f"priority 不是 1–7 的整数：{pri!r}"
+            return None
+        return None
+
     def _apply_undo(self, u: dict) -> tuple[bool, str]:
         """执行一条逆操作。返回 (是否成功, 跳过原因)。"""
-        op = u["op"]
+        op = u.get("op")
+        bad = self._undo_problem(u)
+        if bad:
+            return False, f"逆操作参数不合法，拒绝执行（{op}）：{bad}"
 
         if op == "rename":
             cur = Path(u["path"])
             if not cur.exists():
                 return False, f"当前文件不存在，可能已被再次改名：{cur.name}"
+            if cur.is_dir():
+                return False, f"逆改名的对象是目录而不是文件，拒绝：{cur}"
             back = cur.parent / u["new_name"]
             if back.exists():
                 return False, f"还原目标已存在：{back.name}"
-            if self.dry_run:
-                return True, ""
+            # AGENTS.md 第 3 条对回退同样成立：有种子的文件只走 renameFile。
+            # 以前种子里找不到、或 qBit 不在时，这里退化成 `Path.rename`（critic N3）。
             h = u.get("torrent_hash")
-            if h and self.ctx.qbit:
+            rel = None
+            if h:
+                if not self.ctx.qbit:
+                    return False, "有种子的文件，但 qBittorrent 不可用：拒绝绕过它改名"
                 rel = self._torrent_rel_path(h, cur)
                 if rel is None:
-                    cur.rename(back)      # 种子里找不到，退化为文件系统改名
-                else:
-                    new_rel = (str(Path(rel).parent / u["new_name"])
-                               if "/" in rel else u["new_name"])
-                    self.ctx.qbit.rename_file(h, rel, new_rel)
+                    return False, "种子文件列表里找不到该文件，拒绝退化成文件系统改名"
+            if self.dry_run:
+                return True, ""
+            if rel is not None:
+                new_rel = (str(Path(rel).parent / u["new_name"])
+                           if "/" in rel else u["new_name"])
+                self.ctx.qbit.rename_file(h, rel, new_rel)
             else:
                 cur.rename(back)
             return True, ""
@@ -1018,27 +1557,50 @@ class Executor:
             back = cur.parent / u["new_name"]
             if back.exists():
                 return False, f"还原目标目录已存在：{back.name}"
+
+            # 回退同样由 qBittorrent 搬运（AGENTS.md 第 3 条）。以前这里有两个洞：
+            # setLocation 的异常被 `continue` 吞掉，而改名之后才落进新目录的种子
+            # （此后抓的新集）根本不在 torrent_savepaths 里——接下来按顶层把新目录
+            # 整个 shutil.move 回去，它们的文件就被文件系统搬走、种子失联，
+            # 这条记录还算 reverted。生产上有 78 条已执行的 rename_show_dir，
+            # 回退其中较早的任何一条都会命中后一种，不需要任何故障。
+            # 所以先问 qBittorrent 此刻谁在这个目录里：有不在记录里的，整条不动。
+            if not cur.is_dir():
+                # 改名后的目录不在了（此后又被改过名、或被人挪走）：记录里的种子此刻在哪
+                # 不知道，照记录把它们逐个 setLocation 回去就是盲目覆盖。与逆改名同口径。
+                return False, f"当前目录已不存在，可能此后又改过名：{cur.name}"
+            listed = dict(u.get("torrent_savepaths") or [])
+            owners, claimed = self._live_claims_under(cur)
+            strangers = [h for h in owners if h not in listed]
+            if strangers:
+                names = "、".join(f"{h[:8]}（{owners[h].get('name', '')[:40]}）"
+                                 for h in strangers[:3])
+                return False, (f"{cur.name} 里有 {len(strangers)} 个种子不在当初的改名记录里"
+                               f"（改名之后才落进来的，如 {names}）：回退只会搬回记录里的"
+                               f"种子，其余种子的文件会被连带搬走、就此失联。交给人处理")
             if self.dry_run:
                 return True, ""
 
-            # 回退同样由 qBittorrent 搬运，保持"改动必经 qBit"的不变式
-            for h, sp in u.get("torrent_savepaths", []):
+            moved, failed = 0, []
+            for h, sp in listed.items():
+                if h not in owners:
+                    continue          # 已不在这个目录里（被删了、或此后挪去了别处）：不归这次回退管
                 try:
                     self.ctx.qbit.set_location([h], sp)   # 还原为原始 save_path
-                except Exception:
-                    continue
+                    moved += 1
+                except Exception as e:
+                    failed.append(f"{h[:8]}：{type(e).__name__}: {e}")
+            if failed:
+                # 与正向操作同一口径：有种子没搬成就停手，残留一个都不动——此时是
+                # 半迁移状态，再用文件系统搬只会把没搬成的那个种子的文件也搬走。
+                raise RuntimeError(
+                    f"{len(failed)} 个种子 setLocation 失败（已交给 qBittorrent 搬回 {moved} 个），"
+                    f"残留文件一个没动，需人工核对：{failed[0]}")
 
-            # 残留文件搬回去，再清掉空的新目录
+            # 没有种子声明的残留（NFO、孤儿字幕、`.extras` 里的东西……）逐个文件搬回，
+            # 任何种子声明的路径都不碰：setLocation 是异步的，qBit 可能还没搬完。
             if cur.exists():
-                back.mkdir(parents=True, exist_ok=True)
-                for item in list(cur.iterdir()):
-                    dest = back / item.name
-                    if not dest.exists():
-                        shutil.move(str(item), str(dest))
-                try:
-                    cur.rmdir()
-                except OSError:
-                    pass
+                self._merge_tree(cur, back, skip=claimed)
 
             bid, prev = u.get("bangumi_id"), u.get("prev_savepath")
             if bid and prev and self.ctx.abdb:
@@ -1092,8 +1654,11 @@ class Executor:
             try:
                 # 回滚重加要保持暂停：让人先确认再放行，别一回退就开跑。
                 # 已存在（409）等同于回退成功。
+                # 旧记录没有 no_subfolder 字段：保持原来的 False（撞车受害者都是
+                # 单文件种子，布局对它们无影响）。
                 self.ctx.qbit.add_torrent(
-                    u["magnet"], paused=True, no_subfolder=False,
+                    u["magnet"], paused=True,
+                    no_subfolder=bool(u.get("no_subfolder", False)),
                     save_path=u.get("save_path") or "",
                     category=u.get("category") or "", tags=u.get("tags") or "")
             except Exception as e:
@@ -1142,12 +1707,36 @@ class Executor:
             self.ctx.qbit.remove_tags([u["torrent_hash"]], u["tags"])
             return True, ""
 
+        if op == "restore_file_priority":
+            h = u["torrent_hash"]
+            try:
+                entries = self.ctx.qbit.files(h)
+            except Exception as e:
+                if "404" in str(e):
+                    return False, "所属种子已不在 qBittorrent 里"
+                raise
+            entry = next((e for e in entries if e.get("index") == u["index"]), None)
+            if entry is None:
+                return False, f"种子里已没有第 {u['index']} 个条目"
+            if entry.get("priority", 1) != 0:
+                return False, f"该条目的优先级已被改成 {entry.get('priority')}，不覆盖"
+            if self.dry_run:
+                return True, ""
+            self.ctx.qbit.set_file_priority(h, [u["index"]], u["priority"])
+            return True, ""
+
         if op == "restore_from_trash":
-            src = Path(u.get("trash_path") or "")
-            dst = Path(u.get("path") or "")
-            if not src or not src.exists():
+            # 路径形状已由 _undo_problem 核过（绝对、规范、分别在隔离区 / 媒体库之下）
+            src = Path(os.path.normpath(u["trash_path"]))
+            dst = Path(os.path.normpath(u["path"]))
+            if not os.path.lexists(src):
                 return False, "隔离区文件已不存在（可能已过保留期被清理）"
-            if dst.exists():
+            if src.is_dir() or not src.is_file():
+                # 隔离区里只该有单个文件。是目录就说明当初移进来的是整个目录
+                # （死种按 content_path 删过整季目录的形态），整体搬回会和
+                # 此后长出来的新内容搅在一起，交给人看。
+                return False, f"隔离区里的不是普通文件，拒绝整体搬回：{src}"
+            if os.path.lexists(dst):
                 return False, f"原位置已被占用：{dst.name}"
             if self.dry_run:
                 return True, ""
@@ -1165,52 +1754,81 @@ class Executor:
         把旧目录残留内容合并进新目录。
 
         对**仍有有效种子**的文件优先走 qBittorrent setLocation；
-        种子已失联的（stale path）只能走文件系统——那些种子本来就已经断了，
-        搬运不会让情况更糟，但会记录下来。
+        没有任何种子声明的残留才走文件系统。任何活种子此刻声明的路径都不用
+        文件系统搬（`_live_claims_under`）；某个种子 setLocation 失败，这一对就不合并。
         """
+        # qBit 不在时"哪些文件有活种子"无从得知，_merge_tree 会用文件系统
+        # 搬走活种子的文件（critic N3）。拒绝。
+        refused = self.qbit_blocker()
+        if refused:
+            return {"pairs": 0, "detail": [], "refused": refused}
         pairs = []
         for rec in self._read_audit(run_id):
             if rec.get("status") != "applied" or rec.get("op") != "rename_show_dir":
                 continue
             u = rec.get("undo") or {}
-            new = Path(u.get("path", ""))
-            old = new.parent / u.get("new_name", "")
-            if old.exists() and new.exists() and old != new:
+            # 与回退同一道闸（critic N1）：空 path 会让 new = Path('.')、
+            # old = cwd 下的相对目录，_merge_tree 就在运维者的当前目录里搬文件。
+            new, why = _inside(u.get("path"), Path(self.cfg.media_root), "path")
+            if why or _bad_name(u.get("new_name"), "new_name"):
+                continue
+            old = new.parent / u["new_name"]
+            if old.is_dir() and new.is_dir() and old != new:
                 pairs.append((old, new))
 
         results = []
         for old, new in pairs:
-            # 先让还活着的种子自己搬
-            via_qbit = 0
-            if self.ctx.qbit:
-                for t in self.ctx.qbit.torrents():
-                    sp = t.get("save_path") or ""
-                    cp = t.get("content_path") or ""
-                    if not under(sp, old):
-                        continue
-                    if not Path(cp).exists():
-                        continue          # 死链种子，setLocation 搬不动它
-                    try:
-                        self.ctx.qbit.set_location(
-                            [t["hash"]], repath(sp, old, new))
-                        via_qbit += 1
-                    except Exception:
-                        continue
+            # 先问 qBittorrent 此刻谁在旧目录里有文件——不只是 save_path 在旧目录下的：
+            # Original 布局、save_path 在媒体根、根目录恰好叫剧名的种子，content 在
+            # 旧目录下而 save_path 不在，以前它不进 setLocation 名单，文件直接被
+            # _merge_tree 用文件系统搬走。这些被声明的路径一律不许文件系统碰。
+            owners, claimed = self._live_claims_under(old)
+            movable = []
+            for t in owners.values():
+                sp = t.get("save_path") or ""
+                cp = t.get("content_path") or ""
+                if not under(sp, old):
+                    continue          # 根在旧目录之上：setLocation 改不了它的根目录名，留给人
+                if not (cp and Path(cp).exists()):
+                    continue          # 死链 / 没有元数据：setLocation 搬不动它
+                movable.append(t)
 
             if self.dry_run:
+                # 以前 setLocation 在 dry-run 判断之前就发出去了：预演也真的搬了种子。
                 remaining = sum(1 for p in old.rglob("*")
-                                if p.is_file() and not self._is_junk(p.name))
+                                if p.is_file() and p not in claimed
+                                and not self._is_junk(p.name))
                 results.append({"old": old.name, "new": new.name,
-                                "would_move_via_qbit": via_qbit,
+                                "would_move_via_qbit": len(movable),
                                 "would_move_via_fs": remaining})
                 continue
 
-            moved, stranded = self._merge_tree(old, new)
+            via_qbit, failed = 0, []
+            for t in movable:
+                try:
+                    self.ctx.qbit.set_location(
+                        [t["hash"]], repath(t["save_path"], old, new))
+                    via_qbit += 1
+                except Exception as e:
+                    failed.append(f"{t['hash'][:8]}：{type(e).__name__}: {e}")
+            if failed:
+                # 以前吞掉异常接着 _merge_tree：qBit 仍记着旧 save_path，文件却被
+                # 文件系统搬去了新目录——种子失联。这一对停手，交给人。
+                results.append({"old": old.name, "new": new.name,
+                                "moved_via_qbit": via_qbit, "moved_via_fs": 0,
+                                "stranded": 0, "old_removed": False,
+                                "error": (f"{len(failed)} 个种子 setLocation 失败，这一对不做"
+                                          f"文件系统合并：{failed[0]}")})
+                continue
+
+            moved, stranded = self._merge_tree(old, new, skip=claimed)
             results.append({"old": old.name, "new": new.name,
                             "moved_via_qbit": via_qbit, "moved_via_fs": moved,
-                            "stranded": stranded, "old_removed": not old.exists()})
+                            "stranded": stranded,
+                            "left_for_torrents": sum(1 for p in claimed if p.exists()),
+                            "old_removed": not old.exists()})
 
-        return {"pairs": len(pairs), "detail": results}
+        return {"pairs": len(pairs), "detail": results, "refused": ""}
 
     def list_runs(self) -> list[dict]:
         """列出历史 run，供选择回退哪一次。"""

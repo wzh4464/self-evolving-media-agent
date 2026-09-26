@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -251,6 +252,18 @@ def _is_video(f: MediaFile) -> bool:
     return f.ext in VIDEO_EXTS or (f.ext == ".!qB" and Path(f.path.stem).suffix.lower() in VIDEO_EXTS)
 
 
+def is_phantom(f: MediaFile) -> bool:
+    """种子声明着、盘上却没有（连 `.!qB` 都没有）的文件。
+
+    scan 的来源 1 按 `torrents/files` 出条目，盘上不在的也出（下载中的文件本来就
+    可能还没落盘）。判重只收已下完的，所以进了判重桶的"盘上没有"就是幻影：
+    LAT-01 那次把有种子的文件当本地文件隔离后，种子 d08f05a7 留下的就是这种；
+    用户经 Jellyfin 删文件、手工挪文件也会造出来。
+    """
+    return (bool(f.torrent_hash) and not os.path.lexists(f.path)
+            and not os.path.lexists(str(f.path) + ".!qB"))
+
+
 # ---------------------------------------------------------------------------
 class OrphanTorrentDetector:
     """在 Media 目录里但没有 `ab:<id>` 标签的种子。
@@ -464,8 +477,26 @@ class DuplicateEpisodeDetector:
                 # 2026-09-18 EP11 的合并发布种子里装着 TV 版和邪龙解放版两个
                 # 文件，共用同一个 torrent_name、复核结果完全一样，取第一个
                 # 就是随机——实测选中了 TV 版，正好是用户不要的那份。
+                #
+                # 幻影（种子说已下完、盘上没有）既不能封存也不能当赢家：探测不到文件时
+                # 复核只看发布名，钉了 `ma:` 的幻影会被封存；排序时它的声明大小和
+                # 发布名照样算分，比真文件"好"就赢——真文件被当输家移进隔离区，
+                # 这一集从库里消失、幻影永远留着（2026-09-26 审查复现，LAT-01 余波）。
+                phantoms = {id(f) for f in files if is_phantom(f)}
+                if len(phantoms) == len(files):
+                    yield Finding(
+                        rule=self.id, kind="phantom_only", severity="minor",
+                        classified=True,
+                        summary=(f"S{season:02d}E{ep:02d} 的 {len(files)} 个候选都是种子声明了、"
+                                 f"盘上却没有的幻影，没有可保留的真文件，本轮不做取舍"),
+                        show=show.dir_name, path=str(files[0].path),
+                        evidence={"files": [f.filename for f in files],
+                                  "torrents": [f.torrent_hash for f in files]},
+                    )
+                    continue
                 sealed = None
-                for f in sorted((f for f in files if _pinned(f) == (season, ep)),
+                for f in sorted((f for f in files
+                                 if _pinned(f) == (season, ep) and id(f) not in phantoms),
                                 key=_prefer_score, reverse=True):
                     ok, why = meets_requirements(f)
                     if ok:
@@ -534,7 +565,10 @@ class DuplicateEpisodeDetector:
                         losers = [f for f in losers if f not in holdback]
                     reason = "集位已封存：%s" % seal_why
                 else:
-                    ranked = sorted(files, key=_rank_for_keep, reverse=True)
+                    # 真文件永远排在幻影前面（见上文 phantoms 的注释）
+                    ranked = sorted(files, key=lambda f: (id(f) not in phantoms,
+                                                          _rank_for_keep(f)),
+                                    reverse=True)
                     keeper, losers = ranked[0], ranked[1:]
                     reason = ""
 
@@ -565,7 +599,9 @@ class DuplicateEpisodeDetector:
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(sib.path),
                                             "torrent_hash": sib.torrent_hash,
-                                            "file_only": True},
+                                            "file_only": True,
+                                            **({"phantom": True} if id(sib) in phantoms
+                                               else {})},
                                       note="合并发布的另一版本：设为不下载并移入隔离区"),
                     )
 
@@ -573,25 +609,32 @@ class DuplicateEpisodeDetector:
                 for loser in losers:
                     ld = content_digest(loser.path, cache)
                     identical = bool(kd and ld and kd == ld)
+                    # 幻影输家：盘上没有可搬的文件，要处置的是那条种子记录——它不摘，
+                    # 赢家改到集位名上就成了"两个种子宣称同一路径"。执行器凭这个标记、
+                    # 且执行时复核仍是幻影，才摘记录（可凭 magnet 回退）。
+                    phantom = id(loser) in phantoms
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="important",
                         summary=(f"S{season:02d}E{ep:02d} 重复："
                                  f"{'集位已封存，' if sealed else ''}"
-                                 f"保留 {keeper.filename}，清理 {loser.filename}"),
+                                 f"保留 {keeper.filename}，清理 {loser.filename}"
+                                 f"{'（幻影：种子说已下完、盘上没有）' if phantom else ''}"),
                         show=show.dir_name, path=str(loser.path),
                         torrent_hash=loser.torrent_hash,
                         evidence={
                             "keep": str(keeper.path), "keep_size": keeper.size,
                             "drop_size": loser.size,
                             "keep_digest": kd, "drop_digest": ld,
-                            "byte_identical": identical,
+                            "byte_identical": identical, "phantom": phantom,
                             "reason": ("字节完全相同" if identical
                                        else reason or "同集不同版本，按画质取舍"),
                         },
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(loser.path),
-                                            "torrent_hash": loser.torrent_hash},
-                                      note="移入隔离区，保留期内可恢复"),
+                                            "torrent_hash": loser.torrent_hash,
+                                            **({"phantom": True} if phantom else {})},
+                                      note=("幻影：只摘种子记录（可凭 magnet 回退）" if phantom
+                                            else "移入隔离区，保留期内可恢复")),
                     )
 
 
@@ -636,11 +679,97 @@ class RenameCollisionDetector:
 
 
 # ---------------------------------------------------------------------------
+def is_dead_now(t: dict) -> bool:
+    """此刻的**瞬时**死亡特征：没下完、没人做种、全网拼不出完整副本。
+
+    检测器与执行器（`drop_torrent` 执行前的活体复核）共用这一个判据。
+    """
+    return (t.get("progress", 0) < 1.0
+            and t.get("state") in ("stalledDL", "downloading", "metaDL")
+            and (t.get("num_complete") or 0) <= 0
+            and (t.get("num_seeds") or 0) <= 0
+            and (t.get("availability") or 0) <= 0)
+
+
+def last_sign_of_life(t: dict, now: float) -> float:
+    """最后一次"活着"的时刻：加入、收发数据、见到完整副本，三者取最晚。
+
+    以前只看 `added_on`——量的是**加入多久**，不是**停滞多久**：半年前加的、
+    一小时前还在收数据的种子也会被判死；`relink_torrent` 触发 recheck 后
+    卡在 99.8% 的老种子同样一上来就"停滞了几个月"。
+
+    `last_activity`（最后一次收发数据）/ `seen_complete`（最后一次见到完整副本）
+    按 WebAPI 文档是 Unix 时间戳；**没有逐条在生产上实测**。所以取 max：
+    字段缺失、为 0/-1、或在未来，都自动退回 `added_on`，不会比以前更激进。
+    """
+    stamps = [t.get("added_on") or 0, t.get("last_activity") or 0,
+              t.get("seen_complete") or 0]
+    return max([s for s in stamps if 0 < s <= now + 60] or [now])
+
+
+def _library_show_of(save_path: str, media_root: Path) -> str | None:
+    """种子落在哪部番的目录里；不在媒体库的番剧目录里返回 None。
+
+    与 scan 同一口径：以 `.` 开头的一级目录（`.staging` 等手动暂存区）不算。
+    """
+    sp = (save_path or "").rstrip("/")
+    root = str(media_root).rstrip("/")
+    if not sp.startswith(root + "/"):
+        return None
+    top = sp[len(root) + 1:].split("/", 1)[0]
+    return None if not top or top.startswith(".") else top
+
+
+def completed_members(ctx: Context, torrent_hash: str) -> list[str] | None:
+    """种子里已经下完、仍要下载的成员文件；读不到文件列表返回 None（= 不知道）。"""
+    try:
+        entries = ctx.qbit.files(torrent_hash) if ctx.qbit else None
+    except Exception:
+        return None
+    if entries is None:
+        return None
+    return [e["name"] for e in entries
+            if e.get("priority", 1) != 0 and e.get("progress", 0) >= 1]
+
+
+def droppable_dead(ctx: Context, t: dict, now: float) -> bool:
+    """这一轮 dead-torrent 会不会**摘掉**它——与检测器完全同一个判据。
+
+    抓取的换源放行（`grab._inflight`）必须用它：放行抓新源（op 0）的那一轮，
+    旧种子就得同批被摘掉（op 1），否则新种子被改到同一个集位名上，两个种子抢
+    一个文件。以前放行看的是 `now - added_on`，而死种从 2026-09-26 起改按
+    "最后一次活着"计时——72 小时前加入、10 小时前还在收数据的种子被放行换源、
+    却不算死，新旧并存（审查复现）。有已下完成员的死种检测器只报告不摘，这里
+    同样不放行；读不到文件列表（`completed_members` 为 None）也不放行。
+    """
+    if not is_dead_now(t):
+        return False
+    if _library_show_of(t.get("save_path", ""), ctx.config.media_root) is None:
+        return False
+    if now - last_sign_of_life(t, now) < ctx.config.dead_torrent_hours * 3600:
+        return False
+    return completed_members(ctx, t.get("hash", "")) == []
+
+
 class DeadTorrentDetector:
     """0 做种 + availability 0 + 长期停滞 = 死种，等下去也不会有进度。
 
     出处：《异世界四重奏》S02 整季 —— 所有 tracker 都报 seeds=0，
     availability=0 表示全网 peer 拼不出一份完整文件，换源也无解。
+
+    **处置只针对种子记录本身，磁盘一个字节都不动**（testinfra B1）。
+    早先的动作是 `trash{path: content_path}`，而 NoSubfolder 多文件种子
+    （本项目自己抓的种子默认就是这个布局，生产上 10 个）的 content_path 就是
+    整个 `Season N` 目录——一个死种会把整季、别的种子的文件、所有封存集位一起
+    搬进隔离区，目录的 `st_size` 还让体积配额形同虚设。同一目录下两个死种的
+    finding 又因 key 相同塌成一条（critic N7），所以这里按 hash 出 finding。
+    实际上生产 3 次死种处置都是 `freed 0`：content_path 不带 `.!qB`，
+    从来只摘了记录——现在把这一点明确下来。
+
+    另外两道收窄：
+    - **只管媒体库番剧目录里的种子**：2026-09-08 它删了 `Media/.staging/opm-oad/`
+      下三个手动暂存的种子。
+    - **有已下完的成员文件就只报告**：那是可播的正片、还在做种，"死"不等于"没用"。
     """
     id = "dead-torrent"
     kind = "dead_torrent"
@@ -650,30 +779,47 @@ class DeadTorrentDetector:
         threshold = ctx.config.dead_torrent_hours * 3600
         now = time.time()
         for t in state.torrents:
-            if t.get("progress", 0) >= 1.0:
+            if not is_dead_now(t):
                 continue
-            if t.get("state") not in ("stalledDL", "downloading", "metaDL"):
+            show = _library_show_of(t.get("save_path", ""), ctx.config.media_root)
+            if show is None:
                 continue
-            if t.get("num_complete", 0) > 0 or t.get("num_seeds", 0) > 0:
-                continue
-            if t.get("availability", 0) > 0:
-                continue
-            stalled = now - (t.get("added_on") or now)
+            stalled = now - last_sign_of_life(t, now)
             if stalled < threshold:
+                continue
+            h = t.get("hash", "")
+            done = completed_members(ctx, h)
+            if done is None:
+                continue                  # 看不到文件列表就不下结论
+            evidence = {"num_seeds": t.get("num_seeds"),
+                        "num_complete": t.get("num_complete"),
+                        "availability": t.get("availability"),
+                        "progress": t.get("progress"),
+                        "stalled_hours": round(stalled / 3600),
+                        "content_path": t.get("content_path", "")}
+            name = t.get("name", "")[:60]
+            if done:
+                yield Finding(
+                    rule=self.id, kind=self.kind, severity="important",
+                    summary=(f"死种里有 {len(done)} 个已下完的文件，自动摘种会让它们"
+                             f"失去做种，需人工决定：{name}"),
+                    show=show, torrent_hash=h,
+                    evidence={**evidence, "completed_files": done[:5]},
+                )
                 continue
             yield Finding(
                 rule=self.id, kind=self.kind, severity="important",
-                summary=f"死种（全网无完整副本，已停滞 {stalled/3600:.0f}h）：{t.get('name','')[:60]}",
-                path=t.get("content_path", ""), torrent_hash=t.get("hash", ""),
-                evidence={"num_seeds": t.get("num_seeds"),
-                          "num_complete": t.get("num_complete"),
-                          "availability": t.get("availability"),
-                          "progress": t.get("progress"),
-                          "stalled_hours": round(stalled / 3600)},
-                action=Action(op="trash", reversible=True,
-                              args={"torrent_hash": t.get("hash", ""),
-                                    "path": t.get("content_path", "")},
-                              note="删除种子；已下载的碎片进隔离区"),
+                summary=f"死种（全网无完整副本，已停滞 {stalled/3600:.0f}h）：{name}",
+                show=show, torrent_hash=h, evidence=evidence,
+                action=Action(op="drop_torrent", reversible=True,
+                              args={"torrent_hash": h, "dead": True,
+                                    "name": t.get("name", ""),
+                                    "magnet": t.get("magnet_uri", ""),
+                                    "save_path": t.get("save_path", ""),
+                                    "category": t.get("category", ""),
+                                    "tags": t.get("tags", "")},
+                              note="只摘种子记录（可凭 magnet 回退），磁盘上的文件"
+                                   "（含 .!qB 半成品）一个字节都不动"),
             )
 
 

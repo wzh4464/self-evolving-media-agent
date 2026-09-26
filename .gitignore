@@ -1,5 +1,26 @@
+# 生产机上才有、绝不能入库的东西。生产目录改成 git 工作区之后，
+# 一次顺手的 `git add -A` 就可能把它们带进这个公开仓库。
 .env
+# .env 的一切变体（生产上有 .env.bak-20260917T205051，里面是真密钥），样例除外
+.env.*
+!.env.example
+state/
+
+# 手工备份：生产上见过 media_agent/*.py.bak-20260915、
+# .agents/preferences.json.bak-20260905。备份不是版本，版本在 git 里。
+*.bak
+*.bak-*
+*.bak.*
+
+# 本地环境与工具缓存
 .venv/
 __pycache__/
 *.pyc
-state/
+.pytest_cache/
+.ruff_cache/
+
+# macOS（生产机的 git 没配全局 excludesfile）
+.DS_Store
+
+# 注意：.agents/rules/ 与 .agents/preferences.json 是**版本化**的行为输入，
+# 不许加进这里——生产行为要能从 git 完整复现，部署的漂移闸门靠它们在 git 里。

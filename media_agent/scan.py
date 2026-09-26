@@ -32,8 +32,16 @@ def _iter_files(show_dir: Path) -> list[Path]:
     return out
 
 
-def _torrent_files(ctx: Context, torrent_hash: str) -> list[dict]:
-    """取种子的文件列表。单次扫描内按 hash 缓存，避免同一种子重复请求。"""
+def _torrent_files(ctx: Context, torrent_hash: str, errors: list[str]) -> list[dict]:
+    """取种子的文件列表。单次扫描内按 hash 缓存，避免同一种子重复请求。
+
+    **读失败必须记下来，不能缓存成空列表。** 以前任何 `files()` 错误都被吞成 `[]`：
+    这个种子的文件于是不算"被种子覆盖"，来源 2 又因为 save_path 在本剧目录下
+    把认领丢掉，文件就成了无主的纯本地文件——改名走被禁止的文件系统分支、
+    隔离跳过种子处理（critic N2）。每轮约 539 次调用，一次 WebUI 超时就够；
+    生产上 qBit 超时见过三次（2026-09-19/20）。现在记进 `errors`，
+    执行器看到非空就整批拒绝。
+    """
     cache = getattr(ctx, "_tfile_cache", None)
     if cache is None:
         cache = {}
@@ -41,8 +49,11 @@ def _torrent_files(ctx: Context, torrent_hash: str) -> list[dict]:
     if torrent_hash not in cache:
         try:
             cache[torrent_hash] = ctx.qbit.files(torrent_hash)
-        except Exception:
-            cache[torrent_hash] = []
+        except Exception as e:
+            msg = f"files({torrent_hash[:8]}) 读取失败：{type(e).__name__}: {e}"
+            errors.append(msg)
+            ctx.log(f"[scan] qBittorrent 数据不完整——{msg}")
+            return []                     # 不缓存：这是"不知道"，不是"没有文件"
     return cache[torrent_hash]
 
 
@@ -84,9 +95,36 @@ def _season_dir_of(path: Path, show_dir: Path) -> str:
 def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
     cfg = ctx.config
     state = LibraryState()
+    # 与 ctx 共用同一个列表：执行器从 ctx 上看本轮扫描是否完整（见 Executor.apply）
+    ctx.qbit_errors = state.qbit_errors
+
+    # 每次扫描都是一份新快照：清掉上一次扫描留下的缓存（testinfra B3）。
+    # `_tfile_cache` 以前在 Context 的整个生命周期里从不失效，`cmd_run` 在 apply
+    # 之后用同一个 ctx 重扫给演进器用——改名前的条目名从缓存里出来成了"种子声明了、
+    # 盘上没有"的幻影，改名后的真文件反倒成了本地文件：同一集两份、外加一条未改名。
+    # 幻影一旦被判重 trash，就是 critic N1 那种丢种子记录、`trash_path` 为空的记录。
+    # sidecar 的 `season_offsets` 缓存是模块级的，同样只活到这次扫描为止。
+    ctx._tfile_cache = {}                 # type: ignore[attr-defined]
+    from .plugins import builtin as _builtin
+    _builtin._OFFSET_CACHE.clear()
 
     # --- qBittorrent：按 content_path 建索引 ---
-    torrents = ctx.qbit.torrents() if ctx.qbit else []
+    # 读不到（未登录 / torrents() 出错）时照常扫完磁盘——诊断仍然有用——
+    # 但记进 qbit_errors：没有种子视图的快照，每个有种子的文件都会被当成纯本地
+    # 文件。2026-09-19 run 20260919T225410 就是这样把归种子 d08f05a7 所有的
+    # `朱音落语 S01E12.mp4` 以 `torrent_hash ""` 移进了隔离区。
+    torrents: list[dict] = []
+    listed = False                        # torrents() 真的成功返回过
+    if ctx.qbit is None:
+        state.qbit_errors.append("qBittorrent 不可用（登录失败或未配置）")
+    else:
+        try:
+            torrents = ctx.qbit.torrents()
+            listed = True
+        except Exception as e:
+            msg = f"torrents() 读取失败：{type(e).__name__}: {e}"
+            state.qbit_errors.append(msg)
+            ctx.log(f"[scan] qBittorrent 数据不完整——{msg}")
     state.torrents = torrents
     torrent_by_hash = {t["hash"]: t for t in torrents}
     by_path: dict[str, dict] = {}
@@ -156,7 +194,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
             sp = (t.get("save_path") or "").rstrip("/")
             if not sp or not under(sp, show_dir):
                 continue
-            for entry in _torrent_files(ctx, h):
+            for entry in _torrent_files(ctx, h, state.qbit_errors):
                 if entry.get("priority", 1) == 0:
                     continue            # 被标记为不下载
                 abs_p = Path(sp) / entry["name"]
@@ -244,6 +282,24 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
             show.is_movie = _looks_like_movie(
                 show_dir, sum(1 for f in show.files if f.ext in VIDEO_EXTS))
             state.shows.append(show)
+
+    # --- 合理性：登录成功却 0 个种子，而库里明明有视频 ---
+    # `torrents()` 成功返回 `[]` 与"真的一个种子都没有"在接口上无法区分。前者的后果
+    # 与 qBit 不可用一模一样：每个有种子的文件都成了纯本地文件，改名走文件系统、
+    # 隔离跳过种子——就是 LAT-01（run 20260919T225410）的形态，只是没有任何报错。
+    # qBittorrent 5.x 只在会话恢复完之后才起 WebUI（application.cpp 里 WebUI 建在
+    # Session::restored 的回调里），"启动中返回空列表"不会发生；真正的触发是一个
+    # 端着空会话的 qBit——比如容器重建时没挂上 config / BT_backup 卷。这个判据不需要
+    # 跨轮状态。部分缺失（比上一轮少了一半）要和上一轮比，留给每轮健康摘要。
+    if listed and not torrents and not cfg.qbit_allow_empty:
+        videos = sum(1 for s in state.shows for f in (*s.files, *s.extras_files)
+                     if f.ext in VIDEO_EXTS)
+        if videos:
+            msg = (f"qBittorrent 报告 0 个种子，而媒体库里有 {videos} 个视频文件——"
+                   f"多半是 qBit 的会话没恢复（容器重建丢了 BT_backup 等）；"
+                   f"库里确实不用种子的话设 QBIT_ALLOW_EMPTY=1")
+            state.qbit_errors.append(msg)
+            ctx.log(f"[scan] qBittorrent 数据不可信——{msg}")
 
     # --- 不在 Media 下的种子（下载中/别处）---
     root_str = str(media_root)

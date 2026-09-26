@@ -24,7 +24,11 @@ media_agent/
 .agents/
   notes/          Agent Notes，路径编码 {lifecycle}/{class}/日期-标题.md
   rules/          演进出来的声明式规则（JSON），下轮自动挂载
-state/            运行时数据：审计日志、隔离区、缓存（gitignore）
+tests/
+  harness/        离线测试基座：FakeQbit/FakeWeb/FakeProbe/… + LibraryBuilder
+  conftest.py     自动隔离（断网、state/ 进临时目录）+ tripwire
+state/            运行时数据：审计日志、隔离区、缓存、运行锁（gitignore）
+deploy/           按 git tag 原地部署、launchd、VPN 救援（见 deploy/README.md）
 ```
 
 ## 命令
@@ -34,9 +38,17 @@ uv run media-agent scan               # 看库现状
 uv run media-agent diagnose           # 跑全部规则，出问题清单（只读）
 uv run media-agent apply --dry-run    # 预演修复
 uv run media-agent apply              # 执行修复
-uv run media-agent evolve             # 为规则盲区提议新规则
-uv run media-agent run                # 完整自治轮次
+uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
+uv run media-agent run                # 完整自治轮次（演进默认冻结）
+uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
+
+**改动删改类逻辑前先写离线测试。** 用 `tests/harness` 的 `LibraryBuilder`
+把事故现场搭出来（范例见 `tests/test_e2e_smoke.py`，fixture 一览见
+`tests/harness/__init__.py`），`lib.cycle()` 跑一轮
+扫描 → 全量规则 → 执行。测试里触发的 failed 审计、被吞的检测器异常、
+没配路由的 URL 都会让测试变红，需要时用 `@pytest.mark.allow(...)` 显式声明。
+见 [离线测试基座](.agents/notes/implemented/testing/2026-09-26-offline-test-harness.md)。
 
 ## 不可动摇的约束
 
@@ -93,8 +105,22 @@ uv run media-agent run                # 完整自治轮次
 
 驳回的提议也留档在 `rejected/`，防止后续重复提同样的坏主意。
 
+**默认冻结**（`EVOLVE_MODE=off`，2026-09-26 起）：`run` 不跑演进、不调 LLM、
+不往 `.agents/` 写任何东西。2026-08-20 之后连续 147 轮提议 0 条、现有演进规则
+全无动作，冻结行为中立；而生产改成按 git tag 部署后，工作区里未入库的规则/笔记
+会被部署的漂移闸门拦下。要演进就设 `EVOLVE_MODE=propose`，产出提交入库、打 tag
+再部署。演进规则带的动作无论哪种模式都不自动执行。
+
 ## 写 Agent Note 的时机
 
 任何非平凡改动都要在同一次提交里新增或更新一条 Agent Note：行为变化、架构决策、
 跨文件契约、流程工具、磁盘/配置格式。类别取自闭集：
 `feature` / `bug-fix` / `simplification` / `architecture` / `process` / `testing`。
+
+**提交前自查**：`git diff --cached --stat` 里有 `media_agent/`、`deploy/`、`.github/`、
+`pyproject.toml` / `uv.lock`、`.gitignore` 或配置格式的改动，就必须同时看到 `.agents/notes/`
+的改动（只补测试、只改文案的提交除外）。事后在最后一个提交里补一篇总笔记不算数——
+单独检出、bisect、cherry-pick 中间那个提交时，它没有决策记录（2026-09-26 审查：
+653aff2..c2eca6f 五个提交就是这样，见 `process/2026-09-26-tag-deploy-and-run-lock.md` 的追认）。
+笔记里引用调研编号时，编号要能在
+[审计编号索引](.agents/notes/implemented/process/2026-09-26-phase1-audit-index.md) 里查到。
