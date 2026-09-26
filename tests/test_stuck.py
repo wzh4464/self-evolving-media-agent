@@ -246,12 +246,17 @@ def test_acked_stuck_finding_is_only_counted(offline_cli, capsys):
     fp = _conflict_fp(lib)
     capsys.readouterr()
     assert cli.cmd_ack(_args(fingerprint=fp, reason="两个版本都要，等人挑"), lib.cfg) == 0
+    capsys.readouterr()                                           # ack 自己的输出里有指纹
     for _ in range(3):
         cli.cmd_run(_args(), lib.cfg)
 
     out = capsys.readouterr().out
-    assert not [ln for ln in out.splitlines() if ln.lstrip().startswith("⏳") and fp in ln]
-    assert "1 个已确认" in out
+    # 指纹只出现在「⏳」下一行的「指纹 …——media-agent ack …」里：确认过的一个字都不该列出来。以前断言
+    # "⏳ 那一行里没有指纹"永远成立、「1 个已确认」又被健康报告的「卡住 0（另 1 个已确认）」满足，
+    # 把确认过的当未确认列出的变异（H2o）照样绿（2026-09-26 复审）
+    assert fp not in out
+    assert not [ln for ln in out.splitlines() if ln.lstrip().startswith("⏳")]
+    assert "═══ 卡住：没有未确认的（1 个已确认、不再提醒" in out
 
 
 def test_ack_command_writes_the_versioned_file_and_says_commit_it(offline_cli, capsys):
