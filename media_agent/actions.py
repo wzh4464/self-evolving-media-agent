@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import abmode
 from . import audit as auditlog
 from . import disposal
 from .claims import PARTIAL, ClaimCheck, ClaimIndex, ClaimsUnknown, fold
@@ -1470,8 +1471,11 @@ class Executor:
         # 不同来源季用不同偏移"。给错了的代价是真实文件被覆盖：2026-08-31
         # `[Fyy Raws] ... 3rd Season - 08` 被 AB 改成 S01E08，撞上 2016 年的
         # 第 8 集，随后判重规则把 1.31GB 的原片清进了隔离区。
+        #
+        # 订阅模式（`AB_MODE=subscription`，`abmode`）下 AB 不改名，不给：标签没人认领，只会让"AB 在订阅之外加了种子"的
+        # 核对（`abmode.activity` 认 `ab:<id>`）把本项目抓的认成 AB 的。
         _, raw_ep = parse_episode(a.args.get("title") or "")
-        if bid and raw_ep == ep:
+        if bid and raw_ep == ep and abmode.ab_renames(self.cfg):
             tags.append(f"ab:{bid}")
 
         # 分类就是所有权边界。AutoBangumi 的改名线程扫的是
