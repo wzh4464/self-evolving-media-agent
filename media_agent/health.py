@@ -305,7 +305,9 @@ class RunHealth:
             "audit_problem_kinds": auditlog.kinds(report.audit_problems),
             "failed_detail": brief(report.failed), "unknown_detail": brief(report.unknown),
             "audit_problem_detail": [str(p)[:200] for p in report.audit_problems[:10]],
-            "repeated": repeated_failures(self.cfg.audit_log, report)}
+            "repeated": repeated_failures(self.cfg.audit_log, report),
+            # 改 AB 数据库之后 docker start 报了错、库已改好（`Executor._ab_write`）：容器也许还停着
+            "ab_maybe_stopped": brief([r for r in report.applied if r.get("after_error_note")])}
         self.data["grab"] = grab_stats(findings, report)
         old = unrenamed_old(findings, report, state.torrents, self.cfg.unrenamed_alert_hours)
         self.data["unrenamed"] = {"threshold_hours": self.cfg.unrenamed_alert_hours,
@@ -389,6 +391,12 @@ class RunHealth:
             add("warn", "unknown_actions", f"{act['unknown']} 个动作未确认（也许生效了，要人核对）" + (
                 "；其中 " + "、".join(f"[{r['rule']}] {r['op']} 已在 {r['runs']} 个批次里出现"
                                      for r in rep_[:3]) if rep_ else ""))
+        if act.get("ab_maybe_stopped"):
+            # AutoBangumi 停着，订阅就不走了。以前只有一行日志与审计里的一个字段：这一轮 ok、不发信，最早要 6 小时后
+            # 下一轮 AB 登录失败（ab_down）才看得见——`clients` 是在这次写库之前取的（2026-09-26 复审）
+            add("warn", "ab_container_maybe_stopped",
+                f"{len(act['ab_maybe_stopped'])} 次改 AutoBangumi 数据库之后 docker start 报了错（库已改好）："
+                "容器也许还停着、订阅不走——要人确认（docker ps）")
         st = d["stuck"] or {}
         if st.get("open"):
             add("warn", "stuck", f"{len(st['open'])} 个问题连续 ≥{self.cfg.stuck_runs} 轮都在")

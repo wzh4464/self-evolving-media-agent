@@ -199,8 +199,9 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
 - `fix_title_aliases` / `repoint_rss` 的 `abdb.write` 是"docker stop → 改库提交 → docker start（`check=True`）"。
   容器起不来时 CalledProcessError 在**提交之后**抛出——以前记 failed、没有逆操作，库其实改了、回退也找不到它，
   AutoBangumi 还停着没人知道。现在出错后读库（只读连接，容器停着也能读）：值是新的 → applied、带逆操作，
-  并写 `after_error_note`（"容器可能还停着，需人工确认"），日志一行；值是原来的（`docker stop` 就失败了、
-  或事务没提交）→ failed；读不到 / 对不上 → unknown 带逆操作（`Executor._ab_write`）。
+  并写 `after_error_note`（"容器可能还停着，需人工确认"），日志一行，这一轮健康报告 warn
+  `ab_container_maybe_stopped`（第 3 阶段复审时补——以前只有日志与这个字段，这一轮照样 ok、不发信）；值是原来的
+  （`docker stop` 就失败了、或事务没提交）→ failed；读不到 / 对不上 → unknown 带逆操作（`Executor._ab_write`）。
 - `grab_episode`：
   - `add_torrent` 出错：按 .torrent 算出的 v1 infohash 查种子在不在。在 → 照常走完（即时改名、写 have），
     `already_present: null`（分不清是这次加的还是本来就有）；不在 → failed（沿用「加种子失败: 」开头）；

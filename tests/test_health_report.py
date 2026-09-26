@@ -220,6 +220,35 @@ def test_failed_action_is_a_warning(offline_cli, capsys, monkeypatch):
     assert "failed_actions" in [r["code"] for r in rep["reasons"]]
 
 
+def test_autobangumi_container_left_stopped_after_a_db_write_is_a_warning(offline_cli, capsys,
+                                                                         monkeypatch):
+    """改 AB 数据库是 docker stop → 改库 → docker start。start 失败时库已改好：记 applied 并写明"容器可能还停着"
+    ——可以前只剩一行日志（不改状态）和审计里的一个字段：这一轮 ok、不发信，最早要 6 小时后下一轮 AB 登录失败才
+    看得见（2026-09-26 复审）。AutoBangumi 停着，订阅就不走了。"""
+    lib = offline_cli
+    _clean(lib)
+    lib.bangumi(id=7, official_title="测试番", title_raw="Test Show",
+                save_path=str(lib.media_root / "测试番" / "Season 1"))
+    fix = Finding(rule="title-match-broken", kind="title_match_broken", severity="important",
+                  summary="订阅失效", show="测试番",
+                  action=Action(op="fix_title_aliases", args={"bangumi_id": 7, "aliases": ["Test"]}))
+
+    class _One:
+        id = "one"
+
+        def detect(self, ctx, state):
+            yield fix
+
+    monkeypatch.setattr(cli, "build_registry", lambda: Registry(detectors=[_One()]))
+    lib.docker_fail("start")
+
+    assert cli.cmd_run(_args(), lib.cfg) == 0                      # warn：退出码仍是 0
+    rep = _latest(lib)
+    assert rep["actions"]["applied"] == 1 and rep["status"] == "warn"
+    [r] = [r for r in rep["reasons"] if r["code"] == "ab_container_maybe_stopped"]
+    assert r["level"] == "warn" and "docker" in r["text"]
+
+
 def test_unrenamed_release_names_older_than_the_threshold_warn(offline_cli, capsys):
     """发布名躺了 24 小时还没改（这里是预演，改名没执行）——2026-09-03「最新三集刮削失败」就是这种形态。"""
     lib = offline_cli
