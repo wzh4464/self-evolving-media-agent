@@ -151,6 +151,23 @@ def test_dead_drop_rolls_back_with_the_same_layout(lib):
     assert lib.qbit.torrent(dead.hash)["save_path"] == str(s1.path)
 
 
+def test_dead_drop_of_one_file_in_a_folder_rolls_back_with_the_folder(lib):
+    """Original 布局、只有一集装在根文件夹里：真 qBit 报 root_path，回退按 Original
+    加回来，文件夹还在（以前 FakeQbit 报空 root_path，这条生产上正确的路径在基座里是错的）。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    t = _dead(s1, {"Yani Neko - 11.mkv": GB}, "[G] Yani Neko - 11", layout="original")
+    names = lib.qbit.file_names(t.hash)
+    assert names == ["[G] Yani Neko - 11/Yani Neko - 11.mkv"]
+
+    c = lib.cycle(detectors=[DeadTorrentDetector])
+    [drop] = c.applied("drop_torrent")
+    assert drop["undo"]["no_subfolder"] is False
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 1
+    assert lib.qbit.file_names(t.hash) == names
+
+
 @pytest.mark.parametrize("hours", [47, 49])
 def test_threshold_is_measured_from_last_activity(lib, hours):
     s1 = lib.show("尼古喵喵").season(1)

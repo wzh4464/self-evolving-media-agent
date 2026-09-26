@@ -5,9 +5,13 @@
 
 - `renameFile` **不改**种子的 `name`（显示名），只改文件条目与磁盘文件，
   `.!qB` 半成品一起改。源文件不在盘上时只改映射（`relink_torrent` 依赖这一点）。
-- `content_path`：单文件 = `save_path/<文件>`；Original 布局（所有文件共享一个
-  根目录）= `save_path/<根>`；NoSubfolder 多文件 = `save_path` 本身。
+- `content_path`：单文件 = `save_path/<文件>`（哪怕它在文件夹里）；Original 布局
+  （所有文件共享一个根目录）= `save_path/<根>`；NoSubfolder 多文件 = `save_path` 本身。
   最后这条是 B1（死种把整个 Season 目录送进隔离区）的前提，必须保真。
+- `root_path`：按 `Path::findRootFolder`——所有条目共享第一个路径分量就有根，
+  **单个 `root/file` 条目也算**（死种回退靠 `not root_path` 决定按什么布局加回来）。
+- 没有元数据（metaDL，`files()` 为空）时 `content_path` 与 `root_path` 都是空串，
+  不回落到 save_path（release-5.2.3 torrentimpl.cpp:556-578 的 `hasMetadata()` 分支）。
 - `tags` 排序后用 `", "` 连接；`progress` 完成时是 1。
 - `files()` 对未知 hash 抛 `QBitError("torrents/files -> HTTP 404: Not Found")`，
   与真客户端的报错类型、文本一致（B2 就是这个 404）。
@@ -119,23 +123,36 @@ class FakeQbit:
         os.replace(src, dst)
 
     @staticmethod
-    def _content_path(t: dict) -> str:
+    def _root_folder(t: dict) -> str:
+        """`Path::findRootFolder`（release-5.2.3 path.cpp:305-322）：所有条目共享的
+        第一个路径分量；任一条目没有目录层就没有根。**单个 `root/file` 条目也算有根**，
+        空列表（没有元数据）没有根。"""
+        root = ""
+        for f in t["_files"]:
+            parts = f["name"].split("/")
+            if len(parts) <= 1:
+                return ""
+            if not root:
+                root = parts[0]
+            elif root != parts[0]:
+                return ""
+        return root
+
+    def _content_path(self, t: dict) -> str:
+        """`TorrentImpl::contentPath`（torrentimpl.cpp:568-578）。"""
         sp = Path(t["save_path"])
         fs = t["_files"]
         if not fs:
-            return str(sp)                        # 没有元数据：qBit 回落到存储位置
+            return ""                             # 没有元数据（metaDL）：空，不是 save_path
         if len(fs) == 1:
-            return str(sp / fs[0]["name"])
-        parts = [f["name"].split("/") for f in fs]
-        if all(len(p) > 1 for p in parts) and len({p[0] for p in parts}) == 1:
-            return str(sp / parts[0][0])          # Original 布局：根目录
-        return str(sp)                            # NoSubfolder：就是 save_path
+            return str(sp / fs[0]["name"])        # 单文件：就是那个文件（哪怕在文件夹里）
+        root = self._root_folder(t)
+        return str(sp / root) if root else str(sp)   # Original：根目录；NoSubfolder：save_path
 
     def _root_path(self, t: dict) -> str:
-        cp = self._content_path(t)
-        if len(t["_files"]) > 1 and cp != str(Path(t["save_path"])):
-            return cp
-        return ""
+        """`TorrentImpl::rootPath`（torrentimpl.cpp:556-566）：有根目录才有，否则空。"""
+        root = self._root_folder(t)
+        return str(Path(t["save_path"]) / root) if root else ""
 
     def _view(self, t: dict) -> dict:
         fs = t["_files"]

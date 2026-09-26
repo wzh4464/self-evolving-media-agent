@@ -23,6 +23,9 @@
 - **FakeQbit**：`QBitClient` 被用到的 13 个方法，背后是临时目录里的真文件。
   语义按生产 v5.2.3 实测：`renameFile` 不改显示名、`.!qB` 跟着改；
   `content_path` 单文件 = 文件、Original = 根目录、**NoSubfolder = save_path**；
+  `root_path` 按上游 `findRootFolder`（单个 `root/file` 条目也有根）；没有元数据的
+  metaDL 种子两者都是空串（上游 torrentimpl.cpp:556-578，2026-09-26 审查后对齐——
+  以前"一集装在文件夹里"报空 root_path，死种回退在基座里丢掉文件夹，而生产是对的）；
   标签排序 `", "` 连接；未知 hash 的 `files()` 抛与真客户端同文本的 404；
   优先级 0 文件留在盘上。可注入故障（某个 hash 的 `files()` 超时等）。
 - **FakeWeb**：只替换 `urllib.request.urlopen` 一处——三条网络路径都在调用时

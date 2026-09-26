@@ -42,6 +42,28 @@ def test_content_path_follows_v523_layout_rules(lib):
     assert (s1.path / "c.mkv").stat().st_size == 3_000_000
 
 
+def test_root_and_content_path_match_v523_for_one_file_in_a_folder_and_metadl(lib):
+    """qBittorrent 5.2.3 torrentimpl.cpp:556-578 与 path.cpp:305-322：
+
+    - `rootPath()` = `findRootFolder(filePaths())`——所有条目共享的第一个路径分量，
+      **单个 `root/file` 条目也算**；`contentPath()` 单文件时就是那个文件本身。
+    - 没有元数据（metaDL）时两者都返回空，而不是回落到 save_path。
+
+    以前 FakeQbit 只在多于一个文件时才给 root_path，"一集装在文件夹里"的种子报空
+    root_path——死种回退（`no_subfolder = not root_path`）就会把它按 NoSubfolder
+    加回来、丢掉那层文件夹；而真 qBit 会报 root_path，生产的回退是对的。"""
+    s1 = lib.show("测试番").season(1)
+    folded = s1.torrent({"Yani Neko - 11.mkv": 1_000_000}, name="[G] Yani Neko - 11")
+    v = folded.view()
+    assert v["content_path"] == str(s1.path / "[G] Yani Neko - 11" / "Yani Neko - 11.mkv")
+    assert v["root_path"] == str(s1.path / "[G] Yani Neko - 11")
+
+    lib.qbit.seed("e" * 40, name="magnet only", save_path=s1.path, files={},
+                  progress=0.0, state="metaDL")
+    m = lib.qbit.torrent("e" * 40)
+    assert m["content_path"] == "" and m["root_path"] == ""
+
+
 def test_rename_file_keeps_torrent_name_and_moves_partial(lib):
     s1 = lib.show("测试番").season(1)
     t = s1.single("[G] Show - 01 [1080p].mkv", size=50_000_000, progress=0.5)
