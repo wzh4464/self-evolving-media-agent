@@ -26,6 +26,7 @@
 | N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒） | 0b5a02e |
 | N11 | 没有结构化的发现历史：无动作的发现只以文字进 run.log；没有路径的发现去重键退回 `(show, summary)`，摘要里嵌着计数，跨轮认不出同一个问题——"卡住"检测无从谈起 | 第 3 阶段：发现历史与稳定指纹（`history.py`），见 `architecture/2026-09-26-run-health.md` 第 1 节 |
 | N12 | 回退只写一条汇总：逐步还原了什么没有审计，健康摘要看不见回退改了什么 | 第 3 阶段 8c901f5（逐步记录；回退记录不带逆操作，回退不能再回退）。见 `architecture/2026-09-26-honest-audit.md` 第 8 节 |
+| N13 | 抓取对 AB 带 `episode_offset` 的番无能为力而且不出声：候选按发布的原始集号归拢，只换算声明了季号的偏移；目标集在归拢表里没有时直接 `continue`，不报任何发现。生产上只影响一条有效订阅：AB 37《超超超超超喜欢你的100个女朋友》第三季（`-24`）；退役 AB 会让这部番无声地停抓 | 未处理（第 4 阶段之后）：出处账本不在这一步教抓取认 `episode_offset`，见 `architecture/2026-09-27-provenance-ledger.md` "没做的" |
 | N14 | 集号口径在 `have` 与 `_inflight` 之间不一致：`have_episodes` / `episode_of_file` 不看 `ma:` 钉子，`_inflight` 看；钉着的集号与发布名的原始集号不同、又还没改名的已下完文件从 `have` 里掉出去，被再抓一遍（生产 29 集被抓了不止一次的来源之一） | 第 4 阶段：出处账本，见 `architecture/2026-09-27-provenance-ledger.md` |
 | N15 | 抓取后的即时改名 `rename_single_video` 算目标名时丢掉条目的文件夹层（`_op_rename` 保留）：409 撞上一个已有的 Original 布局种子时，文件被挪到 save_path 根下 | 8a0dec9，见 `architecture/2026-09-26-path-claims.md` 第 4 节 |
 | N17 | `rescue.py` / `vpn-watchdog.sh` 重建 qBittorrent 容器时不看任何锁或维护窗口；运行锁应覆盖 `purge --apply`、`rollback`、`repair` 与手动会话 | 0b5a02e（运行锁）；第 3 阶段：维护暂停（`pause.py`，救援标记 / `state/PAUSE`）与两个脚本重建容器前拿运行锁，见 `architecture/2026-09-26-run-health.md` 第 10、11 节 |
@@ -112,6 +113,7 @@
 |---|---|
 | H1 | 本项目的抓取（`_op_grab_episode`）是记出处的地方：加种之后手上有番组页标题、集位、偏好评分、发布日期、落选的候选，审计却只存 `args` 与摘要——发布日期与结构化的评分哪儿都没留下 |
 | H2 | AutoBangumi 加的种子：出处在 AB 库的 `torrent` 表（`name` = 番组页标题，`url` 里就是 infohash，`qb_hash` 永远是 NULL），本项目以前只在修订阅时按**名字**读它 |
+| H3 | 出处账本该记的生命周期事件：整种子作废与单个条目设为不下载（`_op_trash`）、死种隔离、摘种（`_op_drop_torrent`）、回退时重加、relink、文件改名、显示名改动、目录搬迁（`rename_show_dir`）、扫描里悄悄丢掉的占用认领。第 4 阶段的账本没记这些（审计里有），见 `architecture/2026-09-27-provenance-ledger.md` "没做的" |
 | H4 | 补录的覆盖面（2026-09-26 生产）：539 个种子里 459 个只有 AB 的记录、6 个两边都有、43 个只有本项目的抓取审计、31 个查不到出处；28 个 infohash 被抓了不止一次（42 次多余的抓取，34 次是 409），入间 S4E20 一集 7 次 |
 | H5 | 账本放哪：不放 sidecar（`load()` 丢不认识的键、写档案整份覆盖），放 `state/`；在执行时写、不在检测时写 |
 
