@@ -215,7 +215,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zihan.media-agent.pl
 | 0 | 正常（健康报告 ok 或 warn；warn 的原因见 run.log 末尾的「健康」一节或 `media-agent health`） |
 | 1 | 这一轮崩了（异常冲出）：完整 traceback 在 run.err.log，健康报告照写 |
 | 3 | 降级、整批拒绝改动（qBittorrent 不可用、读不全，或种子数比上一轮骤降而审计解释不了——确认是人为删除的用 `media-agent health --accept-torrent-count`），什么都没改 |
-| 4 | 改动照常做了，但有审计记录没能原样写进 `state/audit.jsonl`（磁盘满、权限……）——已转写到 run.err.log 与 `state/audit.fallback.jsonl`，`rollback` / `runs` 会一起读；先腾空间 |
+| 4 | 改动照常做了，但有审计记录没能原样写进 `state/audit.jsonl`：写不进去的（磁盘满、权限……）已转写到 run.err.log 与 `state/audit.fallback.jsonl`，`rollback` / `runs` 会一起读——先腾空间；值序列化不了的已按字符串降级写进 `audit.jsonl` 本身（run.log 末尾写明是哪一种）——多半是代码 bug |
 | 5 | 这一轮跑完了，但健康报告 critical：隔离区处置之后媒体卷剩余仍低于 `MIN_FREE_GB`——要人腾空间 |
 | 75 | 另一个进程持有运行锁，或维护暂停中（VPN 救援进行中 / 有 `state/PAUSE`），这一轮什么都没做 |
 

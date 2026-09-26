@@ -206,8 +206,8 @@ media_agent/
   rules/          Evolved rules (JSON), auto-mounted on the next run
 ```
 
-Read [AGENTS.md](AGENTS.md) before changing anything — it lists six constraints
-that are not up for debate, each one paid for in lost hours.
+Read [AGENTS.md](AGENTS.md) before changing anything — it lists the constraints
+that are not up for debate (all of them, not just the first few), each one paid for in lost hours.
 
 ## Honest limitations
 
