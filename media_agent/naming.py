@@ -64,8 +64,25 @@ def normalize(s: str) -> str:
 
 
 def is_extra(filename: str) -> bool:
-    """是否为特典/菜单/PV 等非正片内容。"""
+    """是否为特典/菜单/PV 等非正片内容。**只看整个名字**——判断库里的文件请用 `is_extra_of`，
+    它先去掉作品标题。"""
     return bool(_EXTRA_RE.search(filename))
+
+
+def is_extra_of(filename: str, titles) -> bool:
+    """去掉作品标题之后，名字里还有没有特典记号。
+
+    规范名是 `{TMDB 标题} SxxEyy.ext`：标题里带 `trailer` / `preview` / `menu` / `PV` / `特典` /
+    `菜单` / `creditless` 的番，整名匹配会把**每一集**都当成特典移进隔离区——与"The Ghost
+    **in** the Shell 整部被判成特典"同一类（那次只修了 `IN` 一个记号）。所以先把 `titles`
+    （TMDB 标题、目录名、AutoBangumi 的 official_title / title_raw）从名字里拿掉，只按词边界拿
+    （标题 `K` 不能把 `mkv` 里的 k 也拿掉），再看剩下的部分。认不出的标题（发布名里的罗马音）
+    拿不掉——由调用方的"某集唯一的文件不当特典"兜底。
+    """
+    s = normalize(filename)
+    for t in sorted({normalize(t) for t in titles if t and t.strip()}, key=len, reverse=True):
+        s = re.sub(r"(?<!\w)" + re.escape(t) + r"(?!\w)", " ", s)
+    return bool(_EXTRA_RE.search(s))
 
 
 _SXXEYY_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")

@@ -17,7 +17,7 @@ from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
 from ..probe import MediaInfo, probe, size_for_compare
 from ..naming import (
-    SUB_EXTS, VIDEO_EXTS, apply_episode_offset, declared_season, is_extra,
+    SUB_EXTS, VIDEO_EXTS, apply_episode_offset, declared_season, is_extra_of,
     is_normalized, normalize, parse_episode,
     parse_pin, parse_quality, season_of_dir, subtitle_lang_tag, target_filename,
     target_subtitle_filename,
@@ -253,6 +253,19 @@ def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
     return target, ep
 
 
+def _titles(show: Show) -> list[str]:
+    """这部番可能出现在文件名里的标题：规范标题、目录名、TMDB 标题、AB 的两个标题。"""
+    b = show.bangumi or {}
+    return [t for t in (show.official_title, show.dir_name, show.tmdb_title,
+                        b.get("official_title"), b.get("title_raw")) if t]
+
+
+def _is_extra(f: MediaFile, show: Show) -> bool:
+    """特典 / 菜单 / PV 等周边：只看作品标题**之后**的那部分名字（`naming.is_extra_of`）。
+    所有检测器共用这一个判据——特典规则认定不是特典的，改名与判重也要把它当正片。"""
+    return is_extra_of(f.filename, _titles(show))
+
+
 def _is_video(f: MediaFile) -> bool:
     return f.ext in VIDEO_EXTS or (f.ext == ".!qB" and Path(f.path.stem).suffix.lower() in VIDEO_EXTS)
 
@@ -345,7 +358,7 @@ class UnrenamedDetector:
                 # 并继续往新名字写入，不中断下载。
                 # 来源是 torrents/files，文件名本身已是干净的目标名，无需裁剪后缀。
                 stem = f.filename
-                if is_extra(stem):
+                if _is_extra(f, show):
                     continue                       # 交给 ExtrasDetector
                 if is_normalized(stem, title):
                     # `is_normalized` 只看形式（`标题 SxxExx.ext`），不看集号对不对。
@@ -430,7 +443,7 @@ class DuplicateEpisodeDetector:
                 continue
             buckets: dict[tuple[int, int], list[MediaFile]] = defaultdict(list)
             for f in show.files:
-                if not _is_video(f) or f.is_incomplete or is_extra(f.filename):
+                if not _is_video(f) or f.is_incomplete or _is_extra(f, show):
                     continue
                 r = _resolve(f, show)
                 if r:
@@ -713,7 +726,7 @@ class RenameCollisionDetector:
         for show in state.shows:
             targets: dict[str, list[MediaFile]] = defaultdict(list)
             for f in show.files:
-                if not _is_video(f) or is_extra(f.filename):
+                if not _is_video(f) or _is_extra(f, show):
                     continue
                 r = _resolve(f, show)
                 if not r:
@@ -973,16 +986,46 @@ class ExtrasDetector:
 
     出处：TMDB 不把这些收录成 episode（实测《100个女朋友》《令和妖神斑小姐》
     都没有 Season 0），放在库里既刮不到元数据又污染剧集列表。
+
+    **只看标题之后的部分，而且三种不碰**（2026-09-26 修）。以前 `is_extra` 用在整个文件名上，
+    规范名是 `{TMDB 标题} SxxEyy.ext`：标题里带 trailer / preview / menu / PV / 特典 / 菜单的番，
+    每一集都会被当成特典移进隔离区（与"The Ghost **in** the Shell"同一类）。删除关口对"特典处置、
+    没钉 `ma:`"的文件放行，挡不住这一类，所以这里要自己收紧：
+    - 钉着 `ma:` 的**正片**（种子里唯一的视频，或名字认得出钉着的集号）：它是抓取器认定的那一集、
+      封存着，归判重管。钉着的合集里的 NCOP 不是那一集，照旧清理。
+    - 某集**唯一**的可播文件：名字认得出集号、而同一集没有别的下完了的正片——宁可留着一个真特典，
+      也不删掉唯一的一集（标题记号藏在认不出的罗马音标题里时靠这一条）。
     """
     id = "extras-in-library"
     kind = "extra_content"
 
+    @staticmethod
+    def _is_pinned_episode(f: MediaFile, show: Show) -> bool:
+        pin = _pinned(f)
+        if not pin:
+            return False
+        videos = [o for o in show.files if o.torrent_hash == f.torrent_hash and _is_video(o)]
+        return len(videos) <= 1 or parse_episode(f.filename)[1] == pin[1]
+
+    @staticmethod
+    def _only_copy(f: MediaFile, show: Show) -> bool:
+        slot = _resolve(f, show)
+        if not slot:
+            return False
+        return not any(o is not f and _is_video(o) and not o.is_incomplete
+                       and not _is_extra(o, show) and _resolve(o, show) == slot
+                       for o in show.files)
+
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         for show in state.shows:
             for f in show.files:
-                if not is_extra(f.filename):
+                if not _is_extra(f, show):
                     continue
                 if not _is_video(f):
+                    continue
+                if self._is_pinned_episode(f, show):
+                    continue
+                if self._only_copy(f, show):
                     continue
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="minor",
