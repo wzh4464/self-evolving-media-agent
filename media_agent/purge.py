@@ -13,9 +13,12 @@
 
 判重的两条证明：
 
-1. **库里有替代者。** 从它当初的路径推出集位（剧集目录 / 季 / 集号），
-   看库里现在有没有文件占着这个集位。注意是查**当前实际状态**，
-   不是信审计日志里记的"保留了谁"——日志是历史，文件可能后来又被换过。
+1. **库里有替代者，而且它"是这一集"可信。** 集位用检测器当时解析的那一个（`deletion.slot`，
+   旧记录摘要里的 `SxxEyy 重复`），剧目录取自当初的路径；看库里**现在**有没有、且只有一个文件
+   占着这个集位——"占着"与 duplicate-episode 分桶同一个定义（`builtin._resolve`：钉子优先、
+   季号偏移照算，不是文件名正则）。查的是当前实际状态，不是信审计日志里记的"保留了谁"——
+   日志是历史，文件可能后来又被换过。替代者的名字若只是 AutoBangumi 认为的、或者发布名明写着
+   另一季，它不能作保（2026-08-31 Re:Zero）。
 
 2. **替代者是完整的。** 有两条互斥的证明路径，满足其一即可：
 
@@ -49,11 +52,10 @@ from datetime import datetime
 from pathlib import Path
 
 from . import gate
-from .claims import PARTIAL
-from .naming import VIDEO_EXTS, parse_episode
+from .claims import PARTIAL, fold
+from .naming import parse_episode
 from .probe import duration as _duration, tail_decodes as _tail_decodes
 
-_SXXEXX = re.compile(r"S(\d{1,2})E(\d{1,3})", re.IGNORECASE)
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # 永不自动删的处置类别：按定义不存在"库里的替代者"可证，删哪个由人定
@@ -152,79 +154,102 @@ def _trashed_at(rec: dict | None, p: Path, trash_root: Path) -> datetime | None:
     return None
 
 
-def _slot_of(name: str, summary: str, season_hint: int | None = None) -> tuple | None:
-    """从文件名取 (季, 集)；取不到就退回摘要里的 `S03E09 重复：…`。
+_SUMMARY_SLOT = re.compile(r"^S(\d{1,2})E(\d{1,4})(?!\d)")
 
-    集号解析走 `naming.parse_episode`，不要自己写正则——发布组的写法远不止
-    `SxxExx` 一种，`[06]`、`- 06 [1080p]`、`第06话` 都很常见。
 
-    `parse_episode` 可能只给出集号、给不出季号（`[06]` 这种形式本来就没有季）。
-    这时用 `season_hint`；给不出就返回 None：**猜季号会让文件对到错误的集位上**。
+def _slot_of(c: Candidate) -> tuple | None:
+    """判重记录的集位：**检测器当时解析出来的那一个**，不从文件名重新猜。
+
+    1. 新记录的 `deletion.slot`（删除关口记下：动作给的 slot > 钉子 > 名字）；
+    2. 旧记录摘要开头的 `SxxEyy 重复：…`——duplicate-episode 按 `_resolve`（钉子、season_offsets、
+       episode_offset）分桶时的集位；
+    3. 都没有才看原文件名，而且名字里得明写季号——猜季号会对到错的集位上。
+
+    以前是文件名优先：《超超超超超喜欢你的100个女朋友》第三季（episode_offset -24）的发布名
+    `- 25` 会被当成第 25 集去找替代者。
     """
-    for s in (name, summary):
-        if not s:
-            continue
-        sn, ep = parse_episode(s)
-        if ep is None:
-            continue
-        if sn is None:
-            sn = season_hint
-        if sn is None:
-            continue
-        return sn, ep
-    return None
-
-
-def _torrent_size_index(qbit) -> dict:
-    """磁盘绝对路径 -> (种子声明大小, 种子进度)。"""
-    idx: dict[str, tuple] = {}
-    if not qbit:
-        return idx
-    for t in qbit.torrents():
-        sp = (t.get("save_path") or "").rstrip("/")
-        if not sp:
-            continue
-        for f in qbit.files(t["hash"]):
-            if f.get("priority", 1) == 0:
-                continue
-            idx[str(Path(sp) / f["name"])] = (f.get("size", 0), t.get("progress", 0.0))
-    return idx
-
-
-def _season_median_duration(show_dir: Path, sn: int, exclude: Path,
-                            cache: dict) -> float | None:
-    """同一季其他集时长的中位数；不足 2 集参照就返回 None。
-
-    这是"替代者没有种子"时唯一还站得住的完整性标尺：同一部番同一季的正片
-    时长高度一致，截断的那份会明显偏短。参照必须**排除替代者自己**，
-    否则它自己会把中位数拉过去。
-    """
-    key = (str(show_dir), sn)
-    if key not in cache:
-        ds = []
-        for sub in show_dir.iterdir():
-            if not sub.is_dir() or sub.name.startswith("."):
-                continue
-            for q in sub.iterdir():
-                if q.suffix.lower() not in VIDEO_EXTS or q.name.startswith("._"):
-                    continue
-                m = _SXXEXX.search(q.name)
-                if not m or int(m.group(1)) != sn:
-                    continue
-                d = _duration(q)
-                if d:
-                    ds.append((str(q), d))
-        cache[key] = ds
-    ds = [d for p, d in cache[key] if p != str(exclude)]
-    if len(ds) < 2:
+    rec = c.record or {}
+    raw = (rec.get("deletion") or {}).get("slot")
+    try:
+        sn, ep = raw
+        return int(sn), int(ep)
+    except (TypeError, ValueError):
+        pass
+    m = _SUMMARY_SLOT.match(rec.get("summary") or "")
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    sn, ep = parse_episode(Path(c.origin).name)
+    if sn is None or ep is None:
         return None
-    ds.sort()
-    n = len(ds)
-    return ds[n // 2] if n % 2 else (ds[n // 2 - 1] + ds[n // 2]) / 2
+    return sn, ep
+
+
+def _show_dir_of(origin: str, media_root: Path) -> Path | None:
+    """原路径所在的剧目录（媒体根下的第一层）；不在媒体库里返回 None。"""
+    try:
+        rel = Path(origin).relative_to(media_root)
+    except ValueError:
+        return None
+    return media_root / rel.parts[0] if len(rel.parts) >= 2 else None
+
+
+def _holders(show, slot) -> list:
+    """此刻占着 `slot` 的库内文件——**与 duplicate-episode 分桶同一个定义**：视频、下完了、不是特典、
+    不在 `.xxx` 已归置目录（scan 已分流进 `extras_files`）、盘上真的在（幻影不算），集位按
+    `builtin._resolve`：钉子优先，其次文件名（发布名兜底），发布方声明的季号与库内不符又没有
+    `season_offsets` 可换算的认不出（返回 None），AutoBangumi 的 `episode_offset` 照样换算。
+
+    以前按文件名里的 `SxxEyy` 正则找：钉着 `ma:S01E58`、名字却叫 S01E08 的文件被认成 S01E08 的
+    替代者；还没改名、只写 `- 05` 的替代者找不到。
+    """
+    from .plugins import builtin as B
+
+    out, seen = [], set()
+    for f in show.files:
+        if not B._is_video(f) or f.is_incomplete or B._is_extra(f, show):
+            continue
+        if B.is_phantom(f) or not os.path.isfile(f.path) or os.path.islink(f.path):
+            continue
+        if B._resolve(f, show) != tuple(slot):
+            continue
+        k = fold(f.path)
+        if k not in seen:
+            seen.add(k)
+            out.append(f)
+    return out
+
+
+def _identity_problem(f, show, slot) -> str:
+    """替代者"是这一集"可信吗？返回不可信的理由，可信返回空串。
+
+    `_resolve` 认的是它此刻的名字。名字由谁定的，决定了能不能拿它当证据：
+
+    - **钉着 `ma:`**：抓取器按番组页 + 播出日期定的，是定论（`_resolve` 先认钉子，能走到这里
+      就说明钉子就是这个集位）。
+    - **还在 AutoBangumi 的分类（`Bangumi`）下**：名字只是"AB 认为的"（AGENTS.md 第 6 条），发布名
+      也得认这个集位（`_release_agrees`）——判重封存的快车道对 AB 名下的输家是同一条要求。
+    - **发布名明写了另一季**、又没有 `season_offsets` 可换算：名字里的集号多半是按那一季编的。
+      2026-08-31 Re:Zero：AB 把 `3rd Season - 08` 改成 `S01E08`，判重把 2016 年真正的第 8 集清进
+      隔离区；分类交接之后检测器照样认这个名字，purge 再拿它当替代者，就把唯一的原片硬删了。
+    """
+    from .naming import declared_season
+    from .plugins import builtin as B
+
+    if B._pinned(f):
+        return ""
+    sn, ep = slot
+    if f.torrent_category == "Bangumi" and not B._release_agrees(f, show, sn, ep):
+        return (f"替代者 {f.filename} 还在 AutoBangumi 的分类下（改名权未交接），发布名也认不出"
+                f" S{sn:02d}E{ep:02d}——它叫这个名字只是 AB 认为的")
+    dec = declared_season(f.torrent_name or "")
+    if dec is not None and dec != sn and str(dec) not in B._season_offsets(show):
+        return (f"替代者 {f.filename} 的发布名声明的是第 {dec} 季（{f.torrent_name[:60]}），"
+                f"库内是第 {sn} 季、又没有 season_offsets 可换算——名字里的集号可能是按那一季编的")
+    return ""
 
 
 class _Pool:
-    """一次 `build_pool` 的上下文：配置、此刻、按需建的索引。"""
+    """一次 `build_pool` 的上下文：配置、此刻、按需建的库快照。"""
 
     def __init__(self, ctx, now: datetime):
         self.ctx = ctx
@@ -234,13 +259,19 @@ class _Pool:
         self.trash_root = Path(self.cfg.trash_dir)
         self.retention = float(self.cfg.trash_retention_days)
         self.min_age = float(self.cfg.quarantine_min_age_days)
-        self._sizes: dict | None = None
+        self._shows: dict | None = None
+        self.scan_errors: list[str] = []
         self.dur_cache: dict = {}
 
-    def sizes(self) -> dict:
-        if self._sizes is None:
-            self._sizes = _torrent_size_index(self.ctx.qbit)
-        return self._sizes
+    def shows(self) -> dict:
+        """此刻的库（`scan.build_state`，不查 TMDB）：`{fold(剧目录): Show}`。只有要证明判重时才扫，
+        一次 build_pool 只扫一次。读 qBittorrent 不全记在 `scan_errors`。"""
+        if self._shows is None:
+            from .scan import build_state
+            st = build_state(self.ctx, resolve_tmdb=False)
+            self.scan_errors = list(st.qbit_errors)
+            self._shows = {fold(s.dir_path): s for s in st.shows}
+        return self._shows
 
 
 def build_pool(ctx, *, now: datetime | None = None) -> list[Candidate]:
@@ -319,57 +350,82 @@ def _human_why(c: Candidate) -> str:
     return f"规则 {c.rule or '（未知）'} 的删除：没有可复核的判据，不自动删（需人工处置）"
 
 
+def _season_median_duration(pool: _Pool, show, sn: int, exclude: Path) -> float | None:
+    """同一季其他集时长的中位数；不足 2 集参照就返回 None。
+
+    这是"替代者没有种子"时唯一还站得住的完整性标尺：同一部番同一季的正片
+    时长高度一致，截断的那份会明显偏短。参照必须**排除替代者自己**，
+    否则它自己会把中位数拉过去。同季与否按检测器的集位解析认（与找替代者同一个定义）。
+    """
+    from .plugins import builtin as B
+
+    key = (fold(show.dir_path), sn)
+    if key not in pool.dur_cache:
+        ds = []
+        for f in show.files:
+            if not B._is_video(f) or f.is_incomplete or B._is_extra(f, show):
+                continue
+            if not os.path.isfile(f.path):
+                continue
+            r = B._resolve(f, show)
+            if not r or r[0] != sn:
+                continue
+            d = _duration(f.path)
+            if d:
+                ds.append((fold(f.path), d))
+        pool.dur_cache[key] = ds
+    ds = [d for p, d in pool.dur_cache[key] if p != fold(exclude)]
+    if len(ds) < 2:
+        return None
+    ds.sort()
+    n = len(ds)
+    return ds[n // 2] if n % 2 else (ds[n // 2 - 1] + ds[n // 2]) / 2
+
+
 def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
-    rec = c.record or {}
-    c.slot = _slot_of(Path(c.origin).name, rec.get("summary") or "")
+    c.slot = _slot_of(c)
     if not c.slot:
         c.why = "解析不出集号"
         return
 
-    # 集位要在**整部番的各季目录**里找，不能只看原路径的父目录。
-    #
-    # 两种情况会让"只看父目录"给出错误答案：
-    #   - 文件当初在库内的 `.other` / `.extras` 隔离子目录里（那不是集位，
-    #     真正的正片在 `Season N/` 下）——实测《义妹生活》S01E07、
-    #     《药屋少女的呢喃》S01E24 都因此被误报成"库里是空的，
-    #     这份可能是唯一原件"，而它们的正片明明都在。
-    #   - 整部番按 TMDB 重编排过（药屋的 Season 2 并进了 Season 1）。
-    # 误报比漏报更伤：这道检查一旦开始喊狼来了，就没人再信它。
-    media_root = pool.media_root
-    show_dir = Path(c.origin)
-    while show_dir.parent != media_root and show_dir.parent != show_dir:
-        show_dir = show_dir.parent
+    # 集位要在**整部番**里找，不能只看原路径的父目录：文件当初可能在库内的 `.other` / `.extras`
+    # 隔离子目录里（《义妹生活》S01E07、《药屋少女的呢喃》S01E24 曾因此被误报成"唯一原件"），
+    # 整部番也可能按 TMDB 重编排过（药屋的 Season 2 并进了 Season 1）。
+    show_dir = _show_dir_of(c.origin, pool.media_root)
+    if show_dir is None:
+        c.why = f"原路径不在媒体库的某部番目录下：{c.origin or '（空）'}"
+        return
     if not show_dir.is_dir():
         c.why = "原剧集目录已不存在（可能被移动或改名过）"
         return
+    shows = pool.shows()
+    if pool.scan_errors:
+        c.why = (f"看不全：重扫时 qBittorrent 数据不完整（{pool.scan_errors[0]}），"
+                 f"证明不了替代者")
+        return
+    show = shows.get(fold(show_dir))
 
-    # 条件 1：库里现在有没有文件占着这个集位
+    # 条件 1：库里现在有且只有一个文件占着这个集位，而且它"是这一集"可信
     sn, ep = c.slot
-    holders = []
-    for sub in show_dir.iterdir():
-        if not sub.is_dir() or sub.name.startswith("."):
-            continue        # `.other` / `.extras` 是隔离区，不算库内占位
-        for q in sub.iterdir():
-            if q.suffix.lower() not in VIDEO_EXTS or q.name.startswith("._"):
-                continue
-            m = _SXXEXX.search(q.name)
-            if m and (int(m.group(1)), int(m.group(2))) == (sn, ep):
-                holders.append(q)
+    holders = _holders(show, c.slot) if show is not None else []
     if not holders:
         c.why = f"库里 S{sn:02d}E{ep:02d} 现在是空的——这份可能是唯一的原件"
         return
     if len(holders) > 1:
         c.why = (f"库里 S{sn:02d}E{ep:02d} 有 {len(holders)} 个文件，先解决重复再说")
         return
-
-    # 条件 2：占位者必须被证明是完整文件。两条路径，满足其一即可。
     surv = holders[0]
-    c.survivor = surv
-    want = pool.sizes().get(str(surv))
-    if want is not None:
+    c.survivor = surv.path
+    why = _identity_problem(surv, show, c.slot)
+    if why:
+        c.why = why
+        return
+
+    # 条件 2：替代者必须被证明是完整文件。两条路径，满足其一即可。
+    actual = os.path.getsize(surv.path)
+    if surv.torrent_hash:
         # 路径 a：种子校验。最强的证据——种子声明多少字节就该有多少字节。
-        declared, progress = want
-        actual = surv.stat().st_size
+        declared, progress = surv.size, float(surv.torrent_progress or 0)
         if progress < 1.0:
             c.why = f"替代者的种子只下到 {progress*100:.1f}%"
             return
@@ -384,11 +440,11 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
         #   2. 尾部真能解出画面（防的是容器头写着完整时长、数据其实没写完，
         #      这种只查时长是查不出来的）。
         # 两条都过才算数。任一条取不到证据就留着，不做"没查出问题=没问题"。
-        d_surv = _duration(surv)
+        d_surv = _duration(surv.path)
         if d_surv is None:
             c.why = "库内替代者没有种子，且读不出时长，无法确认完整"
             return
-        med = _season_median_duration(show_dir, sn, surv, pool.dur_cache)
+        med = _season_median_duration(pool, show, sn, surv.path)
         if med is None:
             c.why = (f"库内替代者没有种子，同季也不足 2 集可作时长参照"
                      f"（替代者 {d_surv:.0f}s）")
@@ -416,7 +472,7 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
             c.why = (f"替代者时长 {d_surv:.0f}s 远长于同季中位数 {med:.0f}s，"
                      f"疑似合集包占了集位")
             return
-        if not _tail_decodes(surv, d_surv):
+        if not _tail_decodes(surv.path, d_surv):
             c.why = (f"替代者时长看着正常（{d_surv:.0f}s）但尾部解不出画面，"
                      f"疑似写入未完成的空壳")
             return
@@ -424,4 +480,4 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
                         f"{med:.0f}s 相符，且尾部可解码")
 
     c.eligible = True
-    c.why = f"S{sn:02d}E{ep:02d} 由 {surv.name} 占位，{complete_why}"
+    c.why = f"S{sn:02d}E{ep:02d} 由 {surv.filename} 占位，{complete_why}"

@@ -319,3 +319,97 @@ def test_quarantine_min_age_comes_from_the_environment(monkeypatch):
     assert load_config().quarantine_min_age_days == 3
     monkeypatch.setenv("QUARANTINE_MIN_AGE_DAYS", "7.5")
     assert load_config().quarantine_min_age_days == 7.5
+
+
+# ------------------------------------------------------------------ 替代者：按检测器的集位解析认
+REZERO = "Re：从零开始的异世界生活"
+FYY = "[Fyy Raws] Re Zero kara Hajimeru Isekai Seikatsu 3rd Season - 08 [1080p][AVC AAC].mp4"
+
+
+def _rezero_trashed(lib):
+    """2026-08-31：AutoBangumi 把 `3rd Season - 08` 改名成 `S01E08`，与 2016 年真正的第 8 集撞进同一个
+    集位，判重把 1.31GB 的原片清进了隔离区。purge 按文件名正则找替代者，会认下这个"S01E08"
+    （完整、种子校验通过）并把唯一的原片硬删掉。"""
+    return legacy(lib, f"{REZERO} S01E08.mkv", show=REZERO, rule="duplicate-episode",
+                  kind="duplicate", days_ago=40,
+                  summary=f"S01E08 重复：保留 Re:从零开始的异世界生活 S01E08.mkv，清理 {REZERO} S01E08.mkv")
+
+
+@pytest.mark.parametrize("category", ["Bangumi", REZERO], ids=["ab-owned", "handed-over"])
+def test_a_survivor_whose_release_is_another_season_does_not_vouch(lib, no_rmtree, category):
+    moved = _rezero_trashed(lib)
+    lib.show(REZERO).season(1).single("Re:从零开始的异世界生活 S01E08.mkv", size=487_000_000,
+                                      name=FYY, category=category)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert not c.eligible and c.survivor is not None
+    assert ("第 3 季" in c.why) or ("AutoBangumi" in c.why)
+
+
+def test_a_survivor_pinned_to_another_episode_is_not_in_the_slot(lib, no_rmtree):
+    """钉子是抓取器的定论：`ma:S01E58` 的文件哪怕名字叫 S01E08，也不替 S01E08 作保。"""
+    moved = _rezero_trashed(lib)
+    lib.show(REZERO).season(1).single("Re:从零开始的异世界生活 S01E08.mkv", size=487_000_000,
+                                      name=FYY, tags="ma:S01E58")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert "空的" in c.why
+
+
+def test_the_rezero_slot_with_its_real_pinned_episode_is_provable(lib, no_rmtree):
+    """对照：同一个现场，库里 S01E08 此刻是一份钉着 ma:S01E08 的完整文件——那就证明得了。"""
+    moved = _rezero_trashed(lib)
+    lib.show(REZERO).season(1).single(f"{REZERO} S01E08.mkv", size=1_410_655_350,
+                                      name="[VCB-Studio] Re Zero [08][Ma10p_1080p].mkv",
+                                      tags="ma:S01E08")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.deleted] == [moved]
+
+
+def test_a_survivor_still_under_its_release_name_is_found(lib, no_rmtree):
+    """替代者还没改名（发布名里只有 `- 05`）：文件名正则找不到它，检测器的解析找得到。"""
+    moved = legacy(lib, "朱音落语 S01E05.mp4", show="朱音落语", rule="duplicate-episode",
+                   kind="duplicate", days_ago=40, summary="S01E05 重复：保留 …，清理 朱音落语 S01E05.mp4")
+    surv = lib.show("朱音落语").season(1).single("[Group] Akane-banashi - 05 [1080p].mp4")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    [c] = rep.pool
+    assert c.survivor == surv.path and c.slot == (1, 5)
+    assert [c.trash_path for c in rep.deleted] == [moved]
+
+
+def test_the_slot_comes_from_the_detector_not_the_file_name(lib, no_rmtree):
+    """新记录的 `deletion.slot` 是检测器解析过偏移 / 钉子的集位；旧记录的摘要 `S03E01 重复` 也是。
+    文件名里的 `- 25` 是发布方的绝对集号（episode_offset -24 的那一季），不能拿来找替代者。"""
+    moved = legacy(lib, "[Group] Kanojo 100 - 25 [1080p].mkv", show="女朋友", season="Season 3",
+                   rule="duplicate-episode", kind="duplicate", days_ago=40,
+                   summary="S03E01 重复：保留 女朋友 S03E01.mkv，清理 [Group] Kanojo 100 - 25 [1080p].mkv",
+                   deletion={"gate": "passed", "disposition": "duplicate", "slot": [3, 1]})
+    lib.show("女朋友").season(3).single("女朋友 S03E01.mkv", name="[Other] Kanojo 100 - 25.mkv",
+                                        tags="ma:S03E01")
+
+    [c] = purge.build_pool(lib.context())
+
+    assert c.slot == (3, 1) and c.eligible and moved.exists()
+
+
+@pytest.mark.allow("log_failure", match=r"files\(")
+def test_duplicates_are_held_when_the_rescan_cannot_see_every_torrent(lib, no_rmtree):
+    s1, good, moved = _trash_the_raw_one(lib)
+    other = s1.single("尼古喵喵 S01E06.mkv", name="[G] Yani Neko - 06.mkv")
+    lib.qbit.fail("files", hash=other.hash, times=None)
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
+
+    assert moved.exists() and not rep.deleted
+    [c] = [c for c in rep.pool if c.trash_path == moved]
+    assert "看不全" in c.why
