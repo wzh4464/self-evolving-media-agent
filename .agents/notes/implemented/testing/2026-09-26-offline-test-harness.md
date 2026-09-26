@@ -55,6 +55,11 @@
 4. **`PROJECT_ROOT` 打到临时目录、不读 `.env`**：`_load_dotenv` 写进 `os.environ`
    的东西 monkeypatch 撤不回来，而仓库里的 `.env` 有真凭据。
 5. **日期相对今天**：代码直接调 `date.today()`，不引入冻结时钟。
+6. **磁盘剩余空间固定为充足**（2026-09-26 隔离区容量闸加入时补）：`disposal.free_bytes`
+   （`statvfs`）在 conftest 里固定返回 1 PB——容量闸（`MIN_FREE_GB`）与隔离前的空间检查不能随
+   开发机 / CI 的磁盘而变。测空间不足的用例自己再 monkeypatch 它。另外，**不要在测试里调
+   `monkeypatch.undo()`**：它会连 conftest 的隔离（`PROJECT_ROOT`）一起撤掉，之后的写入落进仓库
+   的 `state/`；只撤自己设的那一处就重新 `setattr` 回原值。
 
 ## 依赖与部署的兼容
 

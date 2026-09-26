@@ -660,3 +660,82 @@ def test_nothing_changed_still_deletes(lib, monkeypatch, no_rmtree):
     rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
 
     assert [c.trash_path for c in rep.deleted] == [moved] and not rep.changed
+
+
+# ------------------------------------------------------------------ 容量闸 MIN_FREE_GB
+# 隔离区与媒体在同一个 APFS 容器（约 94% 满，critic N8）：隔离不腾空间，只有硬删除腾。时间清理换掉
+# 之后，要有东西在空间真紧张时腾出来——但只从"已经证明可以删"的里面挑，最老的先删，够了就停。
+def _free(monkeypatch, n):
+    monkeypatch.setattr(disposal, "free_bytes", lambda path: n)
+
+
+def _sealed_dup(lib, ep, days_ago, size=1000):
+    """隔离区里一份判重输家（旧记录）+ 库里一份钉着这一集、复核通过的替代者：证明得了。"""
+    p = legacy(lib, f"[Raw] Yani Neko - {ep:02d}.mkv", rule="duplicate-episode", kind="duplicate",
+               days_ago=days_ago, size=size, summary=f"S01E{ep:02d} 重复：保留 …，清理 …")
+    lib.show("尼古喵喵").season(1).single(
+        f"尼古喵喵 S01E{ep:02d}.mkv", tags=f"ma:S01E{ep:02d}", probe=CHI,
+        name=f"[LoliHouse] Yani Neko - {ep:02d} [WebRip 1080p HEVC-10bit AAC ASSx2].mkv")
+    return p
+
+
+def test_low_space_releases_proven_duplicates_oldest_first_until_above_the_floor(
+        lib, monkeypatch, no_rmtree):
+    old, mid, new = (_sealed_dup(lib, 5, 20), _sealed_dup(lib, 6, 10), _sealed_dup(lib, 7, 5))
+    lib.configure(min_free_gb=50)
+    _free(monkeypatch, 50 * 10**9 - 1500)               # 差 1500 字节：删两份（各 1000）就够
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert rep.low_space
+    assert [c.trash_path for c in rep.deleted] == [old, mid]      # 最老的先删，够了就停
+    assert new.exists()
+    modes = [r["mode"] for r in _wal(lib) if r.get("phase") == "intent"]
+    assert modes == ["capacity", "capacity"]
+    assert all("空间不足" in r["reason"] for r in _wal(lib) if r.get("phase") == "intent")
+
+
+def test_enough_space_keeps_the_rollback_window(lib, monkeypatch, no_rmtree):
+    """对照：空间充足时，保留期内的判重一个不动（回退要用）。"""
+    old = _sealed_dup(lib, 5, 20)
+    _free(monkeypatch, 10**13)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert old.exists() and not rep.deleted and not rep.low_space
+
+
+def test_low_space_never_deletes_anything_unproven(lib, monkeypatch, no_rmtree):
+    young = _sealed_dup(lib, 5, 1)                      # 证明得了，但不满最短隔离期
+    unproven = legacy(lib, "[Raw] Yani Neko - 09.mkv", rule="duplicate-episode", kind="duplicate",
+                      days_ago=20, summary="S01E09 重复：…")          # 库里没有 E09
+    extra = legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=20)
+    bundle = legacy(lib, "【7月】尼古喵喵 11【TV版】.mp4", rule="duplicate-episode",
+                    kind="bundled_version", days_ago=90)
+    other = legacy(lib, "x.mkv", rule="-", kind="-", days_ago=90, audit=False)
+    _free(monkeypatch, 0)                               # 一个字节都不剩
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert rep.low_space and not rep.deleted
+    assert all(p.exists() for p in (young, unproven, extra, bundle, other))
+
+
+def test_run_output_warns_loudly_when_space_is_low(offline_cli, monkeypatch, capsys, no_rmtree):
+    lib = offline_cli
+    lib.configure(min_free_gb=50)
+    _free(monkeypatch, 12 * 10**9)
+
+    assert cli.cmd_run(_run_args(), lib.cfg) == 0
+
+    cap = capsys.readouterr()
+    assert "MIN_FREE_GB" in cap.out and "⚠️" in cap.out
+    assert "MIN_FREE_GB" in cap.err                     # stderr（run.err.log）也有一份
+
+
+def test_min_free_gb_comes_from_the_environment(monkeypatch):
+    from media_agent.config import load_config
+
+    assert load_config().min_free_gb == 50
+    monkeypatch.setenv("MIN_FREE_GB", "80")
+    assert load_config().min_free_gb == 80

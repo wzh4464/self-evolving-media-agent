@@ -293,11 +293,40 @@ def _print_overdue(cfg, rep, limit: int = 30) -> None:
         print(f"  …另 {len(over) - limit} 个（media-agent purge --verbose 看全部）")
 
 
+def _print_space(cfg, rep) -> None:
+    """媒体卷剩余空间低于 MIN_FREE_GB：stdout（run.log）与 stderr 各一份，大声说。"""
+    if rep.free_before is None:
+        msg = "⚠️  读不到媒体卷的剩余空间（statvfs 失败），容量闸这一轮不起作用"
+        print(f"\n{msg}")
+        _log(msg)
+        return
+    if not rep.low_space:
+        return
+    gb = 1e9
+    msg = (f"⚠️  媒体卷剩余 {rep.free_before / gb:.1f} GB，低于 MIN_FREE_GB={cfg.min_free_gb:g} GB"
+           f"（隔离区与媒体同一个 APFS 容器，只有硬删除腾空间）")
+    print(f"\n═══ {msg} ═══")
+    _log(msg)
+    if rep.early:
+        print(f"  已从最老的开始提前删掉 {len(rep.early)} 个已证明安全的判重"
+              f"（{sum(c.size for c in rep.early) / gb:.1f} GB）")
+    after = rep.free_after
+    if after is not None and after < rep.min_free:
+        gone = {id(c) for c in rep.deleted}
+        held = sum(c.size for c in rep.pool if id(c) not in gone)
+        msg = (f"⚠️  能证明安全的都删了，估计仍只剩 {after / gb:.1f} GB（还差 "
+               f"{(rep.min_free - after) / gb:.1f} GB）；隔离区里还有 {held / gb:.1f} GB 证明不了"
+               f"可删，需要人处置（media-agent purge --verbose 看每一份的理由）")
+        print(f"  {msg}")
+        _log(msg)
+
+
 def _print_disposal(cfg, rep) -> None:
-    """`run` 末尾的隔离区处置：删了哪几个、凭什么；过了保留期没删的是哪几个。"""
+    """`run` 末尾的隔离区处置：删了哪几个、凭什么；过了保留期没删的是哪几个；空间够不够。"""
     if rep.refused:
         print(f"\n═══ 隔离区：未处置——{rep.refused} ═══")
         return
+    _print_space(cfg, rep)
     if rep.recovered:
         print(f"\n  ↺ 补完上次中断的 {len(rep.recovered)} 条硬删除记录（{disposal.LOG_NAME}）")
     if rep.deleted:
@@ -305,8 +334,10 @@ def _print_disposal(cfg, rep) -> None:
         head = "预演：将硬删除" if rep.dry_run else "硬删除"
         print(f"\n═══ 隔离区：{head} {len(rep.deleted)} 个文件，释放 {rep.freed_bytes / 1e9:.1f}GB"
               f"（{'、'.join(f'{k} {n}' for k, n in by.most_common())}） ═══")
+        early = {id(c) for c in rep.early}
         for c in rep.deleted:
-            print(f"  🗑️  [{_LABEL.get(c.disposition, c.disposition)}] "
+            tag = "（空间不足，提前）" if id(c) in early else ""
+            print(f"  🗑️  [{_LABEL.get(c.disposition, c.disposition)}]{tag} "
                   f"{_trash_rel(cfg, c.trash_path)} —— {c.why}")
     for c, why in rep.changed:
         print(f"  ⏭️  {_trash_rel(cfg, c.trash_path)} —— 评估之后变了，这次不删：{why}")
@@ -330,6 +361,7 @@ def cmd_purge(args, cfg) -> int:
     rep = disposal.dispose(ctx, mode="manual", run_id=new_run_id(), dry_run=not args.apply)
     if rep.refused:
         return _refuse(rep.refused)
+    _print_space(cfg, rep)
     pool = rep.pool
     chosen = ({id(c) for c in rep.deleted} | {id(c) for c, _ in rep.failed}
               | {id(c) for c, _ in rep.changed})

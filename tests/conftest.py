@@ -42,7 +42,7 @@ _CONFIG_ENV = ("MEDIA_ROOT", "QBIT_URL", "QBIT_USER", "QBIT_PASS", "AB_URL", "AB
                "TMDB_LANG", "LLM_BASE", "LLM_KEY", "LLM_MODEL", "AUTO_APPLY",
                "TRASH_RETENTION_DAYS", "MAX_DELETE_PER_RUN", "MAX_DELETE_GB_PER_RUN",
                "DEAD_TORRENT_HOURS", "EVOLVE_MODE", "QBIT_ALLOW_EMPTY",
-               "QUARANTINE_MIN_AGE_DAYS")
+               "QUARANTINE_MIN_AGE_DAYS", "MIN_FREE_GB")
 
 
 def _is_live(request) -> bool:
@@ -161,7 +161,12 @@ def _offline(request, monkeypatch, tmp_path, project_root, tripwire, web, fake_p
     if not allow_ff:
         monkeypatch.setattr(probe_mod, "_run", fake_probe.run)
 
-    # 5) tripwire 接线：failed 审计、被吞的检测器异常 / 失败日志
+    # 5) 磁盘剩余空间：固定为充足。容量闸（MIN_FREE_GB）与隔离前的空间检查读 statvfs——结果不能
+    #    随开发机 / CI 的磁盘而变；要测空间不足的用例自己再 monkeypatch `disposal.free_bytes`。
+    from media_agent import disposal as disposal_mod
+    monkeypatch.setattr(disposal_mod, "free_bytes", lambda path: 10**15)
+
+    # 6) tripwire 接线：failed 审计、被吞的检测器异常 / 失败日志
     real_audit = Executor._audit
 
     def audit(self, status, finding, action, extra=None, undo=None):

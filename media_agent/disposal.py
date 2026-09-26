@@ -29,6 +29,12 @@
   逐个报给人。保留期内的一律不动：回退（`restore_from_trash`）要用它们，生产上从隔离区捞回来的
   最晚隔了 19 天（义妹生活 S01E01-10）。
 - `manual`（`purge --apply`，人要的）：判据通过的全删——证明安全的判重不必等满保留期。
+
+**容量闸**（`MIN_FREE_GB`，`run` 模式）：隔离区与媒体在同一个 APFS 容器（critic N8，约 94% 满），隔离
+不腾空间，只有硬删除腾。媒体卷（`statvfs(MEDIA_ROOT)`）剩余低于阈值时，大声告警，并在**已证明可删**
+（判据通过、满了最短隔离期）却还在保留期里的里面，从最老的开始提前删，删到回到阈值以上就停。
+证明不了的、要人定的、没到期的特典一个都不为空间删。释放量按删掉的字节数估算，不每删一个就重测：
+同一容器里的 APFS 本地快照会让删掉的块暂不释放，重测只会越删越多；少删的下一轮重测再补。
 """
 from __future__ import annotations
 
@@ -43,6 +49,15 @@ LOG_NAME = "purge.jsonl"
 OP = "purge"
 _OPEN = "intent"
 _CLOSED = ("done", "failed", "abandoned")
+
+
+def free_bytes(path) -> int | None:
+    """`path` 所在卷此刻可用的字节数（`statvfs`：f_bavail × f_frsize）；读不到返回 None。"""
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize
 
 
 def _now() -> str:
@@ -185,6 +200,18 @@ class DisposalReport:
     changed: list = field(default_factory=list)       # [(Candidate, 原因)]：评估之后前提变了，这次不删
     recovered: list = field(default_factory=list)     # 上次中断、这次补完的意图
     refused: str = ""
+    free_before: int | None = None                    # 处置前媒体卷的剩余字节（读不到为 None）
+    min_free: int = 0                                 # MIN_FREE_GB 折成字节
+    early: list = field(default_factory=list)         # 其中因空间不足提前删的（也在 deleted 里）
+
+    @property
+    def low_space(self) -> bool:
+        return self.free_before is not None and self.free_before < self.min_free
+
+    @property
+    def free_after(self) -> int | None:
+        """按删掉的字节数估算的处置后剩余（APFS 快照可能让实际释放更少）。"""
+        return None if self.free_before is None else self.free_before + self.freed_bytes
 
     @property
     def freed_bytes(self) -> int:
@@ -197,13 +224,20 @@ class DisposalReport:
         return [c for c in self.pool if c.expired and id(c) not in gone]
 
 
-def select(pool: list, mode: str) -> list:
-    """按模式挑出这次要删的，最早隔离的在前。"""
+def select(pool: list, mode: str, *, low_space: bool = False) -> list:
+    """按模式挑出这次要删的 `[(Candidate, 是否因空间不足提前删)]`，最早隔离的在前。
+
+    `run` 在空间不足时把"已证明可删、还在保留期里"的也排进来（在已到期的之后、同样按隔离时间）；
+    删到回到阈值以上就停由调用方按实际删掉的字节数决定。"""
     if mode == "manual":
-        chosen = [c for c in pool if c.eligible]
-    else:
-        chosen = [c for c in pool if c.eligible and c.expired]
-    return sorted(chosen, key=lambda c: c.trashed_at)
+        return [(c, False) for c in sorted((c for c in pool if c.eligible),
+                                           key=lambda c: c.trashed_at)]
+    due = sorted((c for c in pool if c.eligible and c.expired), key=lambda c: c.trashed_at)
+    early = []
+    if low_space:
+        early = sorted((c for c in pool if c.eligible and not c.expired),
+                       key=lambda c: c.trashed_at)
+    return [(c, False) for c in due] + [(c, True) for c in early]
 
 
 def dispose(ctx, *, mode: str, run_id: str, dry_run: bool = False,
@@ -221,10 +255,21 @@ def dispose(ctx, *, mode: str, run_id: str, dry_run: bool = False,
     log = PurgeLog(Path(cfg.state_dir) / LOG_NAME, run_id)
     if not dry_run:
         rep.recovered = recover(log)
+    rep.min_free = int(float(cfg.min_free_gb) * 1e9)
+    rep.free_before = free_bytes(cfg.media_root)
     rep.pool = purge.build_pool(ctx, now=now)
-    for c in select(rep.pool, mode):
+    for c, early in select(rep.pool, mode, low_space=(mode == "run" and rep.low_space)):
+        if early:
+            if rep.free_after >= rep.min_free:
+                break                             # 回到阈值以上就停：保留期内的尽量留给回退
+            reason = (f"空间不足（媒体卷剩 {rep.free_after / 1e9:.1f} GB < MIN_FREE_GB="
+                      f"{cfg.min_free_gb:g}），提前删已证明安全的：{c.why}")
+        else:
+            reason = c.why
         if dry_run:
             rep.deleted.append(c)
+            if early:
+                rep.early.append(c)
             continue
         # 评估到这里可能隔着几分钟：按此刻再问一遍（purge.recheck），前提变了就不删、下一轮重新评估
         why = purge.recheck(ctx, c)
@@ -232,15 +277,18 @@ def dispose(ctx, *, mode: str, run_id: str, dry_run: bool = False,
             rep.changed.append((c, why))
             continue
         why = hard_delete(
-            log, c.trash_path, c.size, mode=mode, disposition=c.disposition, rule=c.rule,
+            log, c.trash_path, c.size, mode="capacity" if early else mode,
+            disposition=c.disposition, rule=c.rule,
             origin=c.origin, slot=list(c.slot) if c.slot else None,
             survivor=str(c.survivor) if c.survivor else None,
             trashed_at=c.trashed_at.isoformat(timespec="seconds"),
-            age_days=round(c.age_days or 0, 2), reason=c.why)
+            age_days=round(c.age_days or 0, 2), reason=reason)
         if why:
             rep.failed.append((c, why))
         else:
             rep.deleted.append(c)
+            if early:
+                rep.early.append(c)
     if not dry_run:
         sweep_empty_dirs(cfg.trash_dir)
     return rep

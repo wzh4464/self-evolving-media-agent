@@ -74,6 +74,10 @@ class Config:
     # 以前 `purge --apply` 没有下限，一分钟前隔离的也照删，那一批的回退就此失效。`run` 本来
     # 就要等满 TRASH_RETENTION_DAYS；这条管的是 `purge --apply` 的提前放行，以及保留期设得比它短时。
     quarantine_min_age_days: float = 3.0
+    # 媒体卷（statvfs(MEDIA_ROOT)）剩余空间低于这么多 GB 时，`run` 的隔离区处置在"已证明可删"的里面
+    # 从最老的开始提前删，直到回到阈值以上（`disposal`）。隔离区与媒体在同一个 APFS 容器里（critic N8，
+    # 约 94% 满），隔离不腾空间，只有硬删除腾；时间清理换掉之后，空间紧张时靠这一条。
+    min_free_gb: float = 50.0
 
     @property
     def state_dir(self) -> Path:
@@ -123,4 +127,5 @@ def load_config(env_file: Path | None = None) -> Config:
         evolve_mode=_evolve_mode(g("EVOLVE_MODE", "off")),
         qbit_allow_empty=_bool(g("QBIT_ALLOW_EMPTY", "false")),
         quarantine_min_age_days=float(g("QUARANTINE_MIN_AGE_DAYS", "3")),
+        min_free_gb=float(g("MIN_FREE_GB", "50")),
     )
