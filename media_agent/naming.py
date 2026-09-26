@@ -68,6 +68,26 @@ def is_extra(filename: str) -> bool:
     return bool(_EXTRA_RE.search(filename))
 
 
+_SXXEYY_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+
+
+def apply_episode_offset(raw: str, ep: int, offset: int) -> int | None:
+    """AutoBangumi 的 `episode_offset`（整条订阅一个值）换算成季内集号。
+
+    **只换算发布名里的原始集号，不碰已经是 `SxxEyy` 的名字**——那是换算过之后的结果。
+    生产 AB 订阅 id 37（《超超超超超喜欢你的100个女朋友》第三季，`-24`）：`- 25` 换算成
+    第 1 集，AB 据此改名成 `… S03E01.mkv`；以前判重再对 `S03E01` 减一次 24，落进
+    `(3, -23)`，与刚下完的 `- 25`（`(3, 1)`）永远不在同一个桶里。
+
+    换算出来不是正数（原始集号本来就是季内编号）返回 None——认不出，交给人，
+    不要提议改成 `S03E-23`。偏移为 0 时原样返回。
+    """
+    if not offset or _SXXEYY_RE.search(raw.rsplit("/", 1)[-1]):
+        return ep
+    ep = int(ep) + int(offset)
+    return ep if ep > 0 else None
+
+
 def parse_episode(raw: str) -> tuple[int | None, int | None]:
     """从原始文件名解析 (season, episode)。season 为 None 表示未标注。
 
@@ -77,7 +97,7 @@ def parse_episode(raw: str) -> tuple[int | None, int | None]:
     base = raw.rsplit("/", 1)[-1]
 
     # 1) 显式 SxxExx —— 最可靠
-    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", base)
+    m = _SXXEYY_RE.search(base)
     if m:
         return int(m.group(1)), int(m.group(2))
 

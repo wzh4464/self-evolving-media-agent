@@ -17,8 +17,8 @@ from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
 from ..probe import MediaInfo, probe, size_for_compare
 from ..naming import (
-    SUB_EXTS, VIDEO_EXTS, declared_season, is_extra, is_normalized, normalize,
-    parse_episode,
+    SUB_EXTS, VIDEO_EXTS, apply_episode_offset, declared_season, is_extra,
+    is_normalized, normalize, parse_episode,
     parse_pin, parse_quality, season_of_dir, subtitle_lang_tag, target_filename,
     target_subtitle_filename,
 )
@@ -36,17 +36,19 @@ def _season_of(f: MediaFile, show: Show, parsed_season: int | None) -> int:
     return 1
 
 
-def _apply_offset(ep: int, show: Show) -> int:
-    """绝对集号 → 季内集号。
+def _episode_offset(show: Show) -> int:
+    """AutoBangumi 订阅行上的 `episode_offset`；没有订阅或为 0 时返回 0。"""
+    return int((show.bangumi or {}).get("episode_offset") or 0)
+
+
+def _apply_offset(raw: str, ep: int, show: Show) -> int | None:
+    """绝对集号 → 季内集号；**只换算发布名里的原始集号**（`naming.apply_episode_offset`）。
 
     出处：《超超超超超喜欢你的100个女朋友》第三季用绝对集号 25-36 发布，
-    实际是 S03E01-E12，靠 AutoBangumi 的 episode_offset=-24 换算。
+    实际是 S03E01-E12，靠 AutoBangumi 的 episode_offset=-24 换算。以前连已经
+    规范成 `S03E01` 的名字也再减一次，落进 `(3, -23)`（2026-09-26 修）。
     """
-    if show.bangumi:
-        off = show.bangumi.get("episode_offset") or 0
-        if off:
-            return ep + int(off)
-    return ep
+    return apply_episode_offset(raw, ep, _episode_offset(show))
 
 
 _OFFSET_CACHE: dict[str, dict] = {}
@@ -245,7 +247,10 @@ def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
         if int(ep) <= int(off):
             ep = int(ep) + int(off)
 
-    return target, _apply_offset(ep, show)
+    ep = _apply_offset(raw, ep, show)
+    if ep is None:
+        return None                      # 换算出非正数：原始集号的口径不对，交给人
+    return target, ep
 
 
 def _is_video(f: MediaFile) -> bool:
