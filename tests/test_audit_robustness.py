@@ -220,6 +220,24 @@ def test_cmd_run_reaches_disposal_and_exits_nonzero_when_audit_is_lost(lib, monk
     assert "审计" in out.err
 
 
+def test_a_record_in_both_files_is_read_once_and_rolled_back_once(lib):
+    """主审计写到一半报了错、其实写进去了，又转写进备用文件：同一条（按 run_id / seq / ts / op / status 认）只读一次。
+    去掉这道去重全套照绿（复审变异 B1g）——回退会对同一条尝试两次逆操作，`runs` 也会多数一条。"""
+    _two_renames(lib)
+    c = lib.cycle()
+    [rec] = [r for r in lib.audit(c.run_id) if r["op"] == "rename"][:1]
+    audit_mod.append_line(audit_mod.fallback_path(lib.cfg.audit_log), json.dumps(rec, ensure_ascii=False))
+
+    got = [r for r in audit_mod.iter_records(lib.cfg.audit_log)
+           if r.get("run_id") == c.run_id and r.get("seq") == rec["seq"]]
+    [run] = [r for r in Executor(lib.context()).list_runs() if r["run_id"] == c.run_id]
+    res = lib.rollback(c.run_id)
+
+    assert len(got) == 1
+    assert run["applied"] == len(c.report.applied)
+    assert res["reverted"] == run["undoable"] and res["skipped"] == 0 and res["failed"] == 0
+
+
 # ------------------------------------------------------------------ 问题按种类说（2026-09-26 复审）
 def test_degraded_serialization_is_not_reported_as_moved_to_the_fallback_file(lib, capsys):
     """序列化降级的那一条其实写进了 audit.jsonl（值按字符串）、没进 stderr 也没进备用文件；以前 cli、健康报告、

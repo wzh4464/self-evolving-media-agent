@@ -59,6 +59,20 @@ def test_unknown_status_has_its_own_bucket(lib):
     assert rec["status"] == "unknown"
 
 
+def test_an_unrecognised_status_lands_in_unknown_instead_of_raising(lib):
+    """critic §3.5 的本意：一个不认识的状态（不该出现）不能在改动之后 KeyError。上面那条写的是 `unknown`，
+    它本来就在分桶里——把默认桶去掉、换回 `{…}[status]` 全套照绿（复审变异 B1n）。"""
+    ex = Executor(lib.context(), dry_run=False, run_id="t-weird")
+    f = _finding("retag", {"torrent_hash": "a" * 40, "tags": "x"})
+
+    ex._audit("weird", f, f.action, {"reason": "合成"})
+
+    assert [r["status"] for r in ex.report.unknown] == ["weird"]
+    assert not (ex.report.applied or ex.report.skipped or ex.report.failed)
+    [rec] = lib.audit("t-weird")
+    assert rec["status"] == "weird"
+
+
 @pytest.mark.allow("unknown_record", match="NameError")
 def test_exception_after_an_issued_write_is_unknown_not_failed(lib, monkeypatch):
     """生产 12 次抓取的形态：`add_torrent` 已经成功，之后的代码抛 NameError。
