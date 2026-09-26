@@ -189,6 +189,52 @@ def _season_fit(items: list[dict], air: list[str]) -> float:
     return ok / len(items)
 
 
+# 特典位（第 0 季）只收标着特典的发布。只写集号的（`- 03`）是正片编号——辉夜那一页上别的组写
+# `Kaguya-sama wa Kokurasetai - Ultra Romantic - 03`，`Ultra Romantic` 就是第三季的副标题，不声明季号。
+_SPECIAL_RE = re.compile(r"特别篇|特別篇|番外|总集篇|総集編|\bOVA\b|\bOAD\b|\bSP\s*\d|\bSpecials?\b",
+                         re.IGNORECASE)
+
+
+def _declared_seasons(title: str) -> set[int]:
+    """发布标题里明写的季号。按 ` / ` 分开的每一段各认一次：中文名、日文名、英文名常各写各的
+    （`辉夜大小姐想让我告白 第三季 / Kaguya-sama wa Kokurasetai S3 - 03`），`declared_season` 只看最后一段。"""
+    out = set()
+    for part in re.split(r"\s+/\s+", title):
+        ds = declared_season(part)
+        if ds:
+            out.add(ds)
+    return out
+
+
+def _slot_in_season(title: str, n: int, target: int,
+                    offsets: dict[int, int]) -> tuple[int | None, str]:
+    """集号为 `n` 的这个发布，落在目标季（`target`）的第几集；不属于这一季返回 `(None, 为什么)`。
+
+    - 没声明季号、或声明的就是目标季：第 `n` 集；
+    - 声明了别的季、sidecar 的 `season_offsets` 有它：按偏移换算（`n <= 偏移` 才加，与改名 `_slot_from`
+      同一口径：Fyy Raws 的 `3rd Season - 08` 是第 58 集，Dynamis One 的 `4th Season - 79` 就是第 79 集）；
+      偏移只换算进正片季；
+    - 声明了别的季、没有换算：不是候选（LAT-03）。桜都把入间同学的第四季标成「第3季」这类错位，
+      在 sidecar 里登记 `season_offsets: {"3": 0}` 就收进来；
+    - 目标是第 0 季（特典位）：只收标着特别篇 / OVA / SP（或 `S00Exx`）的——带季号的特典（`第三季 OVA`）
+      也算；没有这些字样的是正片编号，不论声不声明季号。
+    """
+    declared = _declared_seasons(title)
+    if target == 0:
+        if parse_episode(title)[0] == 0 or _SPECIAL_RE.search(title):
+            return n, ""
+        if declared:
+            return None, f"标的是第 {'/'.join(map(str, sorted(declared)))} 季的正片"
+        return None, "正片编号（没有特别篇 / OVA / SP 字样）"
+    if not declared or target in declared:
+        return n, ""
+    for ds in sorted(declared):
+        off = offsets.get(ds)
+        if off is not None:
+            return (n + off if n <= off else n), ""
+    return None, f"标的是第 {'/'.join(map(str, sorted(declared)))} 季"
+
+
 def _feed_cached(mid: str, cache) -> list[dict]:
     ck = f"mikanfeed:{FEED_SCHEMA}:{mid}"
     got = cache.get_llm(ck, ttl=FEED_TTL)
@@ -452,23 +498,29 @@ class EpisodeAvailableDetector:
                 # `39 = 14 + 25` 上，而 S0E39 那条特典播于 2021 年，日期校验
                 # 只防"早于播出"、不防"晚于播出"（老番重新做种本来就晚），
                 # 拦不住它——实测差点把 2026 年的第四季第 14 集当成 2021 年的特典抓下来。
+                #
+                # 声明的季号对不上目标季、又没有偏移换算的，**不是候选**（LAT-03）：2026-09-06 辉夜大小姐的
+                # 特典位 S00E03 / E04 被抓进了「第三季 / … S3 - 03 / 04」——以前按裸集号归拢、声明的季号
+                # 只用来加一个换算后的位置，原来的集号照样登记。它们记进 `off_season`，最后照样报出来。
                 off_by_season = {int(k): int(v)
                                  for k, v in (sc.season_offsets or {}).items()
                                  if str(k).isdigit()}
                 by_ep: dict[int, list[dict]] = {}
+                off_season: dict[int, list[tuple[dict, str]]] = {}
                 for it in items:
                     n = _episode_of(it["title"])
                     if n is None:
                         continue
-                    by_ep.setdefault(n, []).append(it)
-                    ds = declared_season(it["title"])
-                    off = off_by_season.get(ds) if ds else None
-                    if off and n <= off:
-                        by_ep.setdefault(n + off, []).append(it)
+                    ep_here, why = _slot_in_season(it["title"], n, int(season_key), off_by_season)
+                    if ep_here is None:
+                        off_season.setdefault(n, []).append((it, why))
+                    else:
+                        by_ep.setdefault(ep_here, []).append(it)
 
                 for ep in missing[:MAX_PER_SHOW]:
                     raw = by_ep.get(ep) or []
-                    if not raw:
+                    elsewhere = off_season.get(ep) or []
+                    if not raw and not elsewhere:
                         continue
 
                     # 先按播出日期把明显错季的剔掉，再交给偏好打分。
@@ -481,17 +533,20 @@ class EpisodeAvailableDetector:
                         (ok if v is True else
                          unknown if v is None else wrong_season).append(it)
                     cands = ok + unknown
+                    by_season = [f"{why} | {c['title'][:90]}" for c, why in elsewhere][:6]
                     if not cands:
-                        if wrong_season:
+                        if wrong_season or elsewhere:
                             yield Finding(
                                 rule=self.id, kind=self.kind, severity="minor",
                                 subject=f"S{int(season_key):02d}E{ep:02d}",
                                 summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
-                                         f"只搜到 {len(wrong_season)} 个明显属于别季的同集号"
-                                         f"发布，全部跳过"),
+                                         f"只搜到 {len(wrong_season) + len(elsewhere)} 个明显属于别季的同集号"
+                                         f"发布（{len(elsewhere)} 个标的是别季 / 不是特典，{len(wrong_season)} 个"
+                                         f"早于播出），全部跳过"),
                                 show=show.dir_name,
                                 evidence={"season": season_key, "episode": ep,
                                           "air_date": air_of.get(ep, ""), "mikan_id": mid,
+                                          "rejected_by_season": by_season,
                                           "rejected_by_date":
                                               [f"{c.get('pub','?')} | {c['title'][:90]}"
                                                for c in wrong_season][:6]},
@@ -513,7 +568,8 @@ class EpisodeAvailableDetector:
                             show=show.dir_name,
                             evidence={"season": season_key, "episode": ep, "mikan_id": mid,
                                       "candidates": [c["title"][:110] for c in cands],
-                                      "rejected_by_date": len(wrong_season)},
+                                      "rejected_by_date": len(wrong_season),
+                                      "rejected_by_season": by_season},
                         )
                         continue
                     verdict = next(v for c, v in scored if c is best)
@@ -528,6 +584,7 @@ class EpisodeAvailableDetector:
                                   "chosen": best["title"][:140],
                                   "chosen_pub": best.get("pub", ""),
                                   "rejected_by_date": len(wrong_season),
+                                  "rejected_by_season": by_season,
                                   "verdict": verdict.why(),
                                   "rejected": [f"{v.why()} | {c['title'][:90]}"
                                                for c, v in scored if c is not best][:6]},
