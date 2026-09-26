@@ -275,7 +275,10 @@ purge 要判断"隔离区里的这个能不能真删"，需要删除那一刻的
 - `restore_from_trash` 先搬回文件、再恢复条目的优先级（反过来 qBittorrent 会先往这个名字写半成品）——走与
   `restore_file_priority` 同一个 `_restore_priority`：条目此刻必须仍是 0、种子还在、路径没被别的种子声明。
 - 恢复不了时文件照样回来（它是主体），`rollback` 的结果多 `priority_not_restored` 计数与 `notes`，`cmd_rollback`
-  打印「⚠️ 文件已搬回、合集条目的下载没恢复」并逐条说明。
+  打印「⚠️ 文件已搬回、合集条目的下载没恢复」并逐条说明。搬回之后读 qBittorrent 出错同样只记进 `notes`
+  （`_try_restore_priority`）：文件已经回来了，整步记成 failed 会让人以为它还在隔离区里。搬回之前的占用
+  检查读不到照旧整步跳过、文件不动。
 
 **测试**：`tests/test_rollback_claims.py` 末尾——银八合集 [01-03] 的第 2 集输给 1080p 单集：回退后优先级回到
-[1, 1, 1]；合集此后被删：文件照样搬回、CLI 写明没恢复、理由是种子不在。改前两条红。
+[1, 1, 1]；合集此后被删：文件照样搬回、CLI 写明没恢复、理由是种子不在。改前两条红。补一条：搬回之后那一次
+`files()` 超时——`reverted` 1、`failed` 0、`notes` 里写明超时（改前记成 failed）。

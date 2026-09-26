@@ -421,3 +421,24 @@ def test_rollback_says_so_when_the_file_came_back_but_the_download_did_not(lib, 
     assert rc == 0 and "已还原: 1" in out
     assert "合集条目的下载没恢复: 1" in out and "不在" in out
     assert (s1.path / "[G] Ginpachi-sensei - 02 [720p].mkv").exists()
+
+
+def test_a_qbit_error_while_restoring_the_download_does_not_mark_the_restored_file_failed(lib):
+    """文件已经搬回来了，之后读合集的文件列表超时：这一步是"做成了、没做全"，不是"失败"——
+    记成 failed 会让人以为文件还在隔离区里。"""
+    s1, pack, c = _ginpachi(lib)
+    real, calls = lib.qbit.files, []
+
+    def files(h):                       # 搬回之前的占用检查读得到；搬回之后那一次超时
+        calls.append(h)
+        if h == pack.hash and calls.count(h) > 1:
+            raise httpx.ReadTimeout("timed out (injected)")
+        return real(h)
+
+    lib.qbit.files = files
+
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 1 and res["failed"] == 0, res
+    assert res["priority_not_restored"] == 1 and "ReadTimeout" in res["notes"][0]
+    assert (s1.path / "[G] Ginpachi-sensei - 02 [720p].mkv").exists()

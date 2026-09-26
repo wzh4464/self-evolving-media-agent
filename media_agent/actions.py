@@ -2043,8 +2043,8 @@ class Executor:
             fp = u.get("file_priority")
             if self.dry_run:
                 if fp:
-                    ok, why = self._restore_priority(fp)
-                    if not ok:
+                    why = self._try_restore_priority(fp)
+                    if why:
                         self._undo_notes.append(f"{dst.name}：文件会搬回，但合集条目的下载恢复不了（{why}）")
                 return True, ""
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -2053,12 +2053,21 @@ class Executor:
             if fp:
                 if self._claim_index is not None:
                     self._claim_index.invalidate()
-                ok, why = self._restore_priority(fp)
-                if not ok:
+                why = self._try_restore_priority(fp)
+                if why:
                     self._undo_notes.append(f"{dst.name}：文件已搬回，但合集条目的下载没恢复（{why}）")
             return True, ""
 
         return False, f"未知逆操作 {op}"
+
+    def _try_restore_priority(self, u: dict) -> str:
+        """`restore_from_trash` 搬回文件之后恢复条目下载：没恢复成返回理由。这时文件已经回来了，
+        读 qBittorrent 出错也只是"没做全"，不能让整步记成 failed（那样看着像文件还在隔离区里）。"""
+        try:
+            ok, why = self._restore_priority(u)
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
+        return "" if ok else why
 
     def _restore_priority(self, u: dict) -> tuple[bool, str]:
         """把种子里第 `index` 个条目的优先级恢复成 `priority`（它此刻必须仍是 0）。返回 (是否成功, 理由)。"""
