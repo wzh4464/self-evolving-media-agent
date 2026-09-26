@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -61,6 +62,20 @@ def _bad_name(name, what: str) -> str | None:
     if "/" in name or "\0" in name or name in (".", ".."):
         return f"{what} 不是单个路径分量：{name!r}"
     return None
+
+
+def _btih(magnet: str) -> str:
+    """magnet 里的 v1 infohash（小写十六进制）；32 位 base32 形式先转成十六进制。"""
+    m = re.search(r"xt=urn:btih:([0-9A-Za-z]+)", magnet or "")
+    if not m:
+        return ""
+    v = m.group(1)
+    if len(v) == 32:
+        try:
+            return base64.b32decode(v.upper()).hex()
+        except (ValueError, TypeError):
+            pass
+    return v.lower()
 
 
 def _bad_rel(rel, what: str) -> str | None:
@@ -958,6 +973,7 @@ class Executor:
             return
 
         magnet = victim.get("magnet_uri") or a.args.get("magnet") or ""
+        paths = self._claimed_paths(victim)          # 摘之前记下：摘了就问不到了
         self.ctx.qbit.delete([h], delete_files=False)
         self._removed_torrents.add(h)
 
@@ -967,18 +983,34 @@ class Executor:
                      "kept": (keeper or {}).get("name", ""),
                      "files_untouched": True,
                      **({} if magnet else {"note": "无 magnet_uri，此条不可回退"})},
-                    undo=self._readd_undo(victim, magnet))
+                    undo=self._readd_undo(victim, magnet, paths))
+
+    def _claimed_paths(self, victim: dict) -> list[str]:
+        """这个种子此刻声明着的绝对路径（优先级非 0 的条目），写进 `readd_torrent` 逆操作，
+        回退重加前拿来问占用。读不到返回 []——这只是回退的线索，不该拦住摘除本身
+        （回退时退回到记录里的 `args.path` 与显示名）。"""
+        sp = (victim.get("save_path") or "").rstrip("/")
+        if not sp:
+            return []
+        try:
+            entries = self._claims().entries(victim.get("hash", ""))
+        except ClaimsUnknown:
+            return []
+        return [str(Path(sp) / e["name"]) for e in entries if e.get("priority", 1) != 0]
 
     @staticmethod
-    def _readd_undo(victim: dict, magnet: str) -> dict | None:
+    def _readd_undo(victim: dict, magnet: str, paths: list[str] | None = None) -> dict | None:
         """摘掉一条种子记录的逆操作：凭 magnet 按原布局加回来。
 
         magnet 是唯一的回退凭据：删掉之后 .torrent 就没了，只能靠 magnet
         把这条记录重新加回来。取不到就返回 None，调用方要明说不可回退。
+
+        `paths`：摘的时候它声明着的路径。回退重加前逐个问占用——此后被别的种子
+        占了，加回来就是两个种子争一个文件（critic N6）。
         """
         if not magnet:
             return None
-        return {"op": "readd_torrent", "magnet": magnet,
+        undo = {"op": "readd_torrent", "magnet": magnet,
                 "save_path": victim.get("save_path", ""),
                 "category": victim.get("category", ""),
                 "tags": victim.get("tags", ""),
@@ -987,6 +1019,9 @@ class Executor:
                 # 按原布局加回来，已下的半成品才对得上；Original 重加会
                 # 多长一层根目录，半成品全部失联。
                 "no_subfolder": not victim.get("root_path")}
+        if paths is not None:
+            undo["paths"] = list(paths)
+        return undo
 
     def _op_relink_torrent(self, f: Finding, a: Action) -> None:
         """把路径失效的种子重新关联到磁盘上的实际文件。
@@ -1452,6 +1487,7 @@ class Executor:
                                           "would_drop": victim.get("name", "")})
             return
         magnet = victim.get("magnet_uri") or ""
+        paths = self._claimed_paths(victim)          # 摘之前记下：摘了就问不到了
         try:
             self.ctx.qbit.delete([h], delete_files=False)
         except Exception as e:
@@ -1462,7 +1498,7 @@ class Executor:
         self._audit("applied", f, a,
                     {"dropped": victim.get("name", ""), "files_untouched": True, "note": note,
                      **({} if magnet else {"irreversible": "无 magnet_uri，此条不可回退"})},
-                    undo=self._readd_undo(victim, magnet))
+                    undo=self._readd_undo(victim, magnet, paths))
 
     # ---------------- 回退 ----------------
     def rollback(self, run_id: str) -> dict:
@@ -1497,13 +1533,16 @@ class Executor:
         for rec in reversed(undoable):        # LIFO
             u = rec["undo"]
             try:
-                ok, reason = self._apply_undo(u)
+                ok, reason = self._apply_undo(u, rec)
                 if ok:
                     done.append(rec)
                 else:
                     skipped.append({**rec, "skip_reason": reason})
             except Exception as e:
                 failed.append({**rec, "error": f"{type(e).__name__}: {e}"})
+            if self._claim_index is not None:
+                # 每一步逆操作之后占用索引作废（失败的也可能改到一半），下一步看到的是新状态
+                self._claim_index.invalidate()
             if u.get("torrent_record_lost"):
                 lost.append(rec)
 
@@ -1596,6 +1635,14 @@ class Executor:
             if not (isinstance(magnet, str) and magnet.startswith("magnet:?")
                     and "xt=urn:btih:" in magnet):
                 return f"magnet 不合法：{magnet!r}"
+            paths = u.get("paths")
+            if paths is not None:
+                if not isinstance(paths, list):
+                    return f"paths 不是列表：{paths!r}"
+                for p in paths:
+                    why = _inside(p, media, "paths 的条目")[1]
+                    if why:
+                        return why
             if u.get("save_path"):
                 return lib_path("save_path")
             return None
@@ -1627,8 +1674,27 @@ class Executor:
             return None
         return None
 
-    def _apply_undo(self, u: dict) -> tuple[bool, str]:
-        """执行一条逆操作。返回 (是否成功, 跳过原因)。"""
+    def _readd_paths(self, u: dict, args: dict) -> list[Path]:
+        """重加之后这个种子可能声明的路径：摘除时记下的 `paths`、正向动作的 `args.path`
+        （撞车 / 幻影的那个路径），以及 `save_path/显示名`——单文件种子的显示名就是它原本
+        的文件名，磁力重加回来的正是这个名字（第 2 阶段之前的记录只有它可用）。
+        只留媒体库之下的规范绝对路径。"""
+        media = Path(self.cfg.media_root)
+        raw = list(u.get("paths") or [])
+        if args.get("path"):
+            raw.append(args["path"])
+        sp, name = (u.get("save_path") or "").rstrip("/"), u.get("name") or ""
+        if sp and not _bad_name(name, "name"):
+            raw.append(str(Path(sp) / name))
+        out: list[Path] = []
+        for p in raw:
+            q = _inside(p, media, "path")[0]
+            if q is not None and q not in out:
+                out.append(q)
+        return out
+
+    def _apply_undo(self, u: dict, rec: dict | None = None) -> tuple[bool, str]:
+        """执行一条逆操作。返回 (是否成功, 跳过原因)。`rec` 是它所在的整条审计记录。"""
         op = u.get("op")
         bad = self._undo_problem(u)
         if bad:
@@ -1641,15 +1707,23 @@ class Executor:
             if cur.is_dir():
                 return False, f"逆改名的对象是目录而不是文件，拒绝：{cur}"
             back = cur.parent / u["new_name"]
-            if back.exists():
-                return False, f"还原目标已存在：{back.name}"
             # AGENTS.md 第 3 条对回退同样成立：有种子的文件只走 renameFile。
             # 以前种子里找不到、或 qBit 不在时，这里退化成 `Path.rename`（critic N3）。
             h = u.get("torrent_hash")
+            if h and not self.ctx.qbit:
+                return False, "有种子的文件，但 qBittorrent 不可用：拒绝绕过它改名"
+            # 原名此刻归谁（critic N6）。以前只看 `back.exists()`：原名此后被一个还没落盘的
+            # 下载映射了就照改——两个种子声明同一路径；自己当初只改了大小写时，APFS 上
+            # `exists()` 为真（就是它自己），回退永远跳过。
+            chk = self._claims().check(back, own_hash=h or "", own_path=cur)
+            if chk.unknown:
+                return False, f"无法确认还原目标的占用情况，未做任何改动：{chk.unknown}"
+            if chk.in_qbit:
+                return False, f"还原目标仍被另一个种子声明：{chk.describe()}"
+            if chk.claimants:
+                return False, f"还原目标已存在：{back.name}（{chk.describe()}）"
             rel = None
             if h:
-                if not self.ctx.qbit:
-                    return False, "有种子的文件，但 qBittorrent 不可用：拒绝绕过它改名"
                 rel = self._torrent_rel_path(h, cur)
                 if rel is None:
                     return False, "种子文件列表里找不到该文件，拒绝退化成文件系统改名"
@@ -1760,6 +1834,26 @@ class Executor:
             # 用 magnet 把种子加回来。加回来是 paused 的：撞车的那个文件
             # 现在归另一个种子管，让它一上来就开跑等于重演当初的问题，
             # 由人看过再决定要不要启动。
+            #
+            # 加之前先问占用（critic N6）：它声明过的路径此后被**别的**种子占了（死种被摘后
+            # 换源抓来的新种子、幻影被摘后改到集位名上的赢家），加回来就是两个种子争一个
+            # 文件。撞车受害者当初保留的那一方（`keep_hash`）不算——它本来就在，回退要恢复
+            # 的正是那个"暂停着、等人看"的原状。只问 qBittorrent：盘上的半成品多半就是它
+            # 自己留下的。
+            args = (rec or {}).get("args") or {}
+            cands = self._readd_paths(u, args)
+            if not cands:
+                return False, ("无法确定重加后它会占用哪些路径（记录里没有 paths / path / "
+                               "可用的显示名），拒绝盲目重加；magnet 在审计记录里")
+            exempt = [args["keep_hash"]] if args.get("keep_hash") else []
+            h = _btih(u["magnet"])
+            for p in cands:
+                chk = self._claims().check(p, own_hash=h, disk=False, exempt=exempt)
+                if chk.unknown:
+                    return False, f"无法确认重加后的占用情况，未做任何改动：{chk.unknown}"
+                if chk.claimants:
+                    return False, (f"重加会与活种子争同一路径（{chk.describe()}）；magnet 在审计"
+                                   f"记录里，确认没有冲突后可手动加回")
             if self.dry_run:
                 return True, ""
             try:
@@ -1862,6 +1956,13 @@ class Executor:
                 return False, f"隔离区里的不是普通文件，拒绝整体搬回：{src}"
             if os.path.lexists(dst):
                 return False, f"原位置已被占用：{dst.name}"
+            # 盘上空着不等于没人占（critic N6）：一个还没落盘的下载可能已映射到这个名字，
+            # 搬回去之后它完成时 `X.!qB → X` 撞 EEXIST；只差大小写的文件在 APFS 上也是它。
+            chk = self._claims().check(dst)
+            if chk.unknown:
+                return False, f"无法确认原位置的占用情况，未做任何改动：{chk.unknown}"
+            if chk.claimants:
+                return False, f"原位置已被占用：{chk.describe()}"
             if self.dry_run:
                 return True, ""
             dst.parent.mkdir(parents=True, exist_ok=True)

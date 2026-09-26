@@ -229,3 +229,29 @@ def make_file(tmp_path, fake_probe):
                          torrent_category=category)
 
     return _make
+
+
+# ------------------------------------------------------------------ 文件系统语义
+@pytest.fixture(params=["native", "case-sensitive"])
+def fs(request, monkeypatch):
+    """路径占用（`media_agent.claims`）盘上那一侧在两种文件系统语义下都要成立。
+
+    本机（macOS）的临时目录是大小写 / 规范化都不敏感的 APFS，直接 lstat 就认得出
+    `s01e08.MKV`；CI 的 Linux 区分大小写，只能靠列目录折叠比较。`case-sensitive`
+    把 lstat 换成"名字必须逐字节出现在父目录列表里"，在本机也把后一条路径跑一遍。
+    """
+    if request.param == "case-sensitive":
+        from media_agent import claims as claims_mod
+        real = claims_mod._lstat_key
+
+        def exact(p):
+            p = Path(p)
+            try:
+                if p.name not in os.listdir(p.parent):
+                    return None
+            except OSError:
+                return None
+            return real(p)
+
+        monkeypatch.setattr(claims_mod, "_lstat_key", exact)
+    return request.param

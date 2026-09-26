@@ -15,41 +15,14 @@ from __future__ import annotations
 import os
 import unicodedata
 
-from pathlib import Path
-
 import httpx
 import pytest
 
-from media_agent import claims as claims_mod
 from media_agent.claims import ClaimIndex, fold
 
 GB = 600_000_000
 SLOT = "尼古喵喵 S01E08.mkv"
 RAW = "[LoliHouse] Yani Neko - 08 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv"
-
-
-@pytest.fixture(params=["native", "case-sensitive"])
-def fs(request, monkeypatch):
-    """盘上那一侧在两种文件系统语义下都要成立。
-
-    本机（macOS）的临时目录是大小写 / 规范化都不敏感的 APFS，直接 lstat 就认得出
-    `s01e08.MKV`；CI 的 Linux 区分大小写，只能靠列目录折叠比较。`case-sensitive`
-    把 lstat 换成"名字必须逐字节出现在父目录列表里"，在本机也把后一条路径跑一遍。
-    """
-    if request.param == "case-sensitive":
-        real = claims_mod._lstat_key
-
-        def exact(p):
-            p = Path(p)
-            try:
-                if p.name not in os.listdir(p.parent):
-                    return None
-            except OSError:
-                return None
-            return real(p)
-
-        monkeypatch.setattr(claims_mod, "_lstat_key", exact)
-    return request.param
 
 
 def _hashes(chk) -> list[str]:
