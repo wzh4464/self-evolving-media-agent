@@ -80,17 +80,29 @@ def make_torrent(name: str, files: dict[str, int] | None = None,
     return blob, hashlib.sha1(bencode(info)).hexdigest()
 
 
+def _element(raw: bytes) -> str:
+    """一个路径元素，按 libtorrent 的 `sanitize_append_path_element` 处理：元素里的
+    路径分隔符换成 `_`（libtorrent 2.0 torrent_info.cpp，按源码；未在生产上逐条核对）。
+
+    Mikan 的站点标题常带 ` / `（`尼古喵喵 / Yani Neko - 09`）。单文件种子的文件名、
+    种子名都是一个元素，qBittorrent 里不会出现带 `/` 的单文件条目——不处理的话，
+    FakeQbit 会把它当成"文件夹/文件"，抓取后改名保留文件夹层（N15）时就会失真。
+    """
+    return raw.decode("utf-8").replace("/", "_").replace("\\", "_")
+
+
 def torrent_files(blob: bytes) -> tuple[str, str, dict[str, int], bool]:
     """解析 .torrent → (infohash, name, {相对路径: 字节数}, 是否多文件)。
 
     多文件时路径**不含**根目录名，由调用方按布局（Original / NoSubfolder）决定前缀。
+    名字与每个路径元素都按 libtorrent 规范化（见 `_element`）。
     """
     meta, _ = bdecode(blob, 0)
     info = meta["info"]
     h = hashlib.sha1(bencode(info)).hexdigest()
-    name = info["name"].decode("utf-8")
+    name = _element(info["name"])
     if "files" in info:
-        files = {"/".join(p.decode("utf-8") for p in f["path"]): int(f["length"])
+        files = {"/".join(_element(p) for p in f["path"]): int(f["length"])
                  for f in info["files"]}
         return h, name, files, True
     return h, name, {name: int(info["length"])}, False

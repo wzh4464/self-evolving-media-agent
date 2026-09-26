@@ -107,7 +107,8 @@ def test_grab_adds_pinned_torrent_and_bookkeeping_survives_the_batch(lib):
     assert v["tags"] == "ma:S01E09"                       # 无订阅 id → 不给 ab:
     assert v["category"] == "尼古喵喵"                     # 自己抓的直接落剧名分类
     assert v["save_path"] == str(s1.path)
-    assert v["name"] == title + ".mkv"
+    # 显示名是种子自己的名字；libtorrent 把名字里的 `/` 换成 `_`（harness.torrentfile._element）
+    assert v["name"] == title.replace("/", "_") + ".mkv"
     assert lib.qbit.file_names(item.infohash) == ["尼古喵喵 S01E09.mkv"]
     assert 9 in lib.sidecar("尼古喵喵").seasons["1"]["have"]
 
