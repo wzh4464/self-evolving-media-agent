@@ -291,6 +291,10 @@ def _ab_offset_for(show: Show, season: int) -> int:
 def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
     """出处账本对"这个文件是哪一集"怎么说：`("slot", 集位)` / `("conflict", None)` / `("", None)`（没话说）。
 
+    **钉着 `ma:` 的先说**：钉子是抓取器的定论（与抓取行同源），账本里那一行即便是 AB 补录的、"换算不了"，也不能让
+    它变成"名字不可信"。2026-08-31 之前的抓取钉着 `ma:S01E58`、AB 也登记过（补录成 AB 行、标题「第三季 - 08」），
+    以前判重据此把它剔出 S01E58 的桶、报一条说它名字不可信的冲突——这一集的判重永远做不成（2026-09-27 审查）。
+
     账本说得上话的前提：文件有种子、账本里有这个种子的**有效**行（撤销了的不算）、种子只有**一个**要下载的视频
     （番组页标题说的是整个发布，合集、合并发布说不了单个文件）、番组页标题里**发布方声明了季号**
     （没声明的，标题与文件名是同一套编号，账本不比文件名多知道什么）。
@@ -307,6 +311,9 @@ def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
     正片季的偏移。生产快照里《100个女朋友》第三季 10 个名字正确的文件被算成 `S01E25`…`S01E36`、要改名；Re:Zero 的
     `第四季 / … S04E15` 账本算 (4, 15)、抓取算第 81 集；`第三季 OVA - 01` 在 Season 0 被算成 S00E25。
     """
+    pin = _pinned(f)
+    if pin:
+        return "slot", pin
     row = getattr(f, "ledger", None)
     if row is None or not row.active or not f.torrent_hash or f.torrent_videos != 1:
         return "", None

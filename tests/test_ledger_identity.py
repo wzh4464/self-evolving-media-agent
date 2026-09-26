@@ -278,3 +278,25 @@ def test_ab_episode_offset_only_applies_to_the_subscriptions_own_season(lib):
     state = lib.scan()
     s, f = _file(lib, state, t.path)
     assert ledger_view(f, s) == ("slot", (1, 5))
+
+
+def test_a_pinned_seal_takes_part_in_its_own_episodes_dedupe(lib):
+    """2026-08-31 之前的抓取：钉着 `ma:S01E58`、AB 也登记过（补录成 AB 行、番组页标题「第三季 - 08」、没有偏移）、被 AB
+    改名成 `S01E08`。钉子是定论：它在 S01E58 的桶里，不能因为账本"换算不了第 3 季"就被剔出去、报一条说它名字不可信的
+    `season_numbering_conflict`——那样这一集的判重永远做不成（2026-09-27 审查）。"""
+    sh = lib.show(REZERO)
+    s1 = sh.season(1)
+    sh.bangumi(9, title_raw="Re Zero kara Hajimeru Isekai Seikatsu", season=1)
+    lib.ab_rows("torrent", [{"bangumi_id": 9, "name": FYY_MIKAN, "url": _url(H_AB), "downloaded": 1}])
+    fyy = s1.single(AB_NAME, size=487_000_000, name=FYY_FILE, hash=H_AB, tags="ab:9, ma:S01E58", probe=CHI)
+    other = s1.single(f"{REZERO} S01E58.mkv", size=400_000_000, tags="ab:9",
+                      name="[LoliHouse] Re Zero - 58 [WebRip 1080p HEVC-10bit AAC].mkv",
+                      probe=video("hevc", subs=["chi 简体中文"]))
+    lb.backfill(lib.context())
+
+    state = lib.scan()
+    s, f = _file(lib, state, fyy.path)
+    assert ledger_view(f, s) == ("slot", (1, 58))
+    c = lib.cycle(detectors=[DuplicateEpisodeDetector], dry_run=True)
+    assert "season_numbering_conflict" not in c.kinds()
+    assert [t.path for t in c.actions("trash")] == [str(other.path)]     # 钉着的封存这一集，另一份判输
