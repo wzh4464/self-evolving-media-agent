@@ -296,10 +296,12 @@ def build_pool(ctx, *, now: datetime | None = None, early: bool = True) -> list[
     audit = _audit_by_trash_path(Path(pool.cfg.audit_log))
     manual = _manual_by_trash_path(Path(pool.cfg.state_dir) / "purge.jsonl", pool.trash_root)
 
+    from .actions import Executor
+
     out: list[Candidate] = []
     for p in sorted(pool.trash_root.rglob("*")):
-        if p.name.startswith("._"):
-            continue
+        if Executor._is_junk(p.name):
+            continue                    # 访达的 .DS_Store、AppleDouble 的 `._*`：不是被隔离的东西
         try:
             st = os.lstat(p)
         except OSError:

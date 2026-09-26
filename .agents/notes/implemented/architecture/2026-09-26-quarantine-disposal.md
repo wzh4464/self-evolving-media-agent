@@ -257,7 +257,16 @@ APFS 容器（critic N8：`/System/Volumes/Data` 与 `/Volumes/Backup` 共用约
 补上只有那一道能拦住的现场（发布名没写季号、只是集号对不上；…）后 37/38 被杀。剩下的一个是等价变异：
 替代者"种子没下完"那条，`_holders` 已经不收没下完的文件，走不到——留作纵深防御并注明。变异脚本不入库。
 
-## 12. 写进约束
+## 12. 访达的杂项文件不算隔离品
+
+访达浏览过的目录里会多出 `.DS_Store`（外接卷上还有 AppleDouble 的 `._*`）。`build_pool` 以前只跳过 `._*`：
+`.DS_Store` 没有隔离记录 → `other` → 过了保留期每轮在 run.log 里报一次"需人工处置"。现在按执行器搬目录时同一个
+口径（`Executor._is_junk`：`.DS_Store`、`Thumbs.db`、`.localized`、`._*`）整个跳过。它们不被删，所在目录因此
+rmdir 不掉、留一个几 KB 的空壳——比为了它们往 `purge.jsonl` 里写删除记录划算。
+
+**测试**：`tests/test_quarantine_disposal.py` 末条——过期特典旁边的三种杂项文件不进待删池、不报过期。改前红。
+
+## 13. 写进约束
 
 AGENTS.md「不可动摇的约束」第 10 条：隔离区的硬删除只经 `disposal.hard_delete`（先写意图、逐个文件、永不
 `rmtree`），删不删由 `purge.build_pool` 按处置类别判，unlink 前 `purge.recheck`，容量闸只在已证明可删的里面

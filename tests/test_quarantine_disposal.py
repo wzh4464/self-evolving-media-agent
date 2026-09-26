@@ -850,3 +850,16 @@ def test_survivor_unwanted_after_planning_means_no_delete(lib, monkeypatch, no_r
     assert moved.exists() and not rep.deleted
     [(c, why)] = rep.changed
     assert "不再声明" in why
+
+
+def test_finder_junk_is_not_a_quarantined_file(lib, no_rmtree):
+    """访达浏览过的目录里会多出 `.DS_Store`：它不是被隔离的东西，不该每 6 小时在 run.log 里
+    报成"需人工处置"。与执行器搬目录时的口径相同（`Executor._is_junk`）。"""
+    extra = legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=40)
+    for junk in (".DS_Store", "._尼古喵喵 NCOP.mkv", "Thumbs.db"):
+        (extra.parent / junk).write_bytes(b"junk")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.pool] == [extra]
+    assert [c.trash_path for c in rep.deleted] == [extra] and not rep.overdue
