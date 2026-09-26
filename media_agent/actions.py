@@ -173,7 +173,7 @@ class ExecReport:
     refused: str = ""
     # 没能原样写进 audit.jsonl 的记录（每条一句：哪条、怎么了）。写审计永不抛异常（`audit.write`），
     # 但写不进去必须大声说：cli 打印、退出码非零。记录本身照样在上面三个列表里。
-    audit_problems: list[str] = field(default_factory=list)
+    audit_problems: list[auditlog.Problem] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.refused:
@@ -183,7 +183,7 @@ class ExecReport:
             s += f"，未确认 {len(self.unknown)} 项（改动也许生效了，需核对）"
         if self.audit_problems:
             s += (f"；⚠️ {len(self.audit_problems)} 条审计没能原样写进 audit.jsonl"
-                  f"（见 stderr / {auditlog.FALLBACK_NAME}）")
+                  f"（{auditlog.where(auditlog.kinds(self.audit_problems))}）")
         return s
 
 
@@ -410,7 +410,7 @@ class Executor:
         bucket.append(rec)
         for p in auditlog.write(self.cfg.audit_log, rec):
             self.report.audit_problems.append(
-                f"[{action.op}] {str(finding.summary)[:50]}（{status}）：{p}")
+                p.prefixed(f"[{action.op}] {str(finding.summary)[:50]}（{status}）："))
 
     # 动作之间存在安全顺序，与问题严重度无关：
     # 文件改名必须早于目录改名——目录一改，之前算出的文件路径全部失效。
@@ -2084,7 +2084,7 @@ class Executor:
         if refused:
             return refuse(refused)
 
-        problems: list[str] = []
+        problems: list[auditlog.Problem] = []
         with self._tracking():
             for rec in reversed(undoable):        # LIFO
                 u = rec["undo"]
@@ -2152,7 +2152,8 @@ class Executor:
             })
         return result
 
-    def _write_step(self, run_id: str, rec: dict, u: dict, status: str, extra: dict) -> list[str]:
+    def _write_step(self, run_id: str, rec: dict, u: dict, status: str,
+                    extra: dict) -> list[auditlog.Problem]:
         """回退的一步留一条审计（critic N12：以前只有汇总，还原了哪几条、停在哪一步都查不到）。
         记录形状见 `audit` 模块文档。永不抛；返回写盘遇到的问题。"""
         self._seq += 1
@@ -2173,7 +2174,7 @@ class Executor:
                        "status": rec.get("status")},
             **extra,
         }
-        return [f"[undo:{u.get('op')}] {str(rec.get('summary') or '')[:50]}（{status}）：{p}"
+        return [p.prefixed(f"[undo:{u.get('op')}] {str(rec.get('summary') or '')[:50]}（{status}）：")
                 for p in auditlog.write(self.cfg.audit_log, step)]
 
     def _read_audit(self, run_id: str) -> list[dict]:

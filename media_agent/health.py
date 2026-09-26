@@ -218,6 +218,12 @@ def repeated_failures(audit_log, report) -> list[dict]:
             for p in pats if (p["status"], p["rule"], p["op"], p["error"]) in mine][:10]
 
 
+def audit_where(actions: dict) -> str:
+    """健康报告里 `actions` 的审计问题落在了哪（`audit.where`）。没有 `audit_problem_kinds` 的旧报告按转写算。"""
+    counts = actions.get("audit_problem_kinds") or {auditlog.FALLBACK: actions.get("audit_problems") or 0}
+    return auditlog.where(counts)
+
+
 class RunHealth:
     """一轮 `run` 的健康信息，边跑边记，收尾时 `finish(rc)` 定状态与退出码。
 
@@ -295,6 +301,8 @@ class RunHealth:
             "applied": len(report.applied), "skipped": len(report.skipped),
             "failed": len(report.failed), "unknown": len(report.unknown),
             "audit_problems": len(report.audit_problems),
+            # 各种类几条（`audit.kinds`）：原因与通知按它说"落在了哪"——降级的在 audit.jsonl 里，不在备用文件
+            "audit_problem_kinds": auditlog.kinds(report.audit_problems),
             "failed_detail": brief(report.failed), "unknown_detail": brief(report.unknown),
             "audit_problem_detail": [str(p)[:200] for p in report.audit_problems[:10]],
             "repeated": repeated_failures(self.cfg.audit_log, report)}
@@ -354,7 +362,7 @@ class RunHealth:
         act = d["actions"] or {}
         if act.get("audit_problems"):
             add("critical", "audit_incomplete",
-                f"{act['audit_problems']} 条审计没能原样写进 audit.jsonl（已转写 stderr 与备用文件）")
+                f"{act['audit_problems']} 条审计没能原样写进 audit.jsonl：{audit_where(act)}")
         trash = d["trash"] or {}
         gb = 1e9
         if trash.get("space_short"):
@@ -497,7 +505,7 @@ def render(rep: dict, path=None) -> list[str]:
     a = rep.get("actions")
     if a:
         lines.append(f"  执行    执行 {a['applied']} · 跳过 {a['skipped']} · 失败 {a['failed']} · "
-                     f"未确认 {a['unknown']} · 审计转写 {a['audit_problems']}")
+                     f"未确认 {a['unknown']} · 审计没原样写入 {a['audit_problems']}")
     g = rep.get("grab")
     if g and (g["proposed"] or g["applied"] or g["failed"] or g["unknown"]):
         lines.append(f"  抓取    提议 {g['proposed']} · 加上 {g['applied']} · 已存在(409) "

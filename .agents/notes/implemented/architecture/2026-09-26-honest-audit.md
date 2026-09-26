@@ -56,11 +56,19 @@ qBittorrent 其实已经改了，记录却是 failed、没有 undo，此后那�
 - 回退的汇总记录同样走 `audit.write`，问题放进结果的 `audit_problems`。
 - cli：`apply` / `run` / `rollback` 在输出末尾与 stderr 各说一遍，退出码 `EXIT_AUDIT_INCOMPLETE = 4`
   （与"整批拒绝、什么都没改"的 3 分开）。`run` 照样跑完隔离区处置再报。
+- **问题带种类，按落点措辞**（第 3 阶段复审时补）：`write` 返回的是 `audit.Problem`（`str` 的子类，调用方照旧当字符串
+  用），`kind` 是 `DEGRADED`（按字符串写进了主审计）/ `FALLBACK`（转写进了 stderr 与备用文件）/ `STDERR_ONLY`（只剩
+  stderr）；执行器与回退拼"哪一条"前缀用 `prefixed`，种类不丢。cli 的大字、`ExecReport.summary()`、健康报告的
+  `audit_incomplete` 原因（报告里多了 `actions.audit_problem_kinds`）、通知邮件都用 `audit.where(audit.kinds(…))` 说这几条
+  落在了哪。以前一律说"已转写到 stderr 与 audit.fallback.jsonl"——序列化降级的那条其实在 audit.jsonl 里、备用文件根本
+  不存在，照着去找的人扑空。降级仍算 critical / 退出码 4：值没能原样记下（多半是代码把 `Path` / `set` 塞进了审计），
+  这条的回退未必可靠。
 
 **测试**：`tests/test_audit_robustness.py`——ENOSPC 注入在 `audit.append_line`：批次继续、这一条在 stderr
 与备用文件里各一份、照样能回退；动作抛异常 + 审计一直写不进去不冲出 `apply()`；`Path` 混进 `args` 降级写入
 并能回退；末尾半行不吞下一条；`cmd_run` 跑到隔离区处置并以 4 退出。tripwire 新种类 `audit_fallback`：
-测试里任何一条审计没原样写进 audit.jsonl 都会变红，除非声明。
+测试里任何一条审计没原样写进 audit.jsonl 都会变红，除非声明。三种落点各自的措辞：降级的不提备用文件与转写（cli、
+`summary()`、健康原因、通知各一个断言；改之前 3 个红）。
 
 ## 3. 新状态 `unknown`：改动也许生效了、确认不了
 

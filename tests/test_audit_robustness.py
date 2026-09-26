@@ -218,3 +218,54 @@ def test_cmd_run_reaches_disposal_and_exits_nonzero_when_audit_is_lost(lib, monk
     assert rc == cli.EXIT_AUDIT_INCOMPLETE != 0
     assert "审计" in out.out and "audit.fallback.jsonl" in out.out
     assert "审计" in out.err
+
+
+# ------------------------------------------------------------------ 问题按种类说（2026-09-26 复审）
+def test_degraded_serialization_is_not_reported_as_moved_to_the_fallback_file(lib, capsys):
+    """序列化降级的那一条其实写进了 audit.jsonl（值按字符串）、没进 stderr 也没进备用文件；以前 cli、健康报告、
+    通知一律说"已转写到 stderr 与 audit.fallback.jsonl"——照着去找的人找不到那个文件。"""
+    problems = audit_mod.write(lib.cfg.audit_log, {"ts": "t", "run_id": "r", "seq": 1, "status": "applied",
+                                                   "op": "x", "args": {"p": Path("/a")}})
+    assert [p.kind for p in problems] == [audit_mod.DEGRADED]
+    assert not audit_mod.fallback_path(lib.cfg.audit_log).exists()
+
+    assert cli._report_audit_problems(problems, lib.cfg.state_dir)
+    out = capsys.readouterr()
+    assert "按字符串降级写进 audit.jsonl" in out.out
+    assert "fallback" not in out.out and "转写" not in out.out and "转写" not in out.err
+
+
+def test_each_problem_kind_is_worded_where_it_actually_went(lib, monkeypatch, capsys):
+    rec = {"ts": "t", "run_id": "r", "seq": 1, "status": "applied", "op": "x"}
+    _disk_full(monkeypatch, lib, times=1)
+    [fb] = audit_mod.write(lib.cfg.audit_log, rec)
+    _disk_full(monkeypatch, lib, times=None, fallback_too=True)
+    [only] = audit_mod.write(lib.cfg.audit_log, {**rec, "seq": 2})
+    capsys.readouterr()
+    assert (fb.kind, only.kind) == (audit_mod.FALLBACK, audit_mod.STDERR_ONLY)
+
+    text = audit_mod.where(audit_mod.kinds([fb, only, fb.prefixed("[rename] ")]))
+    assert "2 条写不进 audit.jsonl、已转写 stderr 与 audit.fallback.jsonl" in text
+    assert "1 条连 audit.fallback.jsonl 也写不进、只剩 stderr" in text
+    assert "降级" not in text
+
+
+def test_health_and_notify_word_a_degraded_record_by_kind(lib):
+    from media_agent import health, notify
+    from media_agent.actions import ExecReport
+    rh = health.RunHealth(lib.configure(), run_id="r")
+    rep = ExecReport(audit_problems=[audit_mod.Problem("序列化降级", audit_mod.DEGRADED)
+                                     .prefixed("[rename] 改名（applied）：")])
+
+    class State:
+        torrents = []
+
+    rh.applied(rep, [], State())
+    [reason] = [r for r in rh.reasons() if r["code"] == "audit_incomplete"]
+    assert "按字符串降级写进 audit.jsonl" in reason["text"] and "转写" not in reason["text"]
+    assert "按字符串降级" in rep.summary() and "fallback" not in rep.summary()
+
+    evs, _ = notify.events({"status": "critical", "stuck": None, "degraded": {"refused": ""},
+                            "actions": rh.data["actions"]}, {"last_status": "critical", "active": {}})
+    [ev] = evs
+    assert "按字符串降级写进 audit.jsonl" in ev["text"] and "转写" not in ev["text"]

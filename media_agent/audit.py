@@ -13,7 +13,8 @@
 2. 主审计写不进去，就把**同一行**原样写到 stderr，并尽力追加到同目录的 `audit.fallback.jsonl`；
 3. 读的一方（`iter_records`）两个文件一起读——转写的记录照样能回退、照样出现在 `runs` 里。
 
-每一处降级 / 转写都由调用方计数，在本轮输出与退出码里大声说（`ExecReport.audit_problems`）。
+每一处降级 / 转写都由调用方计数，在本轮输出与退出码里大声说（`ExecReport.audit_problems`）。`write` 返回的每条
+问题带种类（`Problem.kind`：`DEGRADED` / `FALLBACK` / `STDERR_ONLY`），报告按种类说它落在了哪（`where`）。
 
 **状态**（`status`）——执行器每条动作记录恰好一个：
 
@@ -58,6 +59,50 @@ ROLLBACK = "rollback"
 ROLLBACK_PREFIX = "rollback-of-"
 
 
+# `write` 返回的问题的种类——这一条到底落在了哪。cli、健康报告、通知按它措辞：以前一律说"已转写到 stderr 与
+# audit.fallback.jsonl"，而序列化降级的那一条其实在 audit.jsonl 里、那个文件根本不存在（2026-09-26 复审）。
+DEGRADED = "degraded"          # 值序列化不了，按字符串写进了主审计（记录在，回退照样读）
+FALLBACK = "fallback"          # 主审计写不进，原样转写到了 stderr 与 audit.fallback.jsonl
+STDERR_ONLY = "stderr_only"    # 两个文件都写不进，只剩 stderr（run.err.log）里的一份
+
+
+class Problem(str):
+    """`write` 返回的一条问题：就是那句话（调用方照旧当字符串拼接、打印、写进报告），另带 `kind`。"""
+
+    kind: str = FALLBACK
+
+    def __new__(cls, text: str, kind: str = FALLBACK):
+        self = super().__new__(cls, text)
+        self.kind = kind
+        return self
+
+    def prefixed(self, prefix: str) -> Problem:
+        """前面加上"哪一条"（执行器 / 回退拼的 `[op] 摘要（状态）：`），种类不变。"""
+        return Problem(prefix + self, self.kind)
+
+
+def kinds(problems) -> dict[str, int]:
+    """各种类几条。不是 `Problem` 的（旧调用方拼出来的纯字符串）按 `FALLBACK` 算——以前的措辞就是这个。"""
+    out: dict[str, int] = {}
+    for p in problems:
+        k = getattr(p, "kind", FALLBACK)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def where(counts: dict[str, int]) -> str:
+    """按种类说这几条落在了哪（cli、健康报告、通知共用这一句）。"""
+    parts = []
+    if counts.get(DEGRADED):
+        parts.append(f"{counts[DEGRADED]} 条值序列化不了、已按字符串降级写进 audit.jsonl（记录在，回退照样读）")
+    if counts.get(FALLBACK):
+        parts.append(f"{counts[FALLBACK]} 条写不进 audit.jsonl、已转写 stderr 与 {FALLBACK_NAME}"
+                     "（rollback / runs 会一起读）")
+    if counts.get(STDERR_ONLY):
+        parts.append(f"{counts[STDERR_ONLY]} 条连 {FALLBACK_NAME} 也写不进、只剩 stderr（run.err.log）里的一份")
+    return "；".join(parts)
+
+
 def fallback_path(audit_log: Path) -> Path:
     """主审计写不进去时的备用文件：与 audit.jsonl 同目录。"""
     return Path(audit_log).with_name(FALLBACK_NAME)
@@ -100,24 +145,24 @@ def append_line(path: Path, line: str) -> None:
         fp.write(data)
 
 
-def write(audit_log: Path, rec: dict) -> list[str]:
-    """把一条记录写进审计。**永不抛异常**；返回这一条遇到的问题（空列表 = 原样写进了主审计）。"""
+def write(audit_log: Path, rec: dict) -> list[Problem]:
+    """把一条记录写进审计。**永不抛异常**；返回这一条遇到的问题（空列表 = 原样写进了主审计），每条带种类。"""
     line, degraded = dumps(rec)
-    problems = [f"序列化降级、按字符串写入（{degraded}）"] if degraded else []
+    problems = [Problem(f"序列化降级、按字符串写入（{degraded}）", DEGRADED)] if degraded else []
     try:
         append_line(Path(audit_log), line)
         return problems
-    except Exception as e:                          # noqa: BLE001
+    except Exception as e:                          # noqa: BLE001 —— 写审计永不抛：下面转写并返回问题
         err = f"{type(e).__name__}: {e}"
-    problems.append(f"写不进 audit.jsonl（{err}），已原样转写到 stderr 与 {FALLBACK_NAME}")
+    problems.append(Problem(f"写不进 audit.jsonl（{err}），已原样转写到 stderr 与 {FALLBACK_NAME}", FALLBACK))
     _stderr(f"[audit-fallback] 审计写不进 {audit_log}（{err}），原样转写如下：\n{line}")
     fb = fallback_path(audit_log)
     try:
         append_line(fb, line)
-    except Exception as e2:                         # noqa: BLE001
+    except Exception as e2:                         # noqa: BLE001 —— 同上：问题换成"只剩 stderr"并在 stderr 说
         why = f"{type(e2).__name__}: {e2}"
-        problems[-1] = (f"写不进 audit.jsonl（{err}），{FALLBACK_NAME} 也写不进（{why}），"
-                        f"只剩 stderr 里的一份")
+        problems[-1] = Problem(f"写不进 audit.jsonl（{err}），{FALLBACK_NAME} 也写不进（{why}），"
+                               f"只剩 stderr 里的一份", STDERR_ONLY)
         _stderr(f"[audit-fallback] {fb} 也写不进（{why}）：上面那一行只剩 stderr 里这一份")
     return problems
 

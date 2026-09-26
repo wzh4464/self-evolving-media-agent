@@ -152,9 +152,10 @@ def events(report: dict, st: dict) -> tuple[list[dict], dict]:
     elif report["actions"].get("audit_problems"):
         active["audit_fallback"] = active_before.get("audit_fallback", now)
         if "audit_fallback" not in active_before:
+            from .health import audit_where
             out.append({"kind": "audit_fallback",
-                        "text": (f"{report['actions']['audit_problems']} 条审计没能写进 audit.jsonl，"
-                                 f"已转写 stderr 与 audit.fallback.jsonl")})
+                        "text": (f"{report['actions']['audit_problems']} 条审计没能原样写进 audit.jsonl："
+                                 f"{audit_where(report['actions'])}")})
     return out, {"last_status": cur, "active": active}
 
 

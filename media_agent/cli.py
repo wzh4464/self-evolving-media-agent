@@ -60,13 +60,16 @@ EXIT_CRITICAL = health.EXIT_CRITICAL
 EXIT_AUDIT_INCOMPLETE = 4
 
 
-def _report_audit_problems(problems: list[str], state_dir) -> bool:
-    """审计没能原样写进 audit.jsonl：stdout（run.log）与 stderr（run.err.log）各说一遍。返回是否有问题。"""
+def _report_audit_problems(problems: list, state_dir) -> bool:
+    """审计没能原样写进 audit.jsonl：stdout（run.log）与 stderr（run.err.log）各说一遍，按种类说落在了哪
+    （`audit.where`：序列化降级的在 audit.jsonl 里；转写的在 stderr 与 `state_dir` 下的备用文件里）。返回是否有问题。"""
     if not problems:
         return False
-    from .audit import FALLBACK_NAME
-    msg = (f"⚠️  {len(problems)} 条审计没能原样写进 audit.jsonl——已转写到 stderr 与 "
-           f"{Path(state_dir) / FALLBACK_NAME}（rollback / runs 会一起读）")
+    from .audit import FALLBACK, FALLBACK_NAME, kinds, where
+    counts = kinds(problems)
+    msg = f"⚠️  {len(problems)} 条审计没能原样写进 audit.jsonl——{where(counts)}"
+    if counts.get(FALLBACK):
+        msg += f"（备用文件 {Path(state_dir) / FALLBACK_NAME}）"
     print(f"\n═══ {msg} ═══")
     for p in problems[:10]:
         print(f"  ⚠️  {p}")

@@ -213,7 +213,8 @@
   `run` 连隔离区处置一起中止。现在序列化不了的值按字符串写入（标 `audit_degraded`）；写不进去的记录原样打到
   stderr（`[audit-fallback]`）并追加到 `state/audit.fallback.jsonl`，`rollback` / `runs` / `repair` / 隔离区处置 /
   失败模式统计把两个文件一起读，这些改动照样能回退。上一次写到一半留下的半行不再吞掉下一条。
-  `apply` / `run` / `rollback` 在输出末尾与 stderr 报告有几条没写进去，退出码 4（新）；`run` 照样跑完隔离区处置。
+  `apply` / `run` / `rollback` 在输出末尾与 stderr 报告有几条没原样写进去、各落在了哪（按字符串降级写进了
+  audit.jsonl / 转写进了备用文件 / 只剩 stderr），退出码 4（新）；`run` 照样跑完隔离区处置。
   每条执行器审计多了 `seq`（本批次内的序号），回退按它排先后。
 - **审计多了一个状态 `unknown`：改动也许生效了、执行器确认不了**。以前这种情形一律记 `failed`、不带逆操作
   （生产上 12 次抓取在加种成功之后撞上 NameError，全记"失败"，qBittorrent 里其实多了种子）。现在动作在已经
