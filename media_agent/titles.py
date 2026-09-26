@@ -15,8 +15,9 @@
 
 记录在 `state/titles.json`（不在仓库里、也不在媒体根下）：每个 tmdb_id 一条——采用的标题与从哪天起、正在确认的
 新标题（看到几轮、哪一轮最后看到）、30 天内被换掉的标题。只有 `run` 记（`record`，扫描之后）；`diagnose` 只读。
-第一次见到的 tmdb_id 没有记录时，以 sidecar 里的 `tmdb_title`（或旧缓存里的标题）为"已采用"——那是库里此刻
-正在用的名字；TMDB 给的若与它不同，同样要连看两轮。
+第一次见到的 tmdb_id 没有记录时，以库里此刻正在用的名字为"已采用"（`scan._title_in_use`：目录名 / 文件名已经是的那个
+标题，否则 v0.4.1 按目录名缓存里的、再否则 sidecar 里的 `tmdb_title`）；TMDB 给的若与它不同，同样要连看两轮。
+sidecar 的 `tmdb_title` 不能排第一：e47a054 之前只在 tmdb_id 变了时重写，2026-09-27 生产上两部番的它早就不是库里在用的。
 """
 from __future__ import annotations
 
@@ -65,7 +66,7 @@ class Book:
     def decide(self, tmdb_id: int, observed: str | None, *, fallback: str = "",
                now: datetime | None = None) -> Decision:
         """这一轮用哪个标题。`observed` = TMDB 这一轮给的（取不到为 None）；`fallback` = 没有记录时当作
-        已采用的（sidecar 里的 `tmdb_title`、或旧缓存里的标题——库里此刻正在用的名字）。"""
+        已采用的（库里此刻正在用的名字，`scan._title_in_use`）。"""
         now = now or datetime.now()
         e = self.entry(tmdb_id)
         adopted = e.get("adopted") or fallback or ""
@@ -103,7 +104,7 @@ def path_of(state_dir) -> Path:
 
 def load(state_dir) -> tuple[Book, str]:
     """读记录；没有就是空的。读不了 / 格式不对返回空记录 + 问题（调用方说出来）：这一轮按"没有记录"处理——
-    以 sidecar 里的标题为已采用，最坏是一个新标题多等一轮，不会退回目录名。"""
+    以库里此刻在用的名字为已采用，最坏是一个新标题多等一轮，不会退回目录名。"""
     p = path_of(state_dir)
     try:
         data = json.loads(p.read_text(encoding="utf-8"))

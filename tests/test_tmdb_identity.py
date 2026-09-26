@@ -249,6 +249,52 @@ def test_cmd_run_records_the_title_decisions(lib, monkeypatch, capsys):
     assert book.entry(1)["adopted"] == "药屋少女的呢喃"
 
 
+# ------------------------------------------------------------------ 部署后第一轮：以库里此刻在用的名字为已采用
+PUNCH = 244617                             # 生产上《深夜重拳》的条目
+
+
+@pytest.mark.parametrize("legacy_cache", [True, False], ids=["legacy-cache", "no-cache"])
+def test_first_run_after_deploy_keeps_the_name_the_library_already_uses(lib, legacy_cache):
+    """2026-09-27 生产快照复现：`深夜重拳/` 与文件 09-16 已随 TMDB 改名（`rename_show_dir 深夜Punch -> 深夜重拳`），
+    sidecar 的 `tmdb_title` 却还是第一次写时的「深夜Punch」（e47a054 之前 sidecar-sync 只在 tmdb_id 变了时重写它）。
+    以它为"已采用"，部署后第一轮把库改回「深夜Punch」、第二轮确认新标题再改回来——LAT-04 的来回改名，由部署触发。"""
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(PUNCH, "深夜重拳", seasons={1: weekly(2, first_days_ago=400)})
+    sh = lib.show("深夜重拳")
+    for n in (1, 2):
+        sh.season(1).local(f"深夜重拳 S01E{n:02d}.mp4")
+    sh.sidecar(tmdb_id=PUNCH, tmdb_title="深夜Punch")
+    if legacy_cache:                                            # v0.4.1 按目录名缓存、按它命名的条目
+        Cache(lib.cfg.cache_db).put_tmdb("深夜重拳", {"id": PUNCH, "title": "深夜重拳", "seasons": [
+            {"season_number": 1, "episode_count": 2, "name": "第 1 季"}]})
+
+    first = _run(lib)
+    second = _run(lib)
+
+    assert first.state.title_decisions[PUNCH].status == "stable"
+    assert not _renamed_to(first) and not _renamed_to(second)
+    assert sorted(p.name for p in (sh.path / "Season 1").iterdir()) == [
+        "深夜重拳 S01E01.mp4", "深夜重拳 S01E02.mp4"]
+    assert lib.sidecar("深夜重拳").tmdb_title == "深夜重拳"      # 档案跟上此刻在用的
+
+
+def test_first_run_after_deploy_still_confirms_a_title_the_library_does_not_use_yet(lib):
+    """对照：库里（目录、文件）用的是旧标题、TMDB 这一轮给了新的——仍要连看两轮才改，部署不让它直接生效。"""
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(PUNCH, "深夜重拳", seasons={1: weekly(2, first_days_ago=400)})
+    sh = lib.show("深夜Punch")
+    for n in (1, 2):
+        sh.season(1).local(f"深夜Punch S01E{n:02d}.mp4")
+    sh.sidecar(tmdb_id=PUNCH, tmdb_title="深夜Punch")
+
+    first = _run(lib)
+    assert first.state.title_decisions[PUNCH].status == "pending"
+    assert not _renamed_to(first)
+    second = _run(lib)
+    assert second.state.title_decisions[PUNCH].status == "adopted"
+    assert "深夜重拳" in _renamed_to(second)
+
+
 @pytest.mark.allow("tmdb_unknown", "log_failure")
 def test_no_known_title_at_all_holds_naming_for_that_show(lib):
     """人钉了 tmdb_id、sidecar 里没有标题、TMDB 这一轮也取不到：不按目录名 / AB 标题去改任何名字。"""

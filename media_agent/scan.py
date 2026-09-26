@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 from .kernel import Context, LibraryState, MediaFile, Show, under
-from .naming import SUB_EXTS, VIDEO_EXTS, season_of_dir
+from .naming import SUB_EXTS, VIDEO_EXTS, is_normalized, normalize, season_of_dir
 
 SKIP_DIRS = {".autobangumi", "@eaDir", ".Trash", "lost+found"}
 SKIP_FILES = {".DS_Store", "Thumbs.db"}
@@ -372,7 +372,7 @@ def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
     cache = Cache(ctx.config.cache_db)
     book, problem = titles.load(ctx.config.state_dir)
     if problem:
-        ctx.log(f"[scan] 标题稳定记录{problem}：这一轮按没有记录处理（以 sidecar 里的标题为已采用）")
+        ctx.log(f"[scan] 标题稳定记录{problem}：这一轮按没有记录处理（以库里此刻在用的名字为已采用）")
     metas: dict[int, dict | None] = {}
     # 这一轮 TMDB 出过错：其余的不再打网络，用缓存兜底。"这一轮"是这个 Context——`run` 迭代到不动点时每次迭代重扫一次，
     # 断路器按扫描算的话 TMDB 挂着时每次迭代都再等一次 20 秒超时（`converge`）
@@ -410,15 +410,39 @@ def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
             show.tmdb_title = sc.tmdb_title          # 人钉住的标题：不过稳定闸、不记
             continue
         if tid not in state.title_decisions:         # 一个条目一个决定（物语系列 14 个目录共用一个）
-            fallback = (sc.tmdb_title if str(sc.tmdb_id) == str(tid) else "") or stale.get("title", "")
-            state.title_decisions[tid] = book.decide(tid, (meta or {}).get("title") or None,
-                                                     fallback=fallback)
+            observed = (meta or {}).get("title") or None
+            fallback = "" if book.entry(tid) else _title_in_use(cache, show, sc, tid, observed, stale)
+            state.title_decisions[tid] = book.decide(tid, observed, fallback=fallback)
         show.tmdb_title = state.title_decisions[tid].title
         if not show.tmdb_title:
             show.naming_hold = (f"TMDB 条目 {tid} 这一轮取不到标题（{net['broken'] or '没有缓存'}），"
                                 f"也没有记录过的标题")
     if net["broken"]:
         ctx.tmdb_scan_down = net["broken"]
+
+
+def _title_in_use(cache, show: Show, sc, tid: int, observed: str | None, stale: dict) -> str:
+    """稳定闸还没有这个条目的记录时（部署后第一轮、记录读不了），库里**此刻**按哪个标题命名——当作"已采用的"。
+
+    按证据的强弱：
+    1. 目录名、或这部番的文件名已经就是某个候选标题（TMDB 这一轮给的、旧的按目录名缓存里的、sidecar 里的、
+       按 id 缓存的旧值）：库里用的就是它；
+    2. 都对不上：v0.4.1 按目录名缓存的条目命名（id 对得上、不看时效）→ sidecar 的 `tmdb_title` → 按 id 缓存的旧值。
+
+    **sidecar 的 `tmdb_title` 排在最后**：e47a054 之前的 sidecar-sync 只在 tmdb_id 变了时才重写它，TMDB 改了
+    标题、v0.4.1 按新标题把目录与文件改过去之后，它还是第一次写时的那个。2026-09-27 生产快照：《深夜重拳》09-16 已
+    `rename_show_dir 深夜Punch -> 深夜重拳`、12 个文件跟上，sidecar（09-17 写过）仍是「深夜Punch」；《虽然我是不完美恶女
+    ～雏宫蝶鼠替换传～》差一个空格。以它为已采用，部署后第一轮把两部番改回旧标题（恶女还连带 AB save_path、11 个分类、
+    删一个分类），第二轮确认新标题再改回来——正是稳定闸要挡的 LAT-04 来回改名。"""
+    legacy = cache.get_tmdb_stale(show.dir_name) or {}
+    legacy_title = legacy.get("title", "") if legacy.get("id") == tid else ""
+    own = sc.tmdb_title if str(sc.tmdb_id) == str(tid) else ""
+    candidates = [t for t in dict.fromkeys((observed or "", legacy_title, own, stale.get("title", ""))) if t]
+    names = [f.filename for f in show.files]
+    for t in candidates:
+        if normalize(t) == normalize(show.dir_name) or any(is_normalized(n, t) for n in names):
+            return t
+    return legacy_title or own or stale.get("title", "")
 
 
 def _tmdb_meta(ctx: Context, cache, tid: int, dir_name: str, net: dict) -> dict | None:
