@@ -148,7 +148,7 @@ def _describe(e: BaseException) -> str:
     """异常的一句话描述，给审计的 `error`。`str(e)` 本身出错也不抛——这是写失败记录的那一步。"""
     try:
         return f"{type(e).__name__}: {e}"
-    except Exception:                               # noqa: BLE001
+    except Exception:                               # noqa: BLE001 —— str(e) 自己坏了：退回类型名，记录照写
         return type(e).__name__
 
 
@@ -293,7 +293,7 @@ class Executor:
         """`probe()` 的结论；它自己抛异常（读不到此刻状态）当作说不清（None）。"""
         try:
             return probe()
-        except Exception:                           # noqa: BLE001
+        except Exception:                           # noqa: BLE001 —— 读不到 = 说不清（None），调用方记 unknown
             return None
 
     def _live_torrent(self, h: str) -> dict | None:

@@ -9,11 +9,12 @@
 判定（按 AST）：处理块里调用了下面这些之一就算"说出来了"——`log` / `_log` / `print` / `_stderr`（日志）、
 `_audit` / `_settle` / `_settle_move` / `_crashed`（审计）、`on_error` / `errors.append` / `failed.append` /
 `results.append`（交给调用方汇报）、`_refuse` / `crashed`，或者 `raise`，或者把异常本身交出去（`return f"…{e}"`）；
-否则 `except` 那一行必须带注释，写明为什么不说。
+否则 `except` 那一行必须带注释，写明为什么不说——只有 `# noqa: BLE001` 不算（那是压 ruff 告警的，不是理由）。
 """
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parent.parent / "media_agent"
@@ -51,6 +52,18 @@ def _reports(h: ast.ExceptHandler) -> bool:
     return False
 
 
+_NOQA = re.compile(r"(?i)\bnoqa\b(?::\s*[A-Z]+[0-9]+(?:\s*,\s*[A-Z]+[0-9]+)*)?")
+
+
+def _says_why(line: str) -> bool:
+    """`except` 那一行的注释里，去掉 `noqa…` 之后还有字（ruff 提示的正是 `# noqa: BLE001`——顺手压掉告警的那一下
+    不算"写明为什么不说"）。"""
+    if "#" not in line:
+        return False
+    text = _NOQA.sub("", line.split("#", 1)[1])
+    return bool(re.sub(r"[\s,，;；:：—\-]+", "", text))
+
+
 def _offenders() -> list[str]:
     out = []
     for p in sorted(PKG.rglob("*.py")):
@@ -61,7 +74,7 @@ def _offenders() -> list[str]:
                 continue
             if _reports(node):
                 continue
-            if "#" in lines[node.lineno - 1]:
+            if _says_why(lines[node.lineno - 1]):
                 continue                         # 写明了为什么不说
             out.append(f"{p.relative_to(PKG.parent)}:{node.lineno}: {lines[node.lineno - 1].strip()}")
     return out
@@ -82,3 +95,18 @@ def test_the_checker_itself_catches_a_silent_handler(tmp_path, monkeypatch):
                               "        ctx.log(f'失败 {e}')\n", encoding="utf-8")
     monkeypatch.setattr(__import__(__name__), "PKG", pkg)
     assert _offenders() == ["media_agent/m.py:4: except Exception:"]
+
+
+def test_a_bare_noqa_is_not_a_reason(tmp_path, monkeypatch):
+    """ruff 的 BLE001 提示的正是 `# noqa: BLE001`——顺手压掉告警的那一下不能同时满足"写明为什么不说"
+    （2026-09-26 复审变异 X29：给 pause.reason 加一个只带 `# noqa: BLE001` 的静默 except，这个测试照绿）。"""
+    pkg = tmp_path / "media_agent"
+    pkg.mkdir()
+    (pkg / "m.py").write_text(
+        "def f():\n    try:\n        g()\n    except Exception:  # noqa: BLE001\n        pass\n"
+        "def h():\n    try:\n        g()\n    except Exception:  # noqa: BLE001, S110\n        pass\n"
+        "def k():\n    try:\n        g()\n    except Exception:  # noqa: BLE001 —— 读不到就当没有，下一轮再看\n"
+        "        pass\n", encoding="utf-8")
+    monkeypatch.setattr(__import__(__name__), "PKG", pkg)
+    assert _offenders() == ["media_agent/m.py:4: except Exception:  # noqa: BLE001",
+                            "media_agent/m.py:9: except Exception:  # noqa: BLE001, S110"]

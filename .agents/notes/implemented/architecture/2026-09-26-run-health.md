@@ -233,7 +233,9 @@ run.err.log 的人认它），末尾加上位置。健康报告（第 6 节）�
   `_season_offsets`（`sidecar.load` 自己兜了坏 JSON；剩下的"没有偏移"是安全一侧）。
 - `tests/test_silent_excepts.py` 按 AST 检查：每个宽 `except` 要么调用日志 / 审计 / 汇报（`log`、`_audit`、`_settle`、
   `on_error`、`errors.append`……），要么 `raise`、要么把异常交给调用方（`return f"…{e}"`），否则那一行必须有注释。
-  以后再加一个不声不响的，这个测试红。
+  以后再加一个不声不响的，这个测试红。**只写 `# noqa: BLE001` 不算注释**（复审时补）：ruff 的 BLE001 提示的正是这一句，
+  顺手压掉告警的那一下以前同时满足了这个检查（变异 X29）。现在去掉 `noqa…` 之后还得有字；`_describe`、`_confirm`、
+  `audit.write` 三处只有 `noqa` 的补上了一句为什么。
 
 **遗留**：回退 relink 时条目改不回来仍算"已还原"（现在会说出来）；`sidecar.load` 把坏 JSON 当作空 sidecar
 （`require_any` / `season_offsets` 这些用户意图就此消失）是窄 except，不在这次范围里；source-abandoned 取集表失败时
