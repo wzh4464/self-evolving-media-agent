@@ -13,11 +13,12 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .claims import ClaimCheck, ClaimIndex, ClaimsUnknown
+from .claims import ClaimCheck, ClaimIndex, ClaimsUnknown, fold
 from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
 
@@ -398,17 +399,17 @@ class Executor:
         return name in cls._JUNK_NAMES or name.startswith(cls._JUNK_PREFIXES)
 
     def _merge_tree(self, old: Path, new: Path,
-                    skip: set[Path] | frozenset = frozenset()) -> tuple[int, int]:
+                    skip: Collection[str] = frozenset()) -> tuple[int, int]:
         """把 old 目录树递归合并进 new，逐**文件**移动并保持相对结构。
 
         必须递归：早先的实现只遍历顶层，遇到 `Season 1` 这种子目录时，
         若 new 下已存在同名子目录就整个跳过，导致里面的文件全部滞留在旧目录，
         造成新旧两个目录并存的分裂状态（实测 19 个目录、50 个文件中招）。
 
-        `skip` 里的路径一个都不碰——调用方传入**此刻有种子声明**的路径
-        （见 `_live_claims_under`）。文件系统搬走种子的文件就是 AGENTS.md 第 3 条
-        说的死链；它们要么已由 setLocation 交给 qBittorrent 搬（异步，可能还没搬完），
-        要么根本不该由这里搬。
+        `skip` 里的路径一个都不碰——调用方传入**此刻有种子声明**的路径，按
+        `claims.fold` 折叠过（见 `ClaimIndex.claims_under`；盘上的名字与条目只差大小写
+        时也认得出）。文件系统搬走种子的文件就是 AGENTS.md 第 3 条说的死链；它们要么
+        已由 setLocation 交给 qBittorrent 搬（异步，可能还没搬完），要么根本不该由这里搬。
 
         返回 (已移动文件数, 因目标已存在而滞留的文件数)。
         """
@@ -418,7 +419,7 @@ class Executor:
         new.mkdir(parents=True, exist_ok=True)
 
         for src in sorted(old.rglob("*")):
-            if not src.is_file() or src in skip:
+            if not src.is_file() or fold(src) in skip:
                 continue
             rel = src.relative_to(old)
             if self._is_junk(src.name):
@@ -477,36 +478,6 @@ class Executor:
             extra["hint"] = ("同一集有多个版本，等 duplicate-episode 判出取舍；"
                              "若它也判不了（画质无法比较等），需要人工介入")
         return extra
-
-    def _live_claims_under(self, root: Path) -> tuple[dict[str, dict], set[Path]]:
-        """此刻 qBittorrent 里谁在 `root` 之下有文件——问活的，不信审计记录。
-
-        返回 `({hash: 种子视图}, {被声明的绝对路径（含 .!qB）})`。一个种子算"在
-        root 之下"：save_path 或 content_path 在 root 下，或者它的某个文件条目落在
-        root 下（save_path 在更上层、Original 布局的根目录恰好就是剧名那种）。
-        save_path 与 root 互不包含的种子，文件不可能落在 root 下，不必问 `files()`。
-        优先级 0 的条目也算：setLocation 会连盘上已有的未勾选文件一起搬。
-
-        `files()` 读失败直接抛——看不全就不能动，调用方此时还什么都没改。
-        """
-        owners: dict[str, dict] = {}
-        claimed: set[Path] = set()
-        for t in self.ctx.qbit.torrents():
-            sp = (t.get("save_path") or "").rstrip("/")
-            cp = (t.get("content_path") or "").rstrip("/")
-            if not sp:
-                continue
-            inside = under(sp, root) or bool(cp and under(cp, root))
-            if not (inside or under(root, sp)):
-                continue
-            for e in self.ctx.qbit.files(t["hash"]):
-                p = Path(sp) / e["name"]
-                if under(p, root):
-                    claimed.update((p, Path(str(p) + ".!qB")))
-                    inside = True
-            if inside:
-                owners[t["hash"]] = t
-        return owners, claimed
 
     @staticmethod
     def _entry_at(t: dict, entries: list[dict], abs_path: Path) -> dict | None:
@@ -1778,7 +1749,7 @@ class Executor:
                 # 不知道，照记录把它们逐个 setLocation 回去就是盲目覆盖。与逆改名同口径。
                 return False, f"当前目录已不存在，可能此后又改过名：{cur.name}"
             listed = dict(u.get("torrent_savepaths") or [])
-            owners, claimed = self._live_claims_under(cur)
+            owners, claimed = self._claims().claims_under(cur)
             strangers = [h for h in owners if h not in listed]
             if strangers:
                 names = "、".join(f"{h[:8]}（{owners[h].get('name', '')[:40]}）"
@@ -2013,7 +1984,7 @@ class Executor:
 
         对**仍有有效种子**的文件优先走 qBittorrent setLocation；
         没有任何种子声明的残留才走文件系统。任何活种子此刻声明的路径都不用
-        文件系统搬（`_live_claims_under`）；某个种子 setLocation 失败，这一对就不合并。
+        文件系统搬（`ClaimIndex.claims_under`）；某个种子 setLocation 失败，这一对就不合并。
         """
         # qBit 不在时"哪些文件有活种子"无从得知，_merge_tree 会用文件系统
         # 搬走活种子的文件（critic N3）。拒绝。
@@ -2040,7 +2011,7 @@ class Executor:
             # Original 布局、save_path 在媒体根、根目录恰好叫剧名的种子，content 在
             # 旧目录下而 save_path 不在，以前它不进 setLocation 名单，文件直接被
             # _merge_tree 用文件系统搬走。这些被声明的路径一律不许文件系统碰。
-            owners, claimed = self._live_claims_under(old)
+            owners, claimed = self._claims().claims_under(old)
             movable = []
             for t in owners.values():
                 sp = t.get("save_path") or ""
@@ -2054,7 +2025,7 @@ class Executor:
             if self.dry_run:
                 # 以前 setLocation 在 dry-run 判断之前就发出去了：预演也真的搬了种子。
                 remaining = sum(1 for p in old.rglob("*")
-                                if p.is_file() and p not in claimed
+                                if p.is_file() and fold(p) not in claimed
                                 and not self._is_junk(p.name))
                 results.append({"old": old.name, "new": new.name,
                                 "would_move_via_qbit": len(movable),
@@ -2069,6 +2040,8 @@ class Executor:
                     via_qbit += 1
                 except Exception as e:
                     failed.append(f"{t['hash'][:8]}：{type(e).__name__}: {e}")
+            if movable:
+                self._claims().invalidate()     # 搬过种子：下一对要重新问占用
             if failed:
                 # 以前吞掉异常接着 _merge_tree：qBit 仍记着旧 save_path，文件却被
                 # 文件系统搬去了新目录——种子失联。这一对停手，交给人。
@@ -2083,7 +2056,7 @@ class Executor:
             results.append({"old": old.name, "new": new.name,
                             "moved_via_qbit": via_qbit, "moved_via_fs": moved,
                             "stranded": stranded,
-                            "left_for_torrents": sum(1 for p in claimed if p.exists()),
+                            "left_for_torrents": sum(1 for p in claimed.values() if p.exists()),
                             "old_removed": not old.exists()})
 
         return {"pairs": len(pairs), "detail": results, "refused": ""}

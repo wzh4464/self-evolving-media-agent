@@ -109,3 +109,33 @@ def test_rollback_into_an_old_dir_a_torrent_now_points_at_is_refused(lib):
     assert res["reverted"] == 0 and res["skipped"] == 1 and res["failed"] == 0
     assert stranger.hash[:8] in res["skipped_detail"][0]["skip_reason"]
     assert lib.snapshot() == before
+
+
+# ------------------------------------------------------------------ 残留搬运认得出"只差大小写"
+def _case_insensitive(tmp_path) -> bool:
+    probe = tmp_path / "case-probe"
+    probe.write_text("x", encoding="utf-8")
+    return (tmp_path / "CASE-PROBE").exists()
+
+
+def test_rollback_leftover_merge_recognizes_a_claimed_file_whose_case_differs(lib, tmp_path):
+    """回退的残留搬运（`_merge_tree`）绕开"此刻有种子声明"的文件。以前逐字比较路径：
+    盘上的名字与 qBittorrent 的条目只差大小写时（APFS 上就是同一个文件），认不出它归种子，
+    在 qBit 的异步搬运完成之前就用文件系统把它搬走了（AGENTS.md 第 3 条）。"""
+    if not _case_insensitive(tmp_path):
+        pytest.skip("只在大小写不敏感的卷上有意义（生产与 macOS 开发机）")
+    show = lib.show("旧名")
+    t = show.season(1).single("旧名 S01E01.mkv", size=1000)
+    ident = lib.ident(t.path)
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")])
+    [rec] = rep.applied
+    on_disk = lib.path("新名/Season 1/旧名 S01E01.mkv")
+    renamed = on_disk.with_name("旧名 s01e01.MKV")
+    on_disk.rename(renamed)                          # 盘上只改了大小写（种子条目没变）
+    lib.qbit.async_moves = True
+
+    res = lib.rollback(rec["run_id"])
+
+    assert res["reverted"] == 1
+    assert renamed.exists() and lib.ident(renamed) == ident   # 还在原地，等 qBit 自己搬
+    assert not lib.path("旧名/Season 1/旧名 s01e01.MKV").exists()

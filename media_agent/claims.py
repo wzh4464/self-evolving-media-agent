@@ -290,6 +290,46 @@ class ClaimIndex:
                         entry=(e or {}).get("name", ""), progress=t.get("progress"),
                         state=t.get("state", ""), category=t.get("category", ""))
 
+    def claims_under(self, root: str | Path) -> tuple[dict[str, dict], dict[str, Path]]:
+        """此刻 qBittorrent 里谁在目录 `root` 之下有文件——目录级搬运（目录改名的回退、
+        repair）用它决定哪些文件交给 qBittorrent 搬、文件系统一个都不许碰。
+
+        返回 `({hash: 种子视图}, {fold(路径): 路径})`，路径含 `.!qB` 形态。一个种子算
+        "在 root 之下"：save_path 或 content_path 在 root 下，或者它的某个条目落在 root 下
+        （save_path 在更上层、Original 布局的根文件夹恰好就是剧名那种）。save_path 与 root
+        互不包含的种子，文件不可能落在 root 下，不必问 `files()`。**优先级 0 的条目也算**：
+        setLocation 会连盘上已有的未勾选文件一起搬。比较按 `fold`：盘上的名字与条目只差
+        大小写时（APFS 上是同一个文件）也认得出。读不到抛 `ClaimsUnknown`。
+        """
+        fr = fold(Path(root))
+
+        def within(p: str | Path) -> bool:
+            fp = fold(p)
+            return fp == fr or fp.startswith(fr + "/")
+
+        skip = {h.lower() for h in self.ignore}
+        owners: dict[str, dict] = {}
+        claimed: dict[str, Path] = {}
+        for h, t in self.torrents().items():
+            if h in skip:
+                continue
+            sp = (t.get("save_path") or "").rstrip("/")
+            cp = (t.get("content_path") or "").rstrip("/")
+            if not sp:
+                continue
+            inside = within(sp) or bool(cp and within(cp))
+            if not (inside or fr.startswith(fold(sp) + "/")):
+                continue
+            for e in self.entries(h):
+                p = Path(sp) / e["name"]
+                if within(p):
+                    for q in (p, Path(str(p) + PARTIAL)):
+                        claimed[fold(q)] = q
+                    inside = True
+            if inside:
+                owners[h] = t
+        return owners, claimed
+
     def check_dir(self, target_dir: str | Path, *, movers: Iterable[str] = ()) -> ClaimCheck:
         """`target_dir`（要搬进去的目录）此刻被谁占着。
 

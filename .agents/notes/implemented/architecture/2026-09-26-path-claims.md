@@ -218,3 +218,24 @@ save_path 在媒体根、根文件夹恰好就叫这个名字的 Original 布局
 媒体根上根文件夹就叫新名的 Original 种子都拒绝且一个 setLocation 都没发；只差大小写的已有目录
 按已存在（两种文件系统语义）；种子列表读不到 failed、快照不变；只有自己的种子照常改名；
 回退时旧目录已被新种子指着就跳过。
+
+## 8. 目录级搬运的"谁在这个目录下有文件"并入原语
+
+第 1 阶段给目录改名的回退与 `repair` 写了 `Executor._live_claims_under(root)`：列出此刻在 `root`
+之下有文件的种子与它们声明的全部路径，`_merge_tree` 据此绕开，交给 qBittorrent 自己搬。它是
+第二个"读占用"的实现：逐字比较路径、每次重新问 qBittorrent、不认本批次已摘的种子。
+
+现在是 `ClaimIndex.claims_under(root) -> ({hash: 视图}, {fold(路径): 路径})`，判据不变（save_path /
+content_path 在 root 下，或有条目落在 root 下；优先级 0 的条目也算；含 `.!qB` 形态），比较改按
+`fold`，走同一份批次索引。`_merge_tree(skip=…)` 按 `fold(src)` 查。`repair` 每对搬过种子后作废索引；
+回退每步之后本来就作废。
+
+**为什么要折叠**：盘上的名字与 qBittorrent 的条目只差大小写时（APFS 上是同一个文件——比如有人在
+Finder 里改过大小写），逐字比较认不出它归种子，回退的残留搬运会在 qBittorrent 异步搬完之前用
+文件系统把它搬走（AGENTS.md 第 3 条）。
+
+**测试**：`tests/test_show_dir_claims.py` 末条（只在大小写不敏感的卷上跑：生产与 macOS 开发机）——
+改名后盘上只改大小写、回退时 qBit 异步搬运：文件留在原地等 qBit，没有被文件系统搬走（改前红）。
+`tests/test_path_claims.py` 末两条直接测 `claims_under`：优先级 0、上层 save_path 的 Original 种子、
+`.!qB`、只差大小写都在清单里；相关种子读不到抛 `ClaimsUnknown`。
+第 1 阶段 `tests/test_show_dir_moves.py` 的回退 / repair 用例全部照旧通过。

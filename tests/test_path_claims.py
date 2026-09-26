@@ -312,3 +312,34 @@ def test_directory_check_is_case_insensitive(lib, fs):
     chk = ClaimIndex(lib.qbit).check_dir(lib.media_root / "GNOSIA")
 
     assert [c.kind for c in chk.claimants] == ["disk"]
+
+
+# ------------------------------------------------------------------ 目录之下谁有文件
+def test_claims_under_lists_owners_and_every_claimed_path_folded(lib):
+    """目录级搬运的"不许文件系统碰"清单：优先级 0 的条目也算（setLocation 会连它一起搬），
+    save_path 在更上层、根文件夹就叫剧名的 Original 种子也算，`.!qB` 形态也在里面。"""
+    sh = lib.show("剧名")
+    inside = sh.season(1).torrent({"a.mkv": GB, "b.mkv": GB}, name="[G] pack", layout="nosub",
+                                  priorities={"b.mkv": 0})
+    top = lib.show("_").folder("").torrent({"Season 2/c.mkv": GB}, name="剧名",
+                                           layout="original", progress=0.0)
+    lib.qbit.raw(top.hash)["save_path"] = str(lib.media_root)
+    far = lib.show("别的番").season(1).single("x.mkv", size=GB)
+
+    owners, claimed = ClaimIndex(lib.qbit).claims_under(sh.path)
+
+    assert sorted(owners) == sorted([inside.hash, top.hash]) and far.hash not in owners
+    s1 = sh.path / "Season 1"
+    for p in (s1 / "a.mkv", s1 / "b.mkv", s1 / "b.mkv.!qB", sh.path / "Season 2" / "c.mkv"):
+        assert fold(p) in claimed and claimed[fold(p)] == p
+    assert fold(str(s1 / "A.MKV")) in claimed                   # 只差大小写也认得出
+
+
+def test_claims_under_is_unknown_when_a_relevant_file_list_cannot_be_read(lib):
+    from media_agent.claims import ClaimsUnknown
+    sh = lib.show("剧名")
+    t = sh.season(1).single("a.mkv", size=GB)
+    lib.qbit.fail("files", hash=t.hash)
+
+    with pytest.raises(ClaimsUnknown):
+        ClaimIndex(lib.qbit).claims_under(sh.path)
