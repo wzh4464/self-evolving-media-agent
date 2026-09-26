@@ -18,6 +18,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
+from .. import abmode
 from ..cache import Cache, FEED_TTL, LOOKUP_TTL, season_episodes
 from ..kernel import Action, Context, Finding, LibraryState, have_episodes
 from ..naming import VIDEO_EXTS, parse_episode, season_of_dir
@@ -285,6 +286,8 @@ class TitleMatchBrokenDetector:
     kind = "subscription_broken"
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
+        if not abmode.ab_downloads(ctx.config):
+            return                       # 订阅模式：AB 不再拉 RSS，它的订阅匹配与字幕组修了也没人用（`abmode`）
         if not state.bangumi_rows:
             return
         cache = Cache(ctx.config.cache_db)
@@ -479,6 +482,8 @@ class SourceAbandonedDetector:
     MAX_CANDIDATES = 4          # 每部番最多探几个 Mikan 番组条目，控制网络开销
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
+        if not abmode.ab_downloads(ctx.config):
+            return                       # 订阅模式：AB 不再拉 RSS，它的订阅匹配与字幕组修了也没人用（`abmode`）
         if not (ctx.tmdb and ctx.tmdb.enabled) or not state.bangumi_rows:
             return
         cache = Cache(ctx.config.cache_db)
@@ -761,6 +766,8 @@ class MissingAbTagDetector:
     kind = "subscription_untagged"
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
+        if not abmode.ab_downloads(ctx.config):
+            return                       # 订阅模式：AB 不再改名，`ab:` 标签没人看（`abmode`）
         if not state.bangumi_rows or not state.torrents:
             return
 

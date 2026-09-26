@@ -515,6 +515,8 @@ class OrphanTorrentDetector:
     kind = "orphan_torrent"
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
+        if not abmode.ab_downloads(ctx.config):
+            return                       # 订阅模式：AB 不再改名，`ab:` 标签没人看（`abmode`）
         by_dir = {s.dir_name: s for s in state.shows}
         bangumi_id: dict[str, int] = {}
         for s in state.shows:
@@ -1005,6 +1007,9 @@ class RenameCollisionDetector:
 
     出处：《朱音落语》E08/E09 的 JPSC 与 JPTC 两个版本集号相同，
     都想改名成 `朱音落语 S01E08.mp4`，日志里每 60 秒重复一次、永不收敛。
+
+    订阅模式（`AB_MODE=subscription`，`abmode`）下 AB 不再改名，谈不上死循环：撞名照报——集位名只有一份拿得到，另一份
+    留在发布名上、刮削器认不出，直到判重取舍——但不再说"死循环"、降为 important。指纹是集位（不含摘要），切模式不断档。
     """
     id = "rename-collision"
     kind = "rename_collision"
@@ -1042,9 +1047,12 @@ class RenameCollisionDetector:
                     if sealed and set(hashes) <= sealed and len(hashes) == len(files):
                         continue
                 season, ep = slot_of[target]
+                ab_loop = abmode.ab_renames(ctx.config)
                 yield Finding(
-                    rule=self.id, kind=self.kind, severity="critical",
-                    summary=f"{len(files)} 个种子争抢同一目标名 {target}，会导致改名死循环",
+                    rule=self.id, kind=self.kind, severity="critical" if ab_loop else "important",
+                    summary=(f"{len(files)} 个种子争抢同一目标名 {target}，会导致改名死循环" if ab_loop else
+                             f"{len(files)} 个种子的文件都要改成 {target}：集位名只有一份拿得到，其余留在发布名上"
+                             f"（刮削器认不出），等判重取舍"),
                     # 身份按集位：`path` 只是桶里第一个文件，有种子的按 torrents() 的顺序排——qBit 5.x 的
                     # /torrents/info 不排序（遍历 QHash），容器重建、加了种子就换第一名，指纹跟着变
                     # （卡住检测的连续段断掉、确认悄悄失效；2026-09-26 复审）

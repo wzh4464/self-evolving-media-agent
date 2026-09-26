@@ -63,6 +63,12 @@ def ab_renames(cfg) -> bool:
     return getattr(cfg, "ab_mode", FULL) != SUBSCRIPTION
 
 
+def ab_downloads(cfg) -> bool:
+    """AB 还在拉 RSS、下载（`full`）。只为 AB 存在的规则（`orphan-torrent` / `missing-ab-tag` / `title-match-broken` /
+    `source-abandoned`，ab 调研 §2.1）按它开关——订阅模式下它们修的东西 AB 不再用；`full` 照旧（回退的路）。"""
+    return getattr(cfg, "ab_mode", FULL) != SUBSCRIPTION
+
+
 # ---------------------------------------------------------------- 状态文件
 def state_path(state_dir) -> Path:
     return Path(state_dir) / STATE_NAME

@@ -57,6 +57,9 @@
 - **订阅模式下 `Bangumi` 分类不再归 AutoBangumi**：AB 的改名线程停了，`Bangumi` 里只剩订阅那一刻它补的集、名字就是发布名。
   判重不再为它让位（不报 `pending_ownership`、封存集位里不再 holdback 发布名认不出这一集的）；`media-agent grab` 当场把
   `Bangumi` / `BangumiCollection` 里的种子交接到剧名分类、改名、判重（以前要等 6 小时的 `run`）。`full` 模式照旧。
+- **订阅模式下只为 AutoBangumi 存在的规则停下来**（按模式关、不删，`full` 照旧）：`orphan-torrent` / `missing-ab-tag`（补
+  `ab:` 标签——AB 不再改名）、`title-match-broken` 与 `source-abandoned`（修 AB 的订阅匹配、换 RSS 链接——AB 不再拉 RSS，
+  修它们还要停容器写 AB 库、叫它刷新）。`rename-collision` 照报撞名，但不再说"AB 改名死循环"、从 critical 降为 important。
 - **第二个 launchd 任务 `com.zihan.media-agent-grab`**（`deploy/com.zihan.media-agent-grab.plist`：每 30 分钟
   `media-agent grab`，加载时不跑，低优先级与主任务相同，日志 `state/grab.log`）。`deploy.sh` 两份都装、各自只在变了时
   重新加载；任何一份装不上两份一起退回；tag 里没有抓取任务（回滚到更早的版本）就卸掉它；装着的任务与 tag 里的对不上时
