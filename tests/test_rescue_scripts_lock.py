@@ -101,6 +101,21 @@ def test_rescue_start_backs_off_when_media_agent_is_running(rescue, capsys):
     assert "media-agent run" in out and "稍后" in out
 
 
+def test_rescue_auto_backs_off_with_75_when_media_agent_is_running(rescue, capsys):
+    """`auto` 先 `start`：等不到锁就以 75 结束、不进入等待（复审变异 H9l：返回 1 全套照绿——launchd / 人看退出码
+    分不出"被挡住了、稍后再来"与"出错了"）。"""
+    busy = RunLock(rescue.lock, "media-agent run")
+    assert busy.acquire(wait=0)
+    try:
+        rc = rescue.mod.cmd_auto(0.01)
+    finally:
+        busy.release()
+
+    assert rc == 75
+    assert rescue.calls == [] and not rescue.marker.exists()
+    assert "进入等待" not in capsys.readouterr().out
+
+
 def test_rescue_stop_recreates_only_while_holding_the_lock_and_clears_the_marker(rescue, capsys):
     rescue.mod.cmd_start()
     rescue.calls.clear()

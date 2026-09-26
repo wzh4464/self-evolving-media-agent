@@ -545,3 +545,39 @@ def test_a_degraded_rescan_before_evolving_is_critical(offline_cli, capsys, monk
     rep = _latest(lib)
     assert rep["status"] == "critical" and rep["evolve"] == "skipped"
     assert "rescan_degraded" in [r["code"] for r in rep["reasons"]]
+
+
+# ------------------------------------------------------------------ 收尾自己的保证（2026-09-26 复审）
+def test_ctrl_c_mid_run_still_writes_a_crash_report_and_propagates(offline_cli, capsys, monkeypatch):
+    """Ctrl-C / 被 kill 的 SystemExit：报告照写（critical、crash），异常照常往外抛。以前只测了 Exception——
+    把 BaseException 那一支换成直接 `raise` 全套照绿（复审变异 H5e）。"""
+    lib = offline_cli
+    _clean(lib)
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(disposal, "dispose", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_run(_args(), lib.cfg)
+
+    rep = _latest(lib)
+    assert rep["status"] == "critical" and rep["exit_code"] == cli.EXIT_CRASH
+    assert rep["crash"]["error"].startswith("KeyboardInterrupt")
+
+
+def test_a_broken_health_report_does_not_change_the_runs_exit_code(offline_cli, capsys, monkeypatch):
+    """收尾自己出错（这里是写报告抛了个意外）：stderr 说一句，这一轮的退出码照原样（复审变异 H5f：把收尾的 except
+    收窄成 OSError 全套照绿——意外会冲出 `run`，launchd 上只剩一段 traceback）。"""
+    lib = offline_cli
+    _clean(lib)
+
+    def broken(*a, **k):
+        raise RuntimeError("report writer bug (injected)")
+
+    monkeypatch.setattr(health, "write_report", broken)
+
+    assert cli.cmd_run(_args(), lib.cfg) == 0
+    err = capsys.readouterr().err
+    assert "健康报告出错" in err and "report writer bug" in err
