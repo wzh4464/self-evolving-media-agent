@@ -98,6 +98,16 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
     # 与 ctx 共用同一个列表：执行器从 ctx 上看本轮扫描是否完整（见 Executor.apply）
     ctx.qbit_errors = state.qbit_errors
 
+    # 每次扫描都是一份新快照：清掉上一次扫描留下的缓存（testinfra B3）。
+    # `_tfile_cache` 以前在 Context 的整个生命周期里从不失效，`cmd_run` 在 apply
+    # 之后用同一个 ctx 重扫给演进器用——改名前的条目名从缓存里出来成了"种子声明了、
+    # 盘上没有"的幻影，改名后的真文件反倒成了本地文件：同一集两份、外加一条未改名。
+    # 幻影一旦被判重 trash，就是 critic N1 那种丢种子记录、`trash_path` 为空的记录。
+    # sidecar 的 `season_offsets` 缓存是模块级的，同样只活到这次扫描为止。
+    ctx._tfile_cache = {}                 # type: ignore[attr-defined]
+    from .plugins import builtin as _builtin
+    _builtin._OFFSET_CACHE.clear()
+
     # --- qBittorrent：按 content_path 建索引 ---
     # 读不到（未登录 / torrents() 出错）时照常扫完磁盘——诊断仍然有用——
     # 但记进 qbit_errors：没有种子视图的快照，每个有种子的文件都会被当成纯本地

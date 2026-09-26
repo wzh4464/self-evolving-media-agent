@@ -158,3 +158,20 @@ rename（op 6）之前。判重把发布名输家整种子作废后，unrenamed-
 **测试**：`tests/test_same_batch.py`——B2 原样现场（一轮后无 failed，赢家拿到集位名）、
 本地输家不报「集位被占」、同一合集两次 trash、幻影不改名、0% 下载中仍改名。
 基座元测试原先用 404 造 failed 记录，改用超时。
+
+## 6. 每次扫描开头清缓存，同 ctx 重扫不再看到改名前的幻影（testinfra B3）
+
+**症状**：`ctx._tfile_cache` 在 Context 的整个生命周期里从不失效。`cmd_run` 在 apply
+之后用同一个 ctx 重扫给演进器用：改名前的条目名从缓存里出来，成了"种子声明了、
+盘上没有"的幻影，改名后的真文件没被任何种子覆盖、成了本地文件——同一集两份
+（幻影重复）外加一条"未改名"。离线复现：一次 renameFile 之后同 ctx 重扫，
+扫描结果里同时有发布名路径与 `尼古喵喵 S01E08.mkv`。今天它只喂演进器；任何在同一
+ctx 上循环 诊断→执行 的改造都会继承它，幻影被 trash 就是第 1、2 条那种记录。
+模块级的 `builtin._OFFSET_CACHE`（sidecar 的 `season_offsets`）同样从不失效：
+用户照提示补上换算后，同一进程里的下一次扫描仍按旧值报冲突。
+
+**修法**：`build_state` 开头重置 `ctx._tfile_cache` 并清空 `_OFFSET_CACHE`——
+缓存只活到这次扫描为止（它们本来就只为"单次扫描内别重复请求"而设）。
+
+**测试**：`tests/test_rescan_freshness.py`——renameFile 后同 ctx 重扫只剩规范名、
+无重复与未改名；两次扫描之间改 `season_offsets`，第二次按新值改名为 S01E58。

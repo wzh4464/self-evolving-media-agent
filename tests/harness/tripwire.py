@@ -3,7 +3,7 @@
 本项目到处都在吞异常，而且吞得有理由——单条规则崩溃不能拖垮整轮：
 - `Registry.run_all` 把检测器异常记一行日志就继续（kernel.py `run_all`）；
 - `Executor.apply` 把动作异常记成 `failed` 审计；
-- `scan._torrent_files` 把 `files()` 的任何错误缓存成空列表；
+- 各处 qBittorrent 读取失败只记一行日志（扫描会记进 `qbit_errors` 并让执行器拒绝）；
 - 各检测器里一串 `except Exception: continue`。
 
 生产上这是韧性，测试里这是陷阱：假对象少实现一个方法、少配一条 URL，

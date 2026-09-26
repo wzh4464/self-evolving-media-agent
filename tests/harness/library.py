@@ -12,10 +12,10 @@
   这里直接 `Context(cfg, qbit=FakeQbit, …)`。
 - **Config 直接构造**，`PROJECT_ROOT` 由 conftest 打到临时目录，于是
   `state/`（审计、隔离区、cache.sqlite3）全落在测试自己的 tmp 里。
-- **每轮一个新 Context**：`ctx._tfile_cache` 在同一个 Context 上永不失效（B3），
-  `cmd_run` 在 apply 之后用同一个 ctx 重扫会看到改名前的幽灵路径。测试模拟的是
-  "launchd 每轮起一个新进程"，所以 `cycle()` 每次都新建 Context，并清掉
-  `probe._CACHE` / `builtin._OFFSET_CACHE` 这类进程级缓存。
+- **每轮一个新 Context**：测试模拟的是"launchd 每轮起一个新进程"，所以 `cycle()`
+  每次都新建 Context，并清掉 `probe._CACHE` / `builtin._OFFSET_CACHE` 这类进程级缓存。
+  （`build_state` 自己也会在每次扫描开头清 `ctx._tfile_cache` 与 `_OFFSET_CACHE`——
+  B3 已修，见 `tests/test_rescan_freshness.py`；同 ctx 重扫的行为由那里单独覆盖。）
 - **run_id 显式给**：执行器的默认 run_id 只精确到秒，同一秒里的两轮会被
   `rollback` 当成一批。
 - **文件是稀疏的**：`stat` 报的是声明的逻辑大小，创建瞬时完成；文件头带身份，
