@@ -49,7 +49,8 @@ def legacy(lib, name, *, rule, kind, days_ago, show="尼古喵喵", season="Seas
     origin = lib.media_root / show / season / name
     p = lib.cfg.trash_dir / f"{ts:%Y-%m-%d}" / show / season / name
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(b"\0" * size)
+    with open(p, "wb") as fh:                   # 稀疏文件，与基座的 write_sparse 同理：GB 级的
+        fh.truncate(size)                       # 用例（size=GB - 7）以前每跑一次真写 572 MB
     if audit:
         rec = {"ts": ts.isoformat(timespec="seconds"), "run_id": f"{ts:%Y%m%dT%H%M%S}",
                "status": "applied", "dry_run": False, "rule": rule, "kind": kind, "op": "trash",
