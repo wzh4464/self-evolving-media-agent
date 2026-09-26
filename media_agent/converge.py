@@ -1,0 +1,366 @@
+"""一轮之内收敛：扫描 → 诊断 → 执行，重复到不动点（最多 `MAX_ITERATIONS` 次，默认 3）。
+
+**为什么要迭代。** 一轮 `run` 以前是"先全量诊断、再统一执行"：执行里做成的事，要等**下一轮**（6 小时后）的诊断
+才看得见。前后依赖的两步因此永远隔一轮（runloop 调研 §7A / §8a）：
+
+- AutoBangumi 的重复版本落在 `Bangumi` 分类：这一轮只能交接分类（recategorize），判重要等分类交接完才敢做
+  （所有权边界，AGENTS.md 第 6 条），赢家的改名又要等判重腾出集位——三轮、18 小时。生产上最近 3 批没有隔离
+  却有「集位被占」的，同一批里都有一次 recategorize。
+- 抓取之后的改名：元数据没在等待时限内到、或种子不止一个视频时，改名"下一轮会补"。
+- relink（op 1）、目录改名（op 8）之后，下游规则看到的都是改之前的样子。
+
+现在一轮 `run` 在同一个进程里重复"扫描 → 诊断 → 执行"，只要上一次迭代**做成了新的动作**就再来一次。
+
+**一轮一个执行器**（`Executor`）：一个批次 ID（整轮仍是一个回退单元）、删除配额跨迭代累计（每次迭代新建执行器
+等于把 `MAX_DELETE_PER_RUN=50` 变成 N×50）、`_grabbed`（写 sidecar 时并回本轮抓的集）、本轮摘掉的种子。按路径记的
+"本批次已隔离"与占用索引每次迭代清掉（`Executor.new_iteration`）：新的扫描已经反映了它们，同一个路径上此刻可能已是
+改名过来的赢家。**每次迭代一份新的扫描**（`build_state` 开头清种子文件列表与 season_offsets 的进程内缓存，testinfra B3、critic §3.2），
+TMDB 身份照常解析（不能像演进重扫那样 `resolve_tmdb=False`：标题退回目录名、同一轮里来回改名，runloop B4）。
+
+**不重试、不打架。** 同一轮里一个动作（按"做什么 + 对谁"认，`key_of`）只试一次：已执行、失败、未确认、被闸拦下
+（删除关口、配额、演进规则、坏 sidecar……）的，后面的迭代不再试——否则每次迭代都会再撞一次同样的 404（testinfra B2）、同样的拒绝（critic §3.12）。
+只有"此刻被别的东西挡着"、而本轮别的动作可能把它挪开的跳过（`RETRYABLE`：集位被占、目标文件归另一个活种子）
+后面的迭代再试：判重在下一次迭代腾出集位，赢家就改得成。一个动作要是会**撤销**本轮已经执行的动作（改名 X→Y 之后
+又要 Y→X、分类 A→B→A、刚抓的种子又要摘掉、刚摘的种子又要抓回来），拒绝它、记一条 skipped 审计，报一条
+`oscillation` 发现：那是两条规则在打架，来回改只会让 Jellyfin 的刮削记录跟着乱（runloop B5 / LAT-04 那种翻来覆去，只是压进了一轮）。
+
+**停在哪。** 某次迭代没有做成任何新动作 = 不动点。到了上限还在做新动作 = 到顶：再扫描、诊断一次（不执行），把
+下一次迭代会做的列成"待做"（健康报告 warn `loop_cap`：到顶多半说明有规则在拉锯）。任何一次迭代的扫描读 qBittorrent
+不完整，执行器照旧整批拒绝（`Executor.qbit_blocker`），循环立刻停，调用方按原来的拒绝语义收尾。预演只跑一次：动作
+都没执行，第二次看到的与第一次相同。
+
+**每次迭代花多少。** 第二次迭代起网络全走缓存：TMDB 身份与标题按 id 缓存 30 天、搜不到的负缓存 24 小时、分集表
+6 小时 / 7 天（`cache.season_episodes`），番组页与 RSS 1 小时，Mikan 搜索 7 天；本地动作改变不了其中任何一样。剩下
+的是 qBittorrent 的种子文件列表（必须是此刻的）与磁盘。所以每次迭代都跑全部检测器，不按迭代挑——生产规模下第二次
+迭代约 2–3 秒（`.agents/notes/implemented/architecture/2026-09-27-converge-within-a-run.md`）。
+
+**给以后的 `media-agent grab` 用。** `run(ctx, reg, ex, scan=…, select=…)` 不认识 `cmd_run`：抓取模式传只有抓取检测器的
+`Registry` 与 `select=lambda f: f.action.op == "grab_episode"`，同样得到一轮一个执行器、不重试、反向拒绝、到顶报待做。
+"""
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Callable
+
+from . import audit as auditlog
+from .kernel import Finding
+
+# 停下来的原因
+FIXED_POINT = "fixed_point"      # 某次迭代没有做成任何新动作（到顶之后的收尾诊断也没有待做的，同样算）
+CAP = "cap"                      # 到了上限，下一次迭代还有要做的
+REFUSED = "refused"              # 某次迭代的扫描读 qBittorrent 不完整，执行器整批拒绝
+DRY_RUN = "dry_run"              # 预演：只跑一次
+
+# 这些跳过是"此刻被别的东西挡着"，本轮别的动作可能把它挪开：后面的迭代再试。其余跳过（删除关口、配额、演进规则、
+# 坏 sidecar、目标目录要人合并、种子已不在……）同一轮里再试结果也一样，按"已试过"处理。
+RETRYABLE = (
+    "集位被占",                   # 改名：判重下一次迭代腾出集位（`Executor._occupied`）
+    "目标文件已归另一个活种子",     # relink：占着的那个种子可能下一次迭代被判重 / 死种处置摘掉
+)
+
+# 各动作"对谁"做（`key_of`）：同一个目标同一种动作，一轮只试一次。没列出的动作按全部参数认。
+_TARGET: dict[str, tuple[str, ...]] = {
+    "rename": ("path", "torrent_hash"),
+    "trash": ("path", "torrent_hash"),
+    "recategorize": ("torrent_hash",),
+    "retag": ("torrent_hash", "tags"),
+    "drop_torrent": ("torrent_hash",),
+    "relink_torrent": ("torrent_hash",),
+    "relocate": ("torrent_hash",),
+    "delete_category": ("category",),
+    "rename_show_dir": ("path",),
+    "write_nfo": ("path",),
+    "write_sidecar": ("show_dir",),
+    "pin_tmdb": ("show_dir",),
+    "grab_episode": ("show_dir", "season", "episode"),
+    "fix_title_aliases": ("bangumi_id",),
+    "repoint_rss": ("bangumi_id",),
+}
+
+
+def key_of(op: str, args: dict | None) -> tuple:
+    """一个动作的身份：做什么（op）+ 对谁（目标的几个参数）。同一个路径上换了一个种子的文件，是另一个目标。"""
+    args = args or {}
+    fields = _TARGET.get(op)
+    if fields is None:
+        return (op, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str))
+    return (op, *(str(args.get(k) if args.get(k) is not None else "") for k in fields))
+
+
+def retryable(rec: dict) -> bool:
+    """这条审计记录说的跳过，本轮后面的迭代值不值得再试（见 `RETRYABLE`）。"""
+    return (rec.get("status") == auditlog.SKIPPED
+            and str(rec.get("reason") or "").startswith(RETRYABLE))
+
+
+def _grabbed_hash(args: dict) -> str:
+    from .ledger import infohash_of_url
+    return (infohash_of_url(str(args.get("url") or "")) or "").lower()
+
+
+def undoes(op: str, args: dict, rec: dict) -> bool:
+    """动作 (op, args) 是不是在撤销已执行的 `rec`（按 `rec` 自己记下的逆操作认）。"""
+    args = args or {}
+    u = rec.get("undo") or {}
+    uop = u.get("op")
+    h = str(args.get("torrent_hash") or "").lower()
+    if op in ("rename", "rename_show_dir") and uop == op:
+        return str(args.get("path")) == str(u.get("path")) and args.get("new_name") == u.get("new_name")
+    if op == "recategorize" and uop == "recategorize":
+        return h == str(u.get("torrent_hash") or "").lower() and args.get("category") == u.get("category")
+    if op == "relink_torrent" and uop == "relink_torrent":
+        pairs = lambda m: {(x.get("old"), x.get("new")) for x in (m or [])}   # noqa: E731
+        return (h == str(u.get("torrent_hash") or "").lower()
+                and pairs(args.get("mapping")) == pairs(u.get("mapping")))
+    if op in ("drop_torrent", "trash") and uop == "ungrab_episode":
+        # 刚抓进来的种子又要摘掉 / 又要把它的文件隔离
+        return bool(h) and h == str(u.get("infohash") or "").lower()
+    if op == "grab_episode":
+        # 刚摘掉的种子又要抓回来
+        removed = (uop == "readd_torrent"
+                   or (uop == "restore_from_trash" and u.get("torrent_record_lost")))
+        rh = str((rec.get("args") or {}).get("torrent_hash") or "").lower()
+        return removed and bool(rh) and rh == _grabbed_hash(args)
+    return False
+
+
+@dataclass
+class Iteration:
+    """一次迭代：扫描、诊断、执行各花多少，诊断出什么，执行结果（只算这一次迭代新写的审计）。"""
+    n: int
+    findings: int = 0
+    actionable: int = 0          # 带动作、且在这一轮要做的范围里（`select`）
+    attempted: int = 0           # 交给执行器的
+    memo: int = 0                # 本轮已经试过、不再试的
+    reversed: int = 0            # 会撤销本轮已执行的动作：拒绝
+    applied: int = 0
+    skipped: int = 0
+    failed: int = 0
+    unknown: int = 0
+    refused: str = ""
+    degraded: bool = False
+    final: bool = False          # 到顶之后的收尾诊断：不执行，只看还剩什么
+    scan_s: float = 0.0
+    diagnose_s: float = 0.0
+    apply_s: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def line(self, max_n: int) -> str:
+        head = "收尾诊断（到顶之后，不执行）" if self.final else f"迭代 {self.n}/{max_n}"
+        s = (f"  ↻ {head}：扫描 {self.scan_s:.1f}s · 诊断 {self.diagnose_s:.1f}s（{self.findings} 个问题，"
+             f"可执行 {self.actionable}）")
+        if self.final:
+            return s + (f" · 待做 {self.attempted}" if self.attempted else " · 没有待做的")
+        if self.refused:
+            return s + f" · ⛔ 整批拒绝：{self.refused[:80]}"
+        s += (f" · 执行 {self.applied} · 跳过 {self.skipped} · 失败 {self.failed}"
+              + (f" · 未确认 {self.unknown}" if self.unknown else "")
+              + (f" · 本轮已试过 {self.memo}" if self.memo else "")
+              + (f" · 反向拒绝 {self.reversed}" if self.reversed else "")
+              + f"（{self.apply_s:.1f}s）")
+        return s
+
+
+@dataclass
+class Outcome:
+    """整轮迭代的结果。`findings` 是**最后一次**诊断的（到顶时是收尾诊断的）加上本轮的 `oscillation`——发现历史、
+    卡住检测、健康报告都只看它；各次迭代的数在 `iterations` 里。"""
+    max_iterations: int
+    iterations: list[Iteration] = field(default_factory=list)
+    stop: str = ""
+    refused: str = ""
+    # 到顶之后的收尾诊断读 qBittorrent 不完整：待做的列不出来（空），原因在这里
+    final_degraded: str = ""
+    state: object = None                             # 最后一次扫描的 LibraryState
+    findings: list[Finding] = field(default_factory=list)
+    oscillations: list[Finding] = field(default_factory=list)
+    pending: list[Finding] = field(default_factory=list)
+    # 全部迭代里提过的动作（按 `key_of` 去重，先到的留下）：抓取提议了几集之类的"本轮合计"
+    proposed: list[Finding] = field(default_factory=list)
+    # TMDB 标题稳定闸的决定（`titles.record` 一轮只记一次：迭代之间记了，同一轮就会被数成两轮）
+    title_decisions: dict = field(default_factory=dict)
+    detector_errors: list[dict] = field(default_factory=list)
+
+    def to_dict(self, limit: int = 20) -> dict:
+        def brief(f: Finding) -> dict:
+            return {"rule": f.rule, "kind": f.kind, "op": f.action.op if f.action else None,
+                    "show": f.show, "path": str(f.path or ""), "summary": str(f.summary)[:160]}
+        return {"max": self.max_iterations, "stop": self.stop, "final_degraded": self.final_degraded,
+                "iterations": [it.to_dict() for it in self.iterations],
+                "pending_count": len(self.pending), "pending": [brief(f) for f in self.pending[:limit]],
+                "oscillations": [{**brief(f), "evidence": f.evidence} for f in self.oscillations[:limit]]}
+
+
+class _Guard:
+    """一轮之内的"试过了"与"反向"两道闸（见模块文档）。"""
+
+    def __init__(self, ex):
+        self.ex = ex
+        self.tried: dict[tuple, str] = {}           # key → 结局（applied / failed / unknown / skipped）
+        self.applied_at: list[tuple[int, dict]] = []  # (第几次迭代, 已执行的审计记录)
+        self.reversed: set[tuple] = set()
+
+    def note(self, recs: list[dict], n: int) -> None:
+        for rec in recs:
+            if retryable(rec):
+                continue
+            key = key_of(str(rec.get("op") or ""), rec.get("args"))
+            self.tried.setdefault(key, str(rec.get("status")))
+            if rec.get("status") == auditlog.APPLIED:
+                self.applied_at.append((n, rec))
+
+    def screen(self, findings: list[Finding], n: int, *, select=None, write: bool = True
+               ) -> tuple[list[Finding], int, list[Finding]]:
+        """这一次迭代要交给执行器的、因为本轮试过而跳过的个数、反向的（`oscillation` 发现）。
+        `write`：反向的写一条 skipped 审计（收尾诊断不执行，不写）。"""
+        todo, memo, osc = [], 0, []
+        for f in findings:
+            if not f.action or (select is not None and not select(f)):
+                continue
+            a = f.action
+            key = key_of(a.op, a.args)
+            if key in self.reversed:
+                memo += 1
+                continue
+            hit = next(((m, rec) for m, rec in self.applied_at if undoes(a.op, a.args, rec)), None)
+            if hit is not None:
+                m, rec = hit
+                self.reversed.add(key)
+                o = _oscillation(f, rec, m, n)
+                osc.append(o)
+                if write:
+                    self.ex.refuse(f, o.evidence["reason"], {"reverses": o.evidence["first"]})
+                continue
+            if key in self.tried:
+                memo += 1
+                continue
+            todo.append(f)
+        return todo, memo, osc
+
+
+def _oscillation(f: Finding, rec: dict, first_n: int, n: int) -> Finding:
+    a = f.action
+    first = {"iteration": first_n, "rule": rec.get("rule"), "op": rec.get("op"),
+             "summary": str(rec.get("summary") or "")[:160], "args": rec.get("args")}
+    second = {"iteration": n, "rule": f.rule, "kind": f.kind, "op": a.op,
+              "summary": str(f.summary)[:160], "args": a.args}
+    reason = (f"反向动作：会撤销本轮第 {first_n} 次迭代 [{rec.get('rule')}] 已执行的 {rec.get('op')}"
+              f"（{str(rec.get('summary') or '')[:60]}）——两条规则在打架，拒绝后一个")
+    return Finding(
+        rule="run-loop", kind="oscillation", severity="important", classified=True,
+        summary=(f"[{f.rule}] 要做的 {a.op}（{str(f.summary)[:60]}）会撤销同一轮里 [{rec.get('rule')}] "
+                 f"刚做的 {rec.get('op')}——两条规则在打架，已拒绝后一个；要人看哪条规则的判断不对"),
+        show=f.show, path=str(f.path or ""), torrent_hash=f.torrent_hash,
+        evidence={"reason": reason, "first": first, "second": second})
+
+
+def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
+        select: Callable[[Finding], bool] | None = None,
+        on_scan: Callable[[int, object], None] | None = None,
+        on_diagnose: Callable[[int, object, list[Finding]], None] | None = None,
+        on_iteration: Callable[[Iteration], None] | None = None) -> Outcome:
+    """迭代到不动点。`scan(n)` 返回第 n 次迭代的 LibraryState；`ex` 是这一轮唯一的执行器。
+
+    回调（都可省）：`on_scan(n, state)` 扫描之后、诊断之前（`cmd_run` 在第一次迭代挂账本补录、记种子数基线）；
+    `on_diagnose(n, state, findings)` 执行之前；`on_iteration(it)` 每次迭代（含收尾诊断）结束时。"""
+    max_iterations = max(1, int(max_iterations))
+    out = Outcome(max_iterations=max_iterations)
+    guard = _Guard(ex)
+    seen: set[tuple] = set()
+    errors: dict[tuple, dict] = {}
+    n = 0
+
+    def diagnose(it: Iteration):
+        t0 = time.monotonic()
+        state = scan(it.n)
+        it.scan_s = round(time.monotonic() - t0, 2)
+        it.degraded = bool(getattr(state, "qbit_errors", None))
+        if on_scan:
+            on_scan(it.n, state)
+        t1 = time.monotonic()
+        findings = reg.run_all(ctx, state)
+        it.diagnose_s = round(time.monotonic() - t1, 2)
+        for e in getattr(reg, "errors", None) or []:
+            errors.setdefault((e.get("rule"), e.get("error")), e)
+        out.title_decisions.update(getattr(state, "title_decisions", None) or {})
+        it.findings = len(findings)
+        it.actionable = sum(1 for f in findings if f.action and (select is None or select(f)))
+        for f in findings:
+            if f.action and (select is None or select(f)):
+                k = key_of(f.action.op, f.action.args)
+                if k not in seen:
+                    seen.add(k)
+                    out.proposed.append(f)
+        out.state, out.findings = state, findings
+        return state, findings
+
+    while n < max_iterations:
+        n += 1
+        if n > 1:
+            ex.new_iteration()
+        it = Iteration(n)
+        state, findings = diagnose(it)
+        if on_diagnose:
+            on_diagnose(n, state, findings)
+        before = {k: len(getattr(ex.report, k)) for k in ("applied", "skipped", "failed", "unknown")}
+        todo: list[Finding] = []
+        if not ex.qbit_blocker():
+            # 读不全的一轮什么都不做（下面 `apply` 整批拒绝），反向动作也不必记
+            todo, it.memo, osc = guard.screen(findings, n, select=select)
+            it.reversed = len(osc)
+            out.oscillations += osc
+        it.attempted = len(todo)
+        t2 = time.monotonic()
+        ex.apply(todo)
+        it.apply_s = round(time.monotonic() - t2, 2)
+        new = {k: getattr(ex.report, k)[before[k]:] for k in before}
+        it.applied, it.skipped = len(new["applied"]), len(new["skipped"])
+        it.failed, it.unknown = len(new["failed"]), len(new["unknown"])
+        out.iterations.append(it)
+        if ex.report.refused:
+            it.refused = out.refused = ex.report.refused
+        else:
+            guard.note([r for recs in new.values() for r in recs], n)
+        if on_iteration:
+            on_iteration(it)
+        if it.refused:
+            out.stop = REFUSED
+            break
+        if ex.dry_run:
+            out.stop = DRY_RUN
+            break
+        if not it.applied:
+            out.stop = FIXED_POINT
+            break
+    else:
+        # 到顶：上一次迭代还做成了新动作。再看一次（不执行），把下一次迭代会做的列成待做
+        ex.new_iteration()
+        it = Iteration(n + 1, final=True)
+        state, findings = diagnose(it)
+        errs = list(getattr(state, "qbit_errors", None) or [])
+        if errs:
+            # 残缺的种子视图里"还要做什么"不可信：待做的不列，原因交给调用方（`cmd_run` 按重扫读不全报 critical）
+            out.final_degraded = errs[0]
+            out.stop = CAP
+        else:
+            todo, it.memo, osc = guard.screen(findings, n + 1, select=select, write=False)
+            it.attempted, it.reversed = len(todo), len(osc)
+            out.oscillations += osc
+            out.pending = todo
+            out.stop = CAP if todo else FIXED_POINT
+        out.iterations.append(it)
+        if on_iteration:
+            on_iteration(it)
+
+    out.detector_errors = list(errors.values())
+    fps = set()
+    for o in out.oscillations:
+        k = key_of(o.evidence["second"]["op"], o.evidence["second"]["args"])
+        if k not in fps:
+            fps.add(k)
+            out.findings = [*out.findings, o]
+    return out

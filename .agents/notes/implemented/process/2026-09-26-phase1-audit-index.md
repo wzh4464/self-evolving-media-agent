@@ -34,6 +34,8 @@
 | §3.6 | 运行锁不能等到后面的阶段：`purge` / `rollback` / `repair` / 手动会话今天就与 `run` 竞争 | 0b5a02e |
 | §3.7 | 锁文件变更与 launchd：plist 用 `uv run`，每轮按 `uv.lock` 联网同步，引入 pytest 后凌晨那轮就要装包；先把 plist 改成直接跑 `.venv/bin/media-agent` | d504b3c |
 | §3.8 | 改成按 git tag 部署之前先冻结演进：演进器往仓库目录里写规则 / 笔记，会被部署的漂移闸门拦下 | 653aff2 |
+| §3.2 | 任何定点循环之前先保证快照新鲜：清 `ctx._tfile_cache` 与 `builtin._OFFSET_CACHE`、扫描读 qBittorrent 按种子 fail closed（N2）——否则第二次诊断把改名前的条目名当成幻影、改名后的真文件当成本地文件 | 第 1 阶段 d40e506、5fde004；第 4 阶段的循环依赖它，见 `architecture/2026-09-27-converge-within-a-run.md` |
+| §3.12 | 定点循环的前提：一个执行器（配额、`_grabbed`、批次 ID）、反向动作闸、一轮之内"失败过的不再试"的备忘——否则每次迭代都再撞一次 B2 的 404 与「集位被占」、多写一条审计 | 第 4 阶段 `media_agent/converge.py`，见同一篇 |
 
 ## testinfra：离线测试基座的调研（原型发现的 bug）
 
@@ -60,6 +62,9 @@
 | §4 | 输出与日志：发现与汇总进 stdout、日志进 stderr，launchd 追加到 `state/run.log` / `run.err.log`；两份日志都没有时间戳、批次号、轮次分隔，也不轮转（生产 run.log 1.8 MB / 159 轮）；没有动作的轮次不留任何审计 |
 | §5 | launchd 的实际配置（每 21600 秒 `run`，当时经 `uv run` 启动），以及"`media_agent/` 与 `deploy/` 里没有任何锁"的核实 |
 | §6 | 实测一轮的成本：170 部番、2,325 个文件、539 个种子，`diagnose` 约 44 秒，完整 `run` 约 1.5–2 分钟（运行锁等待时长据此取 10 秒） |
+| §7A | 代码注释里已经写明"要等下一轮"的依赖：抓取之后的改名、`Bangumi` 分类交接之后才判重、sidecar 的诊断期快照、`have` 与 `seasonal` 标记滞后一轮…… 第 4 阶段的一轮之内收敛（`architecture/2026-09-27-converge-within-a-run.md`）把其中能在同一轮做完的做完 |
+| B4 | 演进重扫用 `resolve_tmdb=False`：标题退回 AB 标题 / 目录名，按 TMDB 标题命名的目录（物语系列一组）被提议改回去；把这一行照搬进循环会在一轮之内来回改名。第 4 阶段的循环每次迭代都照常解析 TMDB；演进重扫本身冻结着、没动 |
+| B5 | TMDB 解析失败造成的跨轮来回改名（鬼物语，即 LAT-04）。跨轮的由身份钉住 + 标题稳定闸处理；一轮之内的来回由 `converge` 的反向动作闸拒绝、报 `oscillation` |
 | §8a | 定点循环的设想里对"永远被跳过的动作"的统计：`rename_show_dir`「目标目录已存在」连续 53 轮、「集位被占」28 轮（到 2026-09-24）、`delete_category`「仍有种子」反复出现——每轮单独看都只是一条 skipped |
 | §8b | 每轮健康摘要该收的信号：客户端状况、检测器崩溃数、发现按严重度、执行结果、演进与处置结果、`find_failure_patterns`（当时只在 `cmd_evolve` 里调用）；外加 try/finally 让崩溃的一轮也有摘要。第 3 阶段的健康报告，见 `architecture/2026-09-26-run-health.md` 第 6 节 |
 | §8c | 设想中的"每 30 分钟只抓取"模式：必须与 `run` 共用一把锁，否则落在 `run` 诊断与执行之间的抓取会被诊断期的 sidecar 快照盖掉，同一集再抓一遍 |

@@ -21,7 +21,7 @@ marker：`live`（只读核对生产库，默认不跑）、`ffmpeg`（要真 ff
 `lib.configure(qbit_allow_empty=True)`——等同生产上设 `QBIT_ALLOW_EMPTY=1`。
 """
 from .ab import FakeAB, make_ab_db
-from .library import Cycle, DirBuilder, LibraryBuilder, ShowBuilder, TorrentHandle
+from .library import Cycle, DirBuilder, LibraryBuilder, Loop, ShowBuilder, TorrentHandle
 from .llm import FakeLLM
 from .probe import FakeProbe, ProbeSpec, video
 from .qbit import FakeQbit
@@ -32,7 +32,7 @@ from .web import MIKAN, FakeWeb, MikanItem, days_ago
 
 __all__ = [
     "Cycle", "DirBuilder", "FakeAB", "FakeLLM", "FakeProbe", "FakeQbit", "FakeTMDB",
-    "FakeWeb", "KINDS", "LibraryBuilder", "MIKAN", "MikanItem", "ProbeSpec",
+    "FakeWeb", "KINDS", "LibraryBuilder", "Loop", "MIKAN", "MikanItem", "ProbeSpec",
     "ShowBuilder", "TorrentHandle", "Tripwire", "bdecode", "bencode", "days_ago",
     "make_ab_db", "make_torrent", "read_ident", "video", "weekly", "write_sparse",
 ]

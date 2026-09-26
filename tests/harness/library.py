@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from media_agent import converge
 from media_agent import probe as probe_mod
 from media_agent import sidecar as sc_mod
 from media_agent.actions import ExecReport, Executor
@@ -231,6 +232,16 @@ class Cycle:
         return [r for r in self.report.unknown if op is None or r["op"] == op]
 
 
+@dataclass
+class Loop(Cycle):
+    """一轮 `run` 的迭代（`converge.run`）：`findings` / `state` 是最后一次诊断的，`report` 是整轮累计的。"""
+    outcome: converge.Outcome | None = None
+
+    @property
+    def iterations(self) -> list:
+        return [it for it in self.outcome.iterations if not it.final]
+
+
 class LibraryBuilder:
     """见模块文档。一般通过 conftest 的 `lib` fixture 拿到。"""
 
@@ -375,6 +386,20 @@ class LibraryBuilder:
         rid = run_id or self.next_run_id()
         report = Executor(ctx, dry_run=dry_run, run_id=rid).apply(todo)
         return Cycle(rid, ctx, state, findings, report)
+
+    def loop(self, *, max_iterations: int = 3, dry_run: bool = False, run_id: str | None = None,
+             resolve_tmdb: bool = True, detectors: Iterable | None = None,
+             select: Callable[[Finding], bool] | None = None) -> Loop:
+        """一轮 `run` 的迭代：新进程语义（清缓存）→ **一个** Context、**一个**执行器 → 扫描 → 诊断 → 执行，
+        重复到不动点（`converge.run`）。`cycle()` 是只跑一次的旧形态。"""
+        reset_process_caches()
+        ctx = self.context()
+        reg = self.registry(detectors)
+        rid = run_id or self.next_run_id()
+        ex = Executor(ctx, dry_run=dry_run, run_id=rid)
+        out = converge.run(ctx, reg, ex, max_iterations=max_iterations, select=select,
+                           scan=lambda n: build_state(ctx, resolve_tmdb=resolve_tmdb))
+        return Loop(rid, ctx, out.state, out.findings, ex.report, outcome=out)
 
     def converge(self, *, max_rounds: int = 5, **kw) -> list[Cycle]:
         """反复 `cycle()` 直到某一轮什么都没执行。到上限仍在变就判失败——

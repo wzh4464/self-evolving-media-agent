@@ -522,6 +522,21 @@ class Executor:
                     self._crashed(f, e)
         return self.report
 
+    def new_iteration(self) -> None:
+        """`run` 迭代到不动点（`converge`）时，下一次迭代开始之前调用。一轮一个执行器：批次 ID、删除配额、
+        `_grabbed`、本轮摘掉的种子（按 hash，qBittorrent 的删除是异步的）都跨迭代留着。
+
+        清掉的两样：占用索引（下一次查询重新问 qBittorrent）与**按路径**记的"本批次已隔离"。后者只在同一份诊断里
+        有意义——同一批里一个输家常同时挂着 trash 与 rename。下一次迭代是新的扫描，隔离掉的文件已经不在里面了；
+        同一个路径上此刻可能是改名过来的赢家，还按路径记着，改名会说"文件本批次已移入隔离区"、删除关口会说
+        "保留方本批次已被移进隔离区"，都是假的拒绝。"""
+        self._claim_index = None
+        self._trashed_paths.clear()
+
+    def refuse(self, f: Finding, reason: str, extra: dict | None = None) -> None:
+        """执行器之外的一道闸拒绝了这个动作（`converge` 的反向动作）：记一条 skipped 审计，与执行器自己的拒绝同一个形状。"""
+        self._audit(auditlog.SKIPPED, f, f.action, {"reason": reason, **(extra or {})})
+
     @contextmanager
     def _tracking(self):
         """期间记下每个动作（每一步逆操作）发出的写调用（见 `_Tracked`）。包的是 Context 上的客户端，
