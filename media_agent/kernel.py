@@ -384,6 +384,10 @@ class Detector(Protocol):
 class Registry:
     """插件注册表：内置检测器 + 演进出的 DSL 规则。"""
     detectors: list[Any] = field(default_factory=list)
+    # 最近一次 `run_all` 里被吞掉的检测器异常：`{rule, error, where}`。单条规则崩溃不拖垮整轮，但必须
+    # 留下来——以前只打一行日志，健康报告说不出"这一轮哪条规则崩了、崩在哪"（critic N9：检测器里一个
+    # "database is locked" 被吞掉，诊断就静默地少了一截）。
+    errors: list[dict] = field(default_factory=list)
 
     def register(self, detector: Any) -> Any:
         self.detectors.append(detector)
@@ -392,6 +396,7 @@ class Registry:
     def run_all(self, ctx: Context, state: LibraryState) -> list[Finding]:
         seen: set[tuple] = set()
         out: list[Finding] = []
+        self.errors = []
         for d in self.detectors:
             try:
                 for f in d.detect(ctx, state):
@@ -399,8 +404,13 @@ class Registry:
                         continue      # 先注册的规则优先，避免重复报同一问题
                     seen.add(f.key())
                     out.append(f)
-            except Exception as e:      # 单个规则崩溃不能拖垮整轮
-                ctx.log(f"[registry] 规则 {getattr(d, 'id', d)} 执行失败: {e}")
+            except Exception as e:      # 单个规则崩溃不能拖垮整轮——但要记下来（`errors`）
+                rule = getattr(d, "id", None) or str(d)
+                where = _where(e)
+                self.errors.append({"rule": rule, "error": f"{type(e).__name__}: {e}",
+                                    "where": where})
+                # 这一行的格式不改：tests 的 tripwire 与读 run.err.log 的人都认它
+                ctx.log(f"[registry] 规则 {rule} 执行失败: {e}（{where}）")
 
         # `unparsable` 的字面意思是"看见了，但归不了类"。要是别的规则**已经**
         # 把它归了类，这句话就不再成立，留着只是把同一个文件报两遍。
@@ -418,6 +428,13 @@ class Registry:
         order = {"critical": 0, "important": 1, "minor": 2}
         out.sort(key=lambda f: (order.get(f.severity, 9), f.kind, f.path))
         return out
+
+
+def _where(e: BaseException, depth: int = 3) -> str:
+    """异常最后几层调用的位置，`文件:行 函数`，由内向外（给健康报告，不是完整 traceback）。"""
+    import traceback
+    frames = traceback.extract_tb(e.__traceback__)[-depth:]
+    return " ← ".join(f"{Path(fr.filename).name}:{fr.lineno} {fr.name}" for fr in reversed(frames))
 
 
 # --------------------------------------------------------------------------

@@ -21,6 +21,7 @@
 | N6 | "这个路径是否已被另一个活种子声明"应当是所有写路径共用的一道闸；`relink_torrent` 只按大小匹配，可能造出两个种子争一个文件 | 第 1 阶段 2577c43 给改名加了 `_claimants`；第 2 阶段换成共用原语 1e7897d，接到改名 9dcf436、抓取后改名 8a0dec9、relink f2c9be8、回退 be0eae6 / 1726d3d、目录改名 4be6339 / 64a2f5b |
 | N7 | `Finding.key()` = `(kind, path)`：同一目录两个死种的 `content_path` 相同，第二条被去重吞掉 | 3ef6825；删除关口按目标（路径 + hash）复核、不按 key，680962b 起 |
 | N8 | 隔离区与媒体在同一个 APFS 容器（约 94% 满）：隔离不腾空间，跨卷搬运是先拷后删，磁盘满时搬到一半失败 | 第 2 阶段：容量闸 `MIN_FREE_GB` 86b1cc5；搬进 / 搬出隔离区先看放不放得下 1a3e5c6。见 `architecture/2026-09-26-quarantine-disposal.md`。余项（写审计本身在磁盘满时抛异常，冲出 `apply()`、整轮连隔离区处置一起中止）：第 3 阶段 105aeee；搬到一半失败的结局按盘上状态认 d6d7d6b |
+| N9 | 每个检测器各开一个 sqlite 连接（默认 5 秒忙等）：第二个进程并发时"database is locked"在检测器里抛出、被 Registry 吞掉，诊断静默地少一截（判重在出错之后的桶全丢） | 第 3 阶段：`Registry.errors` 记下每个被吞的异常，见 `architecture/2026-09-26-run-health.md` 第 4 节；并发本身由运行锁 0b5a02e 排除 |
 | N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒） | 0b5a02e |
 | N11 | 没有结构化的发现历史：无动作的发现只以文字进 run.log；没有路径的发现去重键退回 `(show, summary)`，摘要里嵌着计数，跨轮认不出同一个问题——"卡住"检测无从谈起 | 第 3 阶段：发现历史与稳定指纹（`history.py`），见 `architecture/2026-09-26-run-health.md` 第 1 节 |
 | N12 | 回退只写一条汇总：逐步还原了什么没有审计，健康摘要看不见回退改了什么 | 第 3 阶段 8c901f5（逐步记录；回退记录不带逆操作，回退不能再回退）。见 `architecture/2026-09-26-honest-audit.md` 第 8 节 |
