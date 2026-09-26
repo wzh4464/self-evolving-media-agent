@@ -433,3 +433,115 @@ def test_failures_repeating_across_runs_are_called_out(offline_cli, capsys, monk
     assert r["rule"] == "episode-available" and r["op"] == "trash" and r["runs"] == 2
     [reason] = [x for x in rep["reasons"] if x["code"] == "failed_actions"]
     assert "2 个批次" in reason["text"]
+
+
+# ------------------------------------------------------------------ 每条原因各自钉住（2026-09-26 复审）
+def _seed(data: dict, key: str, value) -> None:
+    data[key] = value
+
+
+_ACTIONS = {"applied": 0, "skipped": 0, "failed": 0, "unknown": 0, "audit_problems": 0,
+            "repeated": []}
+_DISP = {"refused": "", "deleted": 0, "freed_bytes": 0, "early": 0, "failed": 0, "changed": 0,
+         "overdue": 0, "dry_run": False}
+_TRASH = {"free_bytes": 10**12, "free_after_bytes": 10**12, "min_free_bytes": 5 * 10**10,
+          "low_space": False, "space_short": False}
+
+
+@pytest.mark.parametrize("code, level, setup", [
+    ("unknown_actions", "warn", lambda d: _seed(d, "actions", {**_ACTIONS, "unknown": 2})),
+    ("rule_load_failed", "warn",
+     lambda d: _seed(d, "detectors", {"count": 17, "errors": [], "load_errors": ["坏.json: …"]})),
+    ("ab_down", "warn", lambda d: _seed(d, "clients", {"qbit": "ok", "ab": "down: ConnectError: x",
+                                                       "tmdb": "ok", "llm": "off"})),
+    ("low_space", "warn", lambda d: _seed(d, "trash", {**_TRASH, "low_space": True,
+                                                        "disposal": _DISP})),
+    ("free_space_unknown", "warn", lambda d: _seed(d, "trash", {**_TRASH, "free_bytes": None,
+                                                                 "disposal": _DISP})),
+    ("disposal_failed", "warn", lambda d: _seed(d, "trash", {**_TRASH,
+                                                              "disposal": {**_DISP, "failed": 3}})),
+    ("rescan_degraded", "critical",
+     lambda d: d["degraded"].__setitem__("rescan", "qBittorrent 报告 0 个种子")),
+])
+def test_each_reason_sets_its_level_and_the_status(lib, code, level, setup):
+    """复审变异：unknown_actions（H5i）、rule_load_failed（H5ac）、ab_down（H5m）、low_space（H5n）、
+    free_space_unknown（H5n2）、disposal_failed（H5n3）、rescan_degraded（H5x）各自关掉全套照绿——状态可以
+    悄悄回到 ok、不发信。"""
+    rh = health.RunHealth(lib.configure(), run_id="r")
+    setup(rh.data)
+
+    rep = rh.finish(0)
+
+    [r] = [r for r in rep["reasons"] if r["code"] == code]
+    assert r["level"] == level
+    assert rep["status"] == level
+    assert rep["exit_code"] == (health.EXIT_DEGRADED if code == "rescan_degraded" else 0)
+
+
+def test_tap_counts_failure_and_error_lines_by_tag(lib):
+    rh = health.RunHealth(lib.configure(), run_id="r")
+    seen = []
+    log = rh.tap(seen.append)
+
+    log("[grab] 拉 feed 失败 3500: timed out")
+    log("[scan] TMDB 取标题出错：x")                   # 复审变异 H5w：不数「出错」的行，全套照绿
+    log("[scan] 一切正常")
+    log("没有标签的一行 失败")
+
+    le = rh.data["logged_errors"]
+    assert le["count"] == 3 and le["by_tag"] == {"grab": 1, "scan": 1, "-": 1}
+    assert len(seen) == 4                                           # 原来的日志照样走
+
+
+@pytest.mark.allow("unknown_record", match="标签|add_tags|addTags")
+def test_an_unconfirmed_action_makes_the_run_warn(offline_cli, capsys, monkeypatch):
+    """端到端：一个动作记了 unknown（改动也许生效了），这一轮是 warn、原因点名——没有它，改动说不清的一轮照样 ok。"""
+    lib = offline_cli
+    s1 = lib.show("测试番").season(1)
+    t = s1.single("测试番 S01E01.mkv", size=GB, name="[G] Test Show - 01 [1080p].mkv")
+    tag = Finding(rule="pin", kind="pin", severity="minor", summary="钉集号", show="测试番",
+                  action=Action(op="retag", args={"torrent_hash": t.hash, "tags": "ma:S01E01,待人挑"}))
+
+    class _One:
+        id = "one"
+
+        def detect(self, ctx, state):
+            yield tag
+
+    monkeypatch.setattr(cli, "build_registry", lambda: Registry(detectors=[_One()]))
+    real = lib.qbit.add_tags
+
+    def half(hashes, tags):                                         # 只落了一个标签、响应丢了
+        real(hashes, tags.split(",")[0])
+        raise __import__("httpx").ReadTimeout("timed out (injected)")
+
+    monkeypatch.setattr(lib.qbit, "add_tags", half)
+
+    assert cli.cmd_run(_args(), lib.cfg) == 0
+    rep = _latest(lib)
+    assert rep["actions"]["unknown"] == 1 and rep["status"] == "warn"
+    assert "unknown_actions" in [r["code"] for r in rep["reasons"]]
+
+
+def test_a_degraded_rescan_before_evolving_is_critical(offline_cli, capsys, monkeypatch):
+    """EVOLVE_MODE=propose：修复之后重扫时 qBittorrent 读不全，不演进、退出码 3、健康报告 critical。
+    复审变异 X7：去掉 `rh.rescan_degraded(...)`，退出码照样是 3，状态却回到 ok。"""
+    lib = offline_cli
+    _clean(lib)
+    lib.configure(evolve_mode="propose")
+    lib.llm.enabled = True
+    real, n = cli.build_state, []
+
+    def second_blind(ctx, **kw):
+        n.append(1)
+        st = real(ctx, **kw)
+        if len(n) == 2:
+            st.qbit_errors.append("重扫时读不到（注入）")
+        return st
+
+    monkeypatch.setattr(cli, "build_state", second_blind)
+
+    assert cli.cmd_run(_args(), lib.cfg) == cli.EXIT_DEGRADED
+    rep = _latest(lib)
+    assert rep["status"] == "critical" and rep["evolve"] == "skipped"
+    assert "rescan_degraded" in [r["code"] for r in rep["reasons"]]
