@@ -94,11 +94,15 @@
 - `unrenamed-file`：钉着这一集、所属种子是冲突里**非保留方**的文件（正片与外挂字幕），不再提改名。
 - `seal_conflict` 的摘要写明集位名留在 / 给哪一份，`evidence` 多了 `slot_name_held_by`、`slot_name_goes_to`、
   `renames_held`。它按集位认指纹（第 1 节的 `subject`），连着几轮都在交给卡住检测——报一次、有结论。
+- `rename-collision`（critical，"AutoBangumi 改名死循环"）同样不再为这组冲突报：争这个名字的恰好就是冲突里的那几个
+  封存种子时跳过——它们都是本项目抓的、在剧名分类下，AB 查不到，谈不上死循环；而判重已经报了 `seal_conflict`。
+  以前同一个冲突每轮两条（一条 critical），卡住检测里也是两条（写健康报告的测试时发现的）。有没钉的第三份一起争
+  照报——判重这一轮会清掉它。
 
 **测试**：`tests/test_seal_conflict_quiet.py`——已叫集位名的那份留着、另一份不提改名；两份都是发布名时只有
 偏好分最高的那份改名，连跑 4 轮零条「集位被占」、`seal_conflict` 每轮一条且指纹不变；第三份没钉的照旧判输
 进隔离区；另一个种子的外挂字幕同样不提；只有一份钉着时照常改名（对照）；另一份复核不过就不是冲突。把
-`unrenamed-file` 里那一句 `continue` 关掉，前四个测试红。
+`unrenamed-file` 里那一句 `continue` 关掉，前四个测试红。`rename-collision`：封存冲突不再报、有没钉的第三份照报。
 
 ## 4. Registry 记下被吞的检测器异常
 

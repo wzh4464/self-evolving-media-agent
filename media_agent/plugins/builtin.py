@@ -813,6 +813,7 @@ class RenameCollisionDetector:
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         for show in state.shows:
             targets: dict[str, list[MediaFile]] = defaultdict(list)
+            slot_of: dict[str, tuple[int, int]] = {}
             for f in show.files:
                 if not _is_video(f) or _is_extra(f, show):
                     continue
@@ -820,7 +821,10 @@ class RenameCollisionDetector:
                 if not r:
                     continue
                 season, ep = r
-                targets[target_filename(show.official_title, season, ep, f.ext)].append(f)
+                t = target_filename(show.official_title, season, ep, f.ext)
+                targets[t].append(f)
+                slot_of[t] = r
+            conflicts = None             # 封存冲突（按需算：要探测）
 
             for target, files in targets.items():
                 if len(files) < 2:
@@ -828,6 +832,16 @@ class RenameCollisionDetector:
                 hashes = [f.torrent_hash for f in files if f.torrent_hash]
                 if len(set(hashes)) < 2:
                     continue      # 同一个种子的多个文件，不是碰撞
+                if any(_pinned(f) for f in files):
+                    # 争这个名字的恰好就是一组封存冲突（都钉着这一集、都复核通过）：判重已经报了
+                    # `seal_conflict`，集位名只给一份、其余不提改名（`slot_holder`）。它们都是本项目抓的、
+                    # 在剧名分类下，AutoBangumi 查不到，谈不上"改名死循环"——再报一条 critical，同一个
+                    # 冲突每轮两条，卡住检测里也是两条。有没钉的第三份一起争，照报（判重这一轮会清掉它）。
+                    if conflicts is None:
+                        conflicts = seal_conflicts(show)
+                    sealed = {x.torrent_hash for x in conflicts.get(slot_of[target], [])}
+                    if sealed and set(hashes) <= sealed and len(hashes) == len(files):
+                        continue
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="critical",
                     summary=f"{len(files)} 个种子争抢同一目标名 {target}，会导致改名死循环",

@@ -106,3 +106,27 @@ def test_a_conflict_candidate_that_fails_its_check_is_no_conflict(lib):
     s1.single("[Raw] Yani Neko - 08 [1080p].mkv", size=GB + 5, tags="ma:S01E08", probe=RAW)
 
     assert seal_conflicts(lib.scan().shows[0]) == {}
+
+
+def test_rename_collision_does_not_report_the_same_conflict_again(lib):
+    """`rename-collision`（critical）说的是 AutoBangumi 的改名死循环：两个种子的文件都要改成同一个名字。
+    封存冲突的两份都是本项目抓的、在剧名分类下（AB 查不到），而且已经由判重报成 `seal_conflict`——
+    再报一条 critical，同一个冲突每轮两条、卡住检测里也是两条。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    s1.single(SLOT, size=GB, name=LOLI, tags="ma:S01E08", probe=CHI)
+    s1.single(NEST, size=GB + 5, tags="ma:S01E08", probe=CHI)
+
+    kinds = [f.kind for f in lib.diagnose()]
+
+    assert kinds.count("seal_conflict") == 1 and "rename_collision" not in kinds
+
+
+def test_rename_collision_still_reports_an_unsealed_competitor(lib):
+    """对照组：第三份没钉 `ma:` 的也要这个名字——那是判重这一轮会清掉的普通重复，照报。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    s1.single(SLOT, size=GB, name=LOLI, tags="ma:S01E08", probe=CHI)
+    s1.single(NEST, size=GB + 5, tags="ma:S01E08", probe=CHI)
+    s1.single("[Dynamis One] Yani Neko - 08 (ABEMA 1920x1080 AVC AAC MKV).mkv", size=GB + 9,
+              probe=RAW)
+
+    assert "rename_collision" in [f.kind for f in lib.diagnose()]
