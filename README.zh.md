@@ -123,7 +123,7 @@ uv run media-agent run                 # 一轮完整自治
 建议先 `diagnose`，再 `apply --dry-run`。**读清楚它想干什么之后**，
 再决定要不要把 `AUTO_APPLY` 打开。
 
-[`deploy/`](deploy/) 里有每 6 小时跑一轮的 launchd 配置。
+[`deploy/`](deploy/) 里有每 6 小时跑一轮的 launchd 配置。生产按 git tag 原地部署（`deploy/deploy.sh <tag>`），流程、回滚与运行锁见 [deploy/README.md](deploy/README.md)。
 
 ### 依赖的服务
 

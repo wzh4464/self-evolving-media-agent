@@ -27,7 +27,8 @@ media_agent/
 tests/
   harness/        离线测试基座：FakeQbit/FakeWeb/FakeProbe/… + LibraryBuilder
   conftest.py     自动隔离（断网、state/ 进临时目录）+ tripwire
-state/            运行时数据：审计日志、隔离区、缓存（gitignore）
+state/            运行时数据：审计日志、隔离区、缓存、运行锁（gitignore）
+deploy/           按 git tag 原地部署、launchd、VPN 救援（见 deploy/README.md）
 ```
 
 ## 命令

@@ -53,6 +53,11 @@
   之后 `uv sync --frozen`、离线测试、记 `deploy.history`，并打印原样撤销的三条命令。
 - `media-agent --version`：版本号取自源码树的 `pyproject.toml`（可编辑安装切了 tag 还没
   sync 时，已装元数据是旧的），`deploy.sh` 切换后用它确认。
+- `deploy/README.md` 重写为部署手册：什么在 git 里 / 什么只在生产、用户意图放在哪
+  （每部番的意图在媒体库 sidecar；`.agents/preferences.json` 版本化，生产上改了要提交，
+  漂移闸门会拦）、一次性转换与撤销、日常部署每一步的理由、回滚（代码 vs 数据）、
+  运行锁、launchd、bash 3.2 注意事项。配套 Agent Note
+  `process/2026-09-26-tag-deploy-and-run-lock.md`。
 
 ### 变更
 - **批次 ID 不再撞车**（critic N10）：由秒级 `20260926T131502` 改为
