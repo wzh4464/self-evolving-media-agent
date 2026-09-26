@@ -112,6 +112,7 @@ def test_run_deletes_expired_extras_one_by_one_and_keeps_what_needs_a_human(
     lib = offline_cli
     extra = legacy(lib, "尼古喵喵 [Tokuten][01].mkv", rule="extras-in-library", kind="extra",
                    days_ago=40)
+    lib.show("尼古喵喵").season(1).local("尼古喵喵 S01E01.mkv")    # 特典认得出第 1 集：那一集得在
     bundle = legacy(lib, "【7月】尼古喵喵 11【TV版】.mp4", rule="duplicate-episode",
                     kind="bundled_version", days_ago=40,
                     summary="S01E11 同一个种子里还装着 …")
@@ -204,6 +205,50 @@ def test_dead_partial_expires_only_if_it_really_is_a_partial(lib):
 
     assert pool[part].eligible
     assert not pool[whole].eligible and "半成品" in pool[whole].why
+
+
+# 2026-09-26 审查：特典到期就删，不再看它此刻还是不是特典——特典规则认不出罗马音标题里的记号
+# （`[G] Trailer Park Boys - 05`），它的兜底被幻影骗过、关口也放行时，唯一的那一集 30 天后硬删。
+def test_an_expired_numbered_extra_whose_episode_has_no_playable_copy_is_kept(lib, no_rmtree):
+    moved = legacy(lib, "[G] Trailer Park Boys - 05 [1080p].mkv", show="拖车公园",
+                   rule="extras-in-library", kind="extra_content", days_ago=40)
+    s1 = lib.show("拖车公园").season(1)
+    s1.local("拖车公园 S01E04.mkv")
+    s1.single("拖车公园 S01E05.mkv", name="[X] Trailer Park Boys - 05.mkv", on_disk=False)  # 幻影
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert not c.eligible and "S01E05" in c.why and "可能就是那一集" in c.why
+
+
+def test_an_extra_that_is_not_one_by_the_current_rule_is_kept(lib, no_rmtree):
+    """标题里带「菜单」的番，第 2 阶段之前整名匹配、把正片当特典隔离过；按现在的判据（只看标题之后）
+    它不是特典——不按特典到期删，交给人。"""
+    title = "异世界食堂的菜单"
+    moved = legacy(lib, f"{title} S01E04.mkv", show=title, rule="extras-in-library",
+                   kind="extra_content", days_ago=40)
+    lib.show(title).season(1).single(f"{title} S01E01.mkv", name="[G] Isekai - 01 [1080p].mkv")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert "不是特典" in c.why
+
+
+def test_an_expired_numbered_extra_whose_episode_is_there_is_deleted(lib, no_rmtree):
+    """对照：药屋 `[menu][S01E03]`，库里第 3 集好好的——到期照删。"""
+    moved = legacy(lib, "Kusuriya no Hitorigoto[menu][S01E03][1080P].mkv", show="药屋少女的呢喃",
+                   rule="extras-in-library", kind="extra_content", days_ago=40,
+                   deletion={"gate": "passed", "disposition": "extras", "slot": [1, 3]})
+    lib.show("药屋少女的呢喃").season(1).single("药屋少女的呢喃 S01E03.mkv",
+                                             name="[G] Kusuriya - 03 [1080p].mkv")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.deleted] == [moved]
 
 
 def test_new_extras_record_from_a_real_cycle_expires(lib, no_rmtree):

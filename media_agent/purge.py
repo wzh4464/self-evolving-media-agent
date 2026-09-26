@@ -5,7 +5,8 @@
 第 2 阶段之前的旧记录按规则推断，同一张表 `gate.disposition_for`）：
 
 - **`extras`**（特典 / 菜单 / PV / OP-ED）：用户口径就是要删（2026-09-04 核对后的结论："留在隔离区，
-  按 TRASH_RETENTION_DAYS=30 到期清除"）。过了保留期即可删。
+  按 TRASH_RETENTION_DAYS=30 到期清除"）。过了保留期、按此刻再认一次仍是特典（名字认得出集号的，
+  那一集库里另有可播的正片）即可删（`_extras_problem`）。
 - **`dead_partial`**（死种自己的 `.!qB` 半成品）：按定义不是可用拷贝。过了保留期即可删；
   只认 `.!qB`——第 1 阶段之前的死种处置搬的是 `content_path`，可能是完整正片甚至整季。
 - **`duplicate`**：必须**证明**库里有它的替代者、而且替代者是完整的（下面两条）。
@@ -384,12 +385,63 @@ def _judge(pool: _Pool, c: Candidate) -> None:
     if not c.expired:
         c.why = f"{label}：还在保留期里（隔离 {c.age_days:.1f} 天，保留 {pool.retention:g} 天，还剩 {left:.1f} 天）"
         return
-    why = _origin_problem(pool.claims(), c)
+    why = _origin_problem(pool.claims(), c) or (_extras_problem(pool, c) if d == "extras" else "")
     if why:
         c.why = why
         return
     c.eligible = True
     c.why = f"{label}（{c.rule}）已过保留期 {pool.retention:g} 天（隔离 {c.age_days:.0f} 天）"
+
+
+def _extras_problem(pool: _Pool, c: Candidate) -> str:
+    """特典到期硬删之前，按**此刻**再认一次：它还是特典吗？名字认得出集号的，那一集此刻有没有
+    可播的正片？返回不删的理由，没问题返回空串。
+
+    特典规则认不出罗马音标题里的记号（`[G] Trailer Park Boys - 05`），靠"某集唯一的文件不当特典"
+    兜底；兜底曾被一个幻影骗过、关口也曾对没钉子的特典不问集位（2026-09-26 审查）。隔离区是最后
+    一层：以前特典到期就删，不看任何现场——唯一的那一集就这么没了。
+
+    - 按现在的判据（`is_extra_of`：只看剧名之后的部分）它不是特典 → 不删、交给人（第 2 阶段之前
+      整名匹配，标题带「菜单」的番把正片当特典隔离过）；
+    - 集位：新记录用关口记下的 `deletion.slot`（检测器按 `_resolve` 算的 / 钉子 / 名字），旧记录按
+      `_resolve` 重新认；认得出集号、库里那一集此刻没有可播的正片（`_holders`：下完了、不是特典、
+      不是幻影、盘上真在）→ 它可能就是那一集，不删；
+    - 重扫看不全 → 不删。
+    """
+    from .kernel import MediaFile
+    from .naming import is_extra_of
+    from .plugins import builtin as B
+
+    name = Path(c.origin).name if c.origin else c.trash_path.name
+    show_dir = _show_dir_of(c.origin, pool.media_root)
+    if show_dir is None:
+        return f"特典的原路径不在媒体库的某部番目录下（{c.origin or '（空）'}），认不出它此刻还是不是特典"
+    shows = pool.shows()
+    if pool.scan_errors:
+        return (f"看不全：重扫时 qBittorrent 数据不完整（{pool.scan_errors[0]}），"
+                f"确认不了它此刻仍是特典")
+    show = shows.get(fold(show_dir))
+    titles = B._titles(show) if show is not None else [show_dir.name]
+    if not is_extra_of(name, titles):
+        return (f"按现在的判据它不是特典：{name} 去掉剧名（{titles[0]}）之后没有特典记号——当初是按"
+                f"整个名字判的，不按特典到期删，交给人")
+    rel = Path(c.origin).relative_to(show_dir)
+    season_dir = rel.parts[0] if len(rel.parts) > 1 else ""
+    dele = (c.record or {}).get("deletion")
+    if dele is not None:
+        slot = gate._slot_arg(dele.get("slot"))
+    elif show is not None:
+        slot = B._resolve(MediaFile(path=Path(c.origin), size=c.size, show_dir=show_dir.name,
+                                    season_dir=season_dir, filename=name), show)
+    else:
+        slot = gate.name_slot(Path(c.origin), season_dir)
+    if slot is None:
+        return ""
+    c.slot = slot
+    if show is not None and _holders(show, slot):
+        return ""
+    return (f"特典 {name} 的名字认得出 S{slot[0]:02d}E{slot[1]:02d}，而库里这一集此刻没有可播的正片——"
+            f"它可能就是那一集（发布名的标题里带记号的正片），不删、交给人")
 
 
 def _origin_problem(claims, c: Candidate, surv_path: Path | None = None,
