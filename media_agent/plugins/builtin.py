@@ -842,9 +842,14 @@ class RenameCollisionDetector:
                     sealed = {x.torrent_hash for x in conflicts.get(slot_of[target], [])}
                     if sealed and set(hashes) <= sealed and len(hashes) == len(files):
                         continue
+                season, ep = slot_of[target]
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="critical",
                     summary=f"{len(files)} 个种子争抢同一目标名 {target}，会导致改名死循环",
+                    # 身份按集位：`path` 只是桶里第一个文件，有种子的按 torrents() 的顺序排——qBit 5.x 的
+                    # /torrents/info 不排序（遍历 QHash），容器重建、加了种子就换第一名，指纹跟着变
+                    # （卡住检测的连续段断掉、确认悄悄失效；2026-09-26 复审）
+                    subject=f"S{season:02d}E{ep:02d}",
                     show=show.dir_name, path=str(files[0].path),
                     evidence={"target": target,
                               "competitors": [

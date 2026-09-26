@@ -31,13 +31,19 @@
   `seal_conflict`、`pending_ownership`、`suspicious_episode_parse`）的 `path` 只是桶里第一个文件——多一个文件、
   改一个名，第一名就换了；缺集 / 可抓取这类根本没有路径。现在它们分别带 `S01E08` / `S02`，空分类带
   `分类:<名>`。只写身份、不写计数；不参与 `key()` 去重（不改变任何现有行为）。
+  复审时补上漏掉的 `rename_collision`（critical、没有动作，正是卡住 / 确认的对象）：它的 `path` 同样是桶里第一个
+  文件，而有种子的文件按 `torrents()` 的顺序排——qBit 5.x 的 /torrents/info 不排序（`SessionImpl::torrents()` 遍历
+  `QHash`，进程重启换种子、加了种子重新散列都会变），看门狗重建一次容器指纹就换了。现在带 `S01E08`。其余以
+  `files[0]` / `sealed[0]` 为 path 的发现（`phantom_only`、`seal_conflict`、`pending_ownership`、
+  `suspicious_episode_parse`）都已带 `subject`；以单个文件为对象的（判输的那份、同名字幕）按它自己的路径认。
 - `run` 的批次 ID 在开头就定下来（`new_run_id()`），执行器、隔离区处置、发现历史共用——审计与发现历史对得上。
 - **写永不抛异常**：写不进去（`state/findings` 被一个文件占了、磁盘满）只在 stderr 说一句「发现历史：…」，
   这一轮照常。观测不能拦正事。
 - 扫描读 qBittorrent 不完整的一轮，快照标 `degraded`（卡住检测不拿残缺快照算连续，见第 2 节）。
 
 **测试**：`tests/test_findings_history.py`——摘要里的计数变了指纹不变；真检测器
-（`suspicious_episode_parse`）多一个文件、换了第一名指纹不变；目标的取值顺序；空轮写 header；保留 60 份；
+（`suspicious_episode_parse`）多一个文件、换了第一名指纹不变；`rename_collision` 在 `torrents()` 倒序后指纹不变
+（改之前红）；目标的取值顺序；空轮写 header；保留 60 份；
 写不进去不抛、`run` 照样返回 0；`run` / `diagnose` 各写一份、`run` 的快照与审计同一个批次 ID；降级的一轮标
 `degraded`。
 

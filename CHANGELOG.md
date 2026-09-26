@@ -17,7 +17,8 @@
 - **发现历史**：每轮 `run` 与 `diagnose` 把全部发现（含没有动作、已归类的）写进
   `state/findings/<批次 ID>.jsonl`，只留最近 60 份。每条带稳定指纹：规则 + 类型 + 目标（集位 / 季、路径、
   种子 hash 或番名），**不含摘要**——「S01 缺 3 集」下一轮变成「缺 2 集」也还是同一个问题（critic N11）。
-  发现多了 `subject` 字段（`diagnose --json` 里可见），集位级 / 季级的发现带 `S01E08` / `S02`。写不进去只在
+  发现多了 `subject` 字段（`diagnose --json` 里可见），集位级 / 季级的发现（含「改名死循环」`rename_collision`）
+  带 `S01E08` / `S02`，指纹不随 qBittorrent 列种子的顺序变。写不进去只在
   stderr 提一句，这一轮照常。`run` 的发现历史、审计、隔离区处置用同一个批次 ID。
 - **卡住检测**：同一个问题（带动作、或严重度 ≥ important）连续 `STUCK_RUNS`（新配置，默认 4 = 24 小时）轮 `run`
   都在，`run` 末尾报「卡住」：连续几轮、从哪一轮起、指纹。手动的 `diagnose` 与读 qBittorrent 不完整的轮次不算数。

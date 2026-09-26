@@ -90,6 +90,25 @@ def test_detector_fingerprint_is_stable_when_its_count_changes(lib, more):
     assert history.fingerprint(a) == history.fingerprint(b)
 
 
+def test_rename_collision_fingerprint_does_not_follow_the_torrent_list_order(lib, monkeypatch):
+    """rename_collision（critical、没有动作，会进卡住检测）以前以桶里第一个文件为 path：有种子的文件按
+    `torrents()` 的顺序排，而 qBit 5.x 的 /torrents/info 不排序（遍历 QHash，进程重启、加种子后都会变）。
+    看门狗重建一次容器，指纹就换了——连续段断掉、人的确认悄悄失效、再过 STUCK_RUNS 轮又报「新卡住」。"""
+    from media_agent.plugins.builtin import RenameCollisionDetector
+    s1 = lib.show("朱音落语").season(1)
+    s1.single("[JPSC] Akane-banashi - 08 [1080p].mp4", size=600_000_001)
+    s1.single("[JPTC] Akane-banashi - 08 [1080p].mp4", size=600_000_002)
+    [a] = lib.diagnose(detectors=[RenameCollisionDetector])
+    real = type(lib.qbit).torrents
+    monkeypatch.setattr(type(lib.qbit), "torrents",
+                        lambda self, category=None: list(reversed(real(self, category))))
+    [b] = lib.diagnose(detectors=[RenameCollisionDetector])
+
+    assert a.path != b.path                                       # 桶里的第一名确实换了
+    assert history.fingerprint(a) == history.fingerprint(b)
+    assert history.target_of(a) == "朱音落语#S01E08"
+
+
 # ------------------------------------------------------------------ 落盘
 def _read(path):
     lines = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x]
