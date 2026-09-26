@@ -142,6 +142,7 @@ class Iteration:
     attempted: int = 0           # 交给执行器的
     memo: int = 0                # 本轮已经试过、不再试的
     reversed: int = 0            # 会撤销本轮已执行的动作：拒绝
+    deferred: int = 0            # 刚动过的种子：这一轮不按死种摘（`TOUCHING`）
     applied: int = 0
     skipped: int = 0
     failed: int = 0
@@ -168,6 +169,7 @@ class Iteration:
               + (f" · 未确认 {self.unknown}" if self.unknown else "")
               + (f" · 本轮已试过 {self.memo}" if self.memo else "")
               + (f" · 反向拒绝 {self.reversed}" if self.reversed else "")
+              + (f" · 暂缓 {self.deferred}" if self.deferred else "")
               + f"（{self.apply_s:.1f}s）")
         return s
 
@@ -202,14 +204,26 @@ class Outcome:
                 "oscillations": [{**brief(f), "evidence": f.evidence} for f in self.oscillations[:limit]]}
 
 
+# 会让种子重新校验 / 搬存储的动作：做完之后它有一阵子"下载中、0 做种、0 可用"——还没连上 peer，不是死了。
+# 以前一轮只诊断一次，死种判定隔着 6 小时；迭代时下一次迭代就会按死种摘掉它（critic §3.3）。这一轮暂缓。
+TOUCHING = ("relink_torrent", "relocate", "rename_show_dir")
+
+
+def _touched_hashes(rec: dict) -> set[str]:
+    args = rec.get("args") or {}
+    if rec.get("op") == "rename_show_dir":
+        return {str(h).lower() for h, _sp in (rec.get("undo") or {}).get("torrent_savepaths") or []}
+    return {str(args.get("torrent_hash") or "").lower()} - {""}
+
+
 class _Guard:
-    """一轮之内的"试过了"与"反向"两道闸（见模块文档）。"""
+    """一轮之内的"试过了"、"反向"、"刚动过的种子"三道闸（见模块文档）。"""
 
     def __init__(self, ex):
         self.ex = ex
         self.tried: dict[tuple, str] = {}           # key → 结局（applied / failed / unknown / skipped）
         self.applied_at: list[tuple[int, dict]] = []  # (第几次迭代, 已执行的审计记录)
-        self.reversed: set[tuple] = set()
+        self.reversed: set[tuple] = set()           # 拒绝过的（反向 / 暂缓）：后面的迭代不再记一遍
 
     def note(self, recs: list[dict], n: int) -> None:
         for rec in recs:
@@ -220,11 +234,20 @@ class _Guard:
             if rec.get("status") == auditlog.APPLIED:
                 self.applied_at.append((n, rec))
 
+    def _touched(self) -> dict[str, tuple[int, dict]]:
+        out: dict[str, tuple[int, dict]] = {}
+        for m, rec in self.applied_at:
+            if rec.get("op") in TOUCHING:
+                for h in _touched_hashes(rec):
+                    out.setdefault(h, (m, rec))
+        return out
+
     def screen(self, findings: list[Finding], n: int, *, select=None, write: bool = True
-               ) -> tuple[list[Finding], int, list[Finding]]:
-        """这一次迭代要交给执行器的、因为本轮试过而跳过的个数、反向的（`oscillation` 发现）。
-        `write`：反向的写一条 skipped 审计（收尾诊断不执行，不写）。"""
-        todo, memo, osc = [], 0, []
+               ) -> tuple[list[Finding], int, list[Finding], int]:
+        """这一次迭代要交给执行器的、因为本轮试过而跳过的个数、反向的（`oscillation` 发现）、刚动过的种子暂缓的个数。
+        `write`：反向与暂缓的写一条 skipped 审计（收尾诊断不执行，不写）。"""
+        todo, memo, osc, deferred = [], 0, [], 0
+        touched = self._touched()
         for f in findings:
             if not f.action or (select is not None and not select(f)):
                 continue
@@ -242,11 +265,24 @@ class _Guard:
                 if write:
                     self.ex.refuse(f, o.evidence["reason"], {"reverses": o.evidence["first"]})
                 continue
+            hit = (touched.get(str(a.args.get("torrent_hash") or "").lower())
+                   if a.op == "drop_torrent" and a.args.get("dead") else None)
+            if hit is not None:
+                m, rec = hit
+                self.reversed.add(key)
+                deferred += 1
+                if write:
+                    self.ex.refuse(f, (
+                        f"刚动过的种子：本轮第 {m} 次迭代 [{rec.get('rule')}] 已 {rec.get('op')}（重新校验 / 搬存储），"
+                        f"它此刻\"没人做种\"多半只是还没连上 peer——这一轮不按死种摘，下一轮再看"),
+                        {"touched_by": {"iteration": m, "rule": rec.get("rule"), "op": rec.get("op"),
+                                        "summary": str(rec.get("summary") or "")[:160]}})
+                continue
             if key in self.tried:
                 memo += 1
                 continue
             todo.append(f)
-        return todo, memo, osc
+        return todo, memo, osc, deferred
 
 
 def _oscillation(f: Finding, rec: dict, first_n: int, n: int) -> Finding:
@@ -334,7 +370,7 @@ def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
         todo: list[Finding] = []
         if not ex.qbit_blocker():
             # 读不全的一轮什么都不做（下面 `apply` 整批拒绝），反向动作也不必记
-            todo, it.memo, osc = guard.screen(findings, n, select=select)
+            todo, it.memo, osc, it.deferred = guard.screen(findings, n, select=select)
             it.reversed = len(osc)
             out.oscillations += osc
         it.attempted = len(todo)
@@ -371,7 +407,7 @@ def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
             out.final_degraded = errs[0]
             out.stop = CAP
         else:
-            todo, it.memo, osc = guard.screen(findings, n + 1, select=select, write=False)
+            todo, it.memo, osc, it.deferred = guard.screen(findings, n + 1, select=select, write=False)
             it.attempted, it.reversed = len(todo), len(osc)
             out.oscillations += osc
             out.pending = todo

@@ -35,6 +35,7 @@
 | §3.7 | 锁文件变更与 launchd：plist 用 `uv run`，每轮按 `uv.lock` 联网同步，引入 pytest 后凌晨那轮就要装包；先把 plist 改成直接跑 `.venv/bin/media-agent` | d504b3c |
 | §3.8 | 改成按 git tag 部署之前先冻结演进：演进器往仓库目录里写规则 / 笔记，会被部署的漂移闸门拦下 | 653aff2 |
 | §3.2 | 任何定点循环之前先保证快照新鲜：清 `ctx._tfile_cache` 与 `builtin._OFFSET_CACHE`、扫描读 qBittorrent 按种子 fail closed（N2）——否则第二次诊断把改名前的条目名当成幻影、改名后的真文件当成本地文件 | 第 1 阶段 d40e506、5fde004；第 4 阶段的循环依赖它，见 `architecture/2026-09-27-converge-within-a-run.md` |
+| §3.3 | 定点循环之前先处理死种：不再隔离 `content_path`（NoSubfolder 种子就是整季目录）、停滞按最后一次活动算而不是加入时间；否则循环会把"relink → recheck → stalledDL → 死种"从 6 小时缩到几秒 | 3ef6825（只摘记录、按停滞时长判死）；第 4 阶段 `converge` 对本轮刚 relink / 搬存储过的种子暂缓死种处置，见 `architecture/2026-09-27-converge-within-a-run.md` |
 | §3.12 | 定点循环的前提：一个执行器（配额、`_grabbed`、批次 ID）、反向动作闸、一轮之内"失败过的不再试"的备忘——否则每次迭代都再撞一次 B2 的 404 与「集位被占」、多写一条审计 | 第 4 阶段 `media_agent/converge.py`，见同一篇 |
 
 ## testinfra：离线测试基座的调研（原型发现的 bug）

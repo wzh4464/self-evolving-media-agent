@@ -41,6 +41,12 @@
   目录改名来回、分类 A→B→A、relink 的映射反过来、刚抓的种子又要摘 / 隔离、刚摘的种子又要抓回来——拒绝它，记一条
   skipped 审计（「反向动作：…」，带 `reverses`），报一条 `run-loop` / `oscillation` 发现（important）。那是两条规则在
   打架；runloop B5 / LAT-04（鬼物语 20260919 两轮之间改名又改回）压进一轮就是这个形状。同一个反向动作一轮只报一次。
+- **刚动过的种子这一轮不按死种摘**（critic §3.3）：relink（renameFile + recheck）、relocate / 目录改名（setLocation）之后，
+  种子有一阵子是"下载中、0 做种、0 可用"——刚校验完 / 刚搬完，还没连上 peer。死种判定按最后一次活动算停滞时长
+  （3ef6825），对一个几个月前加的老种子，这一刻就够"死"了。以前一轮只诊断一次，中间隔着 6 小时；迭代时下一次迭代就会
+  把它摘掉。`TOUCHING` 里的动作做过的种子，这一轮的 `drop_torrent`（`dead`）记 skipped「刚动过的种子：…」（带
+  `touched_by`），下一轮照常判（`test_a_torrent_relinked_this_run_is_not_dropped_as_dead_in_the_same_run`：recheck 只对上
+  一半分片，改之前同一轮就摘了）。
 - **停在哪**：某次迭代没做成任何新动作 = 不动点（`fixed_point`）。到了上限还在做新动作：再扫描、诊断一次（**不执行**、
   不写审计），下一次迭代会做的列为"待做"（`cap`）；一件都没有就仍算不动点。任何一次迭代的扫描读 qBittorrent 不完整，
   执行器照旧整批拒绝（`qbit_blocker`），循环立刻停（`refused`）。预演只跑一次（`dry_run`）：动作都没执行，第二次看到的

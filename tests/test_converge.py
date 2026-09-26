@@ -471,3 +471,30 @@ def test_an_identity_pinned_from_a_model_pick_is_not_acted_on_in_the_same_run(li
 
     nxt = lib.loop()                                            # 下一轮：照钉住的认
     assert "rename_show_dir" in [r["op"] for r in nxt.applied()]
+
+
+# ------------------------------------------------------------------ 刚动过的种子：这一轮不按死种摘（critic §3.3）
+def test_a_torrent_relinked_this_run_is_not_dropped_as_dead_in_the_same_run(lib):
+    """relink 之后 recheck：校验没全过（同样大小、内容不同的分片）的种子此刻是"下载中、0 做种、0 可用"——刚校验完，
+    还没连上任何 peer。以前一轮只诊断一次，死种判定要等下一轮（6 小时后）；迭代时第二次迭代就会按死种把它摘掉
+    （critic §3.3：relink → recheck → stalledDL → 死种，6 小时缩成几秒）。这一轮暂缓，下一轮再看。"""
+    from media_agent.plugins.builtin import DeadTorrentDetector, StaleTorrentPathDetector
+    size = 734_003_200
+    s1 = lib.show("古诺希亚").season(1)
+    t = s1.single("GNOSIA - S01E08 [WebRip 1080p HEVC-10bit AAC].mkv", size=size, on_disk=False,
+                  num_complete=0, availability=0, added_hours_ago=2000)
+    s1.local("古诺希亚 S01E08.mkv", size=size)
+    real = lib.qbit._disk_progress
+    lib.qbit._disk_progress = lambda tt: 0.5 if tt["hash"] == t.hash else real(tt)   # 分片只对上一半
+
+    c = lib.loop(detectors=[StaleTorrentPathDetector, DeadTorrentDetector])
+
+    assert c.applied("relink_torrent")
+    assert lib.qbit.has(t.hash)                                  # 没摘
+    [rec] = [r for r in lib.audit(c.run_id) if r["op"] == "drop_torrent"]
+    assert rec["status"] == "skipped" and rec["reason"].startswith("刚动过的种子")
+    assert rec["touched_by"]["op"] == "relink_torrent"
+    assert [it.deferred for it in c.iterations] == [0, 1]
+
+    nxt = lib.loop(detectors=[StaleTorrentPathDetector, DeadTorrentDetector])   # 下一轮：照常按死种处置
+    assert nxt.applied("drop_torrent")
