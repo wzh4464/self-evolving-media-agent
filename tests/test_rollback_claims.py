@@ -91,6 +91,44 @@ def test_undo_rename_is_refused_when_occupancy_cannot_be_read(lib):
     assert lib.snapshot() == before
 
 
+# 2026-09-26 审查：逆改名"原名盘上已被别的文件占着"那一支（`chk.claimants` 的盘上一侧）没有测试，
+# 纯本地文件的 `cur.rename(back)` 一次都没跑过——关掉这道检查全套照样全绿，而 os.rename 会无声覆盖。
+@pytest.mark.parametrize("newcomer_name", ["[G] Yani Neko - 05.mkv", "[g] yani neko - 05.MKV"],
+                         ids=["same-name", "case-only"])
+def test_undo_rename_of_a_local_file_never_overwrites_a_file_at_the_old_name(lib, fs,
+                                                                           newcomer_name):
+    lib.configure(qbit_allow_empty=True)
+    s1 = lib.show("尼古喵喵").season(1)
+    a = s1.local("[G] Yani Neko - 05.mkv", size=GB)
+    ident_a = lib.ident(a)
+    rep = lib.apply([_rename(a, "尼古喵喵 S01E05.mkv")], run_id="fw")
+    assert len(rep.applied) == 1 and not a.exists()
+    newcomer = s1.local(newcomer_name, size=GB // 2)       # 此后有人在原名上放了另一个文件
+    ident_n = lib.ident(newcomer)
+
+    res = lib.rollback("fw")
+
+    assert res["reverted"] == 0 and res["skipped"] == 1, res
+    assert "已存在" in res["skipped_detail"][0]["skip_reason"]
+    assert lib.ident(newcomer) == ident_n
+    assert lib.ident(s1.path / "尼古喵喵 S01E05.mkv") == ident_a
+
+
+def test_undo_rename_of_a_local_file_goes_back_when_the_old_name_is_free(lib):
+    """对照：原名空着，纯本地文件按文件系统改回去。"""
+    lib.configure(qbit_allow_empty=True)
+    s1 = lib.show("尼古喵喵").season(1)
+    a = s1.local("[G] Yani Neko - 05.mkv", size=GB)
+    ident_a = lib.ident(a)
+    lib.apply([_rename(a, "尼古喵喵 S01E05.mkv")], run_id="fw")
+
+    res = lib.rollback("fw")
+
+    assert res["reverted"] == 1, res
+    assert lib.ident(s1.path / "[G] Yani Neko - 05.mkv") == ident_a
+    assert not (s1.path / "尼古喵喵 S01E05.mkv").exists()
+
+
 # ------------------------------------------------------------------ 重加种子
 def test_readd_of_a_dead_torrent_is_refused_when_its_path_is_now_claimed(lib):
     """死种被摘；之后换源抓来的新种子占了同一个名字。回退加回死种 = 两个种子争一个文件。"""
