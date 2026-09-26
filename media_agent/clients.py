@@ -230,6 +230,37 @@ class AutoBangumiClient:
         r.raise_for_status()
         return r.json()
 
+    # ---- 配置与程序（`media-agent ab-mode`，`abmode` 模块文档）----
+    def get_config(self) -> dict:
+        """整份配置（`/api/v1/config/get`）。密码类的值是 `********`——原样发回给 `update_config`，AB 按现值还原。"""
+        r = self._client.get(f"{self.base}/api/v1/config/get")
+        r.raise_for_status()
+        return r.json()
+
+    def update_config(self, config: dict) -> dict:
+        """`PATCH /api/v1/config/update`。**必须是整份配置**：AB 按 pydantic 的 `Config` 整体解析，漏掉的段退回默认值
+        （`downloader.host` 变成 `172.17.0.1:8080`、`rename_method` 变成 `pn`）。写不进去回 406。
+
+        只存盘、重载设置，不碰正在跑的线程（AB 3.2.6 `api/config.py`，`update_rss()` 是注释掉的）：开关要等
+        `restart()` 才生效。"""
+        r = self._client.patch(f"{self.base}/api/v1/config/update", json=config)
+        r.raise_for_status()
+        return r.json()
+
+    def restart(self, timeout: float = 30.0) -> dict:
+        """`GET /api/v1/restart`（GET!）：`Program.restart()` 停掉 RSS / 改名 / 偏移扫描 / 日历四个任务，再按 config.json
+        起开着的。WebUI 与接口不停。`start()` 先等下载器（最多 10 × 30 秒），请求可能超时——超时不等于没重启，
+        之后用 `status()` 看它回来没有。"""
+        r = self._client.get(f"{self.base}/api/v1/restart", timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def status(self) -> dict:
+        """`GET /api/v1/status`：`status` 为真 = 程序起来了（重启中途是 false）。它不说哪几个线程在跑。"""
+        r = self._client.get(f"{self.base}/api/v1/status")
+        r.raise_for_status()
+        return r.json()
+
 
 class AutoBangumiDB:
     """直接读 AutoBangumi 的 sqlite。写操作需先停容器（应用层持有连接）。"""

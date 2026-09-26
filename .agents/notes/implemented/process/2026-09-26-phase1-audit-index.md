@@ -90,6 +90,12 @@
 | 编号 | 是什么 |
 |---|---|
 | §0 | 生产事实（2026-09-26 只读核对）：AB 3.2.6，35 条有效订阅（`deleted=0`）、2 条停用；只有 id 37（《超超超超超喜欢你的100个女朋友》第三季）有非 0 的 `episode_offset`（-24）；35 条都对得上一个有 sidecar、sidecar 里有 `tmdb_id` 与这一季的番目录，其中 14 份没有 `mikan_id` |
+| §2.1 | 只因为 AB 也下载 / 改名才存在的规则：`orphan-torrent` 与 `missing-ab-tag`（补 `ab:` 标签——AB 的改名线程其实只按分类扫、不看标签）、`title-match-broken`（AB 按子串匹配发布名）、`source-abandoned`（AB 一条订阅锁一个字幕组）、判重的 `Bangumi` 分类让位（`pending_ownership` 与发布名复核的 holdback）、`rename-collision` 的"AB 每 60 秒重试"理由 |
+| §2.6 | 抓取给 AB 留的 24 小时宽限（87a6fa0）被删掉之后（9fe8994），两个下载者抢同一集：最近 14 天 AB 加 18 个种子、本项目加 16 个，26 次判重清理，AB 改名的每 60 秒重试（日志 1076 行只有 18 个不同的改名） |
+| §3.1 | AB 的后台任务与开关：`Program.start()` 按 `rss_parser.enable` 起 RSS 线程（拉 RSS、下载、聚合 feed 建订阅、`eps_complete`）、按 `bangumi_manage.enable` 起改名线程（含把多文件种子改到 `BangumiCollection`）；两个循环**从不回头看开关**，偏移扫描与日历两个任务总是起、只写 AB 自己的库 |
+| §3.2 | 停掉 AB 的下载与改名、留着容器与 WebUI 的做法：`GET /api/v1/config/get` → 改两个布尔 → `PATCH /api/v1/config/update` 发回**整份**（按 pydantic 的 `Config` 整体解析，漏掉的段退回默认值）→ `GET /api/v1/restart`（程序重启，不是容器重启）。核对不看 `/api/v1/status`（`_tasks_started` 不管哪几个线程起了都置真），看 `rssitem.last_checked_at` 停没停、日志里还有没有 `[Engine]` / ` >> `、qBittorrent 里有没有新的 `Bangumi` 种子。回退：两个开关改回真再重启；**AB 的 `torrent` 表按 URL 判新，暂停期间发布的条目全算新的，回来时一口气补下载** |
+| §3.4 | 两个开关都关了 AB 仍会往 qBittorrent 写的路：WebUI / 接口的订阅（`/rss/subscribe` 当场把整个 feed 补下载，落 `Bangumi` 分类；新订阅那一刻还没有 id，种子不带 `ab:` 标签）、`/rss/collect`、`/rss/refresh/all` 与 `/rss/refresh/{id}`（停用的 feed 也拉）、带 `file=true` 的订阅改 / 删 / 停用，以及 **media-agent 自己的 `refresh_all`**（`fix_title_aliases` / `repoint_rss` 之后） |
+| §4 | 各组件在"本项目是唯一的下载与改名者"之下怎么办（删 / 留 / 改）：AB 专用的规则与动作删；判重的 `Bangumi` 让位在还有种子能进 `Bangumi` 时（AB WebUI 仍用来订阅）必须留；分类交接留、只是不再每轮删 `Bangumi` 分类；`unrenamed-file` 成为唯一的改名者 |
 | §5.1 | AB 每 15 分钟拉一次全部 RSS（`rss_time=900`），media-agent 每 6 小时一轮、番组页 feed 缓存 1 小时：AB 退役之后新集最坏晚 6 小时才抓 |
 | §5.2 | AB 每 60 秒改一次名（`Bangumi` 分类里下完的）；media-agent 只在抓取当场给单视频、10 秒内拿到元数据的发布改名，其余等下一轮（6 小时） |
 | §5.3 | 新番与新季的起点（"the biggest gap"）：media-agent 没有订阅命令，扫描只登记有文件的目录，抓取要 `tmdb_id` 与非空的 `seasons`、只迭代已有的季键——在别的什么（今天是 AB）放进第一个文件之前，新番 / 新一季永远不会被抓 |
