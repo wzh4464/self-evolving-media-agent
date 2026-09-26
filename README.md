@@ -125,8 +125,8 @@ is only safe because being wrong is recoverable.**
 
 A run used to diagnose everything once and then execute: whatever an action made
 possible had to wait for the *next* run, six hours later. An AutoBangumi duplicate
-landing in the `Bangumi` category took three runs to settle (hand the category over,
-then dedupe, then rename the winner into the freed slot); a grab whose metadata
+landing in the `Bangumi` category took two runs to settle (hand the category over;
+only the next run could dedupe and rename the winner into the freed slot); a grab whose metadata
 arrived late stayed release-named for a run.
 
 Now `run` repeats scan → diagnose → execute until an iteration changes nothing new
