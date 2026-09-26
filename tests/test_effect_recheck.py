@@ -247,6 +247,41 @@ def test_recategorize_timeout_with_qbit_unreadable_is_unknown_with_undo(lib):
     assert t.view()["category"] == "Bangumi"
 
 
+@pytest.mark.allow("failed_record", match="ReadTimeout")
+def test_recategorize_timeout_before_it_took_effect_is_failed(lib):
+    """分类还是原来的：核实过没生效（复审变异 B2m：`_category_landed` 永不返回 False 全套照绿）。"""
+    s1 = lib.show(SHOW).season(1)
+    t = s1.single(RAW_11, size=700_000_000, probe=PROBE, category="Bangumi")
+    lib.qbit.fail("set_category", hash=t.hash)
+
+    rep = lib.apply([_cat(t.hash)])
+
+    [rec] = rep.failed
+    assert "没有生效" in rec["effect"] and "undo" not in rec
+    assert t.view()["category"] == "Bangumi"
+
+
+@pytest.mark.allow("unknown_record", match="addTags|add_tags|标签")
+def test_retag_that_landed_only_some_tags_is_unknown_with_undo(lib):
+    """要加两个标签、只看得到一个：部分生效——说不清（复审变异 B2l：部分也算"加上了"全套照绿）。"""
+    _, t = _one_rename(lib)
+    real = lib.qbit.add_tags
+
+    def half(hashes, tags):
+        real(hashes, tags.split(",")[0])
+        raise httpx.ReadTimeout("timed out (injected)")
+
+    lib.qbit.add_tags = half
+    f = _tag(t.hash)
+    f.action.args["tags"] = "ma:S01E11,待人挑"
+
+    rep = lib.apply([f], run_id="t-tag")
+    del lib.qbit.add_tags
+
+    [rec] = rep.unknown
+    assert rec["undo"] == {"op": "remove_tags", "torrent_hash": t.hash, "tags": "ma:S01E11,待人挑"}
+
+
 # ------------------------------------------------------------------ 隔离 / 摘种子 / 设为不下载
 def _trash(path, torrent_hash: str = "", *, file_only: bool = False, show: str = "朱音落语"):
     args = {"path": str(path), "torrent_hash": torrent_hash}
@@ -578,6 +613,49 @@ def test_dir_rename_that_cannot_see_qbit_after_moving_leaves_the_leftovers(lib):
     assert "读不到" in rec["leftovers_skipped"] and rec["leftover_files_moved"] == 0
     assert nfo.exists()
     assert lib.qbit.torrent(t.hash)["save_path"] == str(lib.path("新名") / "Season 1")
+
+
+@pytest.mark.allow("unknown_record", match="bug after setLocation")
+def test_relink_that_crashed_after_moving_is_unknown_with_the_would_be_undo(lib):
+    """setLocation 已经发出、之后读条目时冒出一个没人接的异常：通用兜底记 unknown，逆操作是动手前 `_intend`
+    登记的那一份（整个映射反过来、挪回原目录）。复审变异 B2y：去掉 `_intend`，这条就成了没有逆操作的 unknown。"""
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+
+    sh, t = _stale_moved(lib)
+    findings = lib.diagnose(detectors=[StaleTorrentPathDetector])
+    real = lib.qbit.set_location
+
+    def then_crash(hashes, location):
+        real(hashes, location)
+        lib.qbit.fail("files", hash=t.hash, exc=RuntimeError("bug after setLocation (injected)"))
+
+    lib.qbit.set_location = then_crash
+    rep = Executor(lib.context(), dry_run=False, run_id="t-crash").apply(findings)
+    del lib.qbit.set_location
+
+    [rec] = rep.unknown
+    assert rec["effects_attempted"] == ["qbit.set_location"]
+    assert rec["undo"] == {"op": "relink_torrent", "torrent_hash": t.hash,
+                           "new_save_path": str(sh.path / "Season 1"),
+                           "mapping": [{"old": GN_SLOT, "new": GN_OLD}]}
+
+
+@pytest.mark.allow("failed_record", match="重建关联")
+def test_relink_that_moved_the_dir_but_mapped_nothing_says_where_it_moved(lib):
+    """换了目录、一个映射都没改成：仍是 failed，但目录已经挪了——`relocated_from/to` 是人把它挪回去的唯一线索
+    （复审变异 X15：丢掉这两个字段全套照绿）。"""
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+
+    sh, t = _stale_moved(lib)
+    lib.qbit.fail("rename_file", hash=t.hash, times=None,
+                  exc=QBitError("torrents/renameFile -> HTTP 409: conflict", status=409))
+
+    c = lib.cycle(detectors=[StaleTorrentPathDetector])
+
+    [rec] = c.failed("relink_torrent")
+    assert rec["relocated_from"] == str(sh.path / "Season 1")
+    assert rec["relocated_to"] == str(sh.path / "Season 2")
+    assert lib.qbit.torrent(t.hash)["save_path"] == str(sh.path / "Season 2")
 
 
 def test_relink_whose_set_location_timed_out_while_moving_goes_on(lib):

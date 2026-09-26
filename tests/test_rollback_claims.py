@@ -442,3 +442,6 @@ def test_a_qbit_error_while_restoring_the_download_does_not_mark_the_restored_fi
     assert res["reverted"] == 1 and res["failed"] == 0, res
     assert res["priority_not_restored"] == 1 and "ReadTimeout" in res["notes"][0]
     assert (s1.path / "[G] Ginpachi-sensei - 02 [720p].mkv").exists()
+    # 逐步记录同样写下"没做全"的那一句（复审变异 X26：去掉 notes 全套照绿）
+    [st] = lib.audit(f"rollback-of-{c.run_id}")
+    assert st["status"] == "applied" and "ReadTimeout" in st["notes"][0]

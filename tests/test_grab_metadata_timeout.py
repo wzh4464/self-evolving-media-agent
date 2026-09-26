@@ -73,6 +73,25 @@ def test_metadata_outcome_is_recorded_when_it_arrives(lib):
     assert rec["rename"]["renamed"] == f"{SHOW} S01E12.mkv"
 
 
+def test_metadata_wait_time_is_measured(lib, monkeypatch):
+    """`waited_s` 是这一次真等了多久（复审变异 B5g：写死 0 全套照绿——上面那条的断言 0 也满足）。"""
+    import time as time_mod
+
+    from media_agent import grabber
+    real = grabber.wait_metadata
+
+    def slow(*a, **k):
+        time_mod.sleep(0.25)
+        return real(*a, **k)
+
+    monkeypatch.setattr(grabber, "wait_metadata", slow)
+    f, _ = _grab(lib)
+
+    [rec] = lib.apply([f]).applied
+
+    assert 0.2 <= rec["metadata"]["waited_s"] < 3
+
+
 def test_metadata_timeout_is_recorded_with_the_last_error(lib):
     """等满了也没拿到：记下等了多久、配置的时长、最后一次读 qBittorrent 的报错。"""
     lib.configure(grab_metadata_timeout=0.0)
