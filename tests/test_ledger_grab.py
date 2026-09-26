@@ -117,14 +117,19 @@ def test_rolling_back_a_grab_retracts_the_row(lib, show):
     assert lib.qbit.has(h)                                        # 回退抓取不动种子
 
 
-def test_a_backfilled_row_is_superseded_by_the_grab(lib, show):
-    """补录（AB 登记的）在前，抓取器后来也选中了它（409）：集位按抓取器的，加的人仍是 AB。"""
+@pytest.mark.parametrize("backfilled_slot", [None, (1, 8)], ids=["no-slot", "ab-slot"])
+def test_a_backfilled_row_is_superseded_by_the_grab(lib, show, backfilled_slot):
+    """补录（AB 登记的）在前，抓取器后来也选中了它（409）：集位按抓取器的，加的人仍是 AB。补录那一行已经有集位——
+    Re:Zero 的形态：AB 改名后按标题补录成 S01E08——抓取器的 S01E58 照样盖过它（2026-09-27 审查：以前补录都不带集位，
+    变异"保留之前的集位"全套存活）。"""
     url, h = lib.web.torrent(FYY)
     blob = lib.web.urlopen(url).read()
     lib.qbit.add_torrent(blob, save_path=str(show.path / "Season 1"), category=SHOW)
+    s, e = backfilled_slot or (None, None)
     with ledger.Ledger.open(lib.cfg.state_dir) as led:
         led.upsert_backfill(infohash=h, source=ledger.AUTOBANGUMI, mikan_title=FYY,
-                            show_dir=str(show.path))
+                            show_dir=str(show.path), season=s, episode=e)
+        assert led.get(h).slot == backfilled_slot
 
     lib.apply([grab_finding(show.path, url)])
 
