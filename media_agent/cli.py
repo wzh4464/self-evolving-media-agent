@@ -15,7 +15,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from . import runlock
+from . import __version__, runlock
 from .actions import Executor
 from .cache import Cache
 from .clients import (
@@ -436,6 +436,8 @@ def cmd_run(args, cfg) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="media-agent", description="番剧媒体库自治 agent")
+    # deploy.sh 切换完用它确认"磁盘上这份代码"是哪个版本
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--no-tmdb", action="store_true", help="跳过 TMDB 查询（省时/离线）")
     sub = p.add_subparsers(dest="cmd", required=True)
 

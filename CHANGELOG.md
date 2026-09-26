@@ -35,6 +35,24 @@
   然后打印持有者（pid、命令、开始时间）并以退出码 75（EX_TEMPFAIL）结束，什么都不做。
   锁是 `flock(2)`，进程被 kill 也会自动释放；与 `deploy.sh` 用的 `/usr/bin/lockf -k`
   互斥。此前没有任何锁：launchd 的一轮与手动命令、部署切换代码都可能同时进行。
+- **按 git tag 部署**（`deploy/deploy.sh <tag>`）：只接受已存在的发布 tag（分支、commit
+  一律拒绝）→ `git fetch --tags`（GitHub 不通可用 `--bundle`）→ **漂移闸门**：生产目录里
+  改过的已跟踪文件（打印 diff）或 tag 里没有 / 内容不同的未入库文件一律拒绝部署，
+  `--harvest` 把它们打包到 `state/harvest/` 便于带回开发机提交（`.env*`、`*.bak*` 永不入包）；
+  与 tag 内容完全相同的未入库文件交给 tag 接管 → 在独立 git worktree + 独立 venv 里
+  `uv sync --frozen`、`uv lock --check`、跑离线测试 → 持运行锁原地 `checkout --detach`、
+  `uv sync --frozen`、再跑一遍离线测试，任一步失败自动退回部署前的版本 → plist 变了才
+  `launchctl bootout/bootstrap` 重装（装不上连代码一起退回）→ 每次尝试记一行
+  `state/deploy.history`。`--check` 只验证不切换。回滚 = 部署上一个 tag。
+  兼容生产的 bash 3.2 / BSD 工具 / uv 0.7.2；同时只能有一个部署在跑。
+- `deploy/convert-to-git.sh <tag>`：一次性把手工 rsync 部署的生产目录**原地**转成 git
+  工作区（项目根由 `Path(__file__).resolve()` 定位、审计里存绝对路径，所以不搬家、
+  不用 releases 软链）。先打快照（不含 `state/` 与 `.venv`，600），克隆到临时目录、以
+  生产目录为工作区比对目标 tag：代码 / 依赖 / 规则 / 偏好有任何差异即中止且不动生产；
+  文档类差异由 tag 落地；生产独有的文件（演进笔记等）打包并标出哪些 git 里还没有；
+  之后 `uv sync --frozen`、离线测试、记 `deploy.history`，并打印原样撤销的三条命令。
+- `media-agent --version`：版本号取自源码树的 `pyproject.toml`（可编辑安装切了 tag 还没
+  sync 时，已装元数据是旧的），`deploy.sh` 切换后用它确认。
 
 ### 变更
 - **批次 ID 不再撞车**（critic N10）：由秒级 `20260926T131502` 改为
