@@ -233,6 +233,7 @@ class _Pool:
         self.media_root = Path(self.cfg.media_root)
         self.trash_root = Path(self.cfg.trash_dir)
         self.retention = float(self.cfg.trash_retention_days)
+        self.min_age = float(self.cfg.quarantine_min_age_days)
         self._sizes: dict | None = None
         self.dur_cache: dict = {}
 
@@ -286,6 +287,11 @@ def _judge(pool: _Pool, c: Candidate) -> None:
     d = c.disposition
     if d in HUMAN:
         c.why = _human_why(c)
+        return
+    if (c.age_days or 0) < pool.min_age:
+        # 不管判据多有把握：刚隔离的这一批还可能被整批回退（restore_from_trash 要它在）
+        c.why = (f"隔离才 {c.age_days:.1f} 天，不到最短隔离期 {pool.min_age:g} 天"
+                 f"（QUARANTINE_MIN_AGE_DAYS）：这一批还可能要回退")
         return
     if d == "duplicate":
         _prove_duplicate(pool, c)

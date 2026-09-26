@@ -80,3 +80,17 @@ done 之间，下一轮分别记 abandoned / 补 done；unlink 失败记 failed�
 六种类别，新记录用关口记的；死种记录里的完整文件不删；真实一轮隔离的特典 30 天后删；证明得了的判重
 `run` 等满保留期、`purge --apply` 提前放；证明不了的过了保留期留着并报出来。改前全红（`run` 那条红在
 `rmtree`）。`tests/test_purge_log.py` 的 `purge --apply` 用例从"无记录的 `.!qB`"换成过期特典。
+
+## 3. 最短隔离期 `QUARANTINE_MIN_AGE_DAYS`（默认 3 天）
+
+以前 `purge --apply` 没有任何年龄下限：一分钟前隔离的判重，只要替代者在，就照删——那一批的
+`rollback`（`restore_from_trash`）就此失效（测绘 purge.md 缺口 (d)）。现在不满最短隔离期的一律不删，
+不管判据多有把握，处置类别也不例外；保留期设得比它还短时（`TRASH_RETENTION_DAYS=1`），特典也要等满它。
+
+为什么是 3 天而不是保留期：`run` 本来就要等满保留期（第 2 节），这条只管 `purge --apply` 的提前放行，
+以及之后容量闸在空间不足时的提前放行（后续一节）——那是在"腾空间"与"留回退余地"之间取舍，
+生产 purge.jsonl 里从隔离区捞回的延迟是 0、1、17、19 天：3 天盖住前两档，更长的只能靠保留期。配置不合法（不是数字）时 `load_config` 抛错、命令以配置错误退出，不静默用默认值。
+
+**测试**：`tests/test_quarantine_disposal.py`「最短隔离期」——证明得了的判重隔离 1 天时 `purge --apply`
+不删、3.5 天时删；`TRASH_RETENTION_DAYS=1`、最短隔离期 5 天时特典 3 天不删、5.5 天删；环境变量读得到。
+改前三条红。

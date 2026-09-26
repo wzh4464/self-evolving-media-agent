@@ -70,6 +70,10 @@ class Config:
     # qBittorrent 登录成功却报 0 个种子、而媒体库里有视频时，扫描按"数据不完整"处理
     # （见 scan.build_state）。库里确实一个种子都不用的，设 QBIT_ALLOW_EMPTY=1。
     qbit_allow_empty: bool = False
+    # 隔离区里的东西至少放这么多天才可能被硬删除，不管判据多有把握（`purge` / `disposal`）。
+    # 以前 `purge --apply` 没有下限，一分钟前隔离的也照删，那一批的回退就此失效。`run` 本来
+    # 就要等满 TRASH_RETENTION_DAYS；这条管的是 `purge --apply` 的提前放行，以及保留期设得比它短时。
+    quarantine_min_age_days: float = 3.0
 
     @property
     def state_dir(self) -> Path:
@@ -118,4 +122,5 @@ def load_config(env_file: Path | None = None) -> Config:
         dead_torrent_hours=int(g("DEAD_TORRENT_HOURS", "48")),
         evolve_mode=_evolve_mode(g("EVOLVE_MODE", "off")),
         qbit_allow_empty=_bool(g("QBIT_ALLOW_EMPTY", "false")),
+        quarantine_min_age_days=float(g("QUARANTINE_MIN_AGE_DAYS", "3")),
     )

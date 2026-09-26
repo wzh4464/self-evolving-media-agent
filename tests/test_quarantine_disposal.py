@@ -283,3 +283,39 @@ def test_cmd_purge_preview_changes_nothing(lib, monkeypatch, capsys, no_rmtree):
 
     assert rc == 0 and extra.exists() and _wal(lib) == []
     assert "Tokuten" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ 最短隔离期
+def test_manual_purge_keeps_anything_younger_than_the_minimum_quarantine_age(lib, no_rmtree):
+    """刚隔离的判重即使证明得了也不删：回退（restore_from_trash）要用它。以前 `purge --apply`
+    没有任何年龄下限，一分钟前隔离的也照删——那一批就再也回退不了。"""
+    s1, good, moved = _trash_the_raw_one(lib)
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(1))
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert not c.eligible and "最短隔离期" in c.why
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p002", now=_later(3.5))
+    assert [c.trash_path for c in rep.deleted] == [moved]
+
+
+def test_minimum_age_is_configurable_and_also_binds_short_retention(lib, no_rmtree):
+    lib.configure(trash_retention_days=1, quarantine_min_age_days=5)
+    extra = legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=3)
+
+    [c] = purge.build_pool(lib.context())
+    assert c.expired and not c.eligible and "最短隔离期" in c.why
+
+    [c] = purge.build_pool(lib.context(), now=_later(2.5))
+    assert c.eligible
+    assert extra.exists()
+
+
+def test_quarantine_min_age_comes_from_the_environment(monkeypatch):
+    from media_agent.config import load_config
+
+    assert load_config().quarantine_min_age_days == 3
+    monkeypatch.setenv("QUARANTINE_MIN_AGE_DAYS", "7.5")
+    assert load_config().quarantine_min_age_days == 7.5
