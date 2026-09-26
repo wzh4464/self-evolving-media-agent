@@ -13,6 +13,16 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
+**安全与可复现。** 整改第 1 阶段：先把一条命令之遥的数据灾难堵上，再让生产行为
+可以从 git 完整复现、按 tag 部署与回滚。不改变任何抓取、改名、判重的业务口径。
+
+- 回退不会再因为空的 `trash_path` 把当前目录整个复制进媒体库再删掉（生产上 6 条记录受影响）；
+  隔离永远只处置单个文件，死种不再能搬走整个 Season 目录；qBittorrent 不可用或读不全时整轮拒绝改动。
+- 离线测试基座与 CI：测试从 3 个脚本增至 292 个，每个提交单独全绿。
+- 自演进默认冻结；跨进程运行锁；launchd 不再在运行时联网同步依赖；按 tag 部署的 `deploy.sh`。
+
 条目里的 `critic N…` / `critic §…`、`testinfra B…`、`LAT-…`、`runloop §…` 是整改前那轮只读测绘的
 编号，逐条的说明、日期与批次 ID 见
 [审计编号索引](.agents/notes/implemented/process/2026-09-26-phase1-audit-index.md)。
@@ -71,6 +81,8 @@
   `process/2026-09-26-tag-deploy-and-run-lock.md`。
 
 ### 变更
+- 生产机上的 37 篇演进笔记原样纳入版本库（`.agents/notes/`），与 28 条演进规则配套；
+  转换到 git 部署时它们与 tag 内容一致，直接由 tag 接管。
 - **批次 ID 不再撞车**（critic N10）：由秒级 `20260926T131502` 改为
   `20260926T131502.123-<pid>`。以前同一秒里起的两个执行器共用一个 ID，
   回退其中一批会把另一批一起撤掉（launchd 上 media-agent 与 vpn-watchdog 的
@@ -178,5 +190,6 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wzh4464/self-evolving-media-agent/releases/tag/v0.1.0
