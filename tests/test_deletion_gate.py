@@ -538,3 +538,81 @@ def test_i4_pinned_episode_misread_as_an_extra_is_sealed(lib):
     [skip] = rep.skipped
     assert skip["reason"].startswith("删除关口：I4")
     assert t.path.exists()
+
+
+# ------------------------------------------------------------------ drop_torrent
+from media_agent.plugins.builtin import CollidingTorrentDetector  # noqa: E402
+
+SLOT9 = "尼古喵喵 S01E09.mkv"
+
+
+def _collision(lib):
+    """穹庐下的魔女 E09 的形态：`- 09v2` 下完了，`- 09` 卡在 97.8%，两个种子指着同一个文件。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    keeper = s1.single(SLOT9, size=GB, name="[K] Yani Neko - 09v2.mkv")
+    victim = s1.torrent({SLOT9: GB + 3}, name="[V] Yani Neko - 09.mkv", layout="single",
+                        progress=0.978, state="stalledDL")
+    return s1, keeper, victim
+
+
+def test_drop_of_a_colliding_victim_still_works(lib):
+    s1, keeper, victim = _collision(lib)
+
+    c = lib.cycle(detectors=[CollidingTorrentDetector])
+
+    [drop] = c.applied("drop_torrent")
+    assert drop["deletion"]["gate"] == "passed"
+    assert drop["deletion"]["keeper"]["hash"] == keeper.hash
+    assert not lib.qbit.has(victim.hash) and lib.qbit.has(keeper.hash)
+
+
+def test_drop_is_refused_when_the_keeper_no_longer_claims_the_shared_file(lib):
+    """诊断之后保留方改了名：共享的那个路径已经不归它了，受害者也不再是"撞车"——
+    摘掉它就丢了一个也许能下完的下载，而那个路径谁也不保。"""
+    s1, keeper, victim = _collision(lib)
+    findings = lib.diagnose(detectors=[CollidingTorrentDetector])
+    lib.qbit.rename_file(keeper.hash, SLOT9, "尼古喵喵 S01E09 [v2].mkv")
+
+    rep = lib.apply(findings)
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "不再声明" in skip["reason"]
+    assert lib.qbit.has(victim.hash)
+
+
+def test_drop_is_refused_when_the_shared_file_is_gone_from_disk(lib):
+    """保留方说下完了，盘上的文件却没了（幻影）：摘掉受害者，这一集就一份都没有了。"""
+    s1, keeper, victim = _collision(lib)
+    findings = lib.diagnose(detectors=[CollidingTorrentDetector])
+    (s1.path / SLOT9).unlink()
+
+    rep = lib.apply(findings)
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "不在盘上" in skip["reason"]
+    assert lib.qbit.has(victim.hash)
+
+
+def test_drop_is_refused_when_the_shared_file_is_truncated(lib):
+    s1, keeper, victim = _collision(lib)
+    findings = lib.diagnose(detectors=[CollidingTorrentDetector])
+    with open(s1.path / SLOT9, "r+b") as fp:
+        fp.truncate(GB // 2)
+
+    rep = lib.apply(findings)
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "截断" in skip["reason"]
+
+
+def test_evolved_drop_is_refused_by_the_gate_itself(lib):
+    s1, keeper, victim = _collision(lib)
+    [f] = lib.diagnose(detectors=[CollidingTorrentDetector])
+    f.evidence["origin"] = DSL_ORIGIN
+    ex = Executor(lib.context(), dry_run=False, run_id="ev")
+
+    ex._op_drop_torrent(f, f.action)
+
+    [skip] = ex.report.skipped
+    assert skip["reason"].startswith("删除关口：") and "演进规则" in skip["reason"]
+    assert lib.qbit.has(victim.hash)

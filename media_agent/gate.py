@@ -26,6 +26,8 @@
     `SxxEyy` 没变）；要删的那个也仍然归这个集位。
   - 没点名保留方（特典、死种半成品、手写的删除）：要删的若是某个集位**唯一**的可播文件就拒绝——
     除非这是明确的特典 / 半成品处置，且它没钉 `ma:`、也没封存。
+  - `drop_torrent`（只摘记录）：撞车的受害者被摘之前，保留方此刻仍以优先级非 0 声明那个共享的
+    文件、文件在盘上、没被截断（`check_drop`）。
 - **I2 不删另一个保留着的种子仍然声明的路径**（`claims.ClaimIndex.check(disk=False)`，
   豁免这次动作自己要处置的那个种子的那个条目；本批次已摘的种子不算）。
 - **I3 不为了去掉一个文件整种子作废多文件种子**：所属种子此刻要下载的文件多于一个时，
@@ -452,3 +454,56 @@ def describe(v: Verdict, f: Finding, path: Path, h: str, t: dict | None,
 def i3_note(wanted: list[dict], entry: dict) -> str:
     return (f"I3：所属种子有 {len(wanted)} 个要下载的文件，整种子作废改为"
             f"只作废这一个条目（{entry['name']}）")
+
+
+# ------------------------------------------------------------------ drop_torrent
+def check_drop(ex, f: Finding, victim: dict) -> Verdict:
+    """摘一个种子的记录（`delete_files=False`，盘上一个字节都不动）之前的复核。
+
+    执行器已经复核过"受害者还在、没下完 / 仍是死种；保留方还在、下完了"。这里补上
+    **保留方此刻仍替那个共享的文件作保**（I1）：撞车的两个种子指着同一个文件，摘掉没下完的
+    那个，是因为完整的那份已经在盘上、由保留方做种。诊断之后保留方若改了名（不再声明那个
+    路径）、文件没了或被截断，摘掉受害者就可能让这一集一份都不剩。死种没有保留方：
+    执行器另有"没有已下完的成员文件"的复核。
+    """
+    a = f.action
+    v = Verdict(disposition_of(f))
+    why = screen(f)
+    if why:
+        v.gate, v.refused = "evolved", why
+        return v
+    h = (victim.get("hash") or "").lower()
+    v.torrent_hash = h
+    pin = parse_pin(victim.get("tags") or "")
+    v.subject = {"torrent_hash": h, "name": victim.get("name", ""),
+                 "pin": _fmt(pin) if pin else None, "tags": victim.get("tags", ""),
+                 "category": victim.get("category", ""), "torrent_files": None}
+    kh = (a.args.get("keep_hash") or "").lower()
+    if not kh:
+        return v
+    shared = a.args.get("path") or ""
+    v.keeper = {"path": shared or None, "hash": kh, "digest": None}
+    if kh in ex._removed_torrents:
+        return v.refuse("I1", f"保留方的种子 {kh[:8]} 本批次已被摘掉，它不再替那个文件作保")
+    if not shared:
+        return v
+    from .actions import _inside
+    p, bad = _inside(shared, Path(ex.cfg.media_root), "path")
+    if bad:
+        return v.refuse("I1", f"共享的路径不合法：{bad}")
+    claims = ex._claims()
+    try:
+        kt = claims.torrent(kh)
+        ke = _entry_at(kt, claims.entries(kh), p) if kt is not None else None
+    except ClaimsUnknown as e:
+        return v.fail(f"无法确认保留方的占用情况，未做任何改动：{e}")
+    if ke is None or ke.get("priority", 1) == 0:
+        return v.refuse("I1", f"保留方 {kh[:8]} 已不再声明 {p.name}（诊断之后改过名或设为不下载），"
+                              f"受害者也就不再是撞车")
+    if not os.path.lexists(p) or p.is_symlink() or not p.is_file():
+        return v.refuse("I1", f"保留方声明的 {p.name} 此刻不在盘上（幻影），摘掉受害者这一集就一份都不剩")
+    size = p.stat().st_size
+    if size < int(ke.get("size") or 0):
+        return v.refuse("I1", f"保留方的 {p.name} 盘上只有 {size} 字节，比声明的 {ke['size']} 少"
+                              f"（截断或被替换）")
+    return v

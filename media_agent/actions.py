@@ -904,6 +904,13 @@ class Executor:
         `dead=True` 是死种（dead-torrent）的用法：没有保留方，改为复核它此刻
         **仍然是死的**，且没有已下完的成员文件（那是可播的正片，还在做种）。
         """
+        from . import gate
+        refused = gate.screen(f)
+        if refused:
+            self._audit("skipped", f, a, {
+                "reason": refused,
+                "deletion": {"gate": "evolved", "disposition": gate.disposition_of(f)}})
+            return
         h = a.args["torrent_hash"]
         keep_hash = a.args.get("keep_hash", "")
         dead = bool(a.args.get("dead"))
@@ -937,10 +944,20 @@ class Executor:
                         {"reason": "作为保留方的那个种子已不完整，删了会丢内容"})
             return
 
+        # 删除关口：保留方此刻仍替那个共享的文件作保（I1）——还声明着它、它在盘上、没被截断
+        v = gate.check_drop(self, f, victim)
+        extra = v.audit()
+        if v.failed:
+            self._audit("failed", f, a, {"error": v.failed, **extra})
+            return
+        if v.refused:
+            self._audit("skipped", f, a, {"reason": v.refused, **extra})
+            return
+
         if self.dry_run:
             self._audit("skipped", f, a,
                         {"reason": "dry-run", "would_drop": victim.get("name", ""),
-                         "keep": (keeper or {}).get("name", "")})
+                         "keep": (keeper or {}).get("name", ""), **extra})
             return
 
         magnet = victim.get("magnet_uri") or a.args.get("magnet") or ""
@@ -953,7 +970,8 @@ class Executor:
                      "dropped_progress": round(victim.get("progress", 0), 3),
                      "kept": (keeper or {}).get("name", ""),
                      "files_untouched": True,
-                     **({} if magnet else {"note": "无 magnet_uri，此条不可回退"})},
+                     **({} if magnet else {"note": "无 magnet_uri，此条不可回退"}),
+                     **extra},
                     undo=self._readd_undo(victim, magnet, paths))
 
     def _claimed_paths(self, victim: dict) -> list[str]:
