@@ -291,6 +291,56 @@ def test_cap_reached_exactly_at_the_fixed_point_is_not_reported_as_pending(lib):
     assert c.outcome.stop == converge.FIXED_POINT and c.outcome.pending == []
 
 
+class _Upto3(_Chain):
+    def detect(self, ctx, state):
+        return [f for f in super().detect(ctx, state) if f.summary != "x3.mkv"]
+
+
+def test_a_rename_that_stays_blocked_is_not_pending_at_the_cap(lib):
+    """2026-09-27 审查：「集位被占」的跳过每次迭代都重试（`RETRYABLE`），所以到顶后的收尾诊断总把它列成待做——哪怕它在
+    每一次迭代里都以同样的原因被挡、最后一次迭代也没有任何动作碰过占着的那个文件。真正收敛了的一轮于是报 `loop_cap`
+    （"每轮都到顶，多半是有规则在拉锯"）；生产上长期挂着一个被占集位的库，每一轮用满迭代都会这样报。"""
+    lib.configure(qbit_allow_empty=True)
+    s1 = lib.show(SHOW).season(1)
+    s1.local("x1.mkv")
+    s1.local("a.mkv")
+    s1.local("b.mkv")
+
+    c = lib.loop(detectors=[_Upto3(), _Flip("blocked", "a.mkv", "b.mkv")], max_iterations=2)
+
+    renames = [(r["status"], r["args"]["new_name"]) for r in lib.audit(c.run_id) if r["op"] == "rename"]
+    assert renames.count(("skipped", "b.mkv")) == 2                     # 每次迭代都被挡
+    assert c.outcome.stop == converge.FIXED_POINT and c.outcome.pending == []
+
+
+def test_a_blocked_rename_whose_occupier_moved_away_is_still_pending(lib):
+    """对照：最后一次迭代把占着目标名的文件改走了（`b.mkv → c.mkv`，排在被挡的改名之后）——下一次迭代它就改得成，
+    仍然是待做。"""
+    lib.configure(qbit_allow_empty=True)
+    s1 = lib.show(SHOW).season(1)
+    s1.local("x1.mkv")
+    s1.local("a.mkv")
+    s1.local("b.mkv")
+
+    class Later:
+        id = "later"
+
+        def detect(self, ctx, state):
+            for show in state.shows:
+                for f in show.files:
+                    if f.filename == "x2.mkv":                   # 第二次迭代才提：b.mkv → c.mkv
+                        b = f.path.parent / "b.mkv"
+                        yield Finding(rule=self.id, kind="later", severity="minor", summary="b → c",
+                                      show=show.dir_name, path=str(b),
+                                      action=Action(op="rename", args={
+                                          "path": str(b), "new_name": "c.mkv", "torrent_hash": ""}))
+
+    c = lib.loop(detectors=[_Upto3(), _Flip("blocked", "a.mkv", "b.mkv"), Later()], max_iterations=2)
+
+    assert c.outcome.stop == converge.CAP
+    assert [p.action.args["new_name"] for p in c.outcome.pending] == ["b.mkv"]
+
+
 # ------------------------------------------------------------------ 预演 / 一个执行器的跨迭代状态
 def test_dry_run_iterates_once(lib):
     _ab_duplicate(lib)

@@ -220,6 +220,8 @@ class Outcome:
     findings: list[Finding] = field(default_factory=list)
     oscillations: list[Finding] = field(default_factory=list)
     pending: list[Finding] = field(default_factory=list)
+    # 到顶时仍被挡着、最后一次迭代也没碰过挡着它的东西的（「集位被占」）：下一次迭代再试也一样，不算待做
+    still_blocked: list[Finding] = field(default_factory=list)
     # 全部迭代里提过的动作（按 `key_of` 去重，先到的留下）：抓取提议了几集之类的"本轮合计"
     proposed: list[Finding] = field(default_factory=list)
     # TMDB 标题稳定闸的决定（`titles.record` 一轮只记一次：迭代之间记了，同一轮就会被数成两轮）
@@ -234,6 +236,7 @@ class Outcome:
                 "unsettled": self.unsettled,
                 "iterations": [it.to_dict() for it in self.iterations],
                 "pending_count": len(self.pending), "pending": [brief(f) for f in self.pending[:limit]],
+                "still_blocked": [brief(f) for f in self.still_blocked[:limit]],
                 "oscillations": [{**brief(f), "evidence": f.evidence} for f in self.oscillations[:limit]]}
 
 
@@ -298,15 +301,39 @@ class _Guard:
         self.tried: dict[tuple, str] = {}           # key → 结局（applied / failed / unknown / skipped）
         self.applied_at: list[tuple[int, dict]] = []  # (第几次迭代, 已执行的审计记录)
         self.reversed: set[tuple] = set()           # 拒绝过的（反向 / 暂缓）：后面的迭代不再记一遍
+        self.blocked: dict[tuple, tuple[int, dict]] = {}   # 被挡着的（`RETRYABLE`）：最近一次在哪次迭代、那条记录
 
     def note(self, recs: list[dict], n: int) -> None:
         for rec in recs:
-            if retryable(rec):
-                continue
             key = key_of(str(rec.get("op") or ""), rec.get("args"))
+            if retryable(rec):
+                self.blocked[key] = (n, rec)
+                continue
             self.tried.setdefault(key, str(rec.get("status")))
             if rec.get("status") == auditlog.APPLIED:
                 self.applied_at.append((n, rec))
+
+    def still_blocked(self, f: Finding, n: int, others: list[Finding]) -> bool:
+        """到顶后的收尾诊断：这个动作在最后一次迭代（第 `n` 次）里被挡着，而那次迭代做成的事、其余待做的事都碰不到
+        挡着它的东西（占着目标名的文件 / 声明着它的种子）——下一次迭代再试也一样被挡，不算"待做"。
+
+        以前 `RETRYABLE` 的跳过一律列成待做：长期挂着一个被占集位的库（生产审计里「目标文件名已存在」的跳过 2657 次），
+        每一轮用满迭代都报 `loop_cap`（"每轮都到顶，多半是有规则在拉锯"），而真正要做的早就做完了（2026-09-27 审查）。
+        只看"最后一次迭代也被挡"不够：AB 重复版本那一轮，分类交接之后判重（待做）才腾得出集位——碰得到挡着它的东西的
+        （判重要隔离占位的、同一次迭代里排在后面把占位的改走了的改名）仍是待做。"""
+        a = f.action
+        hit = self.blocked.get(key_of(a.op, a.args)) if a else None
+        if hit is None or hit[0] != n:
+            return False
+        paths, hashes = _blockers(a.args, hit[1])
+        touching = [rec.get("args") or {} for m, rec in self.applied_at if m == n]
+        touching += [g.action.args for g in others if g is not f and g.action]
+        undo_hashes = {str(h).lower() for m, rec in self.applied_at if m == n
+                       for h, _sp in (rec.get("undo") or {}).get("torrent_savepaths") or []}
+        if undo_hashes & hashes:
+            return False
+        return not any(str(x.get("path") or "") in paths
+                       or str(x.get("torrent_hash") or "").lower() in hashes for x in touching)
 
     def _touched(self) -> dict[str, tuple[int, dict]]:
         out: dict[str, tuple[int, dict]] = {}
@@ -357,6 +384,32 @@ class _Guard:
                 continue
             todo.append(f)
         return todo, memo, osc, deferred
+
+
+def _blockers(args: dict, rec: dict) -> tuple[set[str], set[str]]:
+    """被挡着的动作（`RETRYABLE` 的跳过记录）是被谁挡着的：路径（改名的目标、占用者声明的路径）与种子 hash。"""
+    from pathlib import PurePath
+    paths: set[str] = set()
+    hashes: set[str] = set()
+    if args.get("path") and args.get("new_name"):
+        paths.add(str(PurePath(str(args["path"])).parent / str(args["new_name"])))
+
+    def walk(x) -> None:
+        if isinstance(x, dict):
+            if x.get("path"):
+                paths.add(str(x["path"]))
+            if x.get("hash"):
+                hashes.add(str(x["hash"]).lower())
+            for v in x.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk([rec.get("claimants"), rec.get("claims")])
+    hashes.discard("")
+    return paths, hashes
 
 
 def _oscillation(f: Finding, rec: dict, first_n: int, n: int) -> Finding:
@@ -499,6 +552,8 @@ def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
                 out.stop = CAP
             else:
                 todo, it.memo, osc, it.deferred = guard.screen(findings, n + 1, select=select, write=False)
+                out.still_blocked = [f for f in todo if guard.still_blocked(f, n, todo)]
+                todo = [f for f in todo if f not in out.still_blocked]
                 it.attempted, it.reversed = len(todo), len(osc)
                 out.oscillations += osc
                 out.pending = todo

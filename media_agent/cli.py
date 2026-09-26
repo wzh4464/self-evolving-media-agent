@@ -954,6 +954,9 @@ def _print_loop(out, limit: int = 10) -> None:
             print(f"    ⏳ [{f.rule}] {f.action.op}【{f.show or '-'}】{str(f.summary)[:120]}")
         if len(out.pending) > limit:
             print(f"    …另 {len(out.pending) - limit} 个（media-agent health --json 的 loop.pending）")
+    if out.still_blocked:
+        print(f"  ⏸  {len(out.still_blocked)} 个动作每次迭代都被挡着、这一轮也没有别的动作碰得到挡着它的（下一次迭代再试"
+              f"也一样，不算待做）：" + "；".join(f"[{f.rule}] {str(f.summary)[:60]}" for f in out.still_blocked[:3]))
     for o in out.oscillations[:limit]:
         print(f"  ⚠️  两条规则在打架：{o.summary}")
 
