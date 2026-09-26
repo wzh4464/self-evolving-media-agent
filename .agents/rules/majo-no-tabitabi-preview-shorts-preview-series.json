@@ -1,0 +1,28 @@
+{
+  "id": "majo-no-tabitabi-preview-shorts-preview-series",
+  "kind": "preview_episode_unrenamed",
+  "severity": "minor",
+  "summary": "命中魔女之旅 .shorts 目录下 Airota&VCB-Studio 发布的 Preview 系列文件（现有规则均未覆盖的残余异常簇）",
+  "match": {
+    "all": [
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "魔女之旅"
+      },
+      {
+        "field": "parent_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "\\[Airota&VCB-Studio\\] Majo no Tabitabi \\[Preview\\d{2}\\]\\[Ma10p_1080p\\]\\[x265_flac\\]\\.mkv"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

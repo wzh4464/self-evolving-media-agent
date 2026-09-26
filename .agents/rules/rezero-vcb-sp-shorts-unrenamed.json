@@ -1,0 +1,28 @@
+{
+  "id": "rezero-vcb-sp-shorts-unrenamed",
+  "kind": "special_episode_unrenamed",
+  "severity": "important",
+  "summary": "识别 .shorts 目录下仍保留 VCB-Studio 原始命名且含 SP 标记的 Re:从零 特典文件",
+  "match": {
+    "all": [
+      {
+        "field": "parent_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "^\\[VCB-Studio\\].*\\[SP\\d{2}_\\d{2}\\].*\\.mkv$"
+      },
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "Re:从零开始的异世界生活"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

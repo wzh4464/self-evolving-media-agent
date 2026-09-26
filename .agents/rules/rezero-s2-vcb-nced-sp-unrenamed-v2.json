@@ -1,0 +1,33 @@
+{
+  "id": "rezero-s2-vcb-nced-sp-unrenamed-v2",
+  "kind": "special_episode_unrenamed",
+  "severity": "minor",
+  "summary": "命中 Re:Zero 第二季 [VCB-Studio] 发布的 NCED/SP 特别篇未重命名文件",
+  "match": {
+    "all": [
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "Re:从零开始的异世界生活"
+      },
+      {
+        "field": "official_title",
+        "op": "eq",
+        "value": "Re:从零开始的异世界生活"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "^\\[VCB-Studio\\] Re Zero kara Hajimeru Isekai Seikatsu 2nd Season \\[(NCED\\d+_EP\\d+|SP\\d+_\\d+)\\]"
+      },
+      {
+        "field": "parent_dir",
+        "op": "in",
+        "value": ".other,.shorts"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

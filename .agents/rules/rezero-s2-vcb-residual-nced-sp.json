@@ -1,0 +1,23 @@
+{
+  "id": "rezero-s2-vcb-residual-nced-sp",
+  "kind": "special_episode_unrenamed",
+  "severity": "minor",
+  "summary": "抓取 Re:从零开始的异世界生活第二季 VCB-Studio 残留的 NCED/SP 特典文件",
+  "match": {
+    "all": [
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "\\[VCB-Studio\\] Re Zero kara Hajimeru Isekai Seikatsu 2nd Season \\[(NCED|SP)\\d+_\\d+\\]"
+      },
+      {
+        "field": "parent_dir",
+        "op": "in",
+        "value": ".other|.shorts"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

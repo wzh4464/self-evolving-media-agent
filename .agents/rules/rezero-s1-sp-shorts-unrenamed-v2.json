@@ -1,0 +1,28 @@
+{
+  "id": "rezero-s1-sp-shorts-unrenamed-v2",
+  "kind": "special_episode_unrenamed",
+  "severity": "minor",
+  "summary": "识别 Re:从零开始的异世界生活 第一季 .shorts 目录下未按规范重命名的 SP 特典文件",
+  "match": {
+    "all": [
+      {
+        "field": "parent_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "Re:从零开始的异世界生活"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "^\\[VCB-Studio\\] Re Zero kara Hajimeru Isekai Seikatsu \\[SP0[12]_\\d{2}\\]\\[Ma10p_1080p\\]\\[x265_flac\\]\\.mkv$"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}
