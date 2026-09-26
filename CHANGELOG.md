@@ -15,6 +15,13 @@
 
 ### 新增
 - `CHANGELOG.md` 与版本约定。
+- 离线测试基座（`uv run pytest`）：按生产 qBittorrent v5.2.3 实测语义建模的
+  FakeQbit，以及 FakeWeb / FakeProbe / FakeTMDB / FakeAB / FakeLLM、
+  跑在临时 sqlite 上的真 `AutoBangumiDB`、声明式搭库的 `LibraryBuilder`。
+  测试全程断网、不起子进程、`state/` 落在临时目录、不读 `.env`；
+  tripwire 让被吞掉的失败（failed 审计、检测器异常、未配路由的请求）
+  直接判测试失败，防止假对象不完整时测试空转变绿。pytest 作为 dev 依赖；
+  新锁文件已核实生产的 uv 0.7.2 可 `sync --frozen`。
 
 ### 变更
 - 生产机上运行时生成的 28 条演进规则原样纳入版本库（`.agents/rules/`），

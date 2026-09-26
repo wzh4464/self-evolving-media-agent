@@ -24,6 +24,9 @@ media_agent/
 .agents/
   notes/          Agent Notes，路径编码 {lifecycle}/{class}/日期-标题.md
   rules/          演进出来的声明式规则（JSON），下轮自动挂载
+tests/
+  harness/        离线测试基座：FakeQbit/FakeWeb/FakeProbe/… + LibraryBuilder
+  conftest.py     自动隔离（断网、state/ 进临时目录）+ tripwire
 state/            运行时数据：审计日志、隔离区、缓存（gitignore）
 ```
 
@@ -36,7 +39,14 @@ uv run media-agent apply --dry-run    # 预演修复
 uv run media-agent apply              # 执行修复
 uv run media-agent evolve             # 为规则盲区提议新规则
 uv run media-agent run                # 完整自治轮次
+uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
+
+**改动删改类逻辑前先写离线测试。** 用 `tests/harness` 的 `LibraryBuilder`
+把事故现场搭出来（fixture 一览见 `tests/harness/__init__.py`），`lib.cycle()` 跑一轮
+扫描 → 全量规则 → 执行。测试里触发的 failed 审计、被吞的检测器异常、
+没配路由的 URL 都会让测试变红，需要时用 `@pytest.mark.allow(...)` 显式声明。
+见 [离线测试基座](.agents/notes/implemented/testing/2026-09-26-offline-test-harness.md)。
 
 ## 不可动摇的约束
 
