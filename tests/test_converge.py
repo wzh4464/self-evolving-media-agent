@@ -473,6 +473,42 @@ def test_an_identity_pinned_from_a_model_pick_is_not_acted_on_in_the_same_run(li
     assert "rename_show_dir" in [r["op"] for r in nxt.applied()]
 
 
+@pytest.mark.parametrize("llm", [False, True], ids=["no-llm", "llm"])
+def test_a_renamed_dir_keeps_the_identity_it_was_renamed_by(lib, llm):
+    """2026-09-27 审查：没钉 tmdb_id 的番，第一次迭代按旧目录名搜到条目 77，按它写 NFO、把目录改成 TMDB 标题（op 8）；
+    写 sidecar（op 10）因为目录已不在被跳过，身份没钉进去。第二次迭代按**新目录名**（就是 TMDB 标题）重新搜——同名的
+    另一个条目（重制版、真人版）让它选了 88（没开模型取第一个、开了问模型再 `pin_tmdb`），此后只有人改得了。
+    目录名是按 77 改的，身份就得跟着目录走：第二次迭代不再搜、不再问模型。"""
+    from media_agent.actions import Executor
+    from media_agent.scan import build_state
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(88, "同名", seasons={1: weekly(2, first_days_ago=9000)})
+    lib.tmdb.add_show(77, "同名", queries=["旧名字"], seasons={1: weekly(2, first_days_ago=900)})
+    sh = lib.show("旧名字")
+    for n in (1, 2):
+        sh.season(1).local(f"同名 S01E{n:02d}.mkv")
+    if llm:
+        lib.llm.when(lambda s, u: "同名" in u, {"id": 88, "confidence": 0.8, "reason": "同名"})
+    ctx = lib.context()
+    ex = Executor(ctx, dry_run=False, run_id="t001")
+    net: dict[int, list] = {}
+
+    def scan(n):
+        mark = (len(lib.tmdb.calls), len(lib.llm.prompts))
+        state = build_state(ctx)
+        net[n] = lib.tmdb.calls[mark[0]:] + lib.llm.prompts[mark[1]:]
+        return state
+
+    out = converge.run(ctx, lib.registry(), ex, scan=scan, max_iterations=3)
+
+    assert "rename_show_dir" in [r["op"] for r in ex.report.applied]
+    assert out.stop == converge.FIXED_POINT and len(out.iterations) >= 2
+    assert all(net[n] == [] for n in net if n > 1), net
+    assert (lib.sidecar("同名").tmdb_id, lib.sidecar("同名").tmdb_source) == (77, "search")
+    assert "77" in (lib.media_root / "同名" / "tvshow.nfo").read_text(encoding="utf-8")
+    assert "pin_tmdb" not in [r["op"] for r in ex.report.applied]
+
+
 # ------------------------------------------------------------------ 刚动过的种子：这一轮不按死种摘（critic §3.3）
 def test_a_torrent_relinked_this_run_is_not_dropped_as_dead_in_the_same_run(lib):
     """relink 之后 recheck：校验没全过（同样大小、内容不同的分片）的种子此刻是"下载中、0 做种、0 可用"——刚校验完，

@@ -1872,6 +1872,29 @@ class Executor:
                      "stranded_files": stranded,
                      "old_dir_removed": not old.exists(), **skipped_merge},
                     undo=undo)
+        self._carry_identity(f, new)
+
+    def _carry_identity(self, f: Finding, new: Path) -> None:
+        """目录是按哪个 TMDB 条目改的名，下一次扫描就按哪个条目认它：按新目录名记一条（旧格式的按目录名缓存，
+        `scan._search_tmdb` 最先查它）。
+
+        2026-09-27 审查：没钉 tmdb_id 的番，身份是这一轮按**旧目录名**搜到的；写 sidecar（op 10）排在目录改名（op 8）
+        之后、因为目录已不在被跳过，身份没钉进去。下一次扫描（迭代到不动点时就是几毫秒之后）按**新目录名**——也就是
+        TMDB 标题——重新搜：同名的另一个条目（重制版、真人版）让它选了别的（没开模型取第一个、开了问模型再 `pin_tmdb`），
+        而 NFO 与目录名都是按原来那个写的，此后只有人改得了。sidecar 里已经钉着的不需要这一步（扫描照 sidecar 认），
+        记了也无害。写不进缓存只说一句：最坏是下一次扫描照旧重新搜。
+
+        **只记 id，不记标题与季**：`scan._tmdb_meta` 会把带标题的旧格式条目当成元数据迁过去，记了标题，按 id 的缓存过期
+        之后它又顶上 30 天、TMDB 改了的标题迟迟看不见（稳定闸因此认不出"又给回了刚换掉的标题"）。"""
+        tid = (f.evidence or {}).get("tmdb_id")
+        if not tid:
+            return
+        from .cache import Cache
+        try:
+            Cache(self.cfg.cache_db).put_tmdb(new.name, {"id": int(tid)})
+        except Exception as e:                     # noqa: BLE001 —— 说出来；目录改名本身已经做成了
+            self.ctx.log(f"[rename_show_dir] {new.name} 的 TMDB 身份（{tid}）没记进缓存（{type(e).__name__}: {e}），"
+                         f"下一次扫描会按新目录名重新搜")
 
     def _op_trash(self, f: Finding, a: Action) -> None:
         """删除 = 移入隔离区。受配额上限保护，**动手前过删除关口**（`media_agent/gate.py`）。
