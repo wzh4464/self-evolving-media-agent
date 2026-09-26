@@ -688,9 +688,13 @@ class Executor:
         执行前重新查一次 qBittorrent，而不是信扫描时的快照：
         检测到执行之间可能过了几分钟，卡住的那个也许已经自己完成了。
         对不上就跳过——这是删除类操作，宁可白跑一趟。
+
+        `dead=True` 是死种（dead-torrent）的用法：没有保留方，改为复核它此刻
+        **仍然是死的**，且没有已下完的成员文件（那是可播的正片，还在做种）。
         """
         h = a.args["torrent_hash"]
         keep_hash = a.args.get("keep_hash", "")
+        dead = bool(a.args.get("dead"))
         if not h:
             self._audit("skipped", f, a, {"reason": "缺 torrent_hash"})
             return
@@ -704,7 +708,19 @@ class Executor:
             self._audit("skipped", f, a,
                         {"reason": "它自己已经下完了，不再是撞车的受害者"})
             return
-        if keeper is None or keeper.get("progress", 0) < 1.0:
+        if dead:
+            from .plugins.builtin import is_dead_now
+            if not is_dead_now(victim):
+                self._audit("skipped", f, a,
+                            {"reason": "它又有做种或可用副本了，不再是死种"})
+                return
+            done = [e["name"] for e in self.ctx.qbit.files(h)
+                    if e.get("priority", 1) != 0 and e.get("progress", 0) >= 1]
+            if done:
+                self._audit("skipped", f, a,
+                            {"reason": f"死种里有 {len(done)} 个已下完的文件，不自动摘"})
+                return
+        elif keeper is None or keeper.get("progress", 0) < 1.0:
             self._audit("skipped", f, a,
                         {"reason": "作为保留方的那个种子已不完整，删了会丢内容"})
             return
@@ -712,7 +728,7 @@ class Executor:
         if self.dry_run:
             self._audit("skipped", f, a,
                         {"reason": "dry-run", "would_drop": victim.get("name", ""),
-                         "keep": keeper.get("name", "")})
+                         "keep": (keeper or {}).get("name", "")})
             return
 
         # magnet 是唯一的回退凭据：删掉之后 .torrent 就没了，
@@ -726,11 +742,15 @@ class Executor:
                     "save_path": victim.get("save_path", ""),
                     "category": victim.get("category", ""),
                     "tags": victim.get("tags", ""),
-                    "name": victim.get("name", "")}
+                    "name": victim.get("name", ""),
+                    # 没有根目录（`root_path` 为空）= NoSubfolder 或单文件。
+                    # 按原布局加回来，已下的半成品才对得上；Original 重加会
+                    # 多长一层根目录，半成品全部失联。
+                    "no_subfolder": not victim.get("root_path")}
         self._audit("applied", f, a,
                     {"dropped": victim.get("name", ""),
                      "dropped_progress": round(victim.get("progress", 0), 3),
-                     "kept": keeper.get("name", ""),
+                     "kept": (keeper or {}).get("name", ""),
                      "files_untouched": True,
                      **({} if magnet else {"note": "无 magnet_uri，此条不可回退"})},
                     undo=undo)
@@ -1279,8 +1299,11 @@ class Executor:
             try:
                 # 回滚重加要保持暂停：让人先确认再放行，别一回退就开跑。
                 # 已存在（409）等同于回退成功。
+                # 旧记录没有 no_subfolder 字段：保持原来的 False（撞车受害者都是
+                # 单文件种子，布局对它们无影响）。
                 self.ctx.qbit.add_torrent(
-                    u["magnet"], paused=True, no_subfolder=False,
+                    u["magnet"], paused=True,
+                    no_subfolder=bool(u.get("no_subfolder", False)),
                     save_path=u.get("save_path") or "",
                     category=u.get("category") or "", tags=u.get("tags") or "")
             except Exception as e:

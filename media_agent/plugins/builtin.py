@@ -636,11 +636,66 @@ class RenameCollisionDetector:
 
 
 # ---------------------------------------------------------------------------
+def is_dead_now(t: dict) -> bool:
+    """此刻的**瞬时**死亡特征：没下完、没人做种、全网拼不出完整副本。
+
+    检测器与执行器（`drop_torrent` 执行前的活体复核）共用这一个判据。
+    """
+    return (t.get("progress", 0) < 1.0
+            and t.get("state") in ("stalledDL", "downloading", "metaDL")
+            and (t.get("num_complete") or 0) <= 0
+            and (t.get("num_seeds") or 0) <= 0
+            and (t.get("availability") or 0) <= 0)
+
+
+def last_sign_of_life(t: dict, now: float) -> float:
+    """最后一次"活着"的时刻：加入、收发数据、见到完整副本，三者取最晚。
+
+    以前只看 `added_on`——量的是**加入多久**，不是**停滞多久**：半年前加的、
+    一小时前还在收数据的种子也会被判死；`relink_torrent` 触发 recheck 后
+    卡在 99.8% 的老种子同样一上来就"停滞了几个月"。
+
+    `last_activity`（最后一次收发数据）/ `seen_complete`（最后一次见到完整副本）
+    按 WebAPI 文档是 Unix 时间戳；**没有逐条在生产上实测**。所以取 max：
+    字段缺失、为 0/-1、或在未来，都自动退回 `added_on`，不会比以前更激进。
+    """
+    stamps = [t.get("added_on") or 0, t.get("last_activity") or 0,
+              t.get("seen_complete") or 0]
+    return max([s for s in stamps if 0 < s <= now + 60] or [now])
+
+
+def _library_show_of(save_path: str, media_root: Path) -> str | None:
+    """种子落在哪部番的目录里；不在媒体库的番剧目录里返回 None。
+
+    与 scan 同一口径：以 `.` 开头的一级目录（`.staging` 等手动暂存区）不算。
+    """
+    sp = (save_path or "").rstrip("/")
+    root = str(media_root).rstrip("/")
+    if not sp.startswith(root + "/"):
+        return None
+    top = sp[len(root) + 1:].split("/", 1)[0]
+    return None if not top or top.startswith(".") else top
+
+
 class DeadTorrentDetector:
     """0 做种 + availability 0 + 长期停滞 = 死种，等下去也不会有进度。
 
     出处：《异世界四重奏》S02 整季 —— 所有 tracker 都报 seeds=0，
     availability=0 表示全网 peer 拼不出一份完整文件，换源也无解。
+
+    **处置只针对种子记录本身，磁盘一个字节都不动**（testinfra B1）。
+    早先的动作是 `trash{path: content_path}`，而 NoSubfolder 多文件种子
+    （本项目自己抓的种子默认就是这个布局，生产上 10 个）的 content_path 就是
+    整个 `Season N` 目录——一个死种会把整季、别的种子的文件、所有封存集位一起
+    搬进隔离区，目录的 `st_size` 还让体积配额形同虚设。同一目录下两个死种的
+    finding 又因 key 相同塌成一条（critic N7），所以这里按 hash 出 finding。
+    实际上生产 3 次死种处置都是 `freed 0`：content_path 不带 `.!qB`，
+    从来只摘了记录——现在把这一点明确下来。
+
+    另外两道收窄：
+    - **只管媒体库番剧目录里的种子**：2026-09-08 它删了 `Media/.staging/opm-oad/`
+      下三个手动暂存的种子。
+    - **有已下完的成员文件就只报告**：那是可播的正片、还在做种，"死"不等于"没用"。
     """
     id = "dead-torrent"
     kind = "dead_torrent"
@@ -650,30 +705,52 @@ class DeadTorrentDetector:
         threshold = ctx.config.dead_torrent_hours * 3600
         now = time.time()
         for t in state.torrents:
-            if t.get("progress", 0) >= 1.0:
+            if not is_dead_now(t):
                 continue
-            if t.get("state") not in ("stalledDL", "downloading", "metaDL"):
+            show = _library_show_of(t.get("save_path", ""), ctx.config.media_root)
+            if show is None:
                 continue
-            if t.get("num_complete", 0) > 0 or t.get("num_seeds", 0) > 0:
-                continue
-            if t.get("availability", 0) > 0:
-                continue
-            stalled = now - (t.get("added_on") or now)
+            stalled = now - last_sign_of_life(t, now)
             if stalled < threshold:
+                continue
+            h = t.get("hash", "")
+            try:
+                entries = ctx.qbit.files(h) if ctx.qbit else None
+            except Exception:
+                entries = None
+            if entries is None:
+                continue                  # 看不到文件列表就不下结论
+            done = [e["name"] for e in entries
+                    if e.get("priority", 1) != 0 and e.get("progress", 0) >= 1]
+            evidence = {"num_seeds": t.get("num_seeds"),
+                        "num_complete": t.get("num_complete"),
+                        "availability": t.get("availability"),
+                        "progress": t.get("progress"),
+                        "stalled_hours": round(stalled / 3600),
+                        "content_path": t.get("content_path", "")}
+            name = t.get("name", "")[:60]
+            if done:
+                yield Finding(
+                    rule=self.id, kind=self.kind, severity="important",
+                    summary=(f"死种里有 {len(done)} 个已下完的文件，自动摘种会让它们"
+                             f"失去做种，需人工决定：{name}"),
+                    show=show, torrent_hash=h,
+                    evidence={**evidence, "completed_files": done[:5]},
+                )
                 continue
             yield Finding(
                 rule=self.id, kind=self.kind, severity="important",
-                summary=f"死种（全网无完整副本，已停滞 {stalled/3600:.0f}h）：{t.get('name','')[:60]}",
-                path=t.get("content_path", ""), torrent_hash=t.get("hash", ""),
-                evidence={"num_seeds": t.get("num_seeds"),
-                          "num_complete": t.get("num_complete"),
-                          "availability": t.get("availability"),
-                          "progress": t.get("progress"),
-                          "stalled_hours": round(stalled / 3600)},
-                action=Action(op="trash", reversible=True,
-                              args={"torrent_hash": t.get("hash", ""),
-                                    "path": t.get("content_path", "")},
-                              note="删除种子；已下载的碎片进隔离区"),
+                summary=f"死种（全网无完整副本，已停滞 {stalled/3600:.0f}h）：{name}",
+                show=show, torrent_hash=h, evidence=evidence,
+                action=Action(op="drop_torrent", reversible=True,
+                              args={"torrent_hash": h, "dead": True,
+                                    "name": t.get("name", ""),
+                                    "magnet": t.get("magnet_uri", ""),
+                                    "save_path": t.get("save_path", ""),
+                                    "category": t.get("category", ""),
+                                    "tags": t.get("tags", "")},
+                              note="只摘种子记录（可凭 magnet 回退），磁盘上的文件"
+                                   "（含 .!qB 半成品）一个字节都不动"),
             )
 
 

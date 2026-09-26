@@ -147,7 +147,8 @@ class FakeQbit:
             "root_path": self._root_path(t), "download_path": "",
             "category": t["category"], "tags": ", ".join(sorted(t["tags"])),
             "state": t["state"], "progress": 1 if prog >= 1 else prog,
-            "added_on": t["added_on"], "num_seeds": t["num_seeds"],
+            "added_on": t["added_on"], "last_activity": t["last_activity"],
+            "seen_complete": t["seen_complete"], "num_seeds": t["num_seeds"],
             "num_complete": t["num_complete"], "num_leechs": 0,
             "num_incomplete": t["num_incomplete"], "availability": t["availability"],
             "magnet_uri": t["magnet_uri"], "size": wanted,
@@ -200,8 +201,15 @@ class FakeQbit:
              category: str = "", tags="", added_on: float | None = None,
              num_seeds: int = 0, num_complete: int | None = None,
              availability: float | None = None, priorities: dict[str, int] | None = None,
-             magnet_uri: str | None = None) -> dict:
-        """直接放一个种子进来（不碰磁盘；磁盘由调用方负责写）。返回内部记录。"""
+             magnet_uri: str | None = None, last_activity: float | None = None,
+             seen_complete: float | None = None) -> dict:
+        """直接放一个种子进来（不碰磁盘；磁盘由调用方负责写）。返回内部记录。
+
+        `last_activity` / `seen_complete` 是 Unix 时间戳（WebAPI 文档的语义；
+        **未经生产逐条实测**）。默认：`last_activity` = 加入时间（从没传过数据时
+        qBittorrent 报的就是加入时间），`seen_complete` = 已完成的取加入时间、
+        未完成的取 0（从未见过完整副本）。
+        """
         h = torrent_hash.lower()
         assert h not in self._t, f"hash 重复: {h}"
         pri = priorities or {}
@@ -211,6 +219,8 @@ class FakeQbit:
             "progress": progress,
             "state": state or ("stalledUP" if progress >= 1 else "downloading"),
             "added_on": int(added_on if added_on is not None else time.time() - 86400),
+            "last_activity": None if last_activity is None else int(last_activity),
+            "seen_complete": None if seen_complete is None else int(seen_complete),
             "num_seeds": num_seeds,
             "num_complete": (5 if progress >= 1 else 0) if num_complete is None else num_complete,
             "num_incomplete": 0,
@@ -220,6 +230,10 @@ class FakeQbit:
                         "progress": progress}
                        for i, (n, s) in enumerate(files.items())],
         }
+        if t["last_activity"] is None:
+            t["last_activity"] = t["added_on"]
+        if t["seen_complete"] is None:
+            t["seen_complete"] = t["added_on"] if progress >= 1 else 0
         self._t[h] = t
         self._catalog.setdefault(h, self._intrinsic(name, files))
         if category:

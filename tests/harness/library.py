@@ -117,7 +117,8 @@ class DirBuilder:
                 hash: str | None = None, probe: ProbeSpec | dict | None = None,
                 progress: float = 1.0, state: str | None = None,
                 category: str | None = None, tags: str = "",
-                added_hours_ago: float = 24, seeds: int = 0,
+                added_hours_ago: float = 24, active_hours_ago: float | None = None,
+                seeds: int = 0,
                 num_complete: int | None = None, availability: float | None = None,
                 on_disk: bool = True, priorities: dict[str, int] | None = None,
                 same_content_as: dict[str, Path] | None = None) -> TorrentHandle:
@@ -131,6 +132,8 @@ class DirBuilder:
         - `progress < 1` 时磁盘上写的是 `<文件>.!qB`；`progress == 0` 不落盘。
         - `probe`：单个 ProbeSpec（套给所有视频）或 `{相对路径: ProbeSpec}`。
         - `priorities`：`{相对路径: 0}` 表示已设为不下载（文件仍在盘上）。
+        - `active_hours_ago`：最后一次收发数据距今几小时（`last_activity`）；
+          不给则等于加入时间（从没传过数据）。
         """
         assert layout in ("original", "nosub", "single")
         if layout == "original":
@@ -144,6 +147,8 @@ class DirBuilder:
             h, name=name, save_path=self.path, files=entries, progress=progress,
             state=state, category=self.show.name if category is None else category,
             tags=tags, added_on=time.time() - added_hours_ago * 3600,
+            last_activity=(None if active_hours_ago is None
+                           else time.time() - active_hours_ago * 3600),
             num_seeds=seeds, num_complete=num_complete, availability=availability,
             priorities={e: p for e, p in pri.items() if p != 1})
         if on_disk and progress > 0:

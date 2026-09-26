@@ -63,3 +63,39 @@ sidecar；`repair` 按审计里的空 `path` 在 cwd 里 `_merge_tree`；`relink
 **测试**：`tests/test_trash_guards.py`——幻影路径、诊断后被挪走、目录、媒体库外、
 delete / set_file_priority / files 各自失败、条目认不出、搬运失败；每个都断言
 qBittorrent 与磁盘的快照不变（或如实记录）。
+
+## 3. 死种只摘它自己的记录，按停滞时长判死（testinfra B1 / critic N7）
+
+**症状（潜伏，未在生产触发）**：`DeadTorrentDetector` 的动作是
+`trash{path: content_path}`。NoSubfolder 多文件种子（本项目 `add_torrent` 默认的布局，
+生产 10 个）的 content_path 就是整个 `Season N` 目录——一个死掉的
+`[TV版&无修版] 尼古喵喵 - EP11` 会把整季、12 个种子的文件、所有封存集位搬进隔离区，
+目录 `st_size` 只有几百字节，体积配额拦不住。同一目录两个死种的 finding 因
+`key()=(kind, path)` 相同塌成一条。判死用 `now - added_on`：量的是加入多久，
+不是停滞多久。它也不分地方：2026-09-08 删了 `Media/.staging/opm-oad/` 下三个
+手动暂存的种子。
+
+**事实**：生产 3 次死种处置全是 `freed 0`——content_path 不带 `.!qB` 后缀，
+从来只摘了记录，半成品留在盘上。上一条修复之后，旧检测器对单文件死种会被跳过
+（路径不存在）、对 NoSubfolder 会被拒绝（目录），所以本条必须同时改动作。
+
+**修法**：
+- 动作改为 `drop_torrent{dead: True}`：只摘种子记录（magnet 可回退），磁盘一个字节
+  不动。finding 按 hash 出（`path` 为空），不再与同目录的其它死种撞键。
+- 判死：`is_dead_now`（没下完、无做种、availability ≤ 0）且
+  `now - last_sign_of_life ≥ DEAD_TORRENT_HOURS`，后者取 `added_on` /
+  `last_activity` / `seen_complete` 中最晚的。两个字段按 WebAPI 文档是 Unix 时间戳，
+  **未在生产逐条实测**，所以取 max：缺失或异常值自动退回 `added_on`，不会比以前激进。
+- 只管媒体库番剧目录里的种子（与 scan 同口径，`.` 开头的一级目录不算）。
+- 有已下完的成员文件就只报告、不带动作：那是可播的正片，还在做种。
+- 执行器 `drop_torrent` 的 dead 分支执行前活体复核：仍然 `is_dead_now`、仍无已完成文件。
+- 逆操作 `readd_torrent` 记下 `no_subfolder`（`root_path` 为空即是），按原布局加回，
+  半成品才对得上；旧记录没有该字段时保持原来的 False。
+
+**遗留**：死种的 `.!qB` 半成品仍留在盘上（与生产一直以来的实际效果相同），
+清理它们需要"只搬本种子自己的、未被别的种子认领的文件"，留到统一删除闸门那一期。
+
+**测试**：`tests/test_dead_torrent.py`——NoSubfolder 季目录里一个死种不连累兄弟
+（且 `converge` 收敛）、同目录两个死种都处理、老但近期活跃的不算死、刚见过完整
+副本的不算死、`.staging` 与库外种子不管、有已完成成员只报告、执行前复核、回退
+保持布局、48h 阈值按 last_activity 计。
