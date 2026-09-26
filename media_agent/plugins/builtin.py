@@ -590,6 +590,14 @@ class DuplicateEpisodeDetector:
                 siblings = [l for l in losers
                             if l.torrent_hash and l.torrent_hash == keeper.torrent_hash]
                 losers = [l for l in losers if l not in siblings]
+                kd = content_digest(keeper.path, cache)
+                # 删除关口复核用的保留方与集位（`media_agent/gate.py` 的 I1 / I4）：执行那一刻
+                # 保留方还在不在、下完没有、是不是还归这一集，只有点名了才查得了。以前只给
+                # `{path, torrent_hash}`，`_op_trash` 从不看保留方——保留方是幻影、被截断、
+                # 或同批先被删掉时，输家照删，这一集就从库里消失了。
+                keep = {"slot": [season, ep], "keep_path": str(keeper.path),
+                        "keep_hash": keeper.torrent_hash, "keep_size": keeper.size,
+                        "keep_digest": kd}
                 for sib in siblings:
                     yield Finding(
                         rule=self.id, kind="bundled_version", severity="important",
@@ -604,13 +612,12 @@ class DuplicateEpisodeDetector:
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(sib.path),
                                             "torrent_hash": sib.torrent_hash,
-                                            "file_only": True,
+                                            "file_only": True, **keep,
                                             **({"phantom": True} if id(sib) in phantoms
                                                else {})},
                                       note="合并发布的另一版本：设为不下载并移入隔离区"),
                     )
 
-                kd = content_digest(keeper.path, cache)
                 for loser in losers:
                     ld = content_digest(loser.path, cache)
                     identical = bool(kd and ld and kd == ld)
@@ -634,9 +641,16 @@ class DuplicateEpisodeDetector:
                             "reason": ("字节完全相同" if identical
                                        else reason or "同集不同版本，按画质取舍"),
                         },
+                        # 输家一律 `file_only`：它若在多文件合集里（3年Z组银八老师
+                        # [01-12]），整种子作废会让其余集跟着失去做种、回退加不回来——
+                        # 生产审计 63 条 duplicate-episode 的整种子作废就是这么来的。
+                        # 种子只有这一个文件时，执行器自己退回整种子作废（删除关口 I3）。
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(loser.path),
                                             "torrent_hash": loser.torrent_hash,
+                                            **({"file_only": True} if loser.torrent_hash
+                                               else {}),
+                                            **keep,
                                             **({"phantom": True} if phantom else {})},
                                       note=("幻影：只摘种子记录（可凭 magnet 回退）" if phantom
                                             else "移入隔离区，保留期内可恢复")),
