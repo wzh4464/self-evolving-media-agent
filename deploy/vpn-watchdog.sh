@@ -96,7 +96,11 @@ with_runlock() {
     if [ -x /usr/bin/lockf ]; then                          # macOS（生产）
         /usr/bin/lockf -k -s -t "${wait}" "${file}" "$@"
     elif command -v flock >/dev/null 2>&1; then             # Linux
-        ( exec 9>>"${file}" || exit 75; flock -w "${wait}" 9 || exit 75; "$@" )
+        # 命令以 9>&- 启动：锁只由这一层子 shell 持有。子孙进程若继承了 fd 9，任何一个孤儿
+        # （比如 bounded 的计时子 shell 被杀后留下的 sleep）都会在看门狗退出后继续占着锁——
+        # 2026-09-26 CI 的 Ubuntu 上正是这样：compose 超时、看门狗已退出，锁却还被占着。
+        # macOS 的 lockf 不把锁描述符交给子进程，生产走那条路，不受影响。
+        ( exec 9>>"${file}" || exit 75; flock -w "${wait}" 9 || exit 75; "$@" 9>&- )
     else
         python3 -c '
 import fcntl, os, subprocess, sys, time
