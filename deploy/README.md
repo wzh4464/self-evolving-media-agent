@@ -27,7 +27,7 @@
 | `.agents/rules/`、`.agents/notes/` | git（tag） | 演进规则与 Agent Notes |
 | `.env` | 只在生产（600） | 凭据与开关；`.env.*`（含 `.env.bak-*`）被忽略 |
 | `.venv/` | 只在生产 | 由部署用 `uv sync --frozen` 维护，运行时不再同步 |
-| `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`backups/`、`harvest/` |
+| `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`deploy.log`、`backups/`、`harvest/` |
 | 各番目录里的 `.media-agent.json` | 媒体根下 | 每部番的用户意图，不归部署管，见下节 |
 
 ## 用户意图放在哪
@@ -118,6 +118,19 @@ deploy/deploy.sh v0.2.0
 
 同一时刻只能有一个 `deploy.sh` 在跑（`state/deploy.lock`）。脚本启动时先把自己复制一份再执行，
 所以 checkout 改写 `deploy/deploy.sh` 本身不会影响正在跑的这一次。
+
+**被打断了怎么办。** 建议在 `tmux` 里跑部署（`tmux new -s deploy`），断线后 `tmux attach` 回来看。
+不用 tmux 也不会停在半路：
+
+- **ssh 断线（SIGHUP）**：整个部署忽略 HUP，照常走完——成功记 `ok`，失败照常自动退回。全部输出
+  同时追加到 `state/deploy.log`（经 `tee` 转一道，终端没了子进程也不会因为写不出去而失败），
+  重新连上来 `tail -50 ~/media-agent/state/deploy.log` 看结局。
+- **Ctrl-C / SIGTERM**：切换开始之前（闸门、暂存验证）直接退出，生产目录没动；切换开始之后
+  **自动退回**部署前的版本，`deploy.history` 记 `reverted`、说明写「被信号中断」。
+- **旧版本脚本被杀留下的现场**（HEAD 已是新 tag、venv 与 plist 还是旧的）：再跑一次同一个 tag
+  即可。`HEAD == tag` 不再被当成"已经部署过"——只有 `deploy.history` 里最近一次动过生产目录的
+  记录（`ok / converted / reverted / revert-failed`）正是这个 commit 的 `ok` 或 `converted` 时才短路，
+  否则照常走一遍，依赖、测试、launchd 配置都重新落实（对完好的目录这一遍是幂等的）。
 
 **GitHub 不通时**用 bundle 带 tag 过去：
 

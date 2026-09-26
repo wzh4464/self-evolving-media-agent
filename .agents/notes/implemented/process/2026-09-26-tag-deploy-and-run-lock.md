@@ -55,3 +55,30 @@
   逐字节复原）→ 闸门拦下 37 篇笔记 → 入库打 tag → 部署 → 回滚到 v0.1.0 → 再部署 →
   bundle 部署；另测了锁超时、原地失败自动退回、偏好被改时的 diff 与 harvest、坏发布在
   暂存阶段被拦下。全程没有碰真生产。
+
+## 审查后的补丁（2026-09-26）
+
+### 部署被打断：不停在半路，重跑能补齐
+
+**症状（审查在沙盒里复现，/bin/bash 3.2 + 真 lockf + 替身 uv / launchctl）**：切换阶段只装了
+`trap ': > "$LOCK"' EXIT`。ssh 断线（SIGHUP）或 Ctrl-C 打在原地 `uv sync --frozen` / 离线测试上，
+切换直接被杀、不调 `revert`、不写 `deploy.history`：HEAD 已是新 tag，venv 还是旧锁文件装的，
+plist 没换，`ma-*` 临时文件泄漏（rc=129）。再跑 `deploy.sh <同一个 tag>`，`SHA == PREV` 的短路
+报「已经是 v1.1.0，无需部署」并返回 0——venv 与 plist 永远补不上。下一次升级时新 plist 直接跑
+`.venv/bin/media-agent`、不再同步依赖，某个 tag 一旦新增依赖，每一轮 launchd 都会失败，而运维者
+被告知"部署完成"。
+
+**修法**：
+- 脚本开头 `trap '' HUP`：lockf、git、uv、pytest 一路继承，断线不再杀掉任何一步。
+- 最外层把全部输出经 `tee -a state/deploy.log` 转一道：终端没了之后子进程写的是管道，不会因为
+  EIO 失败；日志留下这次部署的结局。
+- 切换阶段在第一次动生产目录之前装 `trap 'revert "被信号中断（INT/TERM）"' INT TERM`，`revert`
+  自身先屏蔽 INT/TERM；`record ok` 之前撤掉这个 trap。
+- 短路改为看 `deploy.history`：最近一次动过生产目录的记录（`ok / converted /
+  converted-tests-failed / reverted / revert-failed`）是这个 commit 的 `ok` 或 `converted` 才算
+  "已经是"；否则照常重走（HEAD 已在目标 commit 时 checkout 是空操作，sync / 测试 / plist 幂等）。
+
+**测试**：`tests/test_deploy_scripts.py`——对整个进程组发 `kill -HUP 0`（`start_new_session`，
+不波及 pytest）后部署照常完成、`deploy.log` 里有结局、临时文件清理；`kill -INT 0` 自动退回并记
+「中断」；手工造出"HEAD 已是新 tag、其余是旧的"的现场后重跑同一 tag 会补齐；转换后与成功部署后
+重跑仍是空操作。沙盒 fixture 补上了 `convert-to-git.sh` 会写的那行 `converted`。

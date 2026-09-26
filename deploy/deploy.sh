@@ -18,6 +18,12 @@
 # LAUNCHCTL LAUNCH_AGENTS_DIR MA_LAUNCHD_LABEL DEPLOY_TEST_CMD LAUNCHD_BOOTSTRAP_TRIES
 set -u
 set -o pipefail
+# ssh 断线（SIGHUP）不许把部署腰斩在半路。以前只有切换阶段的 `trap … EXIT`：断线打在
+# 原地 `uv sync` / 离线测试上，HEAD 已是新 tag、venv 还是旧锁文件装的、plist 没换、
+# deploy.history 一行没有（2026-09-26 审查复现，rc=129）。忽略 HUP 会被 lockf、git、uv、
+# pytest 一路继承——一旦开始，要么完整做完，要么完整退回。Ctrl-C / SIGTERM 仍然有效：
+# 主阶段直接退出（此时生产目录还没动），切换阶段则自动退回（见 switch_phase）。
+trap '' HUP
 # macOS 的 tar 默认给带扩展属性的文件多打一个 ._文件（AppleDouble）；
 # 打包带回开发机的东西解开后会多出一堆 ._ 垃圾文件。
 export COPYFILE_DISABLE=1
@@ -292,6 +298,10 @@ switch_phase() {
     done
     [ -f "$AGENTS_DIR/$PLIST_NAME" ] && cp -p "$AGENTS_DIR/$PLIST_NAME" "$BK/"
 
+    # 从这里开始动生产目录。Ctrl-C / SIGTERM 一律自动退回（HUP 在脚本开头就忽略了）：
+    # 被打断的切换不能停在"新代码 + 旧 venv + 旧 plist"上。
+    trap 'revert "被信号中断（INT/TERM）"' INT TERM
+
     # 与目标 tag 内容完全相同的未入库文件：先挪开，否则 checkout 拒绝覆盖。
     # 切换失败要退回去时从这个包里放回来（旧 tag 不跟踪它们，checkout 会把它们删掉）。
     if [ -s "$REPLACE_LIST" ]; then
@@ -310,6 +320,7 @@ switch_phase() {
     run_tests "$APP" || revert "原地离线测试"
     install_plist || revert "安装 launchd 配置"
 
+    trap - INT TERM                   # 已经完整切换，此后的中断不该再退回
     record ok "from $PREV_DESC"
     local ver
     if ver=$("$APP/.venv/bin/media-agent" --version 2>/dev/null); then
@@ -321,7 +332,9 @@ switch_phase() {
     else
         say "✅ 已部署 ${TAG}（$(g rev-parse --short HEAD)）（这个版本还没有 media-agent --version）"
     fi
-    if printf '%s' "$PREV_DESC" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+    if [ "$PREV" = "$SHA" ]; then
+        say "   （在同一版本上补齐了部署；回滚到更早的版本见 state/deploy.history）"
+    elif printf '%s' "$PREV_DESC" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
         && g rev-parse -q --verify "refs/tags/$PREV_DESC" >/dev/null; then
         say "   回滚：deploy/deploy.sh $PREV_DESC"
     else
@@ -330,8 +343,10 @@ switch_phase() {
     exit 0
 }
 
+
 revert() {
     local why=$1 ok=1
+    trap '' INT TERM                  # 退回本身不能再被打断
     warn "$why 失败，退回 ${PREV_DESC}（${PREV}）"
     g -c advice.detachedHead=false checkout -q -f --detach "$PREV" || ok=0
     if [ -f "$BK/replaced-untracked.tgz" ]; then
@@ -359,6 +374,12 @@ fi
 # 先把自己拷一份再执行：切换会原地改写 deploy/deploy.sh，bash 是边读边执行的。
 # 同时拿 state/deploy.lock，两个部署不会交错。
 if [ -z "${_MA_DEPLOY_COPY:-}" ]; then
+    # 全部输出同时追加到 state/deploy.log。ssh 断线之后终端没了，子进程再往终端写会
+    # 拿到 EIO（uv / pytest 可能因此失败）；经 tee 转一道，子进程写的是管道，tee 写终端
+    # 失败只报一句、照样把日志写完。重新连上来看 state/deploy.log 就知道这次部署的结局。
+    printf '\n===== %s deploy.sh %s =====\n' "$(now_iso)" "${ORIG_ARGS[*]}" \
+        >> "$APP/state/deploy.log" 2>/dev/null || true
+    exec > >(tee -a "$APP/state/deploy.log") 2>&1
     copy=$(mktemp "${TMPDIR:-/tmp}/media-agent-deploy.XXXXXX") || die "mktemp 失败"
     cp "$0" "$copy" || die "复制部署脚本失败"
     export _MA_DEPLOY_COPY=$copy
@@ -410,9 +431,27 @@ PREV_DESC=$(printf '%s' "$PREV_DESC" | tr '/' '_')
 
 say "   当前：${PREV_DESC}（${PREV}）"
 say "   目标：${TAG}（${SHA}）"
+
+# 最近一次**动过生产目录**的部署记录（drift / stage-failed / checked / lock-timeout /
+# busy 都没动过，不算）：打印 "<目标 commit> <结果>"。
+last_effective() {
+    [ -f "$HISTORY" ] || return 0
+    awk -F'\t' '$5 ~ /^(ok|converted|converted-tests-failed|reverted|revert-failed)$/ \
+        { r = $3 " " $5 } END { if (r != "") print r }' "$HISTORY"
+}
+
+# HEAD 已经指向目标 tag 不等于部署成功过：切换阶段被杀掉（旧版本没有信号处理）时，
+# HEAD 停在新 tag、venv 与 plist 还是旧的。只有 deploy.history 最近一次动过生产目录的
+# 记录就是这个 commit 的成功部署（或转换）时才短路；否则照常走一遍，把依赖、测试、
+# launchd 配置重新落实——对已经完好的目录，这一遍是幂等的。
 if [ "$SHA" = "$PREV" ] && [ "$MODE" = deploy ]; then
-    say "✅ 已经是 ${TAG}，无需部署"
-    exit 0
+    case "$(last_effective)" in
+        "$SHA ok"|"$SHA converted")
+            say "✅ 已经是 ${TAG}，无需部署"
+            exit 0 ;;
+    esac
+    say "   HEAD 已是 ${TAG}，但 deploy.history 里没有它部署成功的记录（上次部署可能中途被打断）："
+    say "   照常走一遍，把依赖、测试、launchd 配置重新落实"
 fi
 
 # ------------------------------------------------------------------ 漂移闸门

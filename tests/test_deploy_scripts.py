@@ -146,10 +146,12 @@ class Sandbox:
     env: dict
     bash: Path
 
-    def run(self, script: Path, *args: str, **env) -> subprocess.CompletedProcess:
+    def run(self, script: Path, *args: str, new_session: bool = False,
+            **env) -> subprocess.CompletedProcess:
         e = {**self.env, **{k: str(v) for k, v in env.items()}}
         return subprocess.run([str(self.bash), str(script), *args], env=e,
-                              capture_output=True, text=True, cwd=self.root)
+                              capture_output=True, text=True, cwd=self.root,
+                              start_new_session=new_session)
 
     def deploy(self, *args: str, **env) -> subprocess.CompletedProcess:
         return self.run(DEPLOY, *args, **env)
@@ -235,6 +237,10 @@ def sandbox(tmp_path, upstream, tools) -> Sandbox:
     _write(app / ".env", "QBIT_PASS=synthetic\n", 0o600)
     _write(app / "state" / "audit.jsonl", '{"run_id": "20260920T170126"}\n')
     _write(agents / f"{LABEL}.plist", (app / "deploy" / f"{LABEL}.plist").read_text())
+    # convert-to-git.sh 在转换结束时写的那一行（部署判断"已经是这个版本"要认它）
+    _write(app / "state" / "deploy.history",
+           f"2026-09-26T00:00:00+0800\tv1.0.0\t{sb.tag_sha('v1.0.0')}\tpre-git\tconverted\t"
+           "snapshot=synthetic\n")
     return sb
 
 
@@ -294,9 +300,72 @@ def test_unchanged_plist_is_left_alone(sandbox):
 
 
 def test_already_deployed_is_a_no_op(sandbox):
+    before = sandbox.history()
     r = sandbox.deploy("v1.0.0")
     assert r.returncode == 0 and "已经是 v1.0.0" in r.stdout
-    assert sandbox.history() == []
+    assert sandbox.history() == before
+
+
+def test_already_deployed_after_a_successful_deploy_is_a_no_op(sandbox):
+    assert sandbox.deploy("v1.1.0").returncode == 0
+    n = len(sandbox.history())
+
+    r = sandbox.deploy("v1.1.0")
+
+    assert r.returncode == 0 and "已经是 v1.1.0" in r.stdout
+    assert len(sandbox.history()) == n
+
+
+# ------------------------------------------------------------------ 中途被打断
+# 审查复现（2026-09-26）：switch 阶段只装了 `trap … EXIT`。ssh 断线（SIGHUP）或 Ctrl-C
+# 打在原地 `uv sync` / 离线测试上，切换直接被杀：HEAD 已是新 tag、venv 还是旧锁文件装的、
+# plist 没换、deploy.history 一行没有、临时文件泄漏。再跑同一个 tag，`SHA == PREV`
+# 的短路报「已经是 v1.1.0，无需部署」并返回 0——venv 与 plist 永远不会被补上。
+_IN_PLACE = 'case "$PWD" in *media-agent-stage*) ;; *) {} ;; esac; test -x .venv/bin/media-agent'
+
+
+def test_hangup_during_the_in_place_switch_does_not_kill_it(sandbox):
+    """ssh 断线：整个进程组收到 SIGHUP。部署要么完整做完，要么完整退回，不能停在半路。"""
+    r = sandbox.deploy("v1.1.0", new_session=True,
+                       DEPLOY_TEST_CMD=_IN_PLACE.format("kill -HUP 0"))
+
+    assert r.returncode == 0, _out(r)
+    assert sandbox.head() == sandbox.tag_sha("v1.1.0")
+    assert sandbox.history()[-1][4] == "ok"
+    assert "--v11" in sandbox.installed_plist()
+    log = (sandbox.app / "state" / "deploy.log").read_text(encoding="utf-8")
+    assert "已部署 v1.1.0" in log                             # 终端没了也看得到结果
+    assert not list((sandbox.root / "tmp").glob("ma-*"))       # 临时文件照常清理
+
+
+def test_interrupt_during_the_in_place_switch_reverts(sandbox):
+    """Ctrl-C / SIGTERM 打在原地测试上：自动退回部署前的版本，并记下来。"""
+    before = sandbox.fingerprint()
+
+    r = sandbox.deploy("v1.1.0", new_session=True,
+                       DEPLOY_TEST_CMD=_IN_PLACE.format("kill -INT 0"))
+
+    assert r.returncode != 0
+    assert sandbox.head() == sandbox.tag_sha("v1.0.0")
+    assert sandbox.fingerprint() == before
+    assert sandbox.history()[-1][4] == "reverted" and "中断" in sandbox.history()[-1][5]
+    assert "--v11" not in sandbox.installed_plist()
+
+
+def test_rerun_after_an_interrupted_switch_redoes_the_switch(sandbox):
+    """旧脚本被杀后的现场：HEAD 已是新 tag，venv / plist / history 都停在旧版本。
+    重跑同一个 tag 不能只看 HEAD 就说"已经是"。"""
+    sandbox.git("-c", "advice.detachedHead=false", "checkout", "-q", "--detach", "v1.1.0")
+    (sandbox.root / "uv.log").write_text("")
+
+    r = sandbox.deploy("v1.1.0")
+
+    assert r.returncode == 0, _out(r)
+    assert "已经是" not in r.stdout
+    assert f"{sandbox.app} uv sync --frozen" in (sandbox.root / "uv.log").read_text()
+    assert "--v11" in sandbox.installed_plist()
+    assert sandbox.history()[-1][1:5] == ["v1.1.0", sandbox.tag_sha("v1.1.0"),
+                                         sandbox.tag_sha("v1.1.0"), "ok"]
 
 
 def test_check_mode_stages_but_does_not_switch(sandbox):
