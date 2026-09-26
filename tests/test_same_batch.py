@@ -11,8 +11,11 @@ rename（op 6）之前。判重把发布名输家整种子作废后，unrenamed-
 """
 from __future__ import annotations
 
+import pytest
+
 from harness import video
 from media_agent.kernel import Action, Finding
+from media_agent.plugins.builtin import UnrenamedDetector
 
 LOLI_08 = "[LoliHouse] Yani Neko - 08 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv"
 ABEMA_08 = "[Dynamis One] Yani Neko - 08 (ABEMA 1920x1080 AVC AAC MKV).mkv"
@@ -94,3 +97,56 @@ def test_downloading_file_not_on_disk_yet_is_still_renamed(lib):
 
     assert c.applied("rename")
     assert lib.qbit.file_names(t.hash) == ["尼古喵喵 S01E08.mkv"]
+
+
+# ------------------------------------------------------------------ 各道闸单独的现场
+# 上面 B2 原样那条，输家的路径同时也在 `_trashed_paths` 里：删掉 `_removed_torrents`
+# 那道检查，"文件本批次已移入隔离区"照样满足 `"本批次" in reason`，测试仍绿
+# （审查变异：h5_rename_removed_off / h5_drop_add_removed_off 都存活）。
+# 下面每条只让一道闸有机会拦住它。
+
+def test_rename_of_a_torrent_dropped_as_dead_earlier_in_the_batch_is_skipped(lib):
+    """drop_torrent（op 1）摘掉死种、没有搬任何文件；它的改名（op 6）只能靠
+    `_removed_torrents` 认出来，否则去问已删种子的 `files()`——404。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    dead = s1.torrent({"[A] Yani Neko - 11 [1080p].mkv": 600_000_000},
+                      name="[A] Yani Neko - 11 [1080p].mkv", layout="single",
+                      progress=0.4, state="stalledDL", added_hours_ago=24 * 30,
+                      num_complete=0, availability=0)
+
+    c = lib.cycle()
+
+    [drop] = c.applied("drop_torrent")
+    assert drop["args"]["torrent_hash"] == dead.hash
+    [skip] = [r for r in c.skipped("rename") if r["args"]["torrent_hash"] == dead.hash]
+    assert "本批次" in skip["reason"] and "移除" in skip["reason"]
+    assert not c.failed()
+
+
+@pytest.mark.allow("qbit_error", match="404")
+def test_rename_of_a_torrent_deleted_outside_the_batch_is_skipped_not_failed(lib):
+    """诊断之后、执行之前有人手动删了种子：`files()` 404 是状态变了，不是规则错了。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    t = s1.single(LOLI_08, size=593_601_176)
+    findings = lib.diagnose(detectors=[UnrenamedDetector])
+    lib.qbit.delete([t.hash], delete_files=False)
+
+    rep = lib.apply(findings)
+
+    [skip] = rep.skipped
+    assert "已不在 qBittorrent" in skip["reason"]
+    assert not rep.failed and (s1.path / LOLI_08).exists()
+
+
+def test_rename_of_a_local_file_that_vanished_after_diagnose_is_skipped(lib):
+    lib.configure(qbit_allow_empty=True)             # 纯本地文件的库
+    s1 = lib.show("尼古喵喵").season(1)
+    loose = s1.local("[ZRaw] Yani Neko - 08 [1080p].mkv", size=700_000_000)
+    findings = lib.diagnose(detectors=[UnrenamedDetector])
+    loose.unlink()
+
+    rep = lib.apply(findings)
+
+    [skip] = rep.skipped
+    assert "不在原位" in skip["reason"]
+    assert not rep.failed
