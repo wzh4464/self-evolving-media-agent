@@ -99,3 +99,41 @@ qBittorrent 与磁盘的快照不变（或如实记录）。
 （且 `converge` 收敛）、同目录两个死种都处理、老但近期活跃的不算死、刚见过完整
 副本的不算死、`.staging` 与库外种子不管、有已完成成员只报告、执行前复核、回退
 保持布局、48h 阈值按 last_activity 计。
+
+## 4. qBittorrent 不可用或读不全时整轮 fail closed（critic N2 / N3 / LAT-01）
+
+**症状（生产已发生）**：`build_context` 登录失败只打一行警告，`ctx.qbit=None`
+照样执行。扫描看到 0 个种子，每个有种子的文件都成了"纯本地文件"：改名走被禁止的
+文件系统分支，隔离跳过种子处理。2026-09-19 run 20260919T225410（登录超时）把
+`朱音落语/Season 1/朱音落语 S01E12.mp4` 以 `torrent_hash ""` 移进隔离区——它归种子
+d08f05a7；下一轮 20260920T170126 又把那个种子的记录删了（`freed 0`）。
+离线复现一字不差：同一现场 qBit 断开后，执行器 applied 了一条无 hash 的 trash
+和两条 `via: filesystem` 的改名。
+
+更隐蔽的一半：`scan._torrent_files` 把任何 `files()` 错误缓存成 `[]`，那个种子的
+文件就无声地变成无主文件。每轮约 539 次调用，一次 WebUI 超时就够。
+`rollback` / `repair` / `purge --apply` 也不看 qBit：逆改名退化成 `Path.rename`，
+`repair` 用 `_merge_tree` 搬活种子的文件，purge 丢掉种子证据后判定偏松。
+
+**修法**：
+- `build_state` 把 qBit 不可用、`torrents()` 失败、任一 `files()` 失败都记进
+  `LibraryState.qbit_errors`（`ctx.qbit_errors` 指向同一列表）；`files()` 失败不再
+  缓存成空列表；`torrents()` 失败不再让扫描崩掉——照常扫完磁盘，诊断仍可看。
+- `Executor.qbit_blocker()`：qBit 为 None 或 `qbit_errors` 非空 → `apply` 整批拒绝
+  （`ExecReport.refused`，不逐条写审计——一个都没尝试）；`rollback` / `repair` 同样拒绝，
+  且拒绝时**不写** rollback 汇总记录（否则 `list_runs` 会把这批标成已回退）。
+- 纵深防御：`_op_rename` / `_op_trash` 带 hash 而 qBit 不在 → 跳过；逆改名在种子里
+  找不到文件时不再退化成文件系统改名（AGENTS.md 第 3 条对回退同样成立）。
+- CLI：`run` / `apply` / `rollback` / `repair` / `purge --apply` / `evolve` 被拒时
+  stdout 与 stderr 各打一行 `⛔ 拒绝执行任何改动：…`，退出码 `EXIT_DEGRADED=3`
+  （以前 `run` 永远返回 0，launchd 看不出异常）。降级的 `run` 不修、不演进、
+  不做隔离区的时间清理；apply 之后的演进重扫若读不全，跳过演进并以 3 退出。
+  `scan` / `diagnose` 打一行"数据不完整，结论不可作为改动依据"。
+
+**遗留**：`torrents()` **成功但返回空或残缺列表**（qBit 刚启动）目前识别不了。
+需要与上一轮的种子数做合理性比对，而那要一份跨轮持久化的健康记录与阈值策略
+（合法的大批量删种不能永久卡死后续轮次），归入下一期的每轮健康摘要。
+
+**测试**：`tests/test_qbit_fail_closed.py`——对照组确认现场会产生改名与隔离；
+qBit 断开、单个 `files()` 超时、`torrents()` 超时三种形态下整轮快照不变；
+回退 / repair 拒绝；逆改名不退化；CLI 各命令的退出码与提示；演进重扫残缺时跳过演进。

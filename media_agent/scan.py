@@ -32,8 +32,16 @@ def _iter_files(show_dir: Path) -> list[Path]:
     return out
 
 
-def _torrent_files(ctx: Context, torrent_hash: str) -> list[dict]:
-    """取种子的文件列表。单次扫描内按 hash 缓存，避免同一种子重复请求。"""
+def _torrent_files(ctx: Context, torrent_hash: str, errors: list[str]) -> list[dict]:
+    """取种子的文件列表。单次扫描内按 hash 缓存，避免同一种子重复请求。
+
+    **读失败必须记下来，不能缓存成空列表。** 以前任何 `files()` 错误都被吞成 `[]`：
+    这个种子的文件于是不算"被种子覆盖"，来源 2 又因为 save_path 在本剧目录下
+    把认领丢掉，文件就成了无主的纯本地文件——改名走被禁止的文件系统分支、
+    隔离跳过种子处理（critic N2）。每轮约 539 次调用，一次 WebUI 超时就够；
+    生产上 qBit 超时见过三次（2026-09-19/20）。现在记进 `errors`，
+    执行器看到非空就整批拒绝。
+    """
     cache = getattr(ctx, "_tfile_cache", None)
     if cache is None:
         cache = {}
@@ -41,8 +49,11 @@ def _torrent_files(ctx: Context, torrent_hash: str) -> list[dict]:
     if torrent_hash not in cache:
         try:
             cache[torrent_hash] = ctx.qbit.files(torrent_hash)
-        except Exception:
-            cache[torrent_hash] = []
+        except Exception as e:
+            msg = f"files({torrent_hash[:8]}) 读取失败：{type(e).__name__}: {e}"
+            errors.append(msg)
+            ctx.log(f"[scan] qBittorrent 数据不完整——{msg}")
+            return []                     # 不缓存：这是"不知道"，不是"没有文件"
     return cache[torrent_hash]
 
 
@@ -84,9 +95,24 @@ def _season_dir_of(path: Path, show_dir: Path) -> str:
 def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
     cfg = ctx.config
     state = LibraryState()
+    # 与 ctx 共用同一个列表：执行器从 ctx 上看本轮扫描是否完整（见 Executor.apply）
+    ctx.qbit_errors = state.qbit_errors
 
     # --- qBittorrent：按 content_path 建索引 ---
-    torrents = ctx.qbit.torrents() if ctx.qbit else []
+    # 读不到（未登录 / torrents() 出错）时照常扫完磁盘——诊断仍然有用——
+    # 但记进 qbit_errors：没有种子视图的快照，每个有种子的文件都会被当成纯本地
+    # 文件。2026-09-19 run 20260919T225410 就是这样把归种子 d08f05a7 所有的
+    # `朱音落语 S01E12.mp4` 以 `torrent_hash ""` 移进了隔离区。
+    torrents: list[dict] = []
+    if ctx.qbit is None:
+        state.qbit_errors.append("qBittorrent 不可用（登录失败或未配置）")
+    else:
+        try:
+            torrents = ctx.qbit.torrents()
+        except Exception as e:
+            msg = f"torrents() 读取失败：{type(e).__name__}: {e}"
+            state.qbit_errors.append(msg)
+            ctx.log(f"[scan] qBittorrent 数据不完整——{msg}")
     state.torrents = torrents
     torrent_by_hash = {t["hash"]: t for t in torrents}
     by_path: dict[str, dict] = {}
@@ -156,7 +182,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
             sp = (t.get("save_path") or "").rstrip("/")
             if not sp or not under(sp, show_dir):
                 continue
-            for entry in _torrent_files(ctx, h):
+            for entry in _torrent_files(ctx, h, state.qbit_errors):
                 if entry.get("priority", 1) == 0:
                     continue            # 被标记为不下载
                 abs_p = Path(sp) / entry["name"]

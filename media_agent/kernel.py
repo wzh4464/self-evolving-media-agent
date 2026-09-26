@@ -312,6 +312,9 @@ class LibraryState:
     bangumi_rows: list[dict] = field(default_factory=list)
     rss_rows: list[dict] = field(default_factory=list)
     orphan_torrents: list[dict] = field(default_factory=list)   # content_path 不在 Media 下
+    # 本次扫描读 qBittorrent 时出的错（不可用 / torrents() / 某个种子的 files()）。
+    # 非空 = 种子视图不完整，这份快照只能看、不能拿去改东西（见 Executor.apply）。
+    qbit_errors: list[str] = field(default_factory=list)
 
     def all_files(self) -> Iterable[MediaFile]:
         for s in self.shows:
@@ -345,6 +348,10 @@ class Context:
         self.anilist = anilist
         self.llm = llm
         self.log = logger or (lambda *a, **k: None)
+        # 最近一次 `build_state` 读 qBittorrent 时出的错，与 `LibraryState.qbit_errors`
+        # 是同一个列表。放在 Context 上是为了让执行器不依赖调用方记得把 state 传进来：
+        # 忘了传，闸门就形同虚设。
+        self.qbit_errors: list[str] = []
 
 
 # --------------------------------------------------------------------------

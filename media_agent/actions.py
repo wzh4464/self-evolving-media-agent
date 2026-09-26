@@ -76,8 +76,12 @@ class ExecReport:
     applied: list[dict] = field(default_factory=list)
     skipped: list[dict] = field(default_factory=list)
     failed: list[dict] = field(default_factory=list)
+    # 非空 = 整批被拒绝执行（qBittorrent 不可用或本轮扫描读不全），值是原因
+    refused: str = ""
 
     def summary(self) -> str:
+        if self.refused:
+            return f"⛔ 拒绝执行本批次：{self.refused}"
         return f"执行 {len(self.applied)} 项，跳过 {len(self.skipped)} 项，失败 {len(self.failed)} 项"
 
 
@@ -166,7 +170,31 @@ class Executor:
     }
 
     # ---------------- 入口 ----------------
+    def qbit_blocker(self) -> str:
+        """qBittorrent 这一侧是否可信到足以改东西；可信返回空串，否则返回原因。
+
+        本项目的每一个改动都以种子视图为前提（AGENTS.md 第 2、3 条）：
+        有种子的文件改名必须走 renameFile，隔离必须先处理种子。视图缺了，
+        有种子的文件就会被当成纯本地文件——改名退化成 `mv`、隔离跳过种子。
+        LAT-01：2026-09-19 run 20260919T225410 登录超时仍照常执行，把归种子
+        d08f05a7 的 `朱音落语 S01E12.mp4` 以 `torrent_hash ""` 移进隔离区，
+        下一轮又删了那个种子的记录。所以这里 fail closed：整批拒绝。
+        """
+        if self.ctx.qbit is None:
+            return "qBittorrent 不可用（登录失败或未配置），没有种子视图不能改动任何东西"
+        errs = getattr(self.ctx, "qbit_errors", None) or []
+        if errs:
+            return (f"本轮扫描读 qBittorrent 不完整（{len(errs)} 处失败，首条：{errs[0]}），"
+                    f"种子视图有缺口时不能改动任何东西")
+        return ""
+
     def apply(self, findings: list[Finding]) -> ExecReport:
+        blocked = self.qbit_blocker()
+        if blocked:
+            # 不逐条写审计：这些动作一个都没有尝试。拒绝本身由调用方大声报告
+            # （cli 打印到 stdout/stderr 并以 EXIT_DEGRADED 退出）。
+            self.report.refused = blocked
+            return self.report
         ordered = sorted(
             (f for f in findings if f.action),
             key=lambda f: (self._OP_ORDER.get(f.action.op, 99), f.show, f.path),
@@ -211,7 +239,13 @@ class Executor:
 
         h = a.args.get("torrent_hash")
         via = "filesystem"
-        if h and self.ctx.qbit:
+        if h and not self.ctx.qbit:
+            # AGENTS.md 第 3 条：有种子的文件绝不走文件系统改名。以前 qBit 不在时
+            # 这里直接落到下面的 `path.rename`（apply 的总闸之外的纵深防御）。
+            self._audit("skipped", f, a, {
+                "reason": "有种子的文件，但 qBittorrent 不可用：拒绝绕过它改名"})
+            return
+        if h:
             # 有种子的一律走 qBittorrent API。找不到对应条目就报失败，
             # **绝不退化成文件系统改名**——那会让种子路径失效、做种中断。
             old_rel = self._torrent_rel_path(h, path)
@@ -982,7 +1016,13 @@ class Executor:
         # 因为磁盘上根本没有对应体积的文件可供重新关联。
         # 所以在这里按种子的**实际文件数**复核，只含一个就退化成整种子作废。
         record_lost = zeroed = False
-        if h and self.ctx.qbit:
+        if h and not self.ctx.qbit:
+            # 纵深防御（apply 的总闸之外）：种子不处理就搬文件，qBittorrent 会
+            # 继续宣称这个路径，下一轮 scan 把它当成幻影、或重新下回来。
+            self._audit("skipped", f, a, {
+                "reason": "有种子的文件，但 qBittorrent 不可用：拒绝只搬文件、不处理种子"})
+            return
+        if h:
             entry = None
             if file_only:
                 try:
@@ -1066,6 +1106,17 @@ class Executor:
 
         done, skipped, failed, lost = [], [], [], []
 
+        # qBittorrent 不在就整批拒绝（critic N3）：逆改名会退化成 `mv`，
+        # 目录改名的逆操作把 setLocation 的异常吞掉后改用文件系统搬，其余逆操作
+        # 各自 AttributeError 记成 failed——半截回退比不回退更难收拾。
+        # 也**不写** rollback 汇总记录：写了 `list_runs` 就会把这批标成已回退。
+        refused = self.qbit_blocker()
+        if refused:
+            return {"run_id": run_id, "refused": refused, "total": len(records),
+                    "reverted": 0, "skipped": 0, "failed": 0,
+                    "irreversible": len(no_undo), "torrent_records_lost": 0,
+                    "skipped_detail": [], "failed_detail": []}
+
         for rec in reversed(undoable):        # LIFO
             u = rec["undo"]
             try:
@@ -1089,6 +1140,7 @@ class Executor:
             "torrent_records_lost": len(lost),
             "skipped_detail": skipped[:10],
             "failed_detail": failed[:10],
+            "refused": "",
         }
         if not self.dry_run:
             with self.cfg.audit_log.open("a", encoding="utf-8") as fp:
@@ -1205,17 +1257,22 @@ class Executor:
             back = cur.parent / u["new_name"]
             if back.exists():
                 return False, f"还原目标已存在：{back.name}"
-            if self.dry_run:
-                return True, ""
+            # AGENTS.md 第 3 条对回退同样成立：有种子的文件只走 renameFile。
+            # 以前种子里找不到、或 qBit 不在时，这里退化成 `Path.rename`（critic N3）。
             h = u.get("torrent_hash")
-            if h and self.ctx.qbit:
+            rel = None
+            if h:
+                if not self.ctx.qbit:
+                    return False, "有种子的文件，但 qBittorrent 不可用：拒绝绕过它改名"
                 rel = self._torrent_rel_path(h, cur)
                 if rel is None:
-                    cur.rename(back)      # 种子里找不到，退化为文件系统改名
-                else:
-                    new_rel = (str(Path(rel).parent / u["new_name"])
-                               if "/" in rel else u["new_name"])
-                    self.ctx.qbit.rename_file(h, rel, new_rel)
+                    return False, "种子文件列表里找不到该文件，拒绝退化成文件系统改名"
+            if self.dry_run:
+                return True, ""
+            if rel is not None:
+                new_rel = (str(Path(rel).parent / u["new_name"])
+                           if "/" in rel else u["new_name"])
+                self.ctx.qbit.rename_file(h, rel, new_rel)
             else:
                 cur.rename(back)
             return True, ""
@@ -1384,6 +1441,11 @@ class Executor:
         种子已失联的（stale path）只能走文件系统——那些种子本来就已经断了，
         搬运不会让情况更糟，但会记录下来。
         """
+        # qBit 不在时"哪些文件有活种子"无从得知，_merge_tree 会用文件系统
+        # 搬走活种子的文件（critic N3）。拒绝。
+        refused = self.qbit_blocker()
+        if refused:
+            return {"pairs": 0, "detail": [], "refused": refused}
         pairs = []
         for rec in self._read_audit(run_id):
             if rec.get("status") != "applied" or rec.get("op") != "rename_show_dir":
@@ -1430,7 +1492,7 @@ class Executor:
                             "moved_via_qbit": via_qbit, "moved_via_fs": moved,
                             "stranded": stranded, "old_removed": not old.exists()})
 
-        return {"pairs": len(pairs), "detail": results}
+        return {"pairs": len(pairs), "detail": results, "refused": ""}
 
     def list_runs(self) -> list[dict]:
         """列出历史 run，供选择回退哪一次。"""

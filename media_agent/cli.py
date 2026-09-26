@@ -30,6 +30,27 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+# qBittorrent 不可用或本轮读不全、因此整批拒绝改动时的退出码。
+# 以前 `run` 永远返回 0：2026-09-19 那轮登录超时照样执行、删错了东西，
+# launchd 上看 last exit code 仍是 0。非零才会被看见。
+EXIT_DEGRADED = 3
+
+
+def _refuse(why: str) -> int:
+    """大声报告"本轮拒绝改动"，stdout（进 run.log）与 stderr 各一份。"""
+    msg = f"⛔ 拒绝执行任何改动：{why}"
+    print(f"\n═══ {msg} ═══")
+    _log(msg)
+    return EXIT_DEGRADED
+
+
+def _warn_degraded(state) -> None:
+    """只读命令也要提醒：种子视图不完整时，下面的结论里有种子的文件会被当成本地文件。"""
+    if state.qbit_errors:
+        print(f"⚠️  qBittorrent 数据不完整（{len(state.qbit_errors)} 处）：{state.qbit_errors[0]}"
+              "——以下结论不可作为改动依据")
+
+
 def build_context(cfg, need_llm: bool = False) -> Context:
     qbit = None
     try:
@@ -90,6 +111,7 @@ def _print_findings(findings, as_json: bool) -> None:
 def cmd_scan(args, cfg) -> int:
     ctx = build_context(cfg)
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
+    _warn_degraded(state)
     print(f"番剧目录: {len(state.shows)}")
     print(f"文件总数: {sum(len(s.files) for s in state.shows)}")
     print(f"qBittorrent 种子: {len(state.torrents)}")
@@ -107,6 +129,8 @@ def cmd_diagnose(args, cfg) -> int:
     ctx = build_context(cfg)
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
     findings = build_registry().run_all(ctx, state)
+    if not args.json:
+        _warn_degraded(state)
     _print_findings(findings, args.json)
 
     residue = find_residue(state, findings)
@@ -133,6 +157,8 @@ def cmd_apply(args, cfg) -> int:
     dry = args.dry_run or not cfg.auto_apply
     ex = Executor(ctx, dry_run=dry)
     report = ex.apply(findings)
+    if report.refused:
+        return _refuse(report.refused)
 
     print(("【预演】" if dry else "【已执行】") + report.summary()
           + (f"   批次 ID: {ex.run_id}" if not dry else ""))
@@ -175,6 +201,8 @@ def cmd_rollback(args, cfg) -> int:
 
     print(("【预演回退】" if args.dry_run else "【回退】") + f"批次 {run_id}")
     res = ex.rollback(run_id)
+    if res.get("refused"):
+        return _refuse(res["refused"])
     print(f"  已还原: {res['reverted']}")
     print(f"  跳过:   {res['skipped']}")
     print(f"  失败:   {res['failed']}")
@@ -195,6 +223,8 @@ def cmd_repair(args, cfg) -> int:
     ctx = build_context(cfg)
     ex = Executor(ctx, dry_run=args.dry_run)
     res = ex.repair_split_dirs(args.run)
+    if res.get("refused"):
+        return _refuse(res["refused"])
     print(("【预演】" if args.dry_run else "【修复】") + f"分裂目录 {res['pairs']} 对")
     for d in res["detail"]:
         if args.dry_run:
@@ -213,6 +243,12 @@ def cmd_purge(args, cfg) -> int:
     from .purge import build_pool
 
     ctx = build_context(cfg)
+    if ctx.qbit is None:
+        # 没有 qBit，build_pool 拿不到任何"种子声明大小 / 进度"的证据（critic N3），
+        # 幸存者只能退回时长旁证，判定会偏松。硬删除没有下一层保险，拒绝。
+        if args.apply:
+            return _refuse("qBittorrent 不可用：拿不到种子证据，不做不可逆删除")
+        print("⚠️  qBittorrent 不可用：缺种子证据，以下判定偏松，仅供参考\n")
     pool = build_pool(cfg, ctx.qbit, ctx.tmdb)
     ok = [c for c in pool if c.eligible]
     no = [c for c in pool if not c.eligible]
@@ -286,6 +322,9 @@ def cmd_evolve(args, cfg) -> int:
         return 1
 
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
+    if state.qbit_errors:
+        # 与 run 的演进重扫同理：残缺快照里的"盲区"是假的，规则上线却是永久的
+        return _refuse(f"qBittorrent 数据不完整，不据此演进规则：{state.qbit_errors[0]}")
     reg = build_registry()
     findings = reg.run_all(ctx, state)
 
@@ -325,29 +364,42 @@ def cmd_run(args, cfg) -> int:
 
     findings = reg.run_all(ctx, state)
     print(f"═══ 诊断：{len(findings)} 个问题 ═══")
+    _warn_degraded(state)
     _print_findings(findings, False)
 
     dry = args.dry_run or not cfg.auto_apply
     ex = Executor(ctx, dry_run=dry)
     report = ex.apply(findings)
+    if report.refused:
+        # fail closed：不修、不演进（演进器会拿这份残缺快照去立规则）、
+        # 也不做隔离区的时间清理——降级的一轮不改动任何东西。
+        return _refuse(report.refused)
     print(f"\n═══ 修复：{report.summary()} ═══")
 
+    rc = 0
     if ctx.llm.enabled and not args.no_evolve:
         # 修复后重新扫描，残留才是真盲区
         state2 = build_state(ctx, resolve_tmdb=False)
-        findings2 = reg.run_all(ctx, state2)
-        results = Evolver(ctx, reg).evolve(state2, findings2,
-                                           max_proposals=args.max_proposals)
-        promoted = [r for r in results if r["outcome"] == "promoted"]
-        print(f"\n═══ 演进：提议 {len(results)} 条，上线 {len(promoted)} 条 ═══")
-        for r in promoted:
-            print(f"  🎉 {r['rule_id']}")
+        if state2.qbit_errors:
+            # 种子视图残缺时，有种子的文件全变成"无主文件"，演进器会拿它们当
+            # 盲区去立规则——规则一旦上线就是永久的。宁可这轮不演进。
+            print(f"\n═══ 演进：跳过——重扫时 qBittorrent 数据不完整："
+                  f"{state2.qbit_errors[0]} ═══")
+            rc = EXIT_DEGRADED
+        else:
+            findings2 = reg.run_all(ctx, state2)
+            results = Evolver(ctx, reg).evolve(state2, findings2,
+                                               max_proposals=args.max_proposals)
+            promoted = [r for r in results if r["outcome"] == "promoted"]
+            print(f"\n═══ 演进：提议 {len(results)} 条，上线 {len(promoted)} 条 ═══")
+            for r in promoted:
+                print(f"  🎉 {r['rule_id']}")
 
     purge = ex.purge_trash()
     if purge["purged_files"]:
         print(f"\n═══ 隔离区：清理 {purge['purged_files']} 个过期文件，"
               f"释放 {purge['freed_bytes']/1e9:.1f}GB ═══")
-    return 0
+    return rc
 
 
 def main() -> int:
