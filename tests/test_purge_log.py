@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -184,7 +185,13 @@ def test_cmd_purge_apply_writes_the_intent_before_deleting(lib, monkeypatch):
 
     monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
     lib.show("尼古喵喵").season(1).single("尼古喵喵 S01E01.mkv")   # qBit 里得有种子，扫描才可信
-    victim = _trash_file(lib, "2026-09-14/尼古喵喵/Season 1/尼古喵喵 S01E11.mkv.!qB")
+    ts = datetime.now() - timedelta(days=40)                  # 过了 30 天保留期的特典
+    victim = _trash_file(lib, f"{ts:%Y-%m-%d}/尼古喵喵/Season 1/尼古喵喵 [Tokuten][01].mkv")
+    rec = {"ts": ts.isoformat(timespec="seconds"), "run_id": "old", "status": "applied",
+           "dry_run": False, "rule": "extras-in-library", "kind": "extra", "op": "trash",
+           "args": {"path": str(lib.media_root / "尼古喵喵/Season 1/尼古喵喵 [Tokuten][01].mkv")},
+           "summary": "特典", "trashed_to": str(victim)}
+    lib.cfg.audit_log.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
     order = []
     real = disposal._unlink
 
@@ -201,5 +208,5 @@ def test_cmd_purge_apply_writes_the_intent_before_deleting(lib, monkeypatch):
     assert order == [["intent"]]
     assert _phases(lib, victim) == ["intent", "done"]
     assert not victim.exists()
-    assert not (lib.cfg.trash_dir / "2026-09-14").exists()      # 空目录逐层 rmdir
+    assert not (lib.cfg.trash_dir / f"{ts:%Y-%m-%d}").exists()  # 空目录逐层 rmdir
     assert os.path.isdir(lib.cfg.trash_dir)

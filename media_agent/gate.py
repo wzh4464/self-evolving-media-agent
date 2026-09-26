@@ -84,13 +84,19 @@ def disposition_of(f: Finding) -> str:
     """这次删除属于哪一类处置。**只看产出它的规则**（内置检测器的 id / kind），
     不看动作参数——参数可以由任何人写（手工脚本、演进规则），而处置类别决定了
     I1 的例外（特典 / 半成品可以删掉某集位唯一的文件），不能让参数自己给自己放行。"""
-    if f.rule == "duplicate-episode":
-        return "bundled_version" if f.kind == "bundled_version" else "duplicate"
-    if f.rule == "extras-in-library":
+    return disposition_for(f.rule, f.kind)
+
+
+def disposition_for(rule: str, kind: str) -> str:
+    """`disposition_of` 的规则表。隔离区处置（`purge`）拿它给没有 `deletion` 字段的旧审计记录
+    推断处置类别——同一张表，不能两处各写一份。"""
+    if rule == "duplicate-episode":
+        return "bundled_version" if kind == "bundled_version" else "duplicate"
+    if rule == "extras-in-library":
         return "extras"
-    if f.rule == "dead-torrent":
+    if rule == "dead-torrent":
         return "dead_partial"
-    if f.rule == "manual":
+    if rule == "manual":
         return "manual"
     return "other"
 

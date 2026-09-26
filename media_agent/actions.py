@@ -1,7 +1,8 @@
 """动作执行器。
 
 全自动模式下的三层安全网：
-1. **隔离区**：删除 = 移入 `state/trash/<日期>/`，保留期内可整体还原，到期才真删。
+1. **隔离区**：删除 = 移入 `state/trash/<日期>/`，可按批次还原；真删只经 `disposal`
+   （按处置类别逐个判、先记 `state/purge.jsonl` 再删，见那里的模块文档）。
 2. **配额上限**：单轮删除数量/体积超过阈值就整体跳过并告警——防止规则写错批量误删。
 3. **审计日志**：每个动作（含失败）落 `state/audit.jsonl`，可回溯可还原。
 """
@@ -2135,26 +2136,3 @@ class Executor:
             r["kinds"] = sorted(k for k in r["kinds"] if k)
             out.append(r)
         return sorted(out, key=lambda r: r["ts"])
-
-    # ---------------- 隔离区维护 ----------------
-    def purge_trash(self) -> dict:
-        """清理超过保留期的隔离区内容。"""
-        cutoff = datetime.now() - timedelta(days=self.cfg.trash_retention_days)
-        purged, freed = 0, 0
-        for day_dir in sorted(self.cfg.trash_dir.iterdir()):
-            if not day_dir.is_dir():
-                continue
-            try:
-                day = datetime.strptime(day_dir.name, "%Y-%m-%d")
-            except ValueError:
-                continue
-            if day >= cutoff:
-                continue
-            for p in day_dir.rglob("*"):
-                if p.is_file():
-                    freed += p.stat().st_size
-                    purged += 1
-            if not self.dry_run:
-                shutil.rmtree(day_dir)
-        return {"purged_files": purged, "freed_bytes": freed,
-                "retention_days": self.cfg.trash_retention_days}

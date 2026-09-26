@@ -43,3 +43,40 @@
 **测试**：`tests/test_purge_log.py`——unlink 那一刻盘上已有意图；死在意图与 unlink 之间 / unlink 与
 done 之间，下一轮分别记 abandoned / 补 done；unlink 失败记 failed；日志写不进去就不删；目录与符号
 链接不删；清空目录不调 `rmtree`；`purge --apply` 先意图后删。改前 `purge --apply` 那条红（先删后记）。
+
+## 2. `run` 不再按日期 `rmtree`，按处置类别逐个处置
+
+`Executor.purge_trash` 删掉。`run` 末尾改调 `disposal.dispose(ctx, mode="run")`；`purge` 是同一个
+处置器的手动入口（默认预演，`--apply` 用 `mode="manual"`）。**一套判据、两种时机**：
+
+| 处置类别 | 判据（`purge.build_pool`） | `run` | `purge --apply` |
+|---|---|---|---|
+| `extras` | 过了 `TRASH_RETENTION_DAYS` | 删 | 删 |
+| `dead_partial` | 过了保留期，且是 `.!qB` | 删 | 删 |
+| `duplicate` | 证明得了替代者（第 3 节起逐条加严） | 过了保留期才删 | 证明得了就删 |
+| `bundled_version` / `manual` / `other` / 没有记录 | —— | 不删，过了保留期逐个报 | 不删 |
+
+- **处置类别从哪来**：新记录用删除关口记下的 `deletion.disposition`；旧记录（9,619 行没有这个字段）
+  按规则 / kind 推断，与关口共用一张表（`gate.disposition_for`，从 `disposition_of` 拆出来）——
+  `duplicate-episode` 的 `bundled_version` 仍是 `bundled_version`，不会被当成普通判重。
+  **没有审计记录的一律 `other`**：以前 `build_pool` 还会凭 `purge.jsonl` 的手工记录、或者路径 + TMDB
+  反推集位去证明它们可删；可那样"是哪一集"只来自文件名，没有任何检测器按规则判过它是什么。
+  手工记录只用来说明它从哪来（`origin`）。`.!qB` 与目录元数据（`.nfo` / `.media-agent.json`）的
+  无记录快车道随之取消——它们今天在生产隔离区里一个都没有（测绘：27 个文件全部有审计记录或
+  version_swap 记录）。
+- **特典到期即删是用户的明确口径**（2026-09-04 核对 extras 与 TMDB 的结论：「留在隔离区，按
+  TRASH_RETENTION_DAYS=30 到期清除」）。时间清理删掉之后得有东西接住它，不然特典只进不出。
+- **死种只认 `.!qB`**：第 1 阶段之前死种处置搬的是 `content_path`，NoSubfolder 多文件种子的
+  `content_path` 就是整个 Season 目录（testinfra B1）；那种记录里的完整正片交给人。
+- **保留期内的判重 `run` 不删**：回退（`restore_from_trash`）要用它们，生产上从隔离区捞回来的最晚
+  隔了 19 天（义妹生活 S01E01-10，purge.jsonl）；`purge --apply` 是人要的，可以提前放。
+- **过了保留期没删的逐个报出来**（`run.log` 里「隔离区：N 个文件已过保留期 30 天、没有自动删」），
+  理由各自写明。以前它们会被 rmtree 掉——尼古喵喵 TV 版、6 个 NUKITASHI 字幕在 2026-10-14 之后。
+- 处置在降级的一轮里不跑（qBittorrent 不可用整轮拒绝，与以前的时间清理一样）；`dispose` 自己也在
+  非预演、`qbit=None` 时拒绝。预演只读：不补中断记录、不 rmdir。
+
+**测试**：`tests/test_quarantine_disposal.py`——过了保留期的日目录里，特典逐个删并记录，合并发布的
+另一版本 / 手动 / 没有记录的留着且在输出里逐个点名；保留期内什么都不动；预演不写不删；旧记录按规则推断
+六种类别，新记录用关口记的；死种记录里的完整文件不删；真实一轮隔离的特典 30 天后删；证明得了的判重
+`run` 等满保留期、`purge --apply` 提前放；证明不了的过了保留期留着并报出来。改前全红（`run` 那条红在
+`rmtree`）。`tests/test_purge_log.py` 的 `purge --apply` 用例从"无记录的 `.!qB`"换成过期特典。

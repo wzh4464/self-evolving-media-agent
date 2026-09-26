@@ -21,12 +21,21 @@
 
 **只删普通文件、逐个删**；删空了的目录逐层 `rmdir`，**从不 `rmtree`**——整目录删除会把目录里
 混进来的、此刻不该删的东西（同一日目录里被关口留下的、人手放进来的）一起带走。
+
+**删什么**由 `purge.build_pool` 按处置类别判（见那里的模块文档），**什么时候删**由模式定：
+
+- `run`（每轮自动）：只删判据通过**且**已过 `TRASH_RETENTION_DAYS` 的——特典 / 死种半成品到期即删，
+  判重要证明得了替代者；合并发布的另一版本 / 手动 / 其它 / 没有记录的永不自动删，过了保留期在输出里
+  逐个报给人。保留期内的一律不动：回退（`restore_from_trash`）要用它们，生产上从隔离区捞回来的
+  最晚隔了 19 天（义妹生活 S01E01-10）。
+- `manual`（`purge --apply`，人要的）：判据通过的全删——证明安全的判重不必等满保留期。
 """
 from __future__ import annotations
 
 import json
 import os
 import stat
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -158,3 +167,74 @@ def sweep_empty_dirs(root: Path) -> int:
         except OSError:
             continue
     return n
+
+
+# ------------------------------------------------------------------ 处置
+MODES = ("run", "manual")
+
+
+@dataclass
+class DisposalReport:
+    """一次处置的结果。`dry_run` 时 `deleted` 是"会删的"。"""
+    run_id: str
+    mode: str
+    dry_run: bool
+    pool: list = field(default_factory=list)          # purge.Candidate，隔离区里的每一份
+    deleted: list = field(default_factory=list)       # 删掉的（预演：会删的）
+    failed: list = field(default_factory=list)        # [(Candidate, 原因)]
+    recovered: list = field(default_factory=list)     # 上次中断、这次补完的意图
+    refused: str = ""
+
+    @property
+    def freed_bytes(self) -> int:
+        return sum(c.size for c in self.deleted)
+
+    @property
+    def overdue(self) -> list:
+        """过了保留期却没删的（需要人看的、证明不了的、这次删失败的）。"""
+        gone = {id(c) for c in self.deleted}
+        return [c for c in self.pool if c.expired and id(c) not in gone]
+
+
+def select(pool: list, mode: str) -> list:
+    """按模式挑出这次要删的，最早隔离的在前。"""
+    if mode == "manual":
+        chosen = [c for c in pool if c.eligible]
+    else:
+        chosen = [c for c in pool if c.eligible and c.expired]
+    return sorted(chosen, key=lambda c: c.trashed_at)
+
+
+def dispose(ctx, *, mode: str, run_id: str, dry_run: bool = False,
+            now: datetime | None = None) -> DisposalReport:
+    """处置隔离区：评估每一份（`purge.build_pool`），按模式挑出来，逐个预写日志后删。"""
+    from . import purge
+
+    assert mode in MODES, mode
+    cfg = ctx.config
+    rep = DisposalReport(run_id, mode, dry_run)
+    if not dry_run and ctx.qbit is None:
+        # 纵深防御：run 在 qBittorrent 不可用时整轮拒绝、根本走不到这里；purge --apply 也先拒绝了
+        rep.refused = "qBittorrent 不可用：拿不到种子证据，不做不可逆删除"
+        return rep
+    log = PurgeLog(Path(cfg.state_dir) / LOG_NAME, run_id)
+    if not dry_run:
+        rep.recovered = recover(log)
+    rep.pool = purge.build_pool(ctx, now=now)
+    for c in select(rep.pool, mode):
+        if dry_run:
+            rep.deleted.append(c)
+            continue
+        why = hard_delete(
+            log, c.trash_path, c.size, mode=mode, disposition=c.disposition, rule=c.rule,
+            origin=c.origin, slot=list(c.slot) if c.slot else None,
+            survivor=str(c.survivor) if c.survivor else None,
+            trashed_at=c.trashed_at.isoformat(timespec="seconds"),
+            age_days=round(c.age_days or 0, 2), reason=c.why)
+        if why:
+            rep.failed.append((c, why))
+        else:
+            rep.deleted.append(c)
+    if not dry_run:
+        sweep_empty_dirs(cfg.trash_dir)
+    return rep
