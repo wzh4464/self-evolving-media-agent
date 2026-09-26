@@ -294,6 +294,25 @@ def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
     return ("slot", slot) if slot else ("conflict", None)
 
 
+def recorded_slot(f: MediaFile, show: Show) -> tuple[int, int] | None:
+    """名字之外**记下来的**集位：`ma:` 钉子 > 出处账本（抓取器定的；声明了季号、按此刻换算得出的）。没有返回 None。
+
+    "已有哪些集"（`kernel.have_episodes`）与"在下哪些集"（`grab._inflight`）都先问它，再看名字——两边以前各看
+    各的（critic N14）：钉着 `ma:S01E08`、还叫着发布名 `- 03` 的已下完文件在 `have` 里算第 3 集，第 8 集被再抓一遍；
+    `_inflight` 则让已经规范的名字压过钉子。账本只替单视频的种子说话（合集、合并发布的标题说不了单个文件）；
+    抓取器定的集位不要求声明了季号（它本来就是定论）。"""
+    pin = _pinned(f)
+    if pin:
+        return pin
+    row = getattr(f, "ledger", None)
+    if row is None or not row.active or not f.torrent_hash or f.torrent_videos != 1:
+        return None
+    if row.grabbed:
+        return row.slot
+    kind, slot = ledger_view(f, show)
+    return slot if kind == "slot" else None
+
+
 def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
     """解析出 (season, episode)，失败返回 None。
 

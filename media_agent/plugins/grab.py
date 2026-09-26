@@ -77,7 +77,7 @@ def _inflight(ctx: Context, show, by_hash: dict) -> dict[int, set[int]]:
     """
     import time
 
-    from .builtin import droppable_dead
+    from .builtin import droppable_dead, recorded_slot
     now = time.time()
     out: dict[int, set[int]] = {}
     for f in show.files:
@@ -88,20 +88,19 @@ def _inflight(ctx: Context, show, by_hash: dict) -> dict[int, set[int]]:
         # 刚加进来的种子还叫着原始发布名，`SxxExx` 要等改名规则跑过才有。
         # 只认改名后的名字，就等于"抓下来到改完名之间"这一整段时间里
         # 这一集是不设防的——同一轮 run 里抓取比改名先跑，下一轮就会再抓一次。
-        # 所以退回去认种子上的 `ma:` 集号钉子，再退回去按发布名解析。
-        key = episode_of_file(f, allow_release_name=False)
+        # 口径与 `have_episodes` 相同（critic N14）：先认记下来的集位（`ma:` 钉子、出处账本），
+        # 再认规范名，再按发布名解析——以前规范名压过钉子，被别人按错口径改成 `S01E03` 的在下文件
+        # 算成第 3 集。
+        key = (recorded_slot(f, show) or parse_pin(t.get("tags") or "")
+               or episode_of_file(f, allow_release_name=False))
         if key:
             sn, ep = key
         else:
-            pin = parse_pin(t.get("tags") or "")
-            if pin:
-                sn, ep = pin
-            else:
-                ep = _episode_of(f.torrent_name or f.filename)
-                if ep is None:
-                    continue
-                sd = season_of_dir(f.season_dir or "")
-                sn = sd if sd is not None else 1   # Season 0 是 0，不能用 `or 1`
+            ep = _episode_of(f.torrent_name or f.filename)
+            if ep is None:
+                continue
+            sd = season_of_dir(f.season_dir or "")
+            sn = sd if sd is not None else 1   # Season 0 是 0，不能用 `or 1`
 
         if t and droppable_dead(ctx, t, now):
             continue        # 死种：本轮 dead-torrent 会摘掉它，放行换源

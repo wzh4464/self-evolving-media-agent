@@ -245,18 +245,24 @@ def have_episodes(show: "Show", *, allow_release_names: bool = True) -> dict:
     里明明已经用了四处。
 
     没下完的不算（`.!qB` 或种子进度 <1），否则会把"正在下"误当成"已有"。
+
+    **记下来的集位先于名字**（`builtin.recorded_slot`：`ma:` 钉子、出处账本），`allow_release_names=False`
+    也认它们：钉着 `ma:S01E08`、还叫着发布名 `- 03` 的已下完文件是第 8 集，不是第 3 集——以前按名字算，第 8 集
+    被判成缺、再抓一遍（critic N14）。
     """
     out: dict = {}
     if show.is_movie:
         return out
     from .naming import VIDEO_EXTS
+    # 插件层的判据（钉子、账本的换算要 sidecar 的 season_offsets），按需导入：builtin 在模块层导入 kernel
+    from .plugins.builtin import recorded_slot
 
     offset = int((show.bangumi or {}).get("episode_offset") or 0)
     for f in show.files:
         if f.is_incomplete or f.path.suffix.lower() not in VIDEO_EXTS:
             continue
-        key = episode_of_file(f, allow_release_name=allow_release_names,
-                              episode_offset=offset)
+        key = recorded_slot(f, show) or episode_of_file(
+            f, allow_release_name=allow_release_names, episode_offset=offset)
         if key:
             out.setdefault(key[0], set()).add(key[1])
     return out
