@@ -396,3 +396,36 @@ def test_undelivered_events_are_capped_and_the_rest_counted(lib, monkeypatch):
     body = _text(sent[0])
     assert "另有 2 条更早的事件" in body and "批次 r49，" in body
     assert "批次 r0，" not in body and "批次 r1，" not in body
+
+
+# ------------------------------------------------------------------ 已经 critical 时的「新进入」事件
+def _critical(**extra):
+    return {"status": "critical", "finished": "2026-09-26T12:00:00", "stuck": {"open": [], "acked": 0},
+            "degraded": {"refused": ""}, "actions": {"audit_problems": 0}, **extra}
+
+
+def test_first_refusal_is_mailed_even_when_already_critical_and_only_once():
+    """已经因为磁盘满 critical（退出码 5）时，状态没变——「新进入整批拒绝」是这一封信唯一的理由。"""
+    st = {"last_status": "critical", "active": {}}
+    refused = _critical(actions=None, degraded={"refused": "种子数骤降"})
+    evs, st = notify.events(refused, st)
+    assert [(e["kind"], e["text"]) for e in evs] == [("degraded", "新进入整批拒绝：种子数骤降")]
+    evs, st = notify.events(refused, st)
+    assert evs == []
+    evs, st = notify.events(_critical(), st)                      # 执行器跑完、没拒绝：结束
+    assert evs == [] and "degraded" not in st["active"]
+    evs, _ = notify.events(refused, st)
+    assert [e["kind"] for e in evs] == ["degraded"]               # 再进入，再发
+
+
+def test_first_audit_fallback_is_mailed_even_when_already_critical_and_only_once():
+    st = {"last_status": "critical", "active": {}}
+    bad = _critical(actions={"audit_problems": 3})
+    evs, st = notify.events(bad, st)
+    assert [e["kind"] for e in evs] == ["audit_fallback"] and "3 条审计" in evs[0]["text"]
+    evs, st = notify.events(bad, st)
+    assert evs == []
+    evs, st = notify.events(_critical(), st)
+    assert "audit_fallback" not in st["active"]
+    evs, _ = notify.events(bad, st)
+    assert [e["kind"] for e in evs] == ["audit_fallback"]
