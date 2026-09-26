@@ -99,7 +99,11 @@ class Redacting(io.TextIOBase):
     launchd 的 run.log。打码放在输出流这一层，所有子命令、所有打印路径一次性生效。
 
     按行攒、不按 `write` 调用处理：`print` 常分两次写（正文、换行），一个 URL 也可能被拆开写。
-    显式 `flush()` 时把攒着的半行（遮过）写出去——交互提示不能卡着不显示。
+    **`flush()` 也不吐出半行**：凭据的前缀与值若被拆成两次写、中间 flush 一下，正则就只看得到半截，
+    而写出去的就再也遮不回来（PR #1 审查意见）。CLI 里没有交互提示，半行攒到换行或 `finish()` 再写。
+
+    已配置的密钥按字面替换，但 `notify.redact` 对短于 `_LITERAL_MIN` 的不做字面替换（会误伤正常文本）；
+    这种密钥由 `cli.warn_short_secrets` 在启动时点名告警，而不是悄悄漏过。
     """
 
     def __init__(self, inner, scrub):
@@ -121,10 +125,7 @@ class Redacting(io.TextIOBase):
         self._inner.flush()
 
     def flush(self) -> None:
-        if self._buf:
-            part, self._buf = self._buf, ""
-            self._inner.write(self._scrub(part))
-        self._inner.flush()
+        self._inner.flush()                  # 半行不吐：见类文档
 
     def isatty(self) -> bool:
         return self._inner.isatty()

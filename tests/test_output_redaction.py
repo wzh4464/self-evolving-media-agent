@@ -35,14 +35,54 @@ def test_redacting_stream_scrubs_whole_lines():
     assert out == "TMDB 失败：" + URL.replace(KEY, "***") + "\nsecond ***\nthird\n"
 
 
-def test_flush_emits_the_partial_line_scrubbed():
+def test_flush_never_emits_a_partial_line():
+    """半行一吐出去就再也遮不回来：凭据的前缀与值被拆成两次写、中间 flush 一下，
+    正则就只看得到半截（PR #1 审查意见）。CLI 里没有交互提示，半行攒到换行再写。"""
     buf = io.StringIO()
     w = runlog.Redacting(buf, _scrub)
     w.write(f"prompt {KEY}")
     w.flush()
-    assert buf.getvalue() == "prompt ***"
+    assert buf.getvalue() == ""
     w.write(" tail\n")
     assert buf.getvalue() == "prompt *** tail\n"
+
+
+def test_credential_split_across_a_flush_is_still_scrubbed():
+    """没配置过的 token（只能靠 Bearer / URL 模式认）被拆开写、中间还 flush 了。"""
+    from media_agent import notify
+
+    class Cfg:
+        qbit_pass = ab_pass = tmdb_api_key = llm_key = notify_smtp_pass = ""
+
+    token = "tok_" + "z" * 24
+    buf = io.StringIO()
+    w = runlog.Redacting(buf, lambda s: notify.redact(Cfg(), s))
+    w.write("Authorization: Bearer ")
+    w.flush()
+    w.write(token + "\n")
+    w.write("GET https://example.invalid/x?token=")
+    w.flush()
+    w.write(token + "&a=1\n")
+    w.finish()
+    assert token not in buf.getvalue()
+
+
+def test_short_configured_secret_is_warned_about_not_silently_leaked(monkeypatch, capsys):
+    """短于字面遮挡下限的密钥遮不了（会误伤正常文本）：启动时明说，不打印值。"""
+    from media_agent import notify
+
+    class Cfg:
+        tmdb_api_key = KEY
+        qbit_pass = "abc12"                        # 5 位
+        ab_pass = llm_key = notify_smtp_pass = ""
+
+    monkeypatch.setattr(cli, "load_config", lambda: Cfg())
+    monkeypatch.setattr(cli, "cmd_runs", lambda args, cfg: 0)
+    monkeypatch.setattr(sys, "argv", ["media-agent", "runs"])
+    assert cli.main() == 0
+    err = capsys.readouterr().err
+    assert "QBIT_PASS" in err and str(notify._LITERAL_MIN) in err
+    assert "abc12" not in err
 
 
 def test_redacting_context_wraps_stdout_and_stderr_and_restores(capsys):
