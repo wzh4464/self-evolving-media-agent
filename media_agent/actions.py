@@ -118,8 +118,56 @@ def _bad_rel(rel, what: str) -> str | None:
 # 所以执行器在 `apply()` 期间把 qBittorrent / AutoBangumi 数据库包一层，记下每个动作**发出过**的写调用
 # （发出即记，不管它返回还是抛异常——抛了也可能已经生效）；文件系统上的改动由各动作自己 `_effect()`。
 # 逆操作 `unset_sidecar` 能摘的 sidecar 字段 → 字段的类型（dict 按键摘；其余摘成这个类型的空值）。只列正向动作
-# 会**补**的人的意图（`Executor._set_intent`）：回退绝不能借它摘掉别的东西。
-_UNSETTABLE: dict[str, type] = {"episode_offsets": dict}
+# 会**补**的人的意图与身份（`Executor._set_intent`）：回退绝不能借它摘掉别的东西。
+_UNSETTABLE: dict[str, type] = {"episode_offsets": dict, "subscriptions": dict, "mikan_id": str,
+                                "require_any": list, "tmdb_id": type(None), "tmdb_source": str}
+
+
+def _clean_intent(intent: dict) -> dict:
+    """订阅类动作带进 sidecar 的东西（`create_show_dir` / `subscribe_season` 的 `intent`）：只认这几个字段、形状要对。
+    动作参数来自检测器或人的命令行，照样过一遍——sidecar 里不该出现别的键。"""
+    out: dict = {}
+    for k in ("subscriptions", "episode_offsets"):
+        v = intent.get(k)
+        if isinstance(v, dict):
+            out[k] = {str(s): x for s, x in v.items() if str(s).isdigit()
+                      and (isinstance(x, dict) if k == "subscriptions" else
+                           isinstance(x, int) and not isinstance(x, bool))}
+    if isinstance(intent.get("mikan_id"), str) and intent["mikan_id"].isdigit():
+        out["mikan_id"] = intent["mikan_id"]
+    if isinstance(intent.get("require_any"), list):
+        words = [w for w in intent["require_any"] if isinstance(w, str) and w.strip()]
+        if words:
+            out["require_any"] = words
+    if isinstance(intent.get("tmdb_id"), int) and not isinstance(intent["tmdb_id"], bool):
+        out["tmdb_id"] = intent["tmdb_id"]
+        out["tmdb_source"] = str(intent.get("tmdb_source") or "human")
+    return {k: v for k, v in out.items() if v}
+
+
+def _fill_intent(sc, intent: dict) -> list[dict]:
+    """把 `intent`（`_clean_intent` 过的）**补**进一份 Sidecar：dict 字段按键补还没有的，别的字段只在还是空的时候填；
+    已有的一律不改。返回写下的每一项（`unset_sidecar` 的 entries）。`subscriptions` 由调用方自己处理季键。"""
+    wrote: list[dict] = []
+    for k, v in intent.items():
+        if k == "subscriptions" and getattr(sc, "subscriptions", None):
+            continue                                  # 已有订阅的档案：季键由调用方判断（`_op_subscribe_season`）
+        if isinstance(v, dict):
+            box = dict(getattr(sc, k) or {})
+            for key, x in v.items():
+                if key not in box:
+                    box[key] = x
+                    wrote.append({"field": k, "key": key, "value": x})
+            setattr(sc, k, box)
+        elif k == "tmdb_source":
+            continue                                  # 跟着 tmdb_id 一起写
+        elif not getattr(sc, k):
+            setattr(sc, k, v)
+            wrote.append({"field": k, "value": v})
+            if k == "tmdb_id":
+                sc.tmdb_source = intent.get("tmdb_source") or "human"
+                wrote.append({"field": "tmdb_source", "value": sc.tmdb_source})
+    return wrote
 
 _QBIT_WRITES = frozenset({
     "add_torrent", "rename_torrent", "rename_file", "set_location", "create_category",
@@ -459,6 +507,8 @@ class Executor:
         "write_sidecar": 10,     # 最后写档案，记录本轮结束后的最终状态
         "pin_tmdb": 10,          # 钉 TMDB 身份：只写 sidecar，与写档案同一档（写档案不改已有的 tmdb_id）
         "adopt_episode_offset": 10,   # 把 AB 的集号偏移搬进 sidecar：同上（写档案按写的那一刻合并、不碰人的意图）
+        "subscribe_season": 10,       # 登记要抓的季：同上
+        "create_show_dir": 0,         # 新订阅的番建目录：只建一个谁都没占着的新目录，与别的动作互不干扰
         "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
         "drop_torrent": 1,       # 撞车的种子越早摘掉越好：它占着一条路径的
                                  # 所有权，后面的改名/归位都要以此为前提
@@ -981,6 +1031,78 @@ class Executor:
 
         self._set_intent(f, a, adopt, have=lambda sc: (f"sidecar 里第 {key} 季已有 episode_offsets "
                                                         f"{(sc.episode_offsets or {}).get(key)!r}（人写的为准），不改"))
+
+    def _op_subscribe_season(self, f: Finding, a: Action) -> None:
+        """往 sidecar 的 `subscriptions` 里登记一季（AB 订阅接手、新一季开播、`media-agent subscribe`）。
+
+        **只在这一季还没有订阅时写**。`intent` 里顺带补的（番组页 id、集号偏移、版本要求、TMDB 身份）同样只补还没有的：
+        人写的、上一轮写的一律不改。逆操作 `unset_sidecar` 只摘本动作写下的那几项。"""
+        key = str(int(a.args["season"]))
+        sub = dict(a.args.get("subscription") or {})
+        intent = _clean_intent(a.args.get("intent") or {})
+
+        def subscribe(sc) -> list[dict]:
+            if key in (sc.subscriptions or {}):
+                return []
+            sc.subscriptions = {**(sc.subscriptions or {}), key: sub}
+            return [{"field": "subscriptions", "key": key, "value": sub}, *_fill_intent(sc, intent)]
+
+        self._set_intent(f, a, subscribe, have=lambda sc: (f"sidecar 里第 {key} 季已经订阅"
+                                                           f"（{(sc.subscriptions or {}).get(key)!r}），不改"))
+
+    def _op_create_show_dir(self, f: Finding, a: Action) -> None:
+        """新订阅的番还没有目录：建 `<媒体根>/<番名>/`、订阅季的 `Season N/`，写一份只有人的意图的 sidecar
+        （`subscriptions`、番组页 id、集号偏移……）。扫描从下一次迭代起就登记它（`scan._subscribed`），抓取看订阅的季。
+
+        以前要等 AutoBangumi 把第一个文件放进来，media-agent 才看得见这部番（第 5 阶段 T2）。**这是订阅接手里唯一的
+        媒体根写入**：只建一个此刻谁都没占着的新目录（`claims.check_dir`：盘上同名——大小写不敏感——的目录、save_path 在
+        它下面的种子都算占着；看不全就拒绝）。逆操作 `remove_show_dir`：目录里只剩它自己建的东西时才删。"""
+        from . import sidecar as sc_mod
+        media = Path(self.cfg.media_root)
+        show_dir, why = _inside(a.args.get("show_dir"), media, "show_dir")
+        if not why and show_dir.parent != media:
+            why = f"show_dir 不是媒体根下的一级目录：{show_dir}"
+        why = why or _bad_name(show_dir.name, "目录名") or (
+            f"目录名以 . 开头（扫描不看隐藏目录）：{show_dir.name!r}" if show_dir.name.startswith(".") else None)
+        try:
+            seasons = sorted({int(s) for s in a.args.get("seasons") or []})
+        except (TypeError, ValueError):
+            seasons, why = [], why or f"seasons 不是整数列表：{a.args.get('seasons')!r}"
+        if why or any(s < 0 for s in seasons):
+            self._audit("skipped", f, a, {"reason": why or f"季号不能是负数：{seasons}"})
+            return
+        intent = _clean_intent(a.args.get("intent") or {})
+        created = [f"Season {n}" for n in seasons]
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run", "would_create": [show_dir.name, *created]})
+            return
+        chk = self._claims().check_dir(show_dir)
+        if chk.unknown:
+            self._audit("failed", f, a, {"error": f"无法确认目录名的占用情况，未做任何改动：{chk.unknown}",
+                                         "claims": chk.audit()})
+            return
+        if chk.claimants:
+            self._audit("skipped", f, a, {
+                "reason": (("目录已经在（盘上已有同名目录）" if chk.on_disk else "目录名已被占")
+                           + f"：{chk.describe()}——不建；下一轮按此刻的目录接着接手"),
+                "claims": chk.audit()})
+            return
+        undo = {"op": "remove_show_dir", "path": str(show_dir), "created": created}
+        self._intend(undo)
+        self._effect("fs.mkdir")
+        try:
+            show_dir.mkdir()
+            for name in created:
+                (show_dir / name).mkdir()
+            sc = sc_mod.Sidecar(canonical_title=show_dir.name)
+            _fill_intent(sc, intent)
+            sc_mod.save(show_dir, sc)
+        except Exception as e:
+            probe = lambda: (sc_mod.path_for(show_dir).exists() or None) if show_dir.is_dir() else False  # noqa: E731
+            if not self._settle(f, a, e, probe, what="建番目录", undo=undo):
+                return
+        self._audit("applied", f, a, {"created": [show_dir.name, *created],
+                                      "sidecar": sorted(k for k in intent)}, undo=undo)
 
     def _set_intent(self, f: Finding, a: Action, mutate, *, have) -> None:
         """往 sidecar 里**补**人的意图（`sidecar.USER_INTENT`：还没有的才写，已有的一律不改）。
@@ -2511,6 +2633,20 @@ class Executor:
             if prev and not os.path.isabs(str(prev)):
                 return f"prev_savepath 不是绝对路径：{prev!r}"
             return None
+        if op == "remove_show_dir":
+            why = lib_path("path")
+            if why:
+                return why
+            if Path(u["path"]).parent != media:
+                return f"path 不是媒体根下的一级目录：{u['path']!r}"
+            created = u.get("created")
+            if not isinstance(created, list):
+                return f"created 不是列表：{created!r}"
+            for name in created:
+                why = _bad_name(name, "created 的条目")
+                if why:
+                    return why
+            return None
         if op == "unset_sidecar":
             why = lib_path("show_dir")
             if why:
@@ -2753,6 +2889,9 @@ class Executor:
 
         if op == "unset_sidecar":
             return self._unset_sidecar(u)
+
+        if op == "remove_show_dir":
+            return self._remove_show_dir(u)
 
         if op == "restore_title_aliases":
             if self.dry_run:
@@ -3018,6 +3157,49 @@ class Executor:
 
         self._effect("fs.sidecar")
         sc_mod.update(d, forget)
+        return True, ""
+
+    def _remove_show_dir(self, u: dict) -> tuple[bool, str]:
+        """逆操作 `remove_show_dir`：撤掉 `create_show_dir` 建的番目录——**只在里面只剩它自己建的东西时**：sidecar、
+        它建的 `Season N`（空的）、Finder 撒的元数据。已经有别的（抓来的集、人放的文件、NFO、坏档案的备份）或者有种子的
+        save_path / 文件在它下面，整步跳过并写明：那是之后的事，不是这一步建的。永不 `rmtree`，逐个删、逐层 rmdir。"""
+        from . import sidecar as sc_mod
+        from .claims import ClaimsUnknown
+        d = Path(u["path"])
+        if not d.is_dir():
+            return True, ""                           # 已经没了（人删了 / 改名了）：这一步算已还原
+        try:
+            owners, _claimed = self._claims().claims_under(d)
+        except ClaimsUnknown as e:
+            return False, f"看不全 qBittorrent，确认不了目录里有没有种子的文件，不删：{e}"
+        if owners:
+            names = "、".join(f"{h[:8]}（{str(t.get('name') or '')[:30]}）" for h, t in list(owners.items())[:3])
+            return False, f"目录下已经有种子的文件 / 保存路径（{names}），不删——那是这一步之后的事"
+        created = {str(n) for n in u.get("created") or []}
+        extra, junk = [], []
+        for p in sorted(d.rglob("*")):
+            rel = p.relative_to(d)
+            if self._is_junk(p.name) and p.is_file():
+                junk.append(p)
+            elif p.is_dir() and len(rel.parts) == 1 and rel.parts[0] in created:
+                continue
+            elif p.is_file() and str(rel) == sc_mod.SIDECAR_NAME:
+                continue
+            else:
+                extra.append(str(rel))
+        if extra:
+            return False, (f"目录里已经有别的东西（{'、'.join(extra[:3])}"
+                           f"{' 等' if len(extra) > 3 else ''}），不删——要删就手动")
+        if self.dry_run:
+            return True, ""
+        self._effect("fs.rmdir")
+        for p in junk:
+            p.unlink(missing_ok=True)
+        sc_mod.path_for(d).unlink(missing_ok=True)
+        for name in created:
+            if (d / name).is_dir():
+                (d / name).rmdir()
+        d.rmdir()
         return True, ""
 
     def _try_restore_priority(self, u: dict) -> str:

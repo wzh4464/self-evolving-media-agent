@@ -31,6 +31,11 @@
 `is_seasonal`（只补在播 / 刚播完的季）、`season_layout_mismatch`、偏好、日期闸、`MAX_PER_SHOW`。抓下来的第一集由抓取
 自己写进 `seasons[N].have`，之后 sidecar-sync 按盘上接着记。
 
+## 谁登记订阅
+
+- AutoBangumi 的有效订阅（`ab-adoption`：`create_show_dir` / `subscribe_season`，见 `architecture/2026-09-27-ab-adoption.md`）；
+  盘上已经有的季不登记（抓取本来就看它）。
+
 ## 测试
 
 `tests/test_subscriptions.py`：只有订阅档案的目录被扫描登记（不是电影、TMDB 按 sidecar 认）；没有订阅的空目录、坏档案的

@@ -105,14 +105,17 @@ def test_the_season_offset_decides_which_library_season_gets_it(lib):
     assert f.action.args["season"] == 3
 
 
-def test_a_row_whose_show_dir_does_not_exist_is_not_migrated_here(lib):
-    """目录都还没有：这一步不建目录（订阅接手另作一步）。"""
+def test_a_row_whose_show_dir_does_not_exist_carries_the_offset_into_the_new_dir(lib):
+    """目录都还没有：不单独迁偏移，它随订阅接手建目录时一起写（`test_ab_subscriptions.py`）。诊断不建目录。"""
     lib.configure(qbit_allow_empty=True)
     lib.show("别的番").season(1).local("别的番 S01E01.mkv")
     lib.bangumi(id=37, official_title=TITLE, title_raw="Hyakkano", season=3, episode_offset=-24,
                 save_path=str(lib.path(TITLE) / "Season 3"))
 
-    assert not _proposals(lib)
+    [f] = _proposals(lib)
+
+    assert f.action.op == "create_show_dir"
+    assert f.action.args["intent"]["episode_offsets"] == {"3": -24}
     assert not lib.path(TITLE).exists()
 
 

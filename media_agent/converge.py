@@ -86,6 +86,8 @@ _TARGET: dict[str, tuple[str, ...]] = {
     "write_sidecar": ("show_dir",),
     "pin_tmdb": ("show_dir",),
     "adopt_episode_offset": ("show_dir", "season"),
+    "subscribe_season": ("show_dir", "season"),
+    "create_show_dir": ("show_dir",),
     "grab_episode": ("show_dir", "season", "episode"),
     "fix_title_aliases": ("bangumi_id",),
     "repoint_rss": ("bangumi_id",),
