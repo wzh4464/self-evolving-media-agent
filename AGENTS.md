@@ -18,7 +18,7 @@ media_agent/
   scan.py         三方状态汇总成 LibraryState
   clients.py      capability 的 provider 实现（qBit/AutoBangumi/TMDB/AniList/LLM）
   abrow.py        AutoBangumi 订阅行上要读的几样（番目录、库内季、番组页 id、集号偏移），只读
-  plugins/        内置检测器（`adopt.py`：把 AB 订阅里只有 AB 知道的东西迁进 sidecar）
+  plugins/        内置检测器（`adopt.py`：把 AB 订阅里只有 AB 知道的东西迁进 sidecar；`new_season.py`：订阅着的番开播新一季时登记）
   actions.py      执行器 + 隔离区 + 配额上限 + 审计日志
   converge.py     一轮之内收敛：扫描 → 诊断 → 执行重复到不动点（一个执行器、试过的不再试、撤销本轮动作的拒绝）
   audit.py        audit.jsonl 的读写：写永不抛（降级 / 转写 audit.fallback.jsonl），读两个文件一起读

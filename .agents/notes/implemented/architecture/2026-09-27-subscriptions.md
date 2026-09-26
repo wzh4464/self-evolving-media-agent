@@ -35,9 +35,24 @@
 
 - AutoBangumi 的有效订阅（`ab-adoption`：`create_show_dir` / `subscribe_season`，见 `architecture/2026-09-27-ab-adoption.md`）；
   盘上已经有的季不登记（抓取本来就看它）。
+- **开播的新一季**（`new-season`，`plugins/new_season.py` → `subscribe_season`，source `new-season`）：AB 的订阅一季一行，新
+  一季要人在 AB 里再订一次；AB 退役之后没有这一步，老番的新一季就不会来。规则：
+  - 这部番是**订阅着的**：sidecar 有 `subscriptions`，或 AB 里有它的有效订阅（`show.bangumi`）。档案里留着的旧 `bangumi_id`
+    不算——那可能是人在 AB 里停用了的订阅，人不追了，不替他订。
+  - 下一季 = 库里已知的最大季号（`seasons` 的季键、订阅、盘上下完的、AB 订阅的库内季）+ 1。它在 TMDB 上有定了档的集、第一集
+    在 `NEW_SEASON_LEAD_DAYS`（7）天之内或已经播了、是在播的季（`is_seasonal`）→ 登记。
+  - 分集表走 `cache.season_episodes`（6 小时；TMDB 上还没有这一季的 404 同样 6 小时内不再问），**不看扫描缓存的季列表**：
+    那是按条目缓存 30 天的，新一季上了 TMDB 要等它过期才看得见。每轮每部订阅着的番最多问一次 TMDB。
+  - **不登记**库内编号与 TMDB 对不上的：sidecar 有 `season_offsets`（压平 / 换算进来的番），或库里最大那一季的集数比 TMDB
+    那一季还多（库里按连续编号）——TMDB 的"下一季"多半就是库里已有的后半段，登记了只会再抓一遍。要就自己在 sidecar 里写。
+  - 要停：在 AB 里停用订阅，并删掉 sidecar 的 `subscriptions`。
 
 ## 测试
 
 `tests/test_subscriptions.py`：只有订阅档案的目录被扫描登记（不是电影、TMDB 按 sidecar 认）；没有订阅的空目录、坏档案的
 空目录照旧不登记；订阅的季盘上一集都没有也抓；订阅的季与盘上的季一起看；订阅里的番组页先于搜索（搜到的别的页日期
 对不上）；端到端（迭代）种子加进 `<番目录>/Season 1`、`have` 记上。改之前 5 条红（另两条是"照旧不登记"的对照）。
+
+`tests/test_new_season.py`：AB 订阅着的番第二季三天前开播 → 登记（参数、来源、开播日）；一周内开播的登记、更晚的等着；只有
+sidecar 订阅的也算；没人订着（档案里只剩旧 bangumi_id）的不登记；老早播完的"下一季"不算新；TMDB 上没有下一季时什么都不说；
+已经登记的不再登记；`season_offsets`、库里一季比 TMDB 长的不登记；端到端（迭代）第一次迭代登记、下一次迭代就抓。
