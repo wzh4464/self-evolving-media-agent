@@ -1184,6 +1184,10 @@ class Executor:
                 return
             already = None                   # 种子在；分不清是这次加的还是本来就有
         self._claims().invalidate()          # 多了一个种子：占用索引要重新问
+        # 这个种子是什么——在我们知道得最清楚的这一刻记进出处账本（`ledger`）：番组页标题、抓取器定的集位、
+        # 发布日期、评分、落选了几个。以前这些只进了 Finding 的 evidence，审计只存 args（state 调研 H1），
+        # 之后每条规则都从文件名重新猜（AB 把 `3rd Season - 08` 改成 S01E08，判重就认成第 8 集）。
+        ledger_note = self._ledger_grab(f, a, ih, None if already is None else not already)
 
         # 发布方的分季编号与库内连续编号不一致时，改写 qBittorrent 里的**种子名**。
         #
@@ -1246,10 +1250,40 @@ class Executor:
                     {"already_present": already,
                      "save_path": str(save_path),
                      "have_after": have,
-                     "rename": renamed, "metadata": metadata, **sidecar},
+                     "rename": renamed, "metadata": metadata, **sidecar,
+                     **({"infohash": ih} if ih else {}), **ledger_note},
                     undo={"op": "ungrab_episode", "show_dir": str(show_dir),
                           "season": season, "episode": ep,
-                          "title": title})
+                          "title": title, **({"infohash": ih} if ih else {})})
+
+    def _ledger_grab(self, f: Finding, a: Action, ih: str, added: bool | None) -> dict:
+        """抓取的这一行记进出处账本；返回并进审计的一段（`ledger` / `ledger_error`）。
+
+        写不进去（账本坏了、版本更新、磁盘满）**不让抓取变成失败**：种子已经加进去了，这是抓取的改动本身；
+        审计里写明账本没记上，下一轮开头的自动补录会从审计里的这一条补回来。"""
+        from . import ledger
+
+        if not ih:
+            return {"ledger": "算不出 v1 infohash（纯 v2 种子？），没有记"}
+        ev = f.evidence or {}
+        detail = {k: ev[k] for k in ("air_date", "mikan_id", "rejected_by_date", "rejected_by_season",
+                                     "candidates") if k in ev}
+        rej = ev.get("rejected_count")
+        detail["rejected"] = rej if isinstance(rej, int) else len(ev.get("rejected") or [])
+        try:
+            with ledger.Ledger.open(self.cfg.state_dir) as led:
+                led.record_grab(
+                    infohash=ih, mikan_title=a.args.get("title") or "", mikan_url=a.args.get("url") or "",
+                    pub_date=str(ev.get("chosen_pub") or ""), show_dir=str(a.args.get("show_dir") or ""),
+                    season=int(a.args["season"]), episode=int(a.args["episode"]),
+                    verdict=ev.get("verdict_detail") or {}, chosen_reason=str(f.summary or ""),
+                    ab_bangumi_id=a.args.get("bangumi_id"), run_id=self.run_id, added=added,
+                    evidence=detail)
+        except Exception as e:                       # noqa: BLE001 —— 账本是记账：写不进去写明在审计里，抓取照常算数
+            why = _describe(e)
+            self.ctx.log(f"[grab] {str(a.args.get('title') or '')[:60]}：种子已加入，出处账本没记上（{why}）")
+            return {"ledger_error": why}
+        return {"ledger": "recorded"}
 
     @staticmethod
     def _infohash_v1(blob: bytes) -> str | None:
@@ -2593,6 +2627,16 @@ class Executor:
                     info["have"] = [x for x in (info.get("have") or []) if x != int(u["episode"])]
                 self._effect("fs.sidecar")
                 sc_mod.update(d, forget)
+            if u.get("infohash"):
+                # 出处账本里那一行标成撤销：行留着（它仍然是那个种子），只是不再替它的集位作保。
+                # 账本写不进去不让回退失败——sidecar 已经改了；回退的汇报里写明
+                from . import ledger
+                try:
+                    with ledger.Ledger.open(self.cfg.state_dir) as led:
+                        led.retract(u["infohash"], run_id=self.run_id,
+                                    why=f"回退抓取 {(rec or {}).get('run_id') or ''}".strip())
+                except Exception as e:           # noqa: BLE001 —— 撤销账本是记账：没做成写进回退的汇报
+                    self._undo_notes.append(f"出处账本没能把 {str(u['infohash'])[:8]} 标成撤销（{_describe(e)}）")
             return True, ""
 
         if op == "readd_torrent":

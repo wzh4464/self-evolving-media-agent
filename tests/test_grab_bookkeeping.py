@@ -73,7 +73,8 @@ def test_grab_is_audited_as_applied_with_undo(lib, show):
     [rec] = [r for r in lib.audit("g1") if r["op"] == "grab_episode"]
     assert rec["status"] == "applied"                   # 抓取成功会写 applied 审计（才有 undo 可回退）
     assert rec["undo"] == {"op": "ungrab_episode", "show_dir": str(show.path),
-                           "season": 1, "episode": 12, "title": TITLE_12}
+                           "season": 1, "episode": 12, "title": TITLE_12,
+                           "infohash": h}                    # 回退时把出处账本那一行标成撤销
     assert rec["already_present"] is False
     assert lib.qbit.has(h)
     assert have_of(lib) == [12]

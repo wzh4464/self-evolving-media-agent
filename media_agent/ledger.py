@@ -308,8 +308,12 @@ class Ledger:
         if prev is not None and added is not True and prev.source != MEDIA_AGENT:
             source = prev.source
             notes.append(f"{now} 抓取器也选中了它（种子已经在 qBittorrent 里，409），集位按抓取器的")
+        elif prev is None and added is False:
+            # 409 而账本里没有它：种子早就在，是谁加的说不清（AB、人手、账本之前的抓取）——不冒认
+            source = UNKNOWN
+            notes.append(f"{now} 抓取器选中了它，但种子早就在 qBittorrent 里（409），之前没有记录")
         else:
-            source = MEDIA_AGENT
+            source = prev.source if (prev is not None and added is None) else MEDIA_AGENT
         if prev is not None and not prev.active:
             notes.append(f"{now} 又被抓取（{run_id}），恢复作保")
         if note:
@@ -339,12 +343,31 @@ class Ledger:
                         ab_bangumi_id: int | None = None, chosen_reason: str = "",
                         verdict: dict | None = None, grabbed_at: str = "", run_id: str = "",
                         note: str = "") -> bool:
-        """补录：这个种子还没有一行时才写（抓取写的、之前补录的一律不动）。返回写了没有。"""
+        """补录：只填空。这个种子还没有一行时写一行；已有的行只在"谁加的"还是 `unknown`（409 时抓取器记的）
+        而这里知道时补上来源与空着的字段——抓取器定的集位、之前补录的一律不动。返回改了没有。"""
         h = _norm_hash(infohash)
         if source not in SOURCES:
             raise ValueError(f"来源只能是 {' / '.join(SOURCES)}，收到 {source!r}")
         now = _now()
         declared, raw = release_facts(mikan_title)
+        prev = self.get(h)
+        if prev is not None:
+            if prev.source != UNKNOWN or source == UNKNOWN:
+                return False
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE provenance SET source=?, mikan_title=?, mikan_url=?, pub_date=?, show_dir=?,"
+                    " ab_bangumi_id=?, declared_season=?, raw_episode=?, versions=?, notes=?,"
+                    " updated_at=? WHERE infohash=?",
+                    (source, prev.mikan_title or mikan_title or "", prev.mikan_url or mikan_url or "",
+                     prev.pub_date or pub_date or "", prev.show_dir or show_dir or "",
+                     prev.ab_bangumi_id if prev.ab_bangumi_id is not None else _int_or_none(ab_bangumi_id),
+                     *(release_facts(prev.mikan_title) if prev.mikan_title else (declared, raw)),
+                     json.dumps(sorted(versions_of(prev.mikan_title or mikan_title)), ensure_ascii=False),
+                     json.dumps([*prev.notes, f"{now} 补录认出了是谁加的：{source}"
+                                 + (f"（{note}）" if note else "")], ensure_ascii=False),
+                     now, h))
+            return True
         with self.conn:
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO provenance (infohash, source, status, mikan_title, mikan_url,"

@@ -580,6 +580,14 @@ class EpisodeAvailableDetector:
                                   "rejected_by_date": len(wrong_season),
                                   "rejected_by_season": by_season,
                                   "verdict": verdict.why(),
+                                  # 结构化的评分与候选数：执行时记进出处账本（审计只存 args，这些以前哪儿都没留下）
+                                  "verdict_detail": {"acceptable": verdict.acceptable,
+                                                     "score": verdict.score,
+                                                     "passed": list(verdict.passed),
+                                                     "penalties": list(verdict.penalties),
+                                                     "blocked_by": verdict.blocked_by},
+                                  "candidates": len(cands),
+                                  "rejected_count": len(scored) - 1,
                                   "rejected": [f"{v.why()} | {c['title'][:90]}"
                                                for c, v in scored if c is not best][:6]},
                         action=Action(
