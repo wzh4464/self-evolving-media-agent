@@ -2516,6 +2516,17 @@ class Executor:
                     save_path=u.get("save_path") or "",
                     category=u.get("category") or "", tags=u.get("tags") or "")
             except Exception as e:
+                # 加种请求出错常常是 qBittorrent 处理完了、响应没回来（前向抓取的超时就是这样）。以前一律返回
+                # "跳过"，逐步记录写 skipped——契约里那是"什么都没改"，种子却可能已经回来了（2026-09-26 复审）。
+                # 按 infohash 核实：在 → 还原了；不在 → 确实什么都没改，照旧跳过；读不到 → 往上抛，回退按
+                # "发出过改动之后出错"记 unknown（`qbit.add_torrent` 已记进 `_effects`）。
+                try:
+                    back = self._live_torrent(h) is not None
+                except Exception as e2:
+                    raise RuntimeError(f"重新加种出错（{_describe(e)}），之后读不到 qBittorrent、"
+                                       f"确认不了加没加上（{_describe(e2)}）") from e
+                if back:
+                    return True, ""
                 return False, f"重新加种失败: {e}"
             return True, ""
 

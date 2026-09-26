@@ -234,11 +234,17 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
   （汇总那一行写不进去时也标得上）。`runs` 输出「↩回退 X 的记录」；`rollback --last` 不选回退批次；
   `rollback --run rollback-of-X` 明确拒绝（回退记录不带逆操作，回退不能再回退），退出码 3。
 - `_read_audit` 先按 `rollback_id` 分组再按 `seq` 排：同一批可以回退不止一次，每次的 `seq` 各自从头数。
+- **逆操作自己接住的异常也要说实话**（复审时补）：`readd_torrent` 的逆操作接住 `add_torrent` 的异常、返回
+  "跳过"，逐步记录写 skipped——可加种请求超时常常是 qBittorrent 处理完了、响应没回来（前向抓取修的就是这个形态），
+  种子也许已经回来了。现在按 magnet 的 infohash 核实：在 → 还原了（applied）；不在 → 确实没改，照旧 skipped；
+  读不到 → 往上抛，按"发出过改动之后出错"记 unknown、`effects_attempted: ["qbit.add_torrent"]`。其余逆操作返回
+  "跳过"的都在发出改动之前（核对此刻状态、占用、参数）。
 
 **不做的**：回退的逐步记录不带"再做一遍"的逆操作。逆操作的逆（`restore_from_trash` 的逆是再隔离一次、
 `readd_torrent` 的逆是再摘掉）各自要过删除关口与占用检查，不是把记录反过来就行——需要时另起一个阶段。
 
-**测试**：`tests/test_rollback_steps.py`。
+**测试**：`tests/test_rollback_steps.py`。重新加种：超时但加上了 → applied（改之前 skipped）、请求没被处理 → skipped、
+超时之后读不到 qBittorrent → unknown（改之前 skipped）。
 
 ## 9. 部署前的状态备份带上 audit.fallback.jsonl
 

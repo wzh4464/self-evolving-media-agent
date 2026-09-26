@@ -116,6 +116,74 @@ def test_step_that_raised_before_any_change_is_failed(lib, monkeypatch):
     assert "effects_attempted" not in st
 
 
+# ------------------------------------------------------------------ 重新加种的逆操作（2026-09-26 复审）
+def _dropped_dead(lib):
+    """一个死了的单文件种子：drop_torrent（逆操作 readd_torrent）+ 文件进隔离区（restore_from_trash）。"""
+    from media_agent.plugins.builtin import DeadTorrentDetector
+    s1 = lib.show("尼古喵喵").season(1)
+    t = s1.torrent({"尼古喵喵 S01E11.mkv": 600_000_000}, name="[A] Yani Neko - 11.mkv",
+                   layout="single", progress=0.4, state="stalledDL", added_hours_ago=24 * 30,
+                   availability=0, num_complete=0)
+    c = lib.cycle(detectors=[DeadTorrentDetector])
+    assert [r["undo"]["op"] for r in c.report.applied] == ["readd_torrent", "restore_from_trash"]
+    assert not lib.qbit.has(t.hash)
+    return t, c
+
+
+def _readd_step(lib, run_id):
+    [st] = [x for x in _steps(lib, run_id) if x["op"] == "undo:readd_torrent"]
+    return st
+
+
+def test_readd_that_timed_out_after_qbit_added_it_is_a_reverted_step(lib):
+    """加种请求超时、qBittorrent 其实加上了（前向的抓取就是这个形态）：以前逆操作吞掉异常返回「跳过」，
+    逐步记录写 skipped——契约里 skipped 是"什么都没改"，而种子明明回来了。现在按 infohash 核实。"""
+    t, c = _dropped_dead(lib)
+    lib.qbit.fail("add_torrent", after=True)
+
+    res = lib.rollback(c.run_id)
+
+    assert lib.qbit.has(t.hash)
+    st = _readd_step(lib, c.run_id)
+    assert st["status"] == "applied"
+    assert res["reverted"] == 2 and res["skipped"] == 0
+
+
+def test_readd_that_timed_out_before_adding_is_a_truthful_skip(lib):
+    t, c = _dropped_dead(lib)
+    lib.qbit.fail("add_torrent")                                    # 请求没被处理：确实什么都没改
+
+    res = lib.rollback(c.run_id)
+
+    assert not lib.qbit.has(t.hash)
+    st = _readd_step(lib, c.run_id)
+    assert st["status"] == "skipped" and "重新加种失败" in st["reason"]
+    assert res["skipped"] == 1
+
+
+def test_readd_that_timed_out_and_left_qbit_unreadable_is_unknown(lib):
+    """超时之后连 qBittorrent 都读不到：加没加上说不清——unknown，写明发出过加种。"""
+    import httpx
+    t, c = _dropped_dead(lib)
+    real = lib.qbit.add_torrent
+
+    def flaky(*a, **k):
+        real(*a, **k)
+        lib.qbit.fail("torrents", times=None)
+        raise httpx.ReadTimeout("timed out (injected)")
+
+    lib.qbit.add_torrent = flaky
+
+    res = lib.rollback(c.run_id)
+
+    lib.qbit._faults.clear()
+    del lib.qbit.add_torrent
+    st = _readd_step(lib, c.run_id)
+    assert st["status"] == "unknown" and st["effects_attempted"] == ["qbit.add_torrent"]
+    assert "timed out" in st["error"]
+    assert res["failed"] == 1                                       # 汇总照旧：这一步抛了异常
+
+
 def test_dry_run_rollback_writes_nothing(lib):
     _two_renames(lib)
     c = lib.cycle()
