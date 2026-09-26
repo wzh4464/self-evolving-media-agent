@@ -391,4 +391,17 @@ def test_polling_is_any_change_of_last_checked_at(tmp_path):
 def test_without_a_baseline_nothing_can_be_verified(tmp_path):
     act = abmode.activity(None, rss_rows=[], bangumi_rows=[], torrents=[], media_root=tmp_path)
     assert act["baseline"] is False
-    assert "没有切换基线" in abmode.activity_problems(act)[0]["text"]
+    [p] = abmode.activity_problems(act)
+    assert "没有切换基线" in p["text"] and "AB_MODE" in p["text"]
+    # 经命令切过、只是切换时 AB 库读不了：说的是这个，不是"模式来自 AB_MODE"
+    act = abmode.activity({"mode": "subscription", "baseline": None}, rss_rows=[], bangumi_rows=[], torrents=[],
+                          media_root=tmp_path)
+    [p] = abmode.activity_problems(act)
+    assert "AB 库读不了" in p["text"] and "AB_MODE、" not in p["text"]
+
+
+def test_a_switch_without_an_ab_db_records_no_baseline_and_says_so(ab_lib, monkeypatch, capsys):
+    ab_lib.over["abdb"] = None
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    assert _state(ab_lib)["baseline"] is None
+    assert "没记下" in capsys.readouterr().out

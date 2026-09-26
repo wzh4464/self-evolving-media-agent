@@ -265,8 +265,8 @@ def activity(record: dict | None, *, rss_rows, bangumi_rows, torrents, media_roo
     from .naming import parse_pin
 
     base = (record or {}).get("baseline")
-    out = {"baseline": bool(base), "since": (record or {}).get("since"), "polled": [],
-           "adds": {"subscribe": [], "outside": []}}
+    out = {"baseline": bool(base), "switched": record is not None, "since": (record or {}).get("since"),
+           "polled": [], "adds": {"subscribe": [], "outside": []}}
     if not base:
         return out
     last = base.get("rss_last_checked") or {}
@@ -322,9 +322,11 @@ def activity_problems(act: dict) -> list[dict]:
     - `ab_added_outside_subscribe`：AB 在订阅动作之外加了种子。"""
     out = []
     if not act.get("baseline"):
+        why = ("切换时没能记下基线（AB 库读不了 / 没配 AB_DB）" if act.get("switched") else
+               "模式来自 AB_MODE、没经 media-agent ab-mode 切过")
         out.append({"code": "ab_mode_unverified",
-                    "text": "订阅模式没有切换基线（模式来自 AB_MODE、没经 media-agent ab-mode 切过）：AB 的开关关没关、之后还拉"
-                            "不拉 RSS 都核对不了——用 media-agent ab-mode subscription 切一次（开关已关的只重启、核对、记基线）"})
+                    "text": f"订阅模式没有切换基线（{why}）：AB 的开关关没关、之后还拉不拉 RSS 都核对不了——"
+                            f"用 media-agent ab-mode subscription 切一次（开关已关的只重启、核对、记基线）"})
         return out
     if act.get("rss_unread"):
         out.append({"code": "ab_mode_unverified",
