@@ -15,8 +15,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from . import __version__, runlock
-from .actions import Executor
+from . import __version__, disposal, runlock
+from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
     AniListClient, AutoBangumiClient, AutoBangumiDB, LLMClient, QBitClient, TMDBClient,
@@ -298,19 +298,9 @@ def cmd_purge(args, cfg) -> int:
     elif no:
         print(f"\n保留 {len(no)} 份（加 --verbose 看原因）")
 
-    def _sweep_empty_dirs() -> int:
-        """删完文件会留下空目录，顺手扫掉。与有没有可删文件无关，所以无条件跑。"""
-        root = Path(cfg.trash_dir)
-        n = 0
-        for d in sorted(root.rglob("*"), key=lambda x: -len(x.parts)):
-            if d.is_dir() and not any(d.iterdir()):
-                d.rmdir()
-                n += 1
-        return n
-
     if not ok:
         if args.apply:
-            n = _sweep_empty_dirs()
+            n = disposal.sweep_empty_dirs(cfg.trash_dir)
             if n:
                 print(f"\n清掉 {n} 个空目录")
         return 0
@@ -318,30 +308,24 @@ def cmd_purge(args, cfg) -> int:
         print("\n【预演】未删除任何东西。确认无误后加 --apply 执行。")
         return 0
 
-    # 不可逆删除必须留痕。隔离区本身就是"删除"的可回退形态，从这里再删一次
-    # 就没有下一层保险了——至少要能事后回答"当时删了什么、凭什么判定安全"。
-    import time
-    log = Path(cfg.state_dir) / "purge.jsonl"
-    stamp = time.strftime("%Y%m%dT%H%M%S")
-    gone = 0
-    with log.open("a", encoding="utf-8") as fh:
-        for c in ok:
-            try:
-                c.trash_path.unlink()
-                gone += 1
-                fh.write(json.dumps({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "run": stamp,
-                    "deleted": str(c.trash_path), "bytes": c.size,
-                    "rule": c.rule, "origin": c.origin,
-                    "slot": list(c.slot) if c.slot else None,
-                    "survivor": str(c.survivor) if c.survivor else None,
-                    "why": c.why,
-                }, ensure_ascii=False) + "\n")
-            except OSError as e:
-                print(f"  !! 删除失败 {c.trash_path.name}: {e}")
-    print(f"  记录写入 {log}")
-    n = _sweep_empty_dirs()
-    print(f"\n已删除 {gone} 份，释放 {free / 2**30:.2f} GB，清掉 {n} 个空目录")
+    # 不可逆删除必须留痕，而且**先留痕、后删**（disposal 模块文档）：以前先 unlink 再写
+    # 日志，日志写失败就报成"删除失败"，而文件其实已经没了。
+    log = disposal.PurgeLog(Path(cfg.state_dir) / disposal.LOG_NAME, new_run_id())
+    disposal.recover(log)
+    gone = freed = 0
+    for c in ok:
+        why = disposal.hard_delete(
+            log, c.trash_path, c.size, mode="manual", rule=c.rule, origin=c.origin,
+            slot=list(c.slot) if c.slot else None,
+            survivor=str(c.survivor) if c.survivor else None, reason=c.why)
+        if why:
+            print(f"  !! 删除失败 {c.trash_path.name}: {why}")
+            continue
+        gone += 1
+        freed += c.size
+    print(f"  记录写入 {log.path}（批次 {log.run_id}）")
+    n = disposal.sweep_empty_dirs(cfg.trash_dir)
+    print(f"\n已删除 {gone} 份，释放 {freed / 2**30:.2f} GB，清掉 {n} 个空目录")
     return 0
 
 
