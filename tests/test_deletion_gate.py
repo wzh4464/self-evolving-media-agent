@@ -657,6 +657,23 @@ def test_drop_of_a_colliding_victim_still_works(lib):
     assert not lib.qbit.has(victim.hash) and lib.qbit.has(keeper.hash)
 
 
+@pytest.mark.allow("failed_record", match="占用")
+def test_drop_is_not_done_when_the_keepers_file_list_cannot_be_read(lib):
+    """2026-09-26 审查：关口读不到保留方的文件列表（`check_drop` 记 failed）时执行器必须停手——
+    没有测试注入过这个故障，忽略 `v.failed` 照样全绿（T08），受害者就在没确认保留方仍替那个
+    共享文件作保的情况下被摘了。trash 那一侧的同一道（T02）有测试。"""
+    s1, keeper, victim = _collision(lib)
+    findings = lib.diagnose(detectors=[CollidingTorrentDetector])
+    lib.qbit.fail("files", hash=keeper.hash, times=None)
+
+    rep = lib.apply(findings)
+
+    [fail] = [r for r in rep.failed if r["op"] == "drop_torrent"]
+    assert fail["deletion"]["gate"] == "unknown" and "占用" in fail["error"]
+    assert lib.qbit.has(victim.hash) and lib.qbit.has(keeper.hash)
+    assert not [c for c in lib.qbit.calls if c[0] == "delete"]
+
+
 def test_drop_is_refused_when_the_keeper_no_longer_claims_the_shared_file(lib):
     """诊断之后保留方改了名：共享的那个路径已经不归它了，受害者也不再是"撞车"——
     摘掉它就丢了一个也许能下完的下载，而那个路径谁也不保。"""
