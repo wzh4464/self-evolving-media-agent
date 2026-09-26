@@ -13,6 +13,7 @@ import hashlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tarfile
 from dataclasses import dataclass
@@ -143,6 +144,14 @@ def upstream(tmp_path_factory) -> Path:
     return bare
 
 
+def _like_a_terminal() -> None:
+    """部署脚本是人在终端里跑的：INT / QUIT 是默认处置。pytest 自己可能是以忽略 SIGINT
+    的状态起来的（`uv run pytest … &`，非交互 shell 的后台作业），不复位就会一路继承下去，
+    "Ctrl-C 自动退回"的用例便随起 pytest 的方式时红时绿（2026-09-26，[lockf-INT]）。"""
+    for s in (signal.SIGINT, signal.SIGQUIT):
+        signal.signal(s, signal.SIG_DFL)
+
+
 @dataclass
 class Sandbox:
     root: Path
@@ -156,7 +165,7 @@ class Sandbox:
         e = {**self.env, **{k: str(v) for k, v in env.items()}}
         return subprocess.run([str(self.bash), str(script), *args], env=e,
                               capture_output=True, text=True, cwd=self.root,
-                              start_new_session=new_session)
+                              start_new_session=new_session, preexec_fn=_like_a_terminal)
 
     def deploy(self, *args: str, **env) -> subprocess.CompletedProcess:
         return self.run(DEPLOY, *args, **env)
@@ -379,6 +388,34 @@ def test_interrupt_during_the_in_place_switch_reverts(sandbox, lock_impl, sig):
     assert sandbox.fingerprint() == before
     assert sandbox.history()[-1][4] == "reverted" and "中断" in sandbox.history()[-1][5]
     assert "--v11" not in sandbox.installed_plist()
+
+
+@pytest.fixture
+def pytest_ignores_sigint():
+    """模拟 `uv run pytest … &`：没有作业控制的 shell 把后台作业的 SIGINT 置为忽略，
+    这个处置经 exec / fork 一路继承；bash 对"进来时就被忽略的信号"装不上 trap。"""
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
+def test_interrupt_reverts_even_when_pytest_was_started_with_sigint_ignored(
+        sandbox, lock_impl, pytest_ignores_sigint):
+    """2026-09-26 的"并发 pytest 时 [lockf-INT] 偶发变红"：与并发无关，是后台起的 pytest
+    （`… &`）继承了 SIGINT=忽略。lockf 不动信号处置，切换阶段的 bash 装不上 INT 的 trap、
+    `kill -INT 0` 打不动任何人，部署照常做完、返回 0；Python 持锁实现的 preexec_fn 恰好把
+    INT 复位，所以只有 lockf 一格红。沙盒要像终端里的人那样起部署脚本。"""
+    before = sandbox.fingerprint()
+
+    r = sandbox.deploy("v1.1.0", new_session=True, DEPLOY_LOCK_IMPL=lock_impl,
+                       DEPLOY_TEST_CMD=_IN_PLACE.format('touch "$SANDBOX/interrupted"; kill -INT 0'))
+
+    assert r.returncode != 0, _out(r)
+    assert sandbox.head() == sandbox.tag_sha("v1.0.0")
+    assert sandbox.fingerprint() == before
+    assert sandbox.history()[-1][4] == "reverted"
 
 
 def test_rerun_after_an_interrupted_switch_redoes_the_switch(sandbox):
