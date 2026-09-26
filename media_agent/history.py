@@ -15,7 +15,7 @@
    集位级的发现（封存冲突、所有权未交接、幻影、集号解析异常）的 `path` 只是桶里第一个文件，谁排第一会变；
 2. 路径；3. `torrent:<hash>`（小写）；4. show。
 
-**文件格式**：第一行 header（`type=header`：run_id、ts、cmd、degraded、findings 条数），其后每条发现一行
+**文件格式**：第一行 header（`type=header`：run_id、ts、cmd、degraded、dry_run、findings 条数），其后每条发现一行
 （`type=finding`：fp、rule、kind、severity、show、target、path、torrent_hash、subject、summary、op、classified）。
 一轮什么都没发现也写 header——"连续几轮都有"要靠空的那一轮来断。整份先写临时文件再改名，读的一方
 永远看不到写了一半的快照。**写永不抛异常**（返回问题列表，由调用方大声说）：发现历史是观测，不能因为
@@ -69,6 +69,7 @@ def findings_dir(state_dir) -> Path:
 
 
 def write_snapshot(state_dir, run_id: str, findings, *, cmd: str, degraded: bool = False,
+                   dry_run: bool = False,
                    now: datetime | None = None) -> tuple[Path | None, list[str]]:
     """把这一轮的全部发现写成 `state/findings/<run_id>.jsonl`，并只留最近 `KEEP_RUNS` 份。
 
@@ -79,7 +80,8 @@ def write_snapshot(state_dir, run_id: str, findings, *, cmd: str, degraded: bool
     try:
         head = {"type": "header", "run_id": run_id,
                 "ts": (now or datetime.now()).isoformat(timespec="seconds"),
-                "cmd": cmd, "degraded": bool(degraded), "findings": len(findings)}
+                "cmd": cmd, "degraded": bool(degraded), "dry_run": bool(dry_run),
+                "findings": len(findings)}
         lines = [json.dumps(head, ensure_ascii=False)]
         lines += [json.dumps(record_of(f), ensure_ascii=False, default=str) for f in findings]
         d.mkdir(parents=True, exist_ok=True)
@@ -114,6 +116,7 @@ class Snapshot:
     cmd: str
     degraded: bool
     findings: list[dict] = field(default_factory=list)
+    dry_run: bool = False
 
     @property
     def fps(self) -> set[str]:
@@ -149,7 +152,7 @@ def load_snapshots(state_dir) -> list[Snapshot]:
             continue
         out.append(Snapshot(run_id=str(head.get("run_id") or p.stem), ts=str(head.get("ts") or ""),
                             cmd=str(head.get("cmd") or ""), degraded=bool(head.get("degraded")),
-                            findings=recs))
+                            findings=recs, dry_run=bool(head.get("dry_run"))))
     return out
 
 
@@ -194,6 +197,10 @@ def find_stuck(state_dir, run_id: str, *, min_runs: int, acks: dict | None = Non
     - 读 qBittorrent 不完整（`degraded`）的一轮不算数也不打断——那一轮的发现不可信；本轮就是降级的，
       返回空（残缺快照里"不在了"不代表解决了，"还在"也不可信）；
     - 连续 = 按批次 ID 排好的 run 快照里一轮不缺；中间哪一轮没有它（解决过又复发）就从那之后重新数。
+    - **预演的一轮（`dry_run`）对带动作的发现不算数也不打断**：动作根本没被尝试，它还在说明不了"没收敛"。以前
+      快照不记预演，4 轮 `run --dry-run`（或 `AUTO_APPLY=false`——默认值）就把一个从没执行过的改名报成卡住、发信；
+      人在两轮 launchd run 之间手动预演一次，也让真实的连续段提前一轮升级（2026-09-26 复审）。没有动作的（要人
+      处理的布局 / 封存冲突）与执不执行无关，预演照常算数。
     - 确认过（`acks`，`until` 含当天）的照样返回，`ack` 字段带上确认，由调用方决定只计数不列出。
     """
     runs = [s for s in load_snapshots(state_dir) if s.cmd == "run" and not s.degraded]
@@ -208,7 +215,10 @@ def find_stuck(state_dir, run_id: str, *, min_runs: int, acks: dict | None = Non
     out: list[Stuck] = []
     for fp, rec in current.items():
         streak, first = 0, history_[-1]
+        acts = bool(rec.get("op"))
         for snap, fps in zip(reversed(history_), reversed(present)):
+            if acts and snap.dry_run:
+                continue                            # 预演：动作没被尝试，既不算数也不打断
             if fp not in fps:
                 break
             streak, first = streak + 1, snap

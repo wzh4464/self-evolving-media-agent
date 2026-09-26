@@ -42,13 +42,14 @@ def _rename(path="/m/a.mkv"):
 T0 = datetime(2026, 9, 20, 0, 0, 0)
 
 
-def _runs(state, per_run, *, cmd="run", start=0, degraded=()):
+def _runs(state, per_run, *, cmd="run", start=0, degraded=(), dry=()):
     """按顺序写快照：per_run[i] 是第 i 轮的发现列表。批次 ID 按 6 小时递增。"""
     ids = []
     for i, fs in enumerate(per_run, start=start):
         ts = T0 + timedelta(hours=6 * i)
         rid = f"{ts:%Y%m%dT%H%M%S}.000-1"
-        history.write_snapshot(state, rid, fs, cmd=cmd, degraded=i in degraded, now=ts)
+        history.write_snapshot(state, rid, fs, cmd=cmd, degraded=i in degraded, now=ts,
+                               **({"dry_run": True} if i in dry else {}))
         ids.append(rid)
     return ids
 
@@ -180,6 +181,48 @@ def test_shipped_acks_cover_the_two_known_layout_mismatches(lib):
     for f in found:
         fp = history.fingerprint(f)
         assert fp in acks and acks[fp]["reason"], (f.show, fp)
+
+
+# ------------------------------------------------------------------ 预演的轮次（2026-09-26 复审）
+def test_dry_runs_never_make_an_unattempted_action_stuck(tmp_path):
+    """预演（`run --dry-run`、`AUTO_APPLY=false`）从不执行动作：带动作的发现当然还在。以前快照不记预演，
+    4 轮预演就把一个从没尝试过的改名报成「卡住」、发信——`AUTO_APPLY` 的默认值就是 false。"""
+    ids = _runs(tmp_path, [[_rename()]] * 4, dry=range(4))
+    assert history.find_stuck(tmp_path, ids[-1], min_runs=4) == []
+
+
+def test_a_manual_dry_run_neither_counts_nor_breaks_a_real_streak(tmp_path):
+    """人在两轮 launchd run 之间手动预演一次：不让它提前升级（3 真 + 1 预演 ≠ 4），也不打断（与 diagnose 同理）。"""
+    ids = _runs(tmp_path, [[_rename()]] * 4, dry={3})
+    assert history.find_stuck(tmp_path, ids[-1], min_runs=4) == []
+    ids = _runs(tmp_path, [[_rename()]], start=4)
+    [s] = history.find_stuck(tmp_path, ids[-1], min_runs=4)
+    assert s.runs == 4
+
+
+def test_actionless_findings_still_get_stuck_in_dry_runs(tmp_path):
+    """要人处理、没有动作的（目录布局对不上 TMDB）与执不执行无关：预演模式下照样会卡住。"""
+    ids = _runs(tmp_path, [[_layout()]] * 4, dry=range(4))
+    [s] = history.find_stuck(tmp_path, ids[-1], min_runs=4)
+    assert s.kind == "season_layout_mismatch" and s.runs == 4
+
+
+def test_four_dry_cmd_runs_report_nothing_stuck(offline_cli, capsys):
+    """端到端：一个预演里永远不会执行的 write_sidecar，连跑 4 轮 `run --dry-run` 不进「卡住」。"""
+    from media_agent import health
+    lib = offline_cli
+    lib.tmdb.enabled = True
+    lib.show("测试番").season(1).single("测试番 S01E01.mkv", size=600_000_000,
+                                        name="[G] Test Show - 01 [1080p].mkv")
+    for _ in range(4):
+        cli.cmd_run(_args(dry_run=True), lib.cfg)
+
+    snaps = history.load_snapshots(lib.cfg.state_dir)
+    assert [s.dry_run for s in snaps] == [True] * 4
+    assert any(r.get("op") for r in snaps[-1].findings)            # 确实有一直没执行的动作
+    rep = health.load_report(lib.cfg.state_dir)
+    assert rep["dry_run"] and rep["stuck"]["open"] == []
+    assert "卡住" not in capsys.readouterr().out
 
 
 # ------------------------------------------------------------------ 配置

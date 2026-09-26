@@ -21,7 +21,8 @@
   带 `S01E08` / `S02`，指纹不随 qBittorrent 列种子的顺序变。写不进去只在
   stderr 提一句，这一轮照常。`run` 的发现历史、审计、隔离区处置用同一个批次 ID。
 - **卡住检测**：同一个问题（带动作、或严重度 ≥ important）连续 `STUCK_RUNS`（新配置，默认 4 = 24 小时）轮 `run`
-  都在，`run` 末尾报「卡住」：连续几轮、从哪一轮起、指纹。手动的 `diagnose` 与读 qBittorrent 不完整的轮次不算数。
+  都在，`run` 末尾报「卡住」：连续几轮、从哪一轮起、指纹。手动的 `diagnose` 与读 qBittorrent 不完整的轮次不算数；
+  预演的 `run`（`--dry-run`、`AUTO_APPLY=false`）不让带动作的发现累积连续轮数——动作没被执行过，谈不上卡住。
 - **`media-agent ack <指纹> --reason … [--until YYYY-MM-DD]`**：确认一个卡住的问题、先不提醒（`--remove` 撤销、
   `--list` 列出）。写进 `.agents/acks.json`——它是版本化的用户意图，要提交入库（命令会提醒）；在生产上改了，
   部署的漂移闸门会拦下它。仓库里已确认两条要人重排目录的 `season_layout_mismatch`（胆大党、

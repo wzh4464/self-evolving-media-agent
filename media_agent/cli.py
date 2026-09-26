@@ -200,10 +200,11 @@ def cmd_scan(args, cfg) -> int:
     return 0
 
 
-def _record_findings(cfg, run_id: str, findings, state, cmd: str) -> None:
-    """这一轮的全部发现写进发现历史（`history`，critic N11）。写不进去只在 stderr 说一句：观测不拦正事。"""
+def _record_findings(cfg, run_id: str, findings, state, cmd: str, dry_run: bool = False) -> None:
+    """这一轮的全部发现写进发现历史（`history`，critic N11）。写不进去只在 stderr 说一句：观测不拦正事。
+    `dry_run`：预演的一轮——卡住检测不拿它给带动作的发现算连续（`history.find_stuck`）。"""
     _, problems = history.write_snapshot(cfg.state_dir, run_id, findings, cmd=cmd,
-                                         degraded=bool(state.qbit_errors))
+                                         degraded=bool(state.qbit_errors), dry_run=dry_run)
     for p in problems:
         _log(f"⚠️  发现历史：{p}")
 
@@ -754,12 +755,12 @@ def _run(args, cfg, rh) -> int:
 
     findings = reg.run_all(ctx, state)
     rh.diagnosed(reg, findings)
-    _record_findings(cfg, run_id, findings, state, "run")
+    dry = args.dry_run or not cfg.auto_apply
+    _record_findings(cfg, run_id, findings, state, "run", dry_run=dry)
     print(f"═══ 诊断：{len(findings)} 个问题 ═══")
     _warn_degraded(state)
     _print_findings(findings, False)
 
-    dry = args.dry_run or not cfg.auto_apply
     ex = Executor(ctx, dry_run=dry, run_id=run_id)
     report = ex.apply(findings)
     if report.refused:
