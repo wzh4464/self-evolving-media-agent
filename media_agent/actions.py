@@ -1942,6 +1942,18 @@ class Executor:
                 return False, f"种子里已没有第 {u['index']} 个条目"
             if entry.get("priority", 1) != 0:
                 return False, f"该条目的优先级已被改成 {entry.get('priority')}，不覆盖"
+            # 优先级恢复成非 0，qBittorrent 就又要往这个路径写（critic N6）：此后若另一个
+            # 种子映射到了同一个名字，恢复就是两个种子争一个文件。盘上不看——条目自己的
+            # 文件（或半成品）本来就可能还在那里，分不出是谁的。
+            t = self._claims().torrent(h)
+            if t is None:
+                return False, "所属种子已不在 qBittorrent 里"
+            at = Path((t.get("save_path") or "").rstrip("/") or "/") / entry["name"]
+            chk = self._claims().check(at, own_hash=h, own_path=at, disk=False)
+            if chk.unknown:
+                return False, f"无法确认这个条目路径的占用情况，未做任何改动：{chk.unknown}"
+            if chk.claimants:
+                return False, f"恢复下载会与活种子争同一路径：{chk.describe()}"
             if self.dry_run:
                 return True, ""
             self.ctx.qbit.set_file_priority(h, [u["index"]], u["priority"])

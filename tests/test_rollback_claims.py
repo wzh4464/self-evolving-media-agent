@@ -239,3 +239,30 @@ def test_restore_from_trash_is_refused_when_occupancy_cannot_be_read(lib, fail):
     assert res["reverted"] == 0 and res["skipped"] == 1
     assert "无法确认" in res["skipped_detail"][0]["skip_reason"]
     assert src.read_bytes() == b"trashed"
+
+
+# ------------------------------------------------------------------ 恢复优先级
+def _phantom_member(path, h) -> Finding:
+    return Finding(rule="duplicate-episode", kind="bundled_version", severity="important",
+                   summary="x", show="尼古喵喵", path=str(path), torrent_hash=h,
+                   action=Action(op="trash", args={"path": str(path), "torrent_hash": h,
+                                                   "phantom": True, "file_only": True}))
+
+
+def test_restore_priority_is_refused_when_another_torrent_now_claims_the_entry(lib):
+    """合集里的幻影条目被设为不下载；之后另一个种子映射到了同一个名字。把优先级恢复
+    回来，qBittorrent 就又要往那个路径写——两个种子争一个文件。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    pack = s1.torrent({"尼古喵喵 S01E11.mkv": GB, SLOT: GB}, name="[G] 11-12", layout="nosub")
+    _, e09 = pack.paths
+    e09.unlink()                                          # 用户删了这一集：幻影
+    lib.apply([_phantom_member(e09, pack.hash)], run_id="pz")
+    assert [f["priority"] for f in lib.qbit.raw(pack.hash)["_files"]] == [1, 0]
+    newcomer = s1.torrent({SLOT: GB}, name="[N] Yani Neko - 09.mkv", layout="single",
+                          progress=0.0)
+
+    res = lib.rollback("pz")
+
+    assert res["reverted"] == 0 and res["skipped"] == 1
+    assert newcomer.hash[:8] in res["skipped_detail"][0]["skip_reason"]
+    assert [f["priority"] for f in lib.qbit.raw(pack.hash)["_files"]] == [1, 0]

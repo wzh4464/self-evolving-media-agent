@@ -239,3 +239,13 @@ Finder 里改过大小写），逐字比较认不出它归种子，回退的残�
 `tests/test_path_claims.py` 末两条直接测 `claims_under`：优先级 0、上层 save_path 的 Original 种子、
 `.!qB`、只差大小写都在清单里；相关种子读不到抛 `ClaimsUnknown`。
 第 1 阶段 `tests/test_show_dir_moves.py` 的回退 / repair 用例全部照旧通过。
+
+## 9. 恢复条目优先级的逆操作
+
+`restore_file_priority`（第 1 阶段给"合集里只作废一个条目"加的逆操作）把优先级从 0 改回原值：
+qBittorrent 就又要往那个路径写。此后若另一个种子映射到了同一个名字，恢复就是两个种子争一个文件。
+现在恢复前 `check(save_path/条目名, own_hash=h, own_path=同一路径, disk=False)`——盘上不看，条目
+自己的文件或半成品本来就可能还在，分不出是谁的；别的种子占着 / 读不全就跳过。
+
+**测试**：`tests/test_rollback_claims.py` 末条——合集里的幻影条目被设为不下载，之后另一个种子映射到
+同名，回退跳过、优先级仍是 0（改前红）。
