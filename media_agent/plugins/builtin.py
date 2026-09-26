@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -251,6 +252,18 @@ def _is_video(f: MediaFile) -> bool:
     return f.ext in VIDEO_EXTS or (f.ext == ".!qB" and Path(f.path.stem).suffix.lower() in VIDEO_EXTS)
 
 
+def is_phantom(f: MediaFile) -> bool:
+    """种子声明着、盘上却没有（连 `.!qB` 都没有）的文件。
+
+    scan 的来源 1 按 `torrents/files` 出条目，盘上不在的也出（下载中的文件本来就
+    可能还没落盘）。判重只收已下完的，所以进了判重桶的"盘上没有"就是幻影：
+    LAT-01 那次把有种子的文件当本地文件隔离后，种子 d08f05a7 留下的就是这种；
+    用户经 Jellyfin 删文件、手工挪文件也会造出来。
+    """
+    return (bool(f.torrent_hash) and not os.path.lexists(f.path)
+            and not os.path.lexists(str(f.path) + ".!qB"))
+
+
 # ---------------------------------------------------------------------------
 class OrphanTorrentDetector:
     """在 Media 目录里但没有 `ab:<id>` 标签的种子。
@@ -464,8 +477,26 @@ class DuplicateEpisodeDetector:
                 # 2026-09-18 EP11 的合并发布种子里装着 TV 版和邪龙解放版两个
                 # 文件，共用同一个 torrent_name、复核结果完全一样，取第一个
                 # 就是随机——实测选中了 TV 版，正好是用户不要的那份。
+                #
+                # 幻影（种子说已下完、盘上没有）既不能封存也不能当赢家：探测不到文件时
+                # 复核只看发布名，钉了 `ma:` 的幻影会被封存；排序时它的声明大小和
+                # 发布名照样算分，比真文件"好"就赢——真文件被当输家移进隔离区，
+                # 这一集从库里消失、幻影永远留着（2026-09-26 审查复现，LAT-01 余波）。
+                phantoms = {id(f) for f in files if is_phantom(f)}
+                if len(phantoms) == len(files):
+                    yield Finding(
+                        rule=self.id, kind="phantom_only", severity="minor",
+                        classified=True,
+                        summary=(f"S{season:02d}E{ep:02d} 的 {len(files)} 个候选都是种子声明了、"
+                                 f"盘上却没有的幻影，没有可保留的真文件，本轮不做取舍"),
+                        show=show.dir_name, path=str(files[0].path),
+                        evidence={"files": [f.filename for f in files],
+                                  "torrents": [f.torrent_hash for f in files]},
+                    )
+                    continue
                 sealed = None
-                for f in sorted((f for f in files if _pinned(f) == (season, ep)),
+                for f in sorted((f for f in files
+                                 if _pinned(f) == (season, ep) and id(f) not in phantoms),
                                 key=_prefer_score, reverse=True):
                     ok, why = meets_requirements(f)
                     if ok:
@@ -534,7 +565,10 @@ class DuplicateEpisodeDetector:
                         losers = [f for f in losers if f not in holdback]
                     reason = "集位已封存：%s" % seal_why
                 else:
-                    ranked = sorted(files, key=_rank_for_keep, reverse=True)
+                    # 真文件永远排在幻影前面（见上文 phantoms 的注释）
+                    ranked = sorted(files, key=lambda f: (id(f) not in phantoms,
+                                                          _rank_for_keep(f)),
+                                    reverse=True)
                     keeper, losers = ranked[0], ranked[1:]
                     reason = ""
 
@@ -565,7 +599,9 @@ class DuplicateEpisodeDetector:
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(sib.path),
                                             "torrent_hash": sib.torrent_hash,
-                                            "file_only": True},
+                                            "file_only": True,
+                                            **({"phantom": True} if id(sib) in phantoms
+                                               else {})},
                                       note="合并发布的另一版本：设为不下载并移入隔离区"),
                     )
 
@@ -573,25 +609,32 @@ class DuplicateEpisodeDetector:
                 for loser in losers:
                     ld = content_digest(loser.path, cache)
                     identical = bool(kd and ld and kd == ld)
+                    # 幻影输家：盘上没有可搬的文件，要处置的是那条种子记录——它不摘，
+                    # 赢家改到集位名上就成了"两个种子宣称同一路径"。执行器凭这个标记、
+                    # 且执行时复核仍是幻影，才摘记录（可凭 magnet 回退）。
+                    phantom = id(loser) in phantoms
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="important",
                         summary=(f"S{season:02d}E{ep:02d} 重复："
                                  f"{'集位已封存，' if sealed else ''}"
-                                 f"保留 {keeper.filename}，清理 {loser.filename}"),
+                                 f"保留 {keeper.filename}，清理 {loser.filename}"
+                                 f"{'（幻影：种子说已下完、盘上没有）' if phantom else ''}"),
                         show=show.dir_name, path=str(loser.path),
                         torrent_hash=loser.torrent_hash,
                         evidence={
                             "keep": str(keeper.path), "keep_size": keeper.size,
                             "drop_size": loser.size,
                             "keep_digest": kd, "drop_digest": ld,
-                            "byte_identical": identical,
+                            "byte_identical": identical, "phantom": phantom,
                             "reason": ("字节完全相同" if identical
                                        else reason or "同集不同版本，按画质取舍"),
                         },
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(loser.path),
-                                            "torrent_hash": loser.torrent_hash},
-                                      note="移入隔离区，保留期内可恢复"),
+                                            "torrent_hash": loser.torrent_hash,
+                                            **({"phantom": True} if phantom else {})},
+                                      note=("幻影：只摘种子记录（可凭 magnet 回退）" if phantom
+                                            else "移入隔离区，保留期内可恢复")),
                     )
 
 

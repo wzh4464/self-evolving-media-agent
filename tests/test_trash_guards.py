@@ -26,7 +26,9 @@ def _trash(path, torrent_hash: str = "", *, file_only: bool = False, show: str =
 
 
 def test_phantom_path_is_skipped_and_torrent_is_untouched(lib):
-    """种子声明了文件，磁盘上却没有（或本轮诊断后被挪走）。"""
+    """种子声明了文件，磁盘上却没有，而诊断**没有**把它标成幻影（`phantom`）——
+    比如本轮诊断后才被挪走。盘上没东西可搬，也没有证据说该摘种子：跳过、一样不动。
+    诊断时就确认是幻影的输家会被摘记录，见 `tests/test_phantom_slot.py`。"""
     s1 = lib.show("朱音落语").season(1)
     t = s1.single("朱音落语 S01E12.mp4", size=508_000_000, on_disk=False)
     before = lib.qbit.snapshot()
