@@ -146,6 +146,27 @@ def test_file_only_entry_not_in_torrent_is_refused(lib):
     assert lib.snapshot() == before
 
 
+def test_file_only_matches_the_entry_by_full_relative_path(lib):
+    """合集里不同子目录下同名的 NCOP.mkv：只作废 `b/NCOP.mkv` 时，按文件名认条目会
+    认成 `a/NCOP.mkv`——错的那个被设为不下载，要作废的这个却被搬进隔离区，
+    qBittorrent 下次校验就把它重新下回来。必须按完整相对路径认。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    pack = s1.torrent({"a/E05.mkv": 600_000_000, "a/NCOP.mkv": 90_000_000,
+                       "b/E06.mkv": 600_000_000, "b/NCOP.mkv": 90_000_000},
+                      name="[G] Yani Neko 05-06", layout="nosub")
+    a_ncop, b_ncop = s1.path / "a" / "NCOP.mkv", s1.path / "b" / "NCOP.mkv"
+    ident = lib.ident(b_ncop)
+
+    rep = lib.apply([_trash(b_ncop, pack.hash, file_only=True, show="尼古喵喵")])
+
+    assert len(rep.applied) == 1
+    assert {f["name"]: f["priority"] for f in lib.qbit.raw(pack.hash)["_files"]} == {
+        "a/E05.mkv": 1, "a/NCOP.mkv": 1, "b/E06.mkv": 1, "b/NCOP.mkv": 0}
+    assert a_ncop.exists() and not b_ncop.exists()
+    [moved] = lib.trash_files()
+    assert lib.ident(moved) == ident
+
+
 @pytest.mark.allow("failed_record", match="torrent_record_lost|搬入隔离区失败")
 def test_move_failure_after_torrent_delete_is_recorded_honestly(lib, monkeypatch):
     """搬文件失败时种子记录已经删了——failed 记录必须写明这一点，不能只剩一句异常。"""
