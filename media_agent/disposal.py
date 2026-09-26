@@ -182,6 +182,7 @@ class DisposalReport:
     pool: list = field(default_factory=list)          # purge.Candidate，隔离区里的每一份
     deleted: list = field(default_factory=list)       # 删掉的（预演：会删的）
     failed: list = field(default_factory=list)        # [(Candidate, 原因)]
+    changed: list = field(default_factory=list)       # [(Candidate, 原因)]：评估之后前提变了，这次不删
     recovered: list = field(default_factory=list)     # 上次中断、这次补完的意图
     refused: str = ""
 
@@ -224,6 +225,11 @@ def dispose(ctx, *, mode: str, run_id: str, dry_run: bool = False,
     for c in select(rep.pool, mode):
         if dry_run:
             rep.deleted.append(c)
+            continue
+        # 评估到这里可能隔着几分钟：按此刻再问一遍（purge.recheck），前提变了就不删、下一轮重新评估
+        why = purge.recheck(ctx, c)
+        if why:
+            rep.changed.append((c, why))
             continue
         why = hard_delete(
             log, c.trash_path, c.size, mode=mode, disposition=c.disposition, rule=c.rule,

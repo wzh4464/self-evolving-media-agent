@@ -78,6 +78,10 @@ class Candidate:
     eligible: bool = False    # 按它的处置类别，此刻可以真删
     why: str = ""
     record: dict | None = None
+    # 评估那一刻的事实，unlink 之前按此刻复核（`recheck`）
+    stat_key: tuple = ()      # 隔离文件的 (inode, 大小, mtime)
+    survivor_hash: str = ""
+    survivor_size: int | None = None
 
 
 def _audit_by_trash_path(audit_log: Path) -> dict:
@@ -298,7 +302,8 @@ def build_pool(ctx, *, now: datetime | None = None) -> list[Candidate]:
             continue
         if not stat.S_ISREG(st.st_mode):
             continue                    # 目录、符号链接：只逐个处置普通文件
-        c = Candidate(trash_path=p, size=st.st_size)
+        c = Candidate(trash_path=p, size=st.st_size,
+                      stat_key=(st.st_ino, st.st_size, st.st_mtime_ns))
         rec = audit.get(str(p))
         if rec:
             c.record = rec
@@ -344,7 +349,7 @@ def _judge(pool: _Pool, c: Candidate) -> None:
     if not c.expired:
         c.why = f"{label}：还在保留期里（隔离 {c.age_days:.1f} 天，保留 {pool.retention:g} 天，还剩 {left:.1f} 天）"
         return
-    why = _origin_problem(pool, c)
+    why = _origin_problem(pool.claims(), c)
     if why:
         c.why = why
         return
@@ -352,7 +357,8 @@ def _judge(pool: _Pool, c: Candidate) -> None:
     c.why = f"{label}（{c.rule}）已过保留期 {pool.retention:g} 天（隔离 {c.age_days:.0f} 天）"
 
 
-def _origin_problem(pool: _Pool, c: Candidate, survivor=None) -> str:
+def _origin_problem(claims, c: Candidate, surv_path: Path | None = None,
+                    surv_hash: str = "") -> str:
     """隔离文件**当初的路径**此刻还被种子以优先级非 0 声明吗？声明着就返回不删的理由。
 
     旧 purge 的 `.!qB` 检查拿**隔离区里的路径**去比种子的条目——没有任何种子指向 `state/trash`
@@ -370,9 +376,9 @@ def _origin_problem(pool: _Pool, c: Candidate, survivor=None) -> str:
         return "原路径不明（审计记录里没有 path），无法确认有没有种子还要它"
     base = c.origin[: -len(PARTIAL)] if c.origin.endswith(PARTIAL) else c.origin
     own_hash, own_path = "", None
-    if survivor is not None and survivor.torrent_hash and fold(survivor.path) == fold(base):
-        own_hash, own_path = survivor.torrent_hash, survivor.path
-    chk = pool.claims().check(base, own_hash=own_hash, own_path=own_path, disk=False)
+    if surv_path is not None and surv_hash and fold(surv_path) == fold(base):
+        own_hash, own_path = surv_hash, surv_path
+    chk = claims.check(base, own_hash=own_hash, own_path=own_path, disk=False)
     if chk.unknown:
         return f"无法确认原路径此刻有没有种子声明（{chk.unknown}），不删"
     if chk.claimants:
@@ -456,7 +462,7 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
         c.why = (f"库里 S{sn:02d}E{ep:02d} 有 {len(holders)} 个文件，先解决重复再说")
         return
     surv = holders[0]
-    c.survivor = surv.path
+    c.survivor, c.survivor_hash = surv.path, surv.torrent_hash
     why = _identity_problem(surv, show, c.slot)
     if why:
         c.why = why
@@ -464,6 +470,7 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
 
     # 条件 2：替代者必须被证明是完整文件。两条路径，满足其一即可。
     actual = os.path.getsize(surv.path)
+    c.survivor_size = actual
     if surv.torrent_hash:
         # 路径 a：种子校验。最强的证据——种子声明多少字节就该有多少字节。
         declared, progress = surv.size, float(surv.torrent_progress or 0)
@@ -520,7 +527,8 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
         complete_why = (f"无种子可校验，改以时长自证：{d_surv:.0f}s 与同季中位数 "
                         f"{med:.0f}s 相符，且尾部可解码")
 
-    why = _rank_problem(c, surv, show) or _origin_problem(pool, c, surv)
+    why = (_rank_problem(c, surv, show)
+           or _origin_problem(pool.claims(), c, surv.path, surv.torrent_hash))
     if why:
         c.why = why
         return
@@ -575,3 +583,47 @@ def _rank_problem(c: Candidate, surv, show) -> str:
         return (f"按现在的排序，隔离的这份比库里的 {surv.filename} 更该留（I4 复排：判重当时的规则"
                 f"与现在不同，如 2026-09-08 穹庐 S01E11），不删、交给人")
     return ""
+
+
+def recheck(ctx, c: Candidate) -> str:
+    """unlink 之前的最后一问：评估之后，这一份的前提还在吗？还在返回空串，否则返回不删的理由。
+
+    评估（重扫整个库、探测、算摘要）到逐个 unlink 之间可能隔着几分钟；运行锁挡得住别的 media-agent，
+    挡不住 AutoBangumi（每 60 秒改名一次）、qBittorrent、用户。只复核评估时依赖的**此刻的事实**，
+    每一份用一个新的占用索引（不复用评估时的缓存）：
+
+    - 隔离文件还是评估时那一个（inode、大小、mtime 都没变，仍是普通文件）；
+    - 判重的替代者还在原处、大小没变；有种子的，种子还在、下完了、仍以优先级非 0 声明它；
+    - 原路径此刻没有种子以优先级非 0 声明（第 5 节，替代者自己的除外）。
+    """
+    from .claims import ClaimIndex, ClaimsUnknown
+
+    try:
+        st = os.lstat(c.trash_path)
+    except OSError:
+        return "隔离文件在评估之后已不在"
+    if not stat.S_ISREG(st.st_mode) or (st.st_ino, st.st_size, st.st_mtime_ns) != c.stat_key:
+        return "隔离文件在评估之后变了（被替换或改写过），这次不删、下一轮重新评估"
+    claims = ClaimIndex(ctx.qbit)
+    if c.survivor is not None:
+        try:
+            sst = os.lstat(c.survivor)
+        except OSError:
+            return f"替代者 {c.survivor.name} 在评估之后不见了（被改名、挪走或删掉）"
+        if not stat.S_ISREG(sst.st_mode) or sst.st_size != c.survivor_size:
+            return f"替代者 {c.survivor.name} 在评估之后变了（大小 {c.survivor_size} → {sst.st_size}）"
+        if c.survivor_hash:
+            try:
+                t = claims.torrent(c.survivor_hash)
+                entries = claims.entries(c.survivor_hash) if t is not None else []
+            except ClaimsUnknown as e:
+                return f"无法确认替代者的种子此刻的状态（{e}），不删"
+            if t is None:
+                return f"替代者的种子 {c.survivor_hash[:8]} 在评估之后被摘掉了"
+            if float(t.get("progress") or 0) < 1:
+                return f"替代者的种子 {c.survivor_hash[:8]} 在评估之后又没下完了"
+            sp = Path((t.get("save_path") or "").rstrip("/") or "/")
+            e = next((e for e in entries if fold(sp / e["name"]) == fold(c.survivor)), None)
+            if e is None or e.get("priority", 1) == 0:
+                return f"替代者的种子 {c.survivor_hash[:8]} 已不再声明 {c.survivor.name}"
+    return _origin_problem(claims, c, c.survivor, c.survivor_hash)

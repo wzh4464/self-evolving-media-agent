@@ -308,6 +308,8 @@ def _print_disposal(cfg, rep) -> None:
         for c in rep.deleted:
             print(f"  🗑️  [{_LABEL.get(c.disposition, c.disposition)}] "
                   f"{_trash_rel(cfg, c.trash_path)} —— {c.why}")
+    for c, why in rep.changed:
+        print(f"  ⏭️  {_trash_rel(cfg, c.trash_path)} —— 评估之后变了，这次不删：{why}")
     for c, why in rep.failed:
         print(f"  ❌ {_trash_rel(cfg, c.trash_path)} —— 删除失败：{why}")
     _print_overdue(cfg, rep)
@@ -329,7 +331,8 @@ def cmd_purge(args, cfg) -> int:
     if rep.refused:
         return _refuse(rep.refused)
     pool = rep.pool
-    chosen = {id(c) for c in rep.deleted} | {id(c) for c, _ in rep.failed}
+    chosen = ({id(c) for c in rep.deleted} | {id(c) for c, _ in rep.failed}
+              | {id(c) for c, _ in rep.changed})
     ok = [c for c in pool if id(c) in chosen]
     no = [c for c in pool if id(c) not in chosen]
     size = sum(c.size for c in ok)
@@ -354,6 +357,8 @@ def cmd_purge(args, cfg) -> int:
         if ok:
             print("\n【预演】未删除任何东西。确认无误后加 --apply 执行。")
         return 0
+    for c, why in rep.changed:
+        print(f"  ⏭️  没删 {c.trash_path.name}：评估之后变了——{why}")
     for c, why in rep.failed:
         print(f"  !! 删除失败 {c.trash_path.name}: {why}")
     if rep.recovered:

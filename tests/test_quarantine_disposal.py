@@ -586,3 +586,77 @@ def test_byte_identical_copies_are_not_re_ranked(lib, no_rmtree):
     rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
 
     assert [c.trash_path for c in rep.deleted] == [p]
+
+
+# ------------------------------------------------------------------ 删之前的最后一问
+# 评估（重扫整个库、探测、算摘要）到逐个 unlink 之间可能隔着几分钟；运行锁挡得住别的 media-agent，
+# 挡不住 AutoBangumi、qBittorrent、用户。每一个在 unlink 之前按此刻再问一遍。
+def _after_planning(monkeypatch, change):
+    real = purge.build_pool
+
+    def build_pool(*a, **k):
+        pool = real(*a, **k)
+        change()
+        return pool
+
+    monkeypatch.setattr(purge, "build_pool", build_pool)
+
+
+def _survivor_path(s1):
+    return s1.path / "尼古喵喵 S01E05.mkv"
+
+
+def test_survivor_gone_after_planning_means_no_delete(lib, monkeypatch, no_rmtree):
+    s1, good, moved = _trash_the_raw_one(lib)
+    _after_planning(monkeypatch, lambda: _survivor_path(s1).unlink())
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
+
+    assert moved.exists() and not rep.deleted
+    [(c, why)] = rep.changed
+    assert c.trash_path == moved and "替代者" in why
+    assert _wal(lib) == []                              # 连意图都不写
+
+
+def test_survivor_torrent_dropped_after_planning_means_no_delete(lib, monkeypatch, no_rmtree):
+    s1, good, moved = _trash_the_raw_one(lib)
+    _after_planning(monkeypatch, lambda: lib.qbit.delete([good.hash], delete_files=False))
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
+
+    assert moved.exists() and not rep.deleted and rep.changed
+
+
+def test_trash_file_changed_after_planning_means_no_delete(lib, monkeypatch, no_rmtree):
+    s1, good, moved = _trash_the_raw_one(lib)
+    _after_planning(monkeypatch, lambda: moved.write_bytes(b"replaced"))
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
+
+    assert moved.read_bytes() == b"replaced" and not rep.deleted
+    [(c, why)] = rep.changed
+    assert "隔离文件" in why
+
+
+def test_origin_claimed_after_planning_means_no_delete(lib, monkeypatch, no_rmtree):
+    extra = legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=40)
+    s1 = lib.show("尼古喵喵").season(1)
+    _after_planning(monkeypatch, lambda: s1.torrent({"尼古喵喵 NCOP.mkv": 90_000_000},
+                                                    name="[G] Yani Neko NCOP.mkv",
+                                                    layout="single", progress=0.0))
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert extra.exists() and not rep.deleted
+    [(c, why)] = rep.changed
+    assert "原路径" in why
+
+
+def test_nothing_changed_still_deletes(lib, monkeypatch, no_rmtree):
+    """对照：评估之后什么都没变，照删。"""
+    s1, good, moved = _trash_the_raw_one(lib)
+    _after_planning(monkeypatch, lambda: None)
+
+    rep = disposal.dispose(lib.context(), mode="manual", run_id="p001", now=_later(5))
+
+    assert [c.trash_path for c in rep.deleted] == [moved] and not rep.changed
