@@ -3,6 +3,11 @@
 **日期**: 2026-09-26
 **状态**: implemented / process
 **触发**: 部署调研发现生产 `~/media-agent` 没有 `.git`，靠手工拷文件；全项目没有一把锁
+**追认**: 本笔记随 13704f6 入库，**追溯记录**此前五个提交的决策：653aff2（EVOLVE_MODE）、
+0b5a02e（运行锁与批次 ID 格式）、d504b3c（launchd 入口）、e216f6e（.gitignore）、
+c2eca6f（deploy.sh / convert-to-git.sh）。它们提交时各自都没带 Agent Note，违反了
+AGENTS.md「写 Agent Note 的时机」；分支未推送但不改写历史，以此为准——单独检出、bisect
+或 cherry-pick 其中任何一个时，决策记录在这里（下文「做了什么」第 1–5 条逐一对应）。
 
 ## 为什么需要
 

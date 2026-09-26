@@ -116,3 +116,11 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
 任何非平凡改动都要在同一次提交里新增或更新一条 Agent Note：行为变化、架构决策、
 跨文件契约、流程工具、磁盘/配置格式。类别取自闭集：
 `feature` / `bug-fix` / `simplification` / `architecture` / `process` / `testing`。
+
+**提交前自查**：`git diff --cached --stat` 里有 `media_agent/`、`deploy/`、`.github/`、
+`pyproject.toml` / `uv.lock`、`.gitignore` 或配置格式的改动，就必须同时看到 `.agents/notes/`
+的改动（只补测试、只改文案的提交除外）。事后在最后一个提交里补一篇总笔记不算数——
+单独检出、bisect、cherry-pick 中间那个提交时，它没有决策记录（2026-09-26 审查：
+653aff2..c2eca6f 五个提交就是这样，见 `process/2026-09-26-tag-deploy-and-run-lock.md` 的追认）。
+笔记里引用调研编号时，编号要能在
+[审计编号索引](.agents/notes/implemented/process/2026-09-26-phase1-audit-index.md) 里查到。
