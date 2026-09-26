@@ -1274,7 +1274,7 @@ class Executor:
             return
         if not self.ctx.qbit:
             self._audit("skipped", f, a, {
-                "reason": "有种子的幻影，但 qBittorrent 不可用：拒绝处置"})
+                "reason": "有种子的文件不在盘上，而 qBittorrent 不可用：拒绝处置种子"})
             return
         victim = next((t for t in self.ctx.qbit.torrents() if t["hash"] == h), None)
         if victim is None:
