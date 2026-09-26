@@ -135,3 +135,51 @@ def test_a_backfilled_row_is_superseded_by_the_grab(lib, show, backfilled_slot):
 
     row = _row(lib, h)
     assert row.source == ledger.AUTOBANGUMI and row.slot == (1, 58) and row.grabbed_at
+
+
+def test_the_grab_detector_hands_the_ledger_a_structured_verdict(lib):
+    """detector → executor → 账本这条契约：账本要的结构化评分从抓取发现的 `evidence.verdict_detail` 来。以前账本测试
+    都手写这个 evidence，抓取检测器改了键名、账本里就只剩 `{}`——变异全套存活（2026-09-27 审查）。"""
+    from harness import MikanItem, weekly
+    from media_agent.plugins.grab import EpisodeAvailableDetector
+    lib.configure(qbit_allow_empty=True)
+    name = "尼古喵喵"
+    schedule = weekly(12, first_days_ago=60)
+    sh = lib.show(name)
+    for n in range(1, 9):
+        sh.season(1).local(f"{name} S01E{n:02d}.mkv")
+    sh.tmdb(1234, seasons={1: schedule})
+    sh.sidecar(tmdb_id=1234, tmdb_title=name, mikan_id="3500", seasons={"1": {"have": list(range(1, 9))}})
+    item = MikanItem(title="[LoliHouse] 尼古喵喵 / Yani Neko - 09 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]",
+                     pub=dict(schedule)[9])
+    lib.mikan("3500", [item], search=[name])
+
+    c = lib.cycle(detectors=[EpisodeAvailableDetector])
+
+    assert c.applied("grab_episode")
+    row = _row(lib, item.infohash)
+    assert row is not None and row.grabbed and row.slot == (1, 9)
+    assert {"acceptable", "score", "passed", "penalties", "blocked_by"} <= set(row.verdict)
+    assert row.verdict["acceptable"] is True and row.evidence.get("candidates") == 1
+
+
+def test_grabbing_a_retracted_row_again_makes_it_vouch_again(lib, show):
+    """回退过的抓取（行标成撤销）又被抓了一次：行恢复作保、留一笔（2026-09-27 审查：变异"保持撤销"全套存活）。"""
+    url, h = lib.web.torrent(FYY)
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.record_grab(infohash=h, mikan_title=FYY, season=1, episode=58, run_id="g1")
+        led.retract(h, run_id="rb1", why="回退抓取 g1")
+        assert not led.get(h).active
+
+        row = led.record_grab(infohash=h, mikan_title=FYY, season=1, episode=58, run_id="g2")
+
+    assert row.active and row.status == ledger.ACTIVE
+    assert any("恢复作保" in n for n in row.notes)
+
+
+def test_a_v2_infohash_in_a_torrent_url_is_not_read_as_a_v1_one():
+    """`<64 位十六进制>.torrent`（BitTorrent v2 的 infohash）不是 v1 的：不能截出后 40 位当 infohash（变异存活）。"""
+    v2 = "ab" * 32
+    assert ledger.infohash_of_url(f"https://mikanani.me/Download/20260901/{v2}.torrent") is None
+    v1 = "c" * 40
+    assert ledger.infohash_of_url(f"https://mikanani.me/Download/20260901/{v1}.torrent") == v1

@@ -383,3 +383,45 @@ def test_a_known_row_of_unknown_origin_does_not_refetch_the_feed(lib):
     rep = lb.backfill(lib.context())
 
     assert lib.web.calls == [] and rep.remaining == [] and rep.inserted == {}
+
+
+# ------------------------------------------------------------------ 几条写明了、以前没钉住的规则（2026-09-27 审查的变异）
+def test_a_dry_run_grab_in_the_audit_claims_nothing(lib):
+    """预演的抓取记录（`dry_run: true`）不是加过种：AB 下的种子不能因为某次预演选中过它就算成本项目加的。"""
+    _rezero_ab(lib)
+    rec = {"ts": "2026-08-31T13:00:00", "run_id": "20260831T130000", "status": "skipped", "dry_run": True,
+           "reason": "dry-run", "rule": "episode-available", "op": "grab_episode", "summary": "S1E58 可抓取",
+           "args": {"url": _url(H_AB), "title": FYY_MIKAN, "show_dir": str(lib.path(REZERO)),
+                    "season": 1, "episode": 58}}
+    # 状态就算记成了 applied（旧版本的预演偶尔这样写），dry_run 为真也不算
+    lib.cfg.audit_log.write_text("\n".join(json.dumps({**rec, "status": s}, ensure_ascii=False)
+                                           for s in ("skipped", "applied")) + "\n", encoding="utf-8")
+
+    lb.backfill(lib.context())
+
+    row = _rows(lib)[H_AB]
+    assert row.source == ledger.AUTOBANGUMI and not row.grabbed
+
+
+def test_an_ab_row_that_also_carries_a_pin_takes_the_pins_slot(lib):
+    """AB 也登记过、种子上钉着 `ma:`（2026-08-31 之前本项目的抓取）：集位按钉子（抓取器的定论），来源是本项目。"""
+    _rezero_ab(lib)
+    lib.qbit._t[H_AB]["tags"] = {"ab:9", "ma:S01E58"}
+
+    lb.backfill(lib.context())
+
+    row = _rows(lib)[H_AB]
+    assert row.slot == (1, 58) and row.source == ledger.MEDIA_AGENT and row.mikan_title == FYY_MIKAN
+
+
+def test_a_feed_match_uses_the_shows_season_offsets(lib):
+    """番组页 feed 里认出来的（Fyy 的「第三季 - 08」、Re:Zero 压平成一季、sidecar `{"3": 50}`）：集位按换算，S01E58。"""
+    sh = lib.show(REZERO)
+    sh.sidecar(mikan_id="4103", season_offsets={"3": 50})
+    sh.season(1).single("Re:从零开始的异世界生活 S01E58.mkv", hash=H_FEED, name=FYY_FILE)
+    lib.mikan("4103", [MikanItem(title=FYY_MIKAN, pub="2026-08-31", url=_url(H_FEED))])
+
+    lb.backfill(lib.context())
+
+    assert _rows(lib)[H_FEED].slot == (1, 58)
+
