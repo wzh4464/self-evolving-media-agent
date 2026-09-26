@@ -163,9 +163,19 @@ def load_snapshots(state_dir) -> list[Snapshot]:
 STUCK_SEVERITIES = ("critical", "important")
 
 
+# 带动作、却不能拿"连续几轮都在"说它没收敛的类型：动作每轮都成功，是别人每轮把问题重新造出来。
+# `empty_category`：AutoBangumi 每加一集就重建它的下载分类 `Bangumi`，category-consolidation 每轮删、每次都成功
+# （生产 14 天 25 次、2026-09-20 起连续 4 轮；复审按 run.log 回放两周，它是唯一一条没被确认的「新卡住」，人除了
+# ack 什么也做不了）。删不掉的照样进失败 / 反复失败（`health.repeated_failures`），不会因此看不见。
+_RECURRING_KINDS = frozenset({"empty_category"})
+
+
 def qualifies(rec: dict) -> bool:
-    """这条快照里的发现算不算"该收敛却没收敛"的那一类：带动作，或严重度 ≥ important。"""
-    return bool(rec.get("op")) or rec.get("severity") in STUCK_SEVERITIES
+    """这条快照里的发现算不算"该收敛却没收敛"的那一类：带动作，或严重度 ≥ important。
+    `_RECURRING_KINDS` 的动作不算（只看严重度）。"""
+    if rec.get("severity") in STUCK_SEVERITIES:
+        return True
+    return bool(rec.get("op")) and rec.get("kind") not in _RECURRING_KINDS
 
 
 @dataclass

@@ -183,6 +183,22 @@ def test_shipped_acks_cover_the_two_known_layout_mismatches(lib):
         assert fp in acks and acks[fp]["reason"], (f.show, fp)
 
 
+def test_an_empty_category_that_autobangumi_recreates_is_never_stuck(lib, tmp_path):
+    """AutoBangumi 每加一集就重建它的下载分类 `Bangumi`，category-consolidation 每轮都把它删掉、每次都成功
+    （生产 14 天 25 次，2026-09-20 起连续 4 轮）。它带动作，以前就被当成"该收敛却没收敛"——复审按生产 run.log
+    回放两周，这是唯一一条没被确认的「新卡住」，而人除了 ack 什么也做不了。空分类删了又冒出来不是故障：
+    删不掉会进失败 / 反复失败，那里照样报。"""
+    from media_agent.plugins.builtin import CategoryConsolidationDetector
+    lib.show("尼古喵喵").season(1).single("[A] Yani Neko - 07 [1080p].mkv", category="Bangumi")
+    [f] = [f for f in lib.diagnose(detectors=[CategoryConsolidationDetector])
+           if f.kind == "empty_category"]
+    assert history.fingerprint(f) == "6d1a114717a22386"          # 复审回放里生产上那一条
+
+    ids = _runs(tmp_path, [[f]] * 6)
+
+    assert history.find_stuck(tmp_path, ids[-1], min_runs=4) == []
+
+
 # ------------------------------------------------------------------ 预演的轮次（2026-09-26 复审）
 def test_dry_runs_never_make_an_unattempted_action_stuck(tmp_path):
     """预演（`run --dry-run`、`AUTO_APPLY=false`）从不执行动作：带动作的发现当然还在。以前快照不记预演，
