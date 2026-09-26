@@ -361,7 +361,7 @@ class AniListClient:
                 )
                 r.raise_for_status()
                 return r.json()["data"]["Page"]["media"]
-            except Exception:
+            except Exception:           # 限流 / 网络错误退避重试；AniList 目前没有调用方（critic N20），拿不到就是空
                 if attempt == retries - 1:
                     return []
                 time.sleep(2 * (attempt + 1))   # AniList 限流，退避重试

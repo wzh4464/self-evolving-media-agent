@@ -194,7 +194,7 @@ def _feed_cached(mid: str, cache) -> list[dict]:
     return got.get("items") or []
 
 
-def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None) -> str | None:
+def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None) -> str | None:
     """找这部番在 Mikan 上的番组 id，找到后**写回 sidecar**，省得每轮再搜。
 
     解析顺序是有讲究的：
@@ -230,7 +230,9 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None) -> str | No
         if hit is None:
             try:
                 hit = {"ids": _mikan_search_ids(kw, 3)}
-            except Exception:
+            except Exception as e:
+                if log:
+                    log(f"[episode-available] Mikan 搜索失败 {kw}：{type(e).__name__}: {e}")
                 continue
             cache.put_llm(ck, hit)
         for i in (hit.get("ids") or []):
@@ -247,7 +249,9 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None) -> str | No
     for mid in cands[:4]:
         try:
             fit = _season_fit(_feed_cached(mid, cache), air)
-        except Exception:
+        except Exception as e:
+            if log:
+                log(f"[episode-available] 拉候选番组页 {mid} 的 feed 失败：{type(e).__name__}: {e}")
             continue
         if fit > best_fit:
             best, best_fit = mid, fit
@@ -369,7 +373,9 @@ class EpisodeAvailableDetector:
                 have = set(info.get("have") or []) | disk_eps.get(int(season_key), set())
                 try:
                     eps = ctx.tmdb.season_episodes(show.tmdb_id, int(season_key))
-                except Exception:
+                except Exception as e:
+                    ctx.log(f"[episode-available] TMDB 第 {season_key} 季集表读取失败 {show.dir_name}，"
+                            f"这一季这一轮不抓：{type(e).__name__}: {e}")
                     continue
                 air_of = {e["episode_number"]: e["air_date"] for e in eps
                           if e.get("air_date")}
@@ -399,7 +405,7 @@ class EpisodeAvailableDetector:
                     continue
 
                 mid = _resolve_mikan_id(
-                    sc, show, cache,
+                    sc, show, cache, log=ctx.log,
                     air=[d for d in (air_of.get(n) for n in aired) if d])
                 if not mid:
                     yield Finding(

@@ -392,7 +392,10 @@ class Evolver:
             try:
                 covered = {f.path for f in d.detect(self.ctx, state)
                            if f.path and (f.action is not None or f.classified)}
-            except Exception:
+            except Exception as e:
+                # 影子验证里别的规则崩了：当作与它不重叠（与 Registry 对崩溃检测器的处理一致），但要说出来
+                self.ctx.log(f"[evolve] 影子验证时规则 {getattr(d, 'id', d)} 执行失败，按不重叠处理："
+                             f"{type(e).__name__}: {e}")
                 continue
             if covered and set(hits) & covered:
                 return getattr(d, "id", "?")
@@ -481,7 +484,7 @@ class Evolver:
 
 def load_evolved(registry: Registry) -> int:
     """把 .agents/rules/ 里已提升的规则挂载进注册表。"""
-    specs = load_rule_specs(RULES_DIR)
+    specs = load_rule_specs(RULES_DIR, errors=registry.load_errors)
     for s in specs:
         registry.register(s)
     return len(specs)

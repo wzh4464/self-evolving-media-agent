@@ -361,7 +361,9 @@ def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
         try:
             title, _ = ctx.tmdb.official_title(hit["id"])
             seasons = ctx.tmdb.seasons(hit["id"])
-        except Exception:
+        except Exception as e:
+            ctx.log(f"[scan] TMDB 取标题 / 季信息失败 {show.dir_name}（id {hit['id']}），这一轮按没匹配处理："
+                    f"{type(e).__name__}: {e}")
             continue
         show.tmdb_id = hit["id"]
         show.tmdb_title = title

@@ -154,6 +154,8 @@ def build_registry() -> Registry:
     n = load_evolved(reg)          # 演进出的规则挂在内置之后（内置优先）
     if n:
         _log(f"已挂载 {n} 条演进规则")
+    for e in reg.load_errors:      # 坏规则文件：以前一声不吭地少挂一条
+        _log(f"⚠️  [rules] 演进规则加载失败，没挂上：{e}")
     return reg
 
 

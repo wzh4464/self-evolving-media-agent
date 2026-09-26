@@ -261,7 +261,8 @@ class RunHealth:
         by_sev: dict = {}
         for f in findings:
             by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
-        self.data["detectors"] = {"count": len(reg.detectors), "errors": list(reg.errors)}
+        self.data["detectors"] = {"count": len(reg.detectors), "errors": list(reg.errors),
+                                  "load_errors": list(getattr(reg, "load_errors", []))}
         self.data["findings"] = {"total": len(findings),
                                  "actionable": sum(1 for f in findings if f.action),
                                  "by_severity": by_sev}
@@ -345,6 +346,8 @@ class RunHealth:
         if det.get("errors"):
             rules = "、".join(dict.fromkeys(e["rule"] for e in det["errors"]))
             add("warn", "detector_crash", f"{len(det['errors'])} 条规则崩了（{rules}），这一轮的诊断不完整")
+        if det.get("load_errors"):
+            add("warn", "rule_load_failed", f"{len(det['load_errors'])} 个演进规则文件加载失败、没挂上")
         if act.get("failed"):
             add("warn", "failed_actions", f"{act['failed']} 个动作失败（没生效）")
         if act.get("unknown"):

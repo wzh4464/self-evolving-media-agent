@@ -178,14 +178,19 @@ def test_dead_drop_rechecks_completed_members_at_execution_time(lib):
     assert not rep.applied and lib.qbit.has(t.hash)
 
 
-def test_detector_draws_no_conclusion_when_it_cannot_read_the_file_list(lib):
-    """"看不到文件列表就不下结论"：files() 出错不能当成"没有已下完的成员"。"""
+@pytest.mark.allow("log_failure", match=r"\[dead-torrent\] files\(")
+def test_detector_draws_no_conclusion_when_it_cannot_read_the_file_list(lib, tripwire):
+    """"看不到文件列表就不下结论"：files() 出错不能当成"没有已下完的成员"。
+    不下结论也要说出来（第 3 阶段的静默异常清理；以前一声不吭）。"""
     s1 = lib.show("尼古喵喵").season(1)
     t = _dead(s1, {"尼古喵喵 S01E11.mkv": GB}, "[A] Yani Neko - 11.mkv", layout="single")
     state = lib.scan(resolve_tmdb=False)                  # 扫描时一切正常
     lib.qbit.fail("files", hash=t.hash, times=None)       # 诊断时这个种子的 files() 超时
 
     assert lib.diagnose(state, detectors=[DeadTorrentDetector]) == []
+    assert [e.detail for e in tripwire.of("log_failure")] == [
+        f"[dead-torrent] files({t.hash[:8]}) 读取失败，这个种子这一轮不下结论："
+        f"ReadTimeout: timed out (injected)"]
 
 
 def test_future_activity_timestamp_falls_back_to_added_on(lib):

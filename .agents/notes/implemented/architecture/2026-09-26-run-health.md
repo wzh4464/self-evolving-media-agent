@@ -180,3 +180,37 @@ run.err.log 的人认它），末尾加上位置。健康报告（第 6 节）�
 处置之后仍低于阈值 critical / 5（`test_quarantine_disposal` 里原来断言 0 的那条随之改成 5）；退出码优先级；检测器崩溃、
 动作失败、TMDB 没配、未改名超时、卡住各自 warn，确认之后回到 ok；这一轮改掉的不算未改名；抓取统计；隔离区大小
 与处置；`health` 命令的最近 / 指定 / JSON / 不存在；报告目录写不进去不改退出码；只留 60 份；配置校验。
+
+## 7. 被吞掉的异常：逐个说出来，或写明为什么不说
+
+**现场**：`media_agent/` 里 83 处 `except Exception` / 裸 `except`。大多数吞得有理由（单个请求、单条规则出错不能拖垮
+整轮），而且第 1、2 阶段与本阶段前几节已经让其中多数进了审计（`_settle` / `_audit` / `_crashed`）、往上抛
+（`ClaimsUnknown`）或记进错误列表。剩下 25 处吞得不声不响——`bug-fix/2026-08-30-silent-failures-sweep.md` 那五个
+"不报错、只是不干活"的 bug 就是这种形态。
+
+**做法**（行为一律不变，只是说出来）：
+
+- 18 处改成 `ctx.log` 一行、带上下文（哪个规则 / 哪部番 / 哪个种子 / 异常），前缀 `[规则 id]` 或 `[scan]` /
+  `[rollback]` / `[evolve]` / `[grab]`，统一用「失败」——健康报告（第 6 节）按 `[标签]` 数它们，测试的 tripwire
+  （`log_failure`）也认它。涉及：scan 里 TMDB 取标题 / 季信息；incomplete-season、source-abandoned、episode-available
+  里 TMDB 集表、RSS、Mikan 搜索 / 字幕组 / 候选 feed（`_resolve_mikan_id` 为此多了 `log` 参数）；dead-torrent 与
+  stale-torrent-path 读 `files()`；抓取后改种子显示名（没改成的话 AB 会按分季集号改回去，2026-08-31 Re:Zero 那次拉锯）；
+  回退 relink 时改不回条目名 / save_path（以前一声不吭、照报"已还原"——仍算还原，见遗留）；演进影子验证里别的规则崩了。
+- 演进规则文件读不了 / 格式不对：`load_rule_specs(errors=…)` 把原因交给调用方，`Registry.load_errors` 记下，
+  `build_registry` 在 stderr 说、健康报告 warn（`rule_load_failed`）。以前坏文件一声不吭地少挂一条（evolution 调研 §10b）。
+- 7 处写明为什么不说：AB 就绪轮询、`.torrent` 解析不了（调用方按"说不清"处理并写进审计）、relink 触发校验出错
+  （写进那条 applied 记录的 `recheck_error`）、目录改名 setLocation 出错（记进 `move_failed / move_unsure`、随后写审计）、
+  AniList 退避重试（没有调用方，critic N20）、DSL 条件求值（逐文件 × 逐规则，报了会刷屏；坏规则在加载时报）、
+  `_season_offsets`（`sidecar.load` 自己兜了坏 JSON；剩下的"没有偏移"是安全一侧）。
+- `tests/test_silent_excepts.py` 按 AST 检查：每个宽 `except` 要么调用日志 / 审计 / 汇报（`log`、`_audit`、`_settle`、
+  `on_error`、`errors.append`……），要么 `raise`、要么把异常交给调用方（`return f"…{e}"`），否则那一行必须有注释。
+  以后再加一个不声不响的，这个测试红。
+
+**遗留**：回退 relink 时条目改不回来仍算"已还原"（现在会说出来）；`sidecar.load` 把坏 JSON 当作空 sidecar
+（`require_any` / `season_offsets` 这些用户意图就此消失）是窄 except，不在这次范围里；source-abandoned 取集表失败时
+缓存了空结果（原有行为，现在会说出来）。
+
+**测试**：`tests/test_silent_excepts.py`（检查器本身与它的对照）、`tests/test_silent_excepts_report.py`——TMDB 取标题
+失败说出来、番照旧按没匹配处理；回退 relink 改不回条目说出来、照旧算还原；坏规则文件报出来、其余照常挂上、
+`build_registry` 在 stderr 说；健康报告数到这些行（`logged_errors`）。`test_dead_torrent` 里注入 `files()` 超时的那条
+测试现在声明了预期的那一行日志。改之前这 7 个测试里 6 个红。

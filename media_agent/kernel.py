@@ -393,6 +393,8 @@ class Registry:
     # 留下来——以前只打一行日志，健康报告说不出"这一轮哪条规则崩了、崩在哪"（critic N9：检测器里一个
     # "database is locked" 被吞掉，诊断就静默地少了一截）。
     errors: list[dict] = field(default_factory=list)
+    # 挂载演进规则时读不了 / 格式不对、因此没挂上的规则文件（`load_rule_specs`）。不随 `run_all` 清空。
+    load_errors: list[str] = field(default_factory=list)
 
     def register(self, detector: Any) -> Any:
         self.detectors.append(detector)
@@ -496,7 +498,7 @@ def _eval_clause(clause: dict, f: MediaFile, s: Show) -> bool:
         return False
     try:
         return op(getter(f, s), clause.get("value"))
-    except Exception:
+    except Exception:       # 坏正则 / 类型不对 = 不命中。每个文件 × 每条规则都求值，逐次报会刷屏；坏规则在加载时报
         return False
 
 
@@ -576,14 +578,19 @@ class RuleSpec:
                 )
 
 
-def load_rule_specs(rules_dir: Path) -> list[RuleSpec]:
-    """从 .agents/rules/*.json 加载演进出的规则。"""
+def load_rule_specs(rules_dir: Path, errors: list | None = None) -> list[RuleSpec]:
+    """从 .agents/rules/*.json 加载演进出的规则。
+
+    读不了 / 格式不对的文件跳过（一条坏规则不该让其余的都挂不上），原因追加进 `errors`。以前一声不吭地跳过：
+    规则文件写坏了，这条规则就此消失，没有任何地方看得出来（evolution 调研 §10b）。"""
     specs: list[RuleSpec] = []
     if not rules_dir.exists():
         return specs
     for p in sorted(rules_dir.glob("*.json")):
         try:
             specs.append(RuleSpec.from_json(json.loads(p.read_text(encoding="utf-8"))))
-        except Exception:
+        except Exception as e:
+            if errors is not None:
+                errors.append(f"{p.name}：{type(e).__name__}: {e}")
             continue
     return specs

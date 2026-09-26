@@ -66,6 +66,12 @@
 | §3 | 生产上 launchd 怎么跑：`uv run` 不带 `--frozen`，每轮同步依赖；全项目没有任何锁 |
 | §5 | 三处用 `Path(__file__).resolve()` 定位项目根，审计里存的是隔离区绝对路径：`releases/<sha>` + 软链的布局会让 `state/`、`.env`、规则、偏好"分家"，所以只能原地 checkout |
 
+## evolution 调研：自演进（第 3 阶段引用）
+
+| 编号 | 是什么 | 处理 |
+|---|---|---|
+| §10b | 让演进规则留在版本控制里、又不破坏加载：`load_rule_specs` 对读不了 / 格式不对的规则文件 `except Exception: continue`，一声不吭地少挂一条，应当报出来并补一个"每条规则都能加载"的测试 | 报出来：第 3 阶段 `load_rule_specs(errors=…)` / `Registry.load_errors`，见 `architecture/2026-09-26-run-health.md` 第 7 节；加载测试未做 |
+
 ## grab 调研：抓取链路（第 2 阶段引用）
 
 | 编号 | 是什么 |

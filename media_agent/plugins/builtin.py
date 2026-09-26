@@ -189,7 +189,7 @@ def _season_offsets(show: Show) -> dict:
         from .. import sidecar as sc_mod
         try:
             _OFFSET_CACHE[key] = dict(sc_mod.load(show.dir_path).season_offsets or {})
-        except Exception:
+        except Exception:   # 坏 JSON / 读不了 sidecar.load 自己兜了；到这里是格式怪异：没有偏移 = 声明季对不上就不认（安全一侧）
             _OFFSET_CACHE[key] = {}
     return _OFFSET_CACHE[key]
 
@@ -900,7 +900,9 @@ def _entries_or_none(ctx: Context, torrent_hash: str) -> list[dict] | None:
     """种子的文件列表；读不到返回 None（= 不知道）。"""
     try:
         return ctx.qbit.files(torrent_hash) if ctx.qbit else None
-    except Exception:
+    except Exception as e:
+        ctx.log(f"[dead-torrent] files({torrent_hash[:8]}) 读取失败，这个种子这一轮不下结论："
+                f"{type(e).__name__}: {e}")
         return None
 
 
@@ -1415,7 +1417,9 @@ class StaleTorrentPathDetector:
             try:
                 entries = [e for e in ctx.qbit.files(t["hash"])
                            if e.get("priority", 1) != 0]
-            except Exception:
+            except Exception as e:
+                ctx.log(f"[stale-torrent-path] files({t['hash'][:8]}) 读取失败，这个种子这一轮不重新关联："
+                        f"{type(e).__name__}: {e}")
                 entries = []
 
             for e in entries:

@@ -868,7 +868,7 @@ class Executor:
             try:
                 self.ctx.ab.all_bangumi()
                 return True
-            except Exception:
+            except Exception:           # 就绪轮询：还没起来就等 2 秒再问，等到超时由调用方按 False 处理
                 time.sleep(2)
         return False
 
@@ -1192,7 +1192,7 @@ class Executor:
             i = blob.index(b"4:infod") + len(b"4:info")
             _, end = parse(i)
             return hashlib.sha1(blob[i:end]).hexdigest()
-        except Exception:
+        except Exception:               # 解析不了（纯 v2 / 畸形 .torrent）= 算不出：调用方各自按"说不清"处理并写进审计
             return None
 
     def _retitle_torrent(self, blob: bytes, title: str, raw_ep: int, ep: int) -> None:
@@ -1209,8 +1209,11 @@ class Executor:
             return
         try:
             self.ctx.qbit.rename_torrent(h, new)
-        except Exception:
-            pass
+        except Exception as e:
+            # 不影响抓取本身；但没改成的话 AutoBangumi 会按种子名里的分季集号改回去（2026-08-31 Re:Zero E58
+            # → S01E08 就是这么来回拉锯的），这得看得见
+            self.ctx.log(f"[grab] 改种子显示名失败（{h[:8]} → {new[:60]}）：{_describe(e)}；"
+                         f"AutoBangumi 可能按原名里的分季集号改回")
 
     def _rename_grabbed(self, blob: bytes, title: str, season: int, ep: int) -> tuple[dict, dict]:
         """把刚加进去的种子里那个正片文件改成规范名，返回写进审计的两段结局：
@@ -1495,7 +1498,7 @@ class Executor:
         recheck: dict = {"recheck_triggered": True}
         try:
             self.ctx.qbit.recheck([h])
-        except Exception as e:
+        except Exception as e:          # 出错写进下面这条 applied 记录的 recheck_error
             recheck = {"recheck_triggered": False, "recheck_error": _describe(e),
                        "recheck_note": "触发校验的请求出错；下一轮 stale-torrent-path 会再看它"}
         self._audit("applied", f, a,
@@ -1662,7 +1665,7 @@ class Executor:
             try:
                 self.ctx.qbit.set_location([h], dest)
                 moved_ok.append(h)
-            except Exception as e:
+            except Exception as e:      # 出错按此刻状态认，记进 move_failed / move_unsure，下面写进审计
                 # 超时时 qBittorrent 常常已经受理了（`_location_landed`：save_path 已变或正在 moving）
                 landed = self._confirm(lambda h=h, dest=dest, sp=sp: self._location_landed(h, dest, sp))
                 if landed is True:
@@ -2541,13 +2544,18 @@ class Executor:
             for m in u.get("mapping", []):
                 try:
                     self.ctx.qbit.rename_file(h, m["old"], m["new"])
-                except Exception:
+                except Exception as e:
+                    # 以前一声不吭地跳过，这一步照样报「已还原」。行为不变（仍算还原——其余条目照常还原），
+                    # 但要说出来。（`_undo_notes` 是"合集条目的下载没恢复"的计数，不能往里塞。）
+                    self.ctx.log(f"[rollback] 回退 relink：{h[:8]} 的条目 {m['new'][:60]} → "
+                                 f"{m['old'][:60]} 改回失败：{_describe(e)}，需人工核对")
                     continue
             if u.get("new_save_path"):        # 还原到原来的 save_path
                 try:
                     self.ctx.qbit.set_location([h], u["new_save_path"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.ctx.log(f"[rollback] 回退 relink：{h[:8]} 的 save_path 改回 {u['new_save_path']} "
+                                 f"失败：{_describe(e)}，需人工核对")
             return True, ""
 
         if op == "recategorize":

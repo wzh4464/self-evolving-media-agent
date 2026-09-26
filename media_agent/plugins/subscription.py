@@ -368,7 +368,9 @@ class IncompleteSeasonDetector:
                 else:
                     try:
                         eps = ctx.tmdb.season_episodes(show.tmdb_id, sn)
-                    except Exception:
+                    except Exception as e:
+                        ctx.log(f"[incomplete-season] TMDB 第 {sn} 季集表读取失败 {show.dir_name}，"
+                                f"这一季这一轮不评估：{type(e).__name__}: {e}")
                         continue
                     cache.put_tmdb(ck, {"eps": eps})
 
@@ -509,7 +511,10 @@ class SourceAbandonedDetector:
             if c0 is None:
                 try:
                     c0 = {"eps": ctx.tmdb.season_episodes(show.tmdb_id, season)}
-                except Exception:
+                except Exception as e:
+                    # 行为不变（照旧按"没有已播的集"往下走、并缓存下来），但要说出来
+                    ctx.log(f"[source-abandoned] TMDB 第 {season} 季集表读取失败 {show.dir_name}："
+                            f"{type(e).__name__}: {e}")
                     c0 = {"eps": []}
                 cache.put_tmdb(ck0, c0)
             aired_eps = {e["episode_number"] for e in (c0.get("eps") or [])
@@ -524,7 +529,9 @@ class SourceAbandonedDetector:
             else:
                 try:
                     titles = _fetch_rss_titles(b["rss_link"])
-                except Exception:
+                except Exception as e:
+                    ctx.log(f"[source-abandoned] RSS 拉取失败 {b.get('official_title')}，这一轮不评估："
+                            f"{type(e).__name__}: {e}")
                     continue
                 cache.put_llm(ck, {"titles": titles})
             if not titles:
@@ -551,7 +558,9 @@ class SourceAbandonedDetector:
             else:
                 try:
                     eps = ctx.tmdb.season_episodes(show.tmdb_id, season)
-                except Exception:
+                except Exception as e:
+                    ctx.log(f"[source-abandoned] TMDB 第 {season} 季集表读取失败 {show.dir_name}，"
+                            f"这一轮不评估：{type(e).__name__}: {e}")
                     continue
                 cache.put_tmdb(ck2, {"eps": eps})
 
@@ -665,7 +674,8 @@ class SourceAbandonedDetector:
             if hit is None:
                 try:
                     hit = {"ids": _mikan_search_ids(kw, self.MAX_CANDIDATES)}
-                except Exception:
+                except Exception as e:
+                    ctx.log(f"[source-abandoned] Mikan 搜索失败 {kw}：{type(e).__name__}: {e}")
                     continue
                 cache.put_llm(ck, hit)
             for i in hit.get("ids", []):
@@ -681,7 +691,8 @@ class SourceAbandonedDetector:
             if subs is None:
                 try:
                     subs = {"groups": _mikan_subgroups(bid)}
-                except Exception:
+                except Exception as e:
+                    ctx.log(f"[source-abandoned] 读 Mikan 番组 {bid} 的字幕组失败：{type(e).__name__}: {e}")
                     continue
                 cache.put_llm(ck, subs)
             # 组名必须**完全相等**。模糊匹配（`group in name or name in group`）
@@ -703,7 +714,8 @@ class SourceAbandonedDetector:
             if got is None:
                 try:
                     got = {"titles": _fetch_rss_titles(feed)}
-                except Exception:
+                except Exception as e:
+                    ctx.log(f"[source-abandoned] 拉候选 RSS 失败 {feed[:80]}：{type(e).__name__}: {e}")
                     continue
                 cache.put_llm(ck2, got)
             titles = got.get("titles") or []
