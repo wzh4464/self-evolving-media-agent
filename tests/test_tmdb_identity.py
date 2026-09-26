@@ -445,6 +445,11 @@ def test_llm_pick_is_not_re_asked_every_dry_run(lib):
 
     assert len(lib.llm.prompts) == 1
     assert [f.action.args["tmdb_id"] for f in c.findings if f.kind == "tmdb_pick"] == [11]
+    # 缓存里的答案同样只是提议：钉进 sidecar 之前不按它认、不按它改任何名字（critic N4）。`pin_tmdb` 回退之后、或它一直
+    # 写不进去的时候，每一轮走的都是这条缓存路径（2026-09-27 审查：变异"缓存命中就用它"全套存活）
+    assert c.state.shows[0].tmdb_id is None
+    assert not {"rename", "rename_show_dir", "write_nfo", "recategorize"} & {f.action.op for f in c.findings
+                                                                            if f.action}
 
 
 def test_llm_is_never_asked_for_a_pinned_show(lib):
