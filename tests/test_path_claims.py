@@ -234,6 +234,28 @@ def test_file_list_failure_of_an_unrelated_torrent_does_not_block(lib):
     assert ClaimIndex(lib.qbit).check(s1.path / SLOT).free
 
 
+@pytest.mark.parametrize("call", ["scandir", "lstat"])
+def test_an_unreadable_directory_is_unknown_not_free(lib, monkeypatch, call):
+    """2026-09-26 审查：盘上那一侧读不了（权限、I/O 错误）时同样不知道——以前把 `ClaimsUnknown`
+    换成"当它不在"全套照样全绿（C18 / C19）。看不见的名字不等于没人占。"""
+    from media_agent import claims as claims_mod
+
+    s1 = lib.show("尼古喵喵").season(1)
+    s1.local(SLOT, size=GB)
+    real = getattr(os, call)
+
+    def denied(p, *a, **k):
+        if str(s1.path) in str(p):
+            raise PermissionError(13, "Permission denied", str(p))
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(claims_mod.os, call, denied)
+
+    chk = ClaimIndex(lib.qbit).check(s1.path / SLOT)
+
+    assert chk.unknown and not chk.free and "Permission" in chk.unknown
+
+
 @pytest.mark.allow("qbit_error", match="404")
 def test_torrent_deleted_between_list_and_files_claims_nothing(lib):
     s1 = lib.show("尼古喵喵").season(1)

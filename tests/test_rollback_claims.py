@@ -218,6 +218,64 @@ def test_readd_of_a_colliding_victim_is_refused_when_a_third_torrent_claims_the_
     assert not lib.qbit.has(victim.hash)
 
 
+# 2026-09-26 审查：重加的三道没有测试依赖——看不全照样重加（A16）、一个候选路径都没有照样重加（A17）、
+# 摘除时记下的 `paths` 被忽略（A19，现有用例都靠 `args.path` / 显示名兜底过了）。
+def _drop_only(lib, detectors=(DeadTorrentDetector,)):
+    return lib.cycle(detectors=list(detectors), select=lambda f: f.action.op == "drop_torrent")
+
+
+def test_readd_is_refused_when_occupancy_cannot_be_read(lib):
+    s1 = lib.show("尼古喵喵").season(1)
+    dead = _dead(s1, {SLOT: GB}, SLOT, layout="single", progress=0.0)
+    neighbour = s1.single("尼古喵喵 S01E08.mkv", size=GB)
+    c = _drop_only(lib)
+    lib.qbit.fail("files", hash=neighbour.hash, times=None)
+
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 0 and res["skipped"] == 1, res
+    assert "无法确认" in res["skipped_detail"][0]["skip_reason"]
+    assert not lib.qbit.has(dead.hash)
+
+
+def test_readd_with_no_known_path_is_refused(lib):
+    """记录里既没有 `paths`、也没有 `args.path`、显示名又不是一个可用的文件名：它加回来会占哪儿
+    无从问起——不盲目重加，magnet 留在审计记录里。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    dead = _dead(s1, {SLOT: GB}, SLOT, layout="single", progress=0.0)
+    c = _drop_only(lib)
+    recs = [json.loads(x) for x in lib.cfg.audit_log.read_text(encoding="utf-8").splitlines()]
+    for r in recs:
+        (r.get("undo") or {}).pop("paths", None)
+        if (r.get("undo") or {}).get("op") == "readd_torrent":
+            r["undo"]["name"] = ""
+    lib.cfg.audit_log.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs),
+                                 encoding="utf-8")
+
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 0 and res["skipped"] == 1, res
+    assert "无法确定" in res["skipped_detail"][0]["skip_reason"]
+    assert not lib.qbit.has(dead.hash)
+
+
+def test_readd_of_a_multi_file_torrent_checks_every_path_it_claimed(lib):
+    """NoSubfolder 合集的显示名（`[TV版&无修版] 尼古喵喵 - EP11-12`）不是任何一个文件名：只有摘的
+    那一刻记下的 `paths` 知道它占着 S01E12。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    dead = _dead(s1, {"尼古喵喵 S01E11.mkv": GB, "尼古喵喵 S01E12.mkv": GB},
+                 "[TV版&无修版] 尼古喵喵 - EP11-12", layout="nosub", progress=0.0)
+    c = _drop_only(lib)
+    newcomer = s1.single("尼古喵喵 S01E12.mkv", size=GB, name="[N] Yani Neko - 12.mkv",
+                         progress=0.0)
+
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 0 and res["skipped"] == 1, res
+    assert newcomer.hash[:8] in res["skipped_detail"][0]["skip_reason"]
+    assert not lib.qbit.has(dead.hash)
+
+
 # ------------------------------------------------------------------ 从隔离区搬回
 def _trash_record(lib, run_id: str, dst, src) -> None:
     rec = {"ts": "2026-09-20T17:01:26", "run_id": run_id, "status": "applied",

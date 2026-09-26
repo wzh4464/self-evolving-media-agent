@@ -125,3 +125,50 @@ def test_relink_undo_refuses_to_map_back_onto_a_path_someone_now_claims(lib):
     assert newcomer.hash[:8] in d["skip_reason"]
     assert lib.snapshot() == before
     assert lib.qbit.file_names(t.hash) == [SLOT]
+
+
+# ------------------------------------------------------------------ 每道闸单独的现场
+# 2026-09-26 审查：换目录时被 setLocation 连带搬走的条目（不在映射里的）目的地查不查（A10）、逆操作
+# 盘上一侧查不查（A11），关掉都全绿。
+def test_relink_into_another_dir_checks_where_the_unmapped_entries_land(lib):
+    """映射只改失联的那一个；同一个种子里别的条目会被 setLocation 连带搬进新目录——那里的同名
+    文件此刻归别的种子，搬过去就是两个种子争一个文件。"""
+    from media_agent.kernel import Action, Finding
+
+    sh = lib.show("古诺希亚")
+    s1, s2 = sh.season(1), sh.season(2)
+    t = s1.torrent({OLD: SIZE, "古诺希亚 S01E09.mkv": SIZE + 1}, name="[G] Gnosia 08-09",
+                   layout="nosub")
+    (s1.path / OLD).unlink()
+    s2.local(SLOT, size=SIZE)
+    b = s2.single("古诺希亚 S01E09.mkv", size=SIZE + 1, name="[B] Gnosia - 09 [1080p].mkv")
+    f = Finding(rule="stale-torrent-path", kind="stale_path", severity="important",
+                summary="失联", show="古诺希亚", torrent_hash=t.hash,
+                action=Action(op="relink_torrent", args={
+                    "torrent_hash": t.hash, "mapping": [{"old": OLD, "new": SLOT}],
+                    "new_save_path": str(s2.path)}))
+    before = lib.snapshot()
+
+    rep = lib.apply([f])
+
+    [skip] = rep.skipped
+    assert "古诺希亚 S01E09.mkv" in skip["reason"]
+    assert b.hash in [x.get("hash") for c in skip["claims"] for x in c["claimants"]]
+    assert _relink_calls(lib) == [] and lib.snapshot() == before
+
+
+def test_relink_undo_refuses_to_map_back_onto_a_file_now_on_disk(lib):
+    """回退要映射回的原名上，此后盘上有了一个别的文件（没有种子）：映射过去 recheck 就会拿它校验、
+    判缺、重下覆盖它。"""
+    s1 = lib.show("古诺希亚").season(1)
+    t = _stale(s1)
+    s1.local(SLOT, size=SIZE)
+    c = lib.cycle(detectors=[StaleTorrentPathDetector])
+    s1.local(OLD, size=SIZE // 2)
+    before = lib.snapshot()
+
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 0 and res["skipped"] == 1, res
+    assert "占用" in res["skipped_detail"][0]["skip_reason"]
+    assert lib.snapshot() == before and lib.qbit.file_names(t.hash) == [SLOT]

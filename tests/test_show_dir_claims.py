@@ -111,6 +111,39 @@ def test_rollback_into_an_old_dir_a_torrent_now_points_at_is_refused(lib):
     assert lib.snapshot() == before
 
 
+@pytest.mark.allow("failed_record", match="占用")
+def test_rename_is_refused_when_a_root_level_neighbours_files_cannot_be_read(lib):
+    """2026-09-26 审查：只有 `torrents()` 读失败有测试（它在更早一步就拦下了）；save_path 在媒体根的
+    种子要读 `files()` 才知道它有没有条目落进新目录——读不到同样不能搬（A26）。"""
+    lib.show("旧名").season(1).single("旧名 S01E01.mkv", size=1000)
+    root = lib.show("_").folder("")
+    stranger = root.torrent({"Season 1/别的 S01E03.mkv": 3000}, name="别的", layout="original")
+    lib.qbit.raw(stranger.hash)["save_path"] = str(lib.media_root)
+    lib.qbit.fail("files", hash=stranger.hash, times=None)
+    before = lib.snapshot()
+
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")])
+
+    [rec] = rep.failed
+    assert "未做任何改动" in rec["error"] and stranger.hash[:8] in rec["error"]
+    assert _moves(lib) == [] and lib.snapshot() == before
+
+
+def test_rollback_into_an_old_dir_that_now_exists_on_disk_is_refused(lib):
+    """改名之后旧目录名又在盘上出现了（按旧标题的订阅建出来的）：搬回去就与它混在一起（A27）。"""
+    lib.show("旧名").season(1).single("旧名 S01E01.mkv", size=1000)
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")])
+    [rec] = rep.applied
+    lib.show("旧名").season(1).local("旧名 S01E02.mkv", size=2000)
+    before = lib.snapshot()
+
+    res = lib.rollback(rec["run_id"])
+
+    assert res["reverted"] == 0 and res["skipped"] == 1, res
+    assert "已存在" in res["skipped_detail"][0]["skip_reason"]
+    assert lib.snapshot() == before
+
+
 # ------------------------------------------------------------------ 残留搬运认得出"只差大小写"
 def _case_insensitive(tmp_path) -> bool:
     probe = tmp_path / "case-probe"
