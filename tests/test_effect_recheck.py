@@ -534,6 +534,120 @@ def test_dir_rename_whose_set_location_timed_out_after_moving_is_applied(lib):
     assert lib.rollback("t-dir")["reverted"] == 1
 
 
+# ------------------------------------------------------------------ 异步的 setLocation（2026-09-26 复审）
+# qBittorrent 5.2.3 对有元数据的种子排一个异步搬运：`save_path` 搬完才变，其间 `state` 是 `moving`。以前 FakeQbit
+# 从不报 `moving`，`_location_landed` 里认它的那一支删掉全套照绿（变异 B2n），而真实的超时形态被记成了 failed。
+def test_dir_rename_whose_set_location_timed_out_while_moving_is_applied(lib):
+    show = lib.show("旧名")
+    t = show.season(1).single("旧名 S01E01.mkv", size=1000)
+    show.local("tvshow.nfo", size=10)
+    ident = lib.ident(t.path)
+    lib.qbit.async_moves = True
+    lib.qbit.fail("set_location", hash=t.hash, after=True)
+
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")], run_id="t-dir")
+
+    [rec] = rep.applied
+    assert "ReadTimeout" in rec["confirmed_after_error"] and rec["undo"]["op"] == "rename_show_dir"
+    assert lib.qbit.torrent(t.hash)["state"] == "moving"
+    # 种子的文件交给 qBittorrent 自己搬：以前正向的残留合并不看占用，qBit 还没搬完就被文件系统搬走了
+    assert t.path.exists() and lib.ident(t.path) == ident
+    assert (lib.path("新名") / "tvshow.nfo").exists()                # 没有种子的残留照常搬
+    lib.qbit.drain()
+    [now] = t.current_paths()
+    assert now == lib.path("新名") / "Season 1" / "旧名 S01E01.mkv" and lib.ident(now) == ident
+
+
+def test_dir_rename_that_cannot_see_qbit_after_moving_leaves_the_leftovers(lib):
+    """种子都交给 qBittorrent 搬了，之后读不到它：谁还在旧目录里不知道，残留一个都不用文件系统碰（repair 可以补）。"""
+    show = lib.show("旧名")
+    t = show.season(1).single("旧名 S01E01.mkv", size=1000)
+    nfo = show.local("tvshow.nfo", size=10)
+    real = lib.qbit.set_location
+
+    def then_blind(hashes, location):
+        real(hashes, location)
+        lib.qbit.fail("torrents", times=None)
+
+    lib.qbit.set_location = then_blind
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")], run_id="t-dir")
+    lib.qbit._faults.clear()
+    del lib.qbit.set_location
+
+    [rec] = rep.applied
+    assert "读不到" in rec["leftovers_skipped"] and rec["leftover_files_moved"] == 0
+    assert nfo.exists()
+    assert lib.qbit.torrent(t.hash)["save_path"] == str(lib.path("新名") / "Season 1")
+
+
+def test_relink_whose_set_location_timed_out_while_moving_goes_on(lib):
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+
+    sh, t = _stale_moved(lib)
+    lib.qbit.async_moves = True
+    lib.qbit.fail("set_location", hash=t.hash, after=True)
+
+    c = lib.cycle(detectors=[StaleTorrentPathDetector])
+
+    [rec] = c.applied("relink_torrent")
+    assert rec["relocated_to"] == str(sh.path / "Season 2") and rec["relinked"] == 1
+    assert "ReadTimeout" in rec["confirmed_after_error"]
+
+
+def _relocate(t, dest) -> Finding:
+    """`relocate` 只有演进规则会产出（分派处拦下），这里直接给一条非演进的发现，测它自己的核实。"""
+    return Finding(rule="manual", kind="misplaced", severity="minor", summary="挪种子",
+                   torrent_hash=t.hash,
+                   action=Action(op="relocate", args={"torrent_hash": t.hash, "location": str(dest)}))
+
+
+@pytest.mark.parametrize("async_moves", [False, True], ids=["moved", "moving"])
+def test_relocate_whose_set_location_timed_out_after_accepting_is_applied(lib, async_moves):
+    s1 = lib.show("尼古喵喵").season(1)
+    t = s1.single("尼古喵喵 S01E01.mkv", size=1000)
+    lib.qbit.async_moves = async_moves
+    lib.qbit.fail("set_location", hash=t.hash, after=True)
+
+    rep = lib.apply([_relocate(t, lib.path("尼古喵喵") / "Season 2")], run_id="t-rel")
+
+    [rec] = rep.applied
+    assert "ReadTimeout" in rec["confirmed_after_error"]
+
+
+@pytest.mark.allow("failed_record", match="ReadTimeout")
+def test_relocate_whose_set_location_never_happened_is_failed(lib):
+    """setLocation 出错、save_path 还是原来的、也不在搬：核实过没生效（变异 B2o：把这一支改成"说不清"全套照绿）。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    t = s1.single("尼古喵喵 S01E01.mkv", size=1000)
+    lib.qbit.fail("set_location", hash=t.hash)
+
+    rep = lib.apply([_relocate(t, lib.path("尼古喵喵") / "Season 2")], run_id="t-rel")
+
+    [rec] = rep.failed
+    assert "没有生效" in rec["effect"]
+    assert lib.qbit.torrent(t.hash)["save_path"] == str(s1.path)
+
+
+@pytest.mark.allow("unknown_record", match="setLocation")
+def test_relocate_whose_set_location_cannot_be_checked_is_unknown(lib):
+    s1 = lib.show("尼古喵喵").season(1)
+    t = s1.single("尼古喵喵 S01E01.mkv", size=1000)
+    real = lib.qbit.set_location
+
+    def blind(hashes, location):
+        real(hashes, location)
+        lib.qbit.fail("torrents", times=None)
+        raise httpx.ReadTimeout("timed out (injected)")
+
+    lib.qbit.set_location = blind
+    rep = lib.apply([_relocate(t, lib.path("尼古喵喵") / "Season 2")], run_id="t-rel")
+    lib.qbit._faults.clear()
+    del lib.qbit.set_location
+
+    [rec] = rep.unknown
+    assert "setLocation" in rec["reason"]
+
+
 @pytest.mark.allow("unknown_record", match="setLocation")
 def test_dir_rename_with_an_unconfirmable_set_location_is_unknown_and_not_auto_reverted(lib):
     """两个种子，第二个的 setLocation 超时之后连 qBittorrent 都读不到了：半迁移、而且说不清迁了多少。

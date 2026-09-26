@@ -58,6 +58,8 @@ class FakeQbit:
       **未经生产实测**，所以每次覆盖都记 `qbit_overwrite`）或 `"raise"`（报 409）。
     - `async_moves`：True 时 `set_location` 只登记，`drain()` 才真正搬文件——
       近似 qBittorrent 的异步 moveStorage，用来暴露"setLocation 后立刻 _merge_tree"的竞态。
+      搬完之前种子的 `state` 是 `moving`、`save_path` 不变（qBittorrent 5.2.3：`m_storageIsMoving`
+      在处理请求时就置上，`save_path` 搬完才变），`drain()` 之后恢复原来的状态。
     - `async_deletes`：True 时 `delete` 只登记，种子（连同它的条目）照样出现在 `torrents()` /
       `files()` 里，`drain()` 才真正删——qBittorrent 的删除同样是异步的，刚删完的种子还会在
       列表里出现一会儿（`claims.ClaimIndex` 按引用拿执行器的 `_removed_torrents` 正是为此）。
@@ -341,7 +343,10 @@ class FakeQbit:
         pending, self._pending_moves = self._pending_moves, []
         for h, loc in pending:
             if h in self._t:
-                self._do_move(self._t[h], loc)
+                t = self._t[h]
+                self._do_move(t, loc)
+                if t["state"] == "moving":
+                    t["state"] = t.pop("_state_before_move", None) or "stalledUP"
         deletes, self._pending_deletes = self._pending_deletes, []
         for h, delete_files in deletes:
             self._do_delete(h, delete_files)
@@ -478,6 +483,9 @@ class FakeQbit:
                 continue                            # 真 API 忽略未知 hash
             if self.async_moves:
                 self._pending_moves.append((h, location))
+                if t["state"] != "moving":
+                    t["_state_before_move"] = t["state"]
+                t["state"] = "moving"
             else:
                 self._do_move(t, location)
             self._maybe_fail("set_location", h, after=True)

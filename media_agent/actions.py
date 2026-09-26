@@ -1730,9 +1730,21 @@ class Executor:
                         undo=partial)
             return
 
-        # 种子搬完后，把没有种子关联的残留文件（NFO、孤儿字幕、失联种子的文件等）挪过去
-        self._effect("fs.merge_tree")
-        leftovers, stranded = self._merge_tree(old, new)
+        # 种子搬完后，把没有种子关联的残留文件（NFO、孤儿字幕、失联种子的文件等）挪过去。
+        # **种子声明的路径一个都不碰**（与回退、repair 同一口径）：qBittorrent 5.2.3 对有元数据的种子是异步搬运，
+        # setLocation 返回时文件多半还在旧目录（state=moving）。以前这里不看占用，qBit 还没搬完的文件就被文件系统
+        # 搬走了——正是 AGENTS.md 第 3 条的死链形态（2026-09-26 复审：FakeQbit 报 moving 之后才看见）。
+        self._claims().invalidate()
+        leftovers = stranded = 0
+        skipped_merge = {}
+        try:
+            _, claimed = self._claims().claims_under(old)
+        except ClaimsUnknown as e:
+            # 读不到此刻谁还在旧目录里：残留一个都不动（`repair --run` 可以补），种子已经交给 qBit 搬了
+            skipped_merge = {"leftovers_skipped": f"读不到此刻的种子视图，残留没用文件系统搬：{e}"}
+        else:
+            self._effect("fs.merge_tree")
+            leftovers, stranded = self._merge_tree(old, new, skip=claimed)
 
         if bid and self.ctx.abdb and prev_savepath:
             self.ctx.abdb.write([
@@ -1745,7 +1757,7 @@ class Executor:
                     {"new_path": str(new), "torrents_moved": len(moved_ok),
                      "leftover_files_moved": leftovers,
                      "stranded_files": stranded,
-                     "old_dir_removed": not old.exists()},
+                     "old_dir_removed": not old.exists(), **skipped_merge},
                     undo=undo)
 
     def _op_trash(self, f: Finding, a: Action) -> None:

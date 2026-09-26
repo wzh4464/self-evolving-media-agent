@@ -197,6 +197,15 @@ relink 的逐条改名慢一拍照样算重建成功（改之前整条 failed）
 - `write_sidecar`：`sidecar.save` 先写临时文件再原子替换，抛了异常而内容没变 → failed（核实过的）；变了 → 说不清。
   `write_nfo` 登记文件系统改动（没有逆操作，出错时至少不说成"没生效"）。
 
+**异步搬运的测试与一个正向竞态**（复审时补）：FakeQbit 以前从不报 `moving`（`async_moves` 只登记、状态不变），
+`_location_landed` 认 `moving` 的那一支删掉全套照绿，而"超时时 qBit 正在搬"这个真实形态在测试里被记成 failed。现在
+`async_moves` 期间种子是 `moving`、`save_path` 不变，`drain()` 之后恢复。改完立刻看见一个真 bug：正向目录改名在
+setLocation 之后调 `_merge_tree(old, new)` **不看占用**——qBit 还没搬完的种子文件被文件系统搬走（AGENTS.md 第 3 条的
+死链形态；回退与 repair 早就传 `skip=claimed`）。现在正向同样先 `invalidate` 再 `claims_under(old)`，种子声明的路径
+交给 qBit 自己搬；读不到此刻的种子视图就一个残留都不动（`leftovers_skipped`，AB 的 save_path 照常同步，repair 可补）。
+另补 `relocate` 的核实测试（只有演进规则产出、分派处拦下，以前一条都没有）：受理了（搬完 / 正在搬）→ applied、
+没生效 → failed、读不到 → unknown。
+
 **测试**（repair 接部分改名，复审时补）：`tests/test_effect_recheck.py`——照着回退的建议跑 repair：unknown 的部分改名
 合并成一个目录、两个种子都在新目录（改之前 `pairs == 0`）；failed 的部分改名 repair 搬剩下的并把 AB 的 save_path
 改到新目录；AB 改不成时 `repair` 命令说出来、退出码 1。
