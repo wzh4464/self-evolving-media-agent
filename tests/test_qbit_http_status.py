@@ -91,3 +91,55 @@ def test_a_read_error_whose_text_mentions_404_is_not_taken_as_torrent_gone(lib):
     [fail] = rep.failed
     assert "无法确认" in fail["error"]
     assert lib.qbit.file_names(t.hash) == [LOLI_08]                    # 一个字没改
+
+
+def _files_fail_after(lib, h, n_ok: int):
+    """`files(h)` 前 `n_ok` 次照常，之后报 HTTP 500、正文里碰巧有 "404"。"""
+    real, calls = lib.qbit.files, []
+
+    def files(hh):
+        if hh.lower() == h:
+            calls.append(hh)
+            if len(calls) > n_ok:
+                raise QBitError("torrents/files -> HTTP 500: upstream ab404f", status=500)
+        return real(hh)
+
+    lib.qbit.files = files
+    return calls
+
+
+@pytest.mark.allow("failed_record", match="HTTP 500")
+def test_rename_whose_own_file_listing_fails_with_404_in_the_text_is_not_skipped_as_gone(lib):
+    """占用查询读得到、改名自己读条目时报 HTTP 500（正文里有 404）：读不到 ≠ 种子没了——记 failed、一个字不改。
+    以前这一处也按文本认 404，记「所属种子已不在」跳过；只有占用索引那一处有这种测试（复审变异 B4d）。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    t = s1.single(LOLI_08, size=593_601_176, probe=video("hevc"))
+    findings = lib.diagnose(detectors=[UnrenamedDetector])
+    calls = _files_fail_after(lib, t.hash, n_ok=1)                  # 占用索引那一次读得到
+
+    rep = lib.apply(findings)
+
+    del lib.qbit.files
+    assert len(calls) == 2 and not rep.skipped
+    [fail] = rep.failed
+    assert "HTTP 500" in fail["error"]
+    assert lib.qbit.file_names(t.hash) == [LOLI_08]
+
+
+def test_priority_restore_whose_file_listing_fails_with_404_in_the_text_is_not_skipped_as_gone(lib):
+    """回退恢复条目下载时读条目报 HTTP 500（正文里有 404）：这一步出错，不是"种子已不在、跳过"（复审变异 B4e）。"""
+    from media_agent.plugins.builtin import ExtrasDetector
+
+    s1 = lib.show("银八").season(1)
+    t = s1.torrent({"银八 S01E01.mkv": 600_000_000, "NCOP1.mkv": 90_000_000},
+                   name="[G] Gintama BD", layout="original", state="downloading", progress=0.5)
+    c = lib.cycle(detectors=[ExtrasDetector])
+    [rec] = c.applied("trash")
+    assert rec["undo"]["op"] == "restore_file_priority"
+    lib.qbit.fail("files", hash=t.hash, times=None,
+                  exc=QBitError("torrents/files -> HTTP 500: upstream ab404f", status=500))
+
+    res = lib.rollback(c.run_id)
+
+    assert res["skipped"] == 0 and res["failed"] == 1, res
+    assert "HTTP 500" in res["failed_detail"][0]["error"]
