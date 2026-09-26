@@ -13,8 +13,10 @@
 "消失"只认**评估过**的轮次：被锁挡住、维护暂停、整批拒绝、半路崩溃的一轮没走到卡住检测（或执行器），它不知道的
 事件原样带到下一轮，不算消失。
 
-**发不出去**（SMTP 连不上、认证失败……）：在 stderr 说一句、`failures` 加一、写进这一轮的健康报告，**不更新**
-`last_status` 与 `active`——下一轮按人最后一次被告知的状态重算，事件不会丢。永远不拦这一轮、不改退出码。
+**发不出去**（SMTP 连不上、认证失败……）：在 stderr 说一句、`failures` 加一、写进这一轮的健康报告，这一轮的事件
+存进 `undelivered`（带批次与时间，最多 50 条，更早的只计数），下一封信开头补上。以前只是不推进 `last_status` 与
+`active`、指望下一轮重算——可下一轮若已回到 ok，重算什么都没有，一次短暂的整批拒绝就谁也不知道了（2026-09-26 复审）。
+去重状态照常推进：补发的与这一轮的不会重复。永远不拦这一轮、不改退出码。
 
 **永不带密钥**：主题与正文都过 `redact`——配置里的密码 / key 原样替换成 `***`，URL 里 `api_key=`、`token=`、
 `password=`，`Bearer …`、`user:pass@host` 也遮掉（httpx 的报错会把请求 URL 连同 TMDB 的 `api_key` 一起带出来）。
@@ -156,10 +158,19 @@ def events(report: dict, st: dict) -> tuple[list[dict], dict]:
     return out, {"last_status": cur, "active": active}
 
 
+# 发不出去时留着补发的事件最多这么多条（SMTP 一直配错时 notify.json 不能无限长）；更早的只计数
+_UNDELIVERED_MAX = 50
+
+
+def _late(e: dict) -> dict:
+    """上一次没发出去、这一封补上的事件：写明是哪一批、什么时候的。"""
+    return {**e, "late": True, "text": f"（补发：批次 {e.get('run_id')}，{e.get('at')}）{e['text']}"}
+
+
 def _subject(report: dict, evs: list[dict]) -> str:
     from .health import ICON
     status = report.get("status") or "?"
-    st = next((e for e in evs if e["kind"] == "status"), None)
+    st = next((e for e in evs if e["kind"] == "status" and not e.get("late")), None)
     if st and st.get("recovery"):
         head = f"{ICON.get(status, '')} 恢复 {status}"
     else:
@@ -209,24 +220,34 @@ def maybe_send(cfg, report: dict) -> dict:
     try:
         st = load_state(cfg)
         evs, after = events(report, st)
-        if not evs:
+        pending = [e for e in st.get("undelivered") or [] if isinstance(e, dict) and e.get("text")]
+        out = [_late(e) for e in pending] + evs
+        if st.get("undelivered_dropped"):
+            out.insert(0, {"kind": "dropped", "late": True,
+                           "text": (f"另有 {st['undelivered_dropped']} 条更早的事件一直没发出去、已不再补发"
+                                    f"（media-agent health --run <批次> 看当时的报告）")})
+        keep = {"last_sent": st["last_sent"]} if st.get("last_sent") else {}
+        if not out:
             # 没有要说的：静静跟上此刻的状态（warn → ok 这种不发信的变化也记下来）
-            _save_state(cfg, {**after, "failures": 0,
-                              **({"last_sent": st["last_sent"]} if st.get("last_sent") else {})})
+            _save_state(cfg, {**after, "failures": 0, **keep})
             return {"enabled": True, "events": [], "sent": False}
-        msg = compose(cfg, report, evs)
+        msg = compose(cfg, report, out)
         try:
             send(cfg, msg)
-        except Exception as e:                      # noqa: BLE001 —— 发不出去不拦这一轮；不更新状态，下一轮重来
+        except Exception as e:                      # noqa: BLE001 —— 发不出去不拦这一轮；事件留着，下一封补上
             err = redact(cfg, f"{type(e).__name__}: {e}")
-            st["failures"] = int(st.get("failures") or 0) + 1
-            st["last_error"] = err
-            _save_state(cfg, st)
-            _stderr(f"⚠️  通知邮件没发出去（第 {st['failures']} 次）：{err}；下一轮重试")
-            return {"enabled": True, "events": [e["text"] for e in evs], "sent": False, "error": err}
+            failures = int(st.get("failures") or 0) + 1
+            mine = [{**e, "run_id": report.get("run_id"), "at": report.get("finished")} for e in evs]
+            queued = (pending + mine)[-_UNDELIVERED_MAX:]
+            _save_state(cfg, {**after, **keep, "failures": failures, "last_error": err,
+                              "undelivered": queued,
+                              "undelivered_dropped": int(st.get("undelivered_dropped") or 0)
+                              + len(pending) + len(mine) - len(queued)})
+            _stderr(f"⚠️  通知邮件没发出去（第 {failures} 次）：{err}；{len(queued)} 条事件留到下一封补发")
+            return {"enabled": True, "events": [e["text"] for e in out], "sent": False, "error": err}
         _save_state(cfg, {**after, "failures": 0,
                           "last_sent": datetime.now().isoformat(timespec="seconds")})
-        return {"enabled": True, "events": [e["text"] for e in evs], "sent": True,
+        return {"enabled": True, "events": [e["text"] for e in out], "sent": True,
                 "subject": msg["Subject"]}
     except Exception as e:                          # noqa: BLE001 —— 通知是观测，任何意外都不拦这一轮
         err = redact(cfg, f"{type(e).__name__}: {e}")

@@ -207,7 +207,8 @@ def test_send_failure_is_logged_counted_and_retried(offline_cli, smtp, capsys):
     err = capsys.readouterr().err
     assert "通知邮件没发出去" in err and "Connection refused" in err
     st = _state(lib)
-    assert st["failures"] == 1 and st["last_status"] == "ok"      # 没通知到：下一轮重来
+    assert st["failures"] == 1                                    # 没通知到：事件留着，下一封补上
+    assert [e["kind"] for e in st["undelivered"]] == ["status", "degraded"]
 
     smtp.fail = None
     _run(lib)
@@ -337,3 +338,61 @@ def test_stuck_item_through_refused_paused_and_locked_runs_is_mailed_once(offlin
 
     bodies = [_text(m) for m in smtp.sent]
     assert sum("新卡住" in b for b in bodies) == 1, bodies
+
+
+# ------------------------------------------------------------------ 发不出去的事件留着补发（2026-09-26 复审）
+def test_a_transient_critical_whose_mail_failed_is_delivered_with_the_next_mail(lib, monkeypatch):
+    """以前发不出去时只是不推进 `last_status`，指望下一轮重算——可下一轮若已经回到 ok，重算什么都没有，
+    这次整批拒绝就谁也不知道了（只剩生产机上那份健康报告）。现在没发出去的事件留在 notify.json 里，
+    下一封信补上（写明是哪一批的）。"""
+    cfg = lib.configure(notify_email_to="you@example.com", notify_smtp_host="smtp.example.com")
+    sent, calls = [], []
+
+    def send(cfg_, msg):
+        calls.append(msg)
+        if len(calls) == 1:
+            raise OSError("smtp down")
+        sent.append(msg)
+
+    monkeypatch.setattr(notify, "send", send)
+    acts = {"applied": 0, "skipped": 0, "failed": 0, "unknown": 0, "audit_problems": 0}
+    ok = {"run_id": "r0", "status": "ok", "finished": "2026-09-26T00:00:00", "reasons": [],
+          "actions": acts, "degraded": {"refused": ""}, "stuck": {"open": [], "acked": 0}}
+    assert notify.maybe_send(cfg, ok)["sent"] is False               # 第一轮 ok：没什么要说
+    critical = {**ok, "run_id": "r1", "status": "critical", "finished": "2026-09-26T06:00:00",
+                "actions": None, "degraded": {"refused": "qBittorrent 登录超时"},
+                "reasons": [{"level": "critical", "code": "refused", "text": "整批拒绝改动"}]}
+    res = notify.maybe_send(cfg, critical)
+    assert res["sent"] is False and "smtp down" in res["error"]
+
+    res = notify.maybe_send(cfg, {**ok, "run_id": "r2", "finished": "2026-09-26T12:00:00"})
+
+    assert res["sent"] is True and len(calls) == 2
+    body = _text(sent[0])
+    assert "ok → critical" in body and "新进入整批拒绝" in body and "r1" in body and "补发" in body
+    assert "critical → ok" in body                                   # 这一轮自己的：从 critical 恢复
+    st = _state(lib)
+    assert st["failures"] == 0 and not st.get("undelivered")
+
+
+def test_undelivered_events_are_capped_and_the_rest_counted(lib, monkeypatch):
+    """SMTP 一直配错时 notify.json 不能无限长：只留最近 50 条，更早的计数，补发时说一句。"""
+    cfg = lib.configure(notify_email_to="you@example.com", notify_smtp_host="smtp.example.com")
+    st = {"last_status": "warn", "active": {}, "failures": 9,
+          "undelivered": [{"kind": "stuck", "text": f"新卡住 {i}", "run_id": f"r{i}", "at": "t"}
+                          for i in range(50)]}
+    (cfg.state_dir / "notify.json").write_text(json.dumps(st), encoding="utf-8")
+    monkeypatch.setattr(notify, "send", lambda c, m: (_ for _ in ()).throw(OSError("still down")))
+    rep = {"run_id": "r50", "status": "critical", "finished": "t50", "actions": None, "stuck": None,
+           "degraded": {"refused": "x"}, "reasons": []}
+    notify.maybe_send(cfg, rep)
+    after = _state(lib)
+    assert len(after["undelivered"]) == 50 and after["undelivered_dropped"] == 2
+    assert after["undelivered"][-1]["run_id"] == "r50"
+
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda c, m: sent.append(m))
+    notify.maybe_send(cfg, {**rep, "run_id": "r51"})
+    body = _text(sent[0])
+    assert "另有 2 条更早的事件" in body and "批次 r49，" in body
+    assert "批次 r0，" not in body and "批次 r1，" not in body
