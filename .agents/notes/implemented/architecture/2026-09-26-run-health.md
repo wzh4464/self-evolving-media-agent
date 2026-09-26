@@ -214,3 +214,33 @@ run.err.log 的人认它），末尾加上位置。健康报告（第 6 节）�
 失败说出来、番照旧按没匹配处理；回退 relink 改不回条目说出来、照旧算还原；坏规则文件报出来、其余照常挂上、
 `build_registry` 在 stderr 说；健康报告数到这些行（`logged_errors`）。`test_dead_torrent` 里注入 `files()` 超时的那条
 测试现在声明了预期的那一行日志。改之前这 7 个测试里 6 个红。
+
+## 8. 通知邮件（`media_agent/notify.py`）
+
+**为什么**：健康报告写在生产机的 `state/health/` 里，没人去看就等于没写。可每轮都发一封，第三天就没人看邮件了。
+
+**只发变化，一轮最多一封**（`notify.events`）：状态变坏（ok → warn、ok / warn → critical，第一轮就不是 ok 也算）；
+从 critical 出来（→ ok / warn；warn → ok 不发，没什么要人做的）；新出现的卡住指纹（状态一直是 warn 也照发，消失后再
+出现再发）；新进入整批拒绝、审计开始转写（持续期间只发第一轮）。去重状态 `state/notify.json`：`last_status` 是**人最后
+一次被告知的**状态，`active` 是正在持续的事件（`stuck:<指纹>` / `degraded` / `audit_fallback` → 第一次发出的时间）。
+
+**发不出去**：stderr 说一句、`failures` 加一、写进这一轮健康报告的 `notify`，**不更新** `last_status` 与 `active`——
+下一轮按人最后一次被告知的状态重算，事件不丢。永远不拦这一轮、不改退出码。任何意外同样兜住。
+
+**永不带密钥**（`notify.redact`）：配置里的 qBit / AB 密码、TMDB key、LLM key、SMTP 密码原样换成 `***`；URL 里的
+`api_key=` / `token=` / `password=` 等、`Bearer …`、`scheme://user:pass@` 也遮掉——httpx 的报错会带上整个请求 URL，
+TMDB 的 `api_key` 就在查询串里。健康报告落盘前同样过一遍（`redact_obj`）。配置里的密钥只在 ≥ 8 个字符时按原文
+替换：测试里 `qbit_pass="test"` 把健康报告里路径的 `pytest-…` / `test_…` 也换成了 `***`，路径就对不上了——短密钥
+只会随 URL / 请求头出现，由上面的模式遮掉。
+
+**信**：主题 `[media-agent] <图标> <状态>：<第一条原因>`（恢复时写"恢复"），正文是事件列表 + 健康报告的文字版
+（`health.render`）+ `media-agent health --run …`；另附一小段 HTML（事件列表 + `<pre>`）。SMTP over SSL
+（`smtplib.SMTP_SSL`，默认 465，`ssl.create_default_context()`），配了用户就登录。发件人是 `NOTIFY_SMTP_USER`。
+
+**配置**：`NOTIFY_EMAIL_TO` / `NOTIFY_SMTP_HOST` / `NOTIFY_SMTP_PORT=465` / `NOTIFY_SMTP_USER` / `NOTIFY_SMTP_PASS`；
+收件人与主机都没配 = 关闭、不写 `notify.json`、一个字不说；只配了一半 = 关闭并在 stderr 提醒；端口写错启动即报错。
+
+**测试**：`tests/test_notify.py`（`smtplib.SMTP_SSL` 换成替身，不联网）——健康的第一轮不发；ok → critical 发一封、
+再拒绝不再发；从 critical 恢复发；warn → ok 不发；新卡住发一次、状态一直 warn 时第二个新卡住照发；密钥（配置里的与
+URL / Bearer / userinfo 里的）不进信也不进健康报告；发送失败说出来、计数、下一轮重发；没配置一声不吭；配一半提醒；
+配置默认值与校验；`redact` 本身。

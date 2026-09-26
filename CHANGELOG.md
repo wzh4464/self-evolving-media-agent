@@ -30,6 +30,10 @@
   审计转写）、抓取（提议 / 加上 / 409 已存在 / 元数据超时）、检测器崩溃、隔离区大小与剩余空间与处置结果、卡住、
   超过 `UNRENAMED_ALERT_HOURS`（新配置，默认 12）还是发布名的文件、日志里的报错行数、耗时，以及总体状态
   ok / warn / critical 和每条原因。`media-agent health [--run ID] [--json]` 看最近（或指定）一轮。
+- **通知邮件**（可选，`NOTIFY_EMAIL_TO` / `NOTIFY_SMTP_HOST` / `NOTIFY_SMTP_PORT`=465 / `NOTIFY_SMTP_USER` /
+  `NOTIFY_SMTP_PASS`，SMTP over SSL；都不配 = 关闭）：只在**变化**时发、一轮最多一封——健康状态变坏或从 critical
+  恢复、新的卡住问题、新进入整批拒绝、审计开始转写到备用文件。去重状态在 `state/notify.json`；发不出去只在 stderr
+  说、下一轮重发，不拦这一轮。信里与健康报告里的密钥（配置里的密码 / key，URL 里的 `api_key=` 等）一律遮掉。
 - 检测器崩溃不再只留一行日志：`Registry` 记下这一轮哪条规则崩了、异常、崩在哪（最后三层调用的文件:行），
   日志行末尾也带上位置（critic N9：一个被吞掉的 "database is locked" 让诊断静默地少一截）。
 

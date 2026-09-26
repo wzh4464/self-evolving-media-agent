@@ -498,6 +498,11 @@ def render(rep: dict, path=None) -> list[str]:
         lines.append(f"  日志    {le['count']} 行报错（{top}）")
     for r in reasons:
         lines.append(f"  {ICON.get(r['level'], '·')} {r['text']}")
+    nt = rep.get("notify") or {}
+    if nt.get("sent"):
+        lines.append(f"  ✉️  已发通知：{nt.get('subject', '')}")
+    elif nt.get("error"):
+        lines.append(f"  ⚠️  通知邮件没发出去：{nt['error']}（下一轮重试）")
     if path:
         lines.append(f"  报告 {path}（media-agent health [--run ID] [--json]）")
     return lines

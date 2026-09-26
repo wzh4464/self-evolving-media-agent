@@ -19,7 +19,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, disposal, health, history, runlock
+from . import __version__, disposal, health, history, notify, runlock
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -714,7 +714,10 @@ def cmd_run(args, cfg) -> int:
 def _finish_run(cfg, rh, rc: int) -> int:
     """定状态、写报告、打印一小节；返回最终退出码。这一步自己出错不改变这一轮的退出码。"""
     try:
-        rep = rh.finish(rc)
+        # 报告里可能混进带凭据的报错（httpx 的异常会带上整个请求 URL，TMDB 的 api_key 就在里面）
+        rep = notify.redact_obj(cfg, rh.finish(rc))
+        # 有变化才发通知，一轮最多一封；发不出去只在 stderr 说、记进报告，不改退出码
+        rep["notify"] = notify.maybe_send(cfg, rep)
         path, problems = health.write_report(cfg.state_dir, rep)
         for line in health.render(rep, path):
             print(line)

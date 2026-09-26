@@ -136,6 +136,12 @@ class Config:
     # 健康报告：这一轮之后仍是发布名、而且已经待了超过这么多小时的文件报 warn（`health.unrenamed_old`）。
     # 拿到种子就该改名（下载中也改），6 小时一轮的节奏下 12 小时 = 已经错过两轮。
     unrenamed_alert_hours: float = 12.0
+    # 通知邮件（`notify`）：健康报告有变化时发一封，SMTP over SSL。收件人与主机都没配 = 关闭（不是错误）。
+    notify_email_to: str = ""
+    notify_smtp_host: str = ""
+    notify_smtp_port: int = 465
+    notify_smtp_user: str = ""
+    notify_smtp_pass: str = ""
 
     @property
     def state_dir(self) -> Path:
@@ -191,4 +197,9 @@ def load_config(env_file: Path | None = None) -> Config:
         torrent_drop_min=_int_at_least(g("TORRENT_DROP_MIN", "20"), "TORRENT_DROP_MIN", 0),
         torrent_drop_pct=_percent(g("TORRENT_DROP_PCT", "10"), "TORRENT_DROP_PCT"),
         unrenamed_alert_hours=_hours(g("UNRENAMED_ALERT_HOURS", "12"), "UNRENAMED_ALERT_HOURS"),
+        notify_email_to=g("NOTIFY_EMAIL_TO", ""),
+        notify_smtp_host=g("NOTIFY_SMTP_HOST", ""),
+        notify_smtp_port=_int_at_least(g("NOTIFY_SMTP_PORT", "465"), "NOTIFY_SMTP_PORT", 1),
+        notify_smtp_user=g("NOTIFY_SMTP_USER", ""),
+        notify_smtp_pass=g("NOTIFY_SMTP_PASS", ""),
     )
