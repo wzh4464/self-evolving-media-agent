@@ -29,6 +29,13 @@
 ### 变更
 - 生产机上运行时生成的 28 条演进规则原样纳入版本库（`.agents/rules/`），
   此前生产行为无法从 git 复现。
+- 三个脚本式回归测试（`test_seal_slot` / `test_grab_bookkeeping` /
+  `test_no_phantom_duplicate`）迁移为 pytest，每条原有检查都保留。
+  抓取记账原先靠切 `actions.py` 源码文本检查，文件一拆就会崩，
+  改为真跑一次抓取并核对 `applied` 审计与 `ungrab_episode` 逆操作；
+  "两个种子宣称同一路径"改为离线搭现场验证；对生产全库的只读检查
+  移到 `tests/live/`，默认不跑（`MEDIA_AGENT_LIVE=1 uv run pytest -m live`），
+  且媒体卷不在或 qBittorrent 登录失败时明确失败，不再空转通过。
 
 ## [0.1.0] - 2026-09-26
 
