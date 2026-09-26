@@ -521,6 +521,9 @@ def test_an_unconfirmed_action_makes_the_run_warn(offline_cli, capsys, monkeypat
     rep = _latest(lib)
     assert rep["actions"]["unknown"] == 1 and rep["status"] == "warn"
     assert "unknown_actions" in [r["code"] for r in rep["reasons"]]
+    # run 的输出逐条列出未确认的动作（复审变异 X18：去掉 `_print_unknown` 全套照绿）
+    out = capsys.readouterr().out
+    assert "❓ [retag] 钉集号 —— 未确认：" in out and "rollback 会按此刻状态尝试还原" in out
 
 
 def test_a_degraded_rescan_before_evolving_is_critical(offline_cli, capsys, monkeypatch):

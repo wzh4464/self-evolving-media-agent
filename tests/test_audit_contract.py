@@ -254,9 +254,46 @@ def test_rollback_attempts_unknown_records_and_labels_them(lib, monkeypatch, cap
     assert rc == 0
     assert lib.qbit.file_names(t8.hash) == [LOLI.format(8)]               # 生效了的：还原
     assert lib.qbit.file_names(t9.hash) == [LOLI.format(9)]               # 没生效的：不动
-    assert "未确认" in out and "2" in out
+    # 具体到那两句（复审变异 X20 / B2ao：去掉汇总那一行、或明细里的「当初未确认」全套照绿——
+    # 以前的 "未确认" / "2" 从别处也能凑出来）
+    assert "❓ 当初未确认是否生效（unknown）: 2 项——其中 1 项按此刻状态核对后已还原" in out
+    assert [ln for ln in out.splitlines() if ln.lstrip().startswith("⏭️  （当初未确认）")]
     res = Executor(lib.context()).list_runs()
     assert next(r for r in res if r["run_id"] == "20260914T100214")["rolled_back"]
+
+
+@pytest.mark.allow("unknown_record")
+def test_apply_lists_each_unconfirmed_action(lib, monkeypatch, capsys):
+    """`apply` 的输出逐条列出记 unknown 的动作（复审变异 X19：去掉 `_print_unknown` 全套照绿）。"""
+    import httpx
+
+    from media_agent.kernel import Registry
+    s1 = lib.show("尼古喵喵").season(1)
+    t = s1.single(LOLI.format(8), size=593_601_176, probe=SUBS)
+    tag = _finding("retag", {"torrent_hash": t.hash, "tags": "ma:S01E08,待人挑"})
+
+    class _One:
+        id = "one"
+
+        def detect(self, ctx, state):
+            yield tag
+
+    real = lib.qbit.add_tags
+
+    def half(hashes, tags):                                         # 只落了一个标签、响应丢了
+        real(hashes, tags.split(",")[0])
+        raise httpx.ReadTimeout("timed out (injected)")
+
+    monkeypatch.setattr(lib.qbit, "add_tags", half)
+    monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
+    monkeypatch.setattr(cli, "build_registry", lambda: Registry(detectors=[_One()]))
+
+    rc = cli.cmd_apply(argparse.Namespace(dry_run=False, kind=None, show=None, limit=None,
+                                          no_tmdb=True), lib.cfg)
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"❓ [retag] {tag.summary} —— 未确认：" in out and "rollback 会按此刻状态尝试还原" in out
 
 
 # ------------------------------------------------------------------ 隔离区处置：unknown 的隔离不算数

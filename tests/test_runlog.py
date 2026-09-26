@@ -70,6 +70,24 @@ def test_main_run_stamps_its_output_with_the_run_id(monkeypatch, capsys):
     assert all(STAMP.match(ln).group("rid") == rid for ln in err.splitlines())
 
 
+def test_main_run_uses_one_run_id_for_the_log_prefix_the_report_and_the_snapshot(lib, monkeypatch,
+                                                                                  capsys):
+    """日志前缀、健康报告、发现历史是同一个批次 ID——出事时拿 run.log 里的一行就能找到那一轮的报告。上面那条把
+    cmd_run 换成了替身，cmd_run 自己另起一个 ID 全套照绿（复审变异 H1i）。"""
+    from media_agent import health, history
+    lib.tmdb.enabled = True
+    monkeypatch.setattr(cli, "load_config", lambda: lib.cfg)
+    monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
+    monkeypatch.setattr(sys, "argv", ["media-agent", "run"])
+
+    assert cli.main() == 0
+
+    out, _ = capsys.readouterr()
+    [rid] = {STAMP.match(ln).group("rid") for ln in out.splitlines() if STAMP.match(ln)}
+    assert health.load_report(lib.cfg.state_dir)["run_id"] == rid
+    assert [s.run_id for s in history.load_snapshots(lib.cfg.state_dir)] == [rid]
+
+
 def test_other_commands_are_not_stamped(monkeypatch, capsys):
     monkeypatch.setattr(cli, "cmd_runs", lambda args, cfg: print("批次列表") or 0)
     monkeypatch.setattr(sys, "argv", ["media-agent", "runs"])
