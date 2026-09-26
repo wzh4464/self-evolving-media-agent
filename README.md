@@ -107,6 +107,12 @@ Even in full-auto mode:
   execution time.
 - **Parse-failure guard.** If more than 3 files claim to be the same episode, that's
   treated as a parsing bug, not a duplicate — and nothing gets deleted.
+- **Provenance ledger.** What each torrent *is* — its Mikan release title, the slot the
+  grabber chose, the season the publisher declared, the version words — is recorded
+  by infohash in `state/ledger.sqlite` when it is known best (at grab time, or from
+  AutoBangumi's own database, read-only). Deduplication, renaming, the "already have
+  it" check and the quarantine purge ask the ledger before re-guessing from a file
+  name that someone else may have renamed.
 
 That last one isn't hypothetical. On its very first dry run this agent proposed
 deleting 11 episodes of a 12-episode season, because collection torrents share one
@@ -164,6 +170,7 @@ uv run media-agent evolve              # draft rules for the blind spots
 uv run media-agent run                 # one full autonomous cycle
 uv run media-agent health              # the last run's health report
 uv run media-agent ack <fp> --reason … # acknowledge a stuck finding (commit .agents/acks.json)
+uv run media-agent ledger backfill --dry-run   # provenance coverage (every run backfills new torrents)
 ```
 
 Start with `diagnose`, then `apply --dry-run`. Only flip `AUTO_APPLY=true` once

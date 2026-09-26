@@ -150,6 +150,12 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     影子验证之后媒体根下一个字节都不变（`tests/test_diagnose_purity.py` 守着）。见
     [diagnose 改写 sidecar](.agents/notes/implemented/bug-fix/2026-09-26-diagnose-writes-sidecars.md)。
 
+14. **"这个种子是哪一集、是什么版本"先问出处账本，不再从文件名重新猜。** 名字会被 AutoBangumi、人、别的规则改
+    （2026-08-31 AB 把 `3rd Season - 08` 改成 `S01E08`，判重据此把 2016 年的第 8 集清进隔离区）。集位用
+    `builtin.recorded_slot` / `ledger_view`（钉子 > 账本 > 名字，`_resolve` 已经这样），版本词用 `release_text`
+    （番组页标题 + 显示名），新写的加种路径要调 `ledger.record_grab`。账本读不了时一切按名字走、健康报告说出来，
+    **永不因账本拦下一轮**。见 [出处账本](.agents/notes/implemented/architecture/2026-09-27-provenance-ledger.md)。
+
 ## 自演进的闭环
 
 ```

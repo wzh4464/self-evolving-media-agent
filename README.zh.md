@@ -97,6 +97,9 @@ agent 产出的是**声明式 JSON**，由固定的解释器求值。它只能�
 - **完整审计。** 每个动作、跳过、失败都落在 `state/audit.jsonl`。
 - **纵深防御。** 动作参数在提议时验一次、执行时再验一次。
 - **解析失败闸。** 超过 3 个文件声称是同一集，判定为解析出错而非重复，**不删任何东西**。
+- **出处账本。** 每个种子**是什么**——番组页上的发布标题、抓取器定的集位、发布方声明的季号、版本词——在知道得最清楚
+  的时候（抓取那一刻、或从 AutoBangumi 自己的库里只读补录）按 infohash 记进 `state/ledger.sqlite`。判重、改名、
+  "已经有了"的判断、隔离区处置先问账本，再从可能被别人改过的文件名里猜。
 
 最后这条不是假想。这个 agent 第一次 dry-run 时就提议删掉某季 12 集里的 11 集，
 因为合集种子的所有成员文件共享同一个种子名。dry-run 拦住了它，
@@ -141,6 +144,7 @@ uv run media-agent evolve              # 为盲区起草规则
 uv run media-agent run                 # 一轮完整自治
 uv run media-agent health              # 最近一轮的健康报告
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题（要提交 .agents/acks.json）
+uv run media-agent ledger backfill --dry-run   # 出处覆盖率（每轮 run 会自动补新种子）
 ```
 
 建议先 `diagnose`，再 `apply --dry-run`。**读清楚它想干什么之后**，
