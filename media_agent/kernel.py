@@ -463,6 +463,10 @@ def _eval_clause(clause: dict, f: MediaFile, s: Show) -> bool:
         return False
 
 
+# DSL 规则产出的 finding 在 `evidence["origin"]` 上带这个标记
+DSL_ORIGIN = "dsl"
+
+
 @dataclass
 class RuleSpec:
     """一条声明式规则。演进器产出它，解释器执行它。"""
@@ -524,8 +528,11 @@ class RuleSpec:
                     show=show.dir_name,
                     path=str(f.path),
                     torrent_hash=f.torrent_hash,
+                    # `origin` 由解释器写死，规则 JSON 改不了它（`source` 却是 JSON
+                    # 自己声明的）。执行器凭它拒绝执行 DSL 规则带的动作，见
+                    # Executor._dispatch 与 critic N5。
                     evidence={"matched_by": self.id, "source": self.source,
-                              "resolution": self.resolution},
+                              "resolution": self.resolution, "origin": DSL_ORIGIN},
                     action=action,
                     # 有动作的规则天然算已解释；无动作的按其声明的意图判定
                     classified=(action is None and self.resolution == "classified"),

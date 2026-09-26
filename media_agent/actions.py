@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .kernel import Action, Context, Finding, repath, under
+from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
 
 
@@ -213,6 +213,16 @@ class Executor:
         return self.report
 
     def _dispatch(self, f: Finding, a: Action) -> None:
+        if (f.evidence or {}).get("origin") == DSL_ORIGIN:
+            # critic N5：演进规则由 LLM 提议、影子验证只在上线那一刻跑一次，此后
+            # 不再复核；它的动作参数也由模型选（甚至可以自带 path 覆盖）。一条
+            # `retag ma:SxxExx` 就能决定改名目标与判重去留——这是未经人审的
+            # "LLM → 改名 / 删除"通路。在人工确认放行的流程落地之前，一律不执行。
+            # 生产上 30 条演进规则的 action 全是 null，这道闸今天行为中立。
+            self._audit("skipped", f, a, {
+                "reason": "演进规则未经人工确认，不自动执行其动作",
+                "rule_source": f.evidence.get("source", "")})
+            return
         handler = getattr(self, f"_op_{a.op}", None)
         if handler is None:
             self._audit("skipped", f, a, {"reason": f"未知动作 {a.op}"})

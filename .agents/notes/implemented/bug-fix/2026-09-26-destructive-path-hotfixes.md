@@ -175,3 +175,23 @@ ctx 上循环 诊断→执行 的改造都会继承它，幻影被 trash 就是�
 
 **测试**：`tests/test_rescan_freshness.py`——renameFile 后同 ctx 重扫只剩规范名、
 无重复与未改名；两次扫描之间改 `season_offsets`，第二次按新值改名为 S01E58。
+
+## 7. 演进规则带的动作一律不自动执行（critic N5）
+
+**风险（潜伏）**：演进器的提示词允许 `trash` / `retag` / `recategorize` / `relocate` /
+`write_nfo`，参数由模型选；`RuleSpec.detect` 用 `setdefault` 填 `path`，模型自带的
+`path` 会保留下来。影子验证只在上线那一刻跑一次，此后不再复核。一条
+`retag ma:SxxExx` 会成为 `_resolve`、封存、改名到钉子、`_inflight` 的权威依据——
+未经人审的"LLM → 改名 / 判重删除"通路。离线复现：一条带 `trash` 且自带
+`path=<Season 目录>` 的规则，走生产注册表（内置 + 演进）直接被执行（这次被第 2 条的
+目录闸拦下，换成文件路径就是真删）。
+
+**修法**：`RuleSpec.detect` 在 `evidence["origin"]` 写死 `"dsl"`（解释器写的，规则
+JSON 改不了；`source` 字段却是 JSON 自己声明的，模型写 `builtin` 也能冒充）。
+`Executor._dispatch` 见到它就跳过，理由「演进规则未经人工确认，不自动执行其动作」。
+生产上 30 条演进规则 `action` 全是 null，这道闸今天行为中立；无动作规则照常出
+finding、照常算"已解释"。人工确认后放行的正式流程留到后面的阶段。
+
+**测试**：`tests/test_evolved_actions_gated.py`——规则 JSON 落在 RULES_DIR、经
+`cli.build_registry()` 加载，trash（含自带 path）/ retag / recategorize / rename
+都被跳过、库快照不变；JSON 自称 builtin 也拦得住；无动作规则不受影响。
