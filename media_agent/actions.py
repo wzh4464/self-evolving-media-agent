@@ -1194,8 +1194,6 @@ class Executor:
           不写——本项目的模式不跟着一个说不清的切换走。
         - AB 已经是这两个开关（人在 WebUI 里关过、或 PATCH 之后没重启）：不 PATCH，照样重启一次让线程对上配置、核对、记录。
         """
-        from . import abmode
-
         target = abmode.parse(a.args.get("mode", ""), "mode")
         want = abmode.flags_for(target)
         if self.dry_run:
@@ -1256,6 +1254,16 @@ class Executor:
             # AB 已切（读回核实过），本项目却没记下：它仍按原来的模式对待 AB——要人补上（再跑一次命令即可）
             extra["state_error"] = f"{abmode.state_path(self.cfg.state_dir)} 写不进去（{type(e).__name__}: {e}）"
         self._audit(auditlog.APPLIED, f, a, extra, undo=undo)
+
+    def _ab_retired(self, f: Finding, a: Action) -> bool:
+        """订阅模式（`abmode`）下不替 AutoBangumi 修订阅：不写它的库（要停容器）、**永远不叫它刷新**——`refresh_all` 会让它
+        当场拉 RSS、下载，两个开关都关了照样下（ab 调研 §3.4）。规则在订阅模式下已经不提议了，这里拦的是别处来的同名
+        动作（手动 apply、演进规则、之前诊断的快照）。拦下了记 skipped、返回 True。"""
+        if abmode.ab_downloads(self.cfg):
+            return False
+        self._audit(auditlog.SKIPPED, f, a, {"reason": "订阅模式（AB_MODE=subscription）：AB 不拉 RSS，不改它的订阅、"
+                                                       "不停它的容器、不叫它刷新（刷新会让它下载）"})
+        return True
 
     def _wait_ab_ready(self, timeout: float = 45.0) -> bool:
         """等 AutoBangumi 重新起来再调它的接口。
@@ -1322,6 +1330,8 @@ class Executor:
         """
         bid = a.args["bangumi_id"]
         aliases = a.args["aliases"]
+        if self._ab_retired(f, a):
+            return
         if self.dry_run:
             self._audit("skipped", f, a,
                         {"reason": "dry-run", "would_set_aliases": aliases})
@@ -1392,6 +1402,8 @@ class Executor:
         bid = a.args["bangumi_id"]
         new_url = a.args["rss_link"]
         aliases = a.args.get("aliases") or []
+        if self._ab_retired(f, a):
+            return
 
         rows = self.ctx.abdb.query(
             "SELECT rss_link, title_aliases FROM bangumi WHERE id=?", (bid,))
@@ -2754,7 +2766,6 @@ class Executor:
                     return "season / episode 缺失或不是整数"
             return None
         if op == "set_ab_mode":
-            from . import abmode
             for key in ("flags", "set"):
                 v = u.get(key)
                 if not (isinstance(v, dict) and set(v) == set(abmode.FLAG_KEYS)
@@ -3210,8 +3221,6 @@ class Executor:
         只在它们此刻还是这一步切成的样子（`set`）时动：人后来在 WebUI 里改过的整步跳过并说明。状态文件还是这一步写下的
         （`run_id` 对得上；被人删了也行）才动——之后又切过一次的，只退这一步会让两边对不上，整步跳过。重启之后没核对上
         抛异常：改动已经发出，回退的这一步记 unknown。"""
-        from . import abmode
-
         ab = self.ctx.ab
         if ab is None:
             return False, "AutoBangumi 接口不可用：没法把开关改回去（也可以在 WebUI 设置里改、或 media-agent ab-mode）"

@@ -61,6 +61,8 @@
   `ab:` 标签——AB 不再改名）、`title-match-broken` 与 `source-abandoned`（修 AB 的订阅匹配、换 RSS 链接——AB 不再拉 RSS，
   修它们还要停容器写 AB 库、叫它刷新）。`rename-collision` 照报撞名，但不再说"AB 改名死循环"、从 critical 降为 important。
 - **订阅模式下抓取不打 `ab:` 标签**（只钉 `ma:SxxEyy`）：AB 不再认领，标签只会让切换之后的核对把本项目抓的认成 AB 加的。
+- **订阅模式下永远不叫 AutoBangumi 刷新**（`refresh_all` 会让它当场拉 RSS、下载，两个开关都关了照样下）：规则不再提议之外，
+  执行器也拦下别处来的 `fix_title_aliases` / `repoint_rss`（skipped，不写 AB 库、不停容器、不刷新）。
 - **第二个 launchd 任务 `com.zihan.media-agent-grab`**（`deploy/com.zihan.media-agent-grab.plist`：每 30 分钟
   `media-agent grab`，加载时不跑，低优先级与主任务相同，日志 `state/grab.log`）。`deploy.sh` 两份都装、各自只在变了时
   重新加载；任何一份装不上两份一起退回；tag 里没有抓取任务（回滚到更早的版本）就卸掉它；装着的任务与 tag 里的对不上时
