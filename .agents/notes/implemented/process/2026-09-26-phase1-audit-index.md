@@ -26,6 +26,7 @@
 | N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒） | 0b5a02e |
 | N11 | 没有结构化的发现历史：无动作的发现只以文字进 run.log；没有路径的发现去重键退回 `(show, summary)`，摘要里嵌着计数，跨轮认不出同一个问题——"卡住"检测无从谈起 | 第 3 阶段：发现历史与稳定指纹（`history.py`），见 `architecture/2026-09-26-run-health.md` 第 1 节 |
 | N12 | 回退只写一条汇总：逐步还原了什么没有审计，健康摘要看不见回退改了什么 | 第 3 阶段 8c901f5（逐步记录；回退记录不带逆操作，回退不能再回退）。见 `architecture/2026-09-26-honest-audit.md` 第 8 节 |
+| N14 | 集号口径在 `have` 与 `_inflight` 之间不一致：`have_episodes` / `episode_of_file` 不看 `ma:` 钉子，`_inflight` 看；钉着的集号与发布名的原始集号不同、又还没改名的已下完文件从 `have` 里掉出去，被再抓一遍（生产 29 集被抓了不止一次的来源之一） | 第 4 阶段：出处账本，见 `architecture/2026-09-27-provenance-ledger.md` |
 | N15 | 抓取后的即时改名 `rename_single_video` 算目标名时丢掉条目的文件夹层（`_op_rename` 保留）：409 撞上一个已有的 Original 布局种子时，文件被挪到 save_path 根下 | 8a0dec9，见 `architecture/2026-09-26-path-claims.md` 第 4 节 |
 | N17 | `rescue.py` / `vpn-watchdog.sh` 重建 qBittorrent 容器时不看任何锁或维护窗口；运行锁应覆盖 `purge --apply`、`rollback`、`repair` 与手动会话 | 0b5a02e（运行锁）；第 3 阶段：维护暂停（`pause.py`，救援标记 / `state/PAUSE`）与两个脚本重建容器前拿运行锁，见 `architecture/2026-09-26-run-health.md` 第 10、11 节 |
 | §2（对 executor 调研的更正） | executor 调研以为 `list_runs` 把"已回退"标在 `rollback-of-X` 上、`rollback --last` 会再选 X；其实汇总里的字面量 `rollback-of-…` 被随后的 `**result` 覆盖回原批次号，一直标对了（生产 4 条历史汇总都是原批次号） | 第 3 阶段 8c901f5 明写汇总的 `run_id`，逐步记录另用 `rollback-of-…` |
@@ -98,6 +99,15 @@
 | purge P7 | unlink 之前按此刻复核，并与 `run` 共用锁 | d123a61；锁见 0b5a02e |
 | destructive I | `run` 末尾的时间清理：超过 30 天的日目录整个 `rmtree`、不写记录（生产 run.log 两次共 6 个文件 4.7 GB） | 8faf076 |
 | destructive J | `purge --apply`：替代者按名字认、`.!qB` 检查形同虚设 | 963f2bc、6e62bd8 |
+
+## state 调研：状态测绘（第 4 阶段引用）
+
+| 编号 | 是什么 |
+|---|---|
+| H1 | 本项目的抓取（`_op_grab_episode`）是记出处的地方：加种之后手上有番组页标题、集位、偏好评分、发布日期、落选的候选，审计却只存 `args` 与摘要——发布日期与结构化的评分哪儿都没留下 |
+| H2 | AutoBangumi 加的种子：出处在 AB 库的 `torrent` 表（`name` = 番组页标题，`url` 里就是 infohash，`qb_hash` 永远是 NULL），本项目以前只在修订阅时按**名字**读它 |
+| H4 | 补录的覆盖面（2026-09-26 生产）：539 个种子里 459 个只有 AB 的记录、6 个两边都有、43 个只有本项目的抓取审计、31 个查不到出处；28 个 infohash 被抓了不止一次（42 次多余的抓取，34 次是 409），入间 S4E20 一集 7 次 |
+| H5 | 账本放哪：不放 sidecar（`load()` 丢不认识的键、写档案整份覆盖），放 `state/`；在执行时写、不在检测时写 |
 
 ## 第 2 阶段审查（2026-09-26）：单点变异编号
 

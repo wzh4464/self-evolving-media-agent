@@ -27,7 +27,7 @@ from .. import preferences
 from ..cache import Cache, FEED_TTL, LOOKUP_TTL
 from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
                       tmdb_groups)
-from ..naming import declared_season, parse_episode, parse_pin, season_of_dir
+from ..naming import declared_seasons, parse_episode, parse_pin, season_of_dir
 from ..sidecar import load as load_sidecar
 from .subscription import (MIKAN, _disk_episodes, _http_get,
                            _mikan_search_ids, is_seasonal)
@@ -196,14 +196,8 @@ _SPECIAL_RE = re.compile(r"特别篇|特別篇|番外|总集篇|総集編|\bOVA\
 
 
 def _declared_seasons(title: str) -> set[int]:
-    """发布标题里明写的季号。按 ` / ` 分开的每一段各认一次：中文名、日文名、英文名常各写各的
-    （`辉夜大小姐想让我告白 第三季 / Kaguya-sama wa Kokurasetai S3 - 03`），`declared_season` 只看最后一段。"""
-    out = set()
-    for part in re.split(r"\s+/\s+", title):
-        ds = declared_season(part)
-        if ds:
-            out.add(ds)
-    return out
+    """发布标题里明写的季号（`naming.declared_seasons`：按 ` / ` 分段各认一次）。"""
+    return declared_seasons(title)
 
 
 def _slot_in_season(title: str, n: int, target: int,

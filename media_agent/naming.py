@@ -245,6 +245,18 @@ def declared_season(raw: str) -> int | None:
     return None
 
 
+def declared_seasons(title: str) -> set[int]:
+    """番组页发布标题里明写的季号。按 ` / ` 分开的每一段各认一次：中文名、日文名、英文名常各写各的
+    （`辉夜大小姐想让我告白 第三季 / Kaguya-sama wa Kokurasetai S3 - 03`），`declared_season` 只看最后一段。
+    抓取挑候选（`grab._slot_in_season`）与出处账本（`ledger.release_facts`）共用这一处。"""
+    out = set()
+    for part in re.split(r"\s+/\s+", title or ""):
+        ds = declared_season(part)
+        if ds:
+            out.add(ds)
+    return out
+
+
 _SIMPLIFIED_RE = re.compile(
     r"简|GB\b|CHS|SC\b|JPSC|scjp|\bsc\.|简日|简繁|Chs|hans|simplified", re.IGNORECASE)
 _TRADITIONAL_RE = re.compile(

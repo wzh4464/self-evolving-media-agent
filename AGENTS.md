@@ -25,6 +25,7 @@ media_agent/
   history.py      发现历史：每轮全部发现落 state/findings/，指纹 = 规则 + 类型 + 目标（不含摘要）
   titles.py       TMDB 标题稳定闸：取不到不退回目录名、新标题连续两轮 run 才采用、30 天内不改回去（state/titles.json）
   sidecar.py      每部番的 .media-agent.json：字段归属（派生 / 身份 / 人的意图），按写的那一刻合并，坏文件不覆盖
+  ledger.py       出处账本 state/ledger.sqlite：按 infohash 记每个种子是什么（番组页标题、集位、发布方编号、版本词、评分）
   health.py       运行健康：种子数基线（骤降且审计解释不了 → 整轮拒绝）、每轮健康报告
   notify.py       通知邮件：健康报告有变化才发（一轮最多一封），去重在 state/notify.json，永不带密钥
   runlog.py       run 的输出每行带时间与批次 ID；run.log / run.err.log 先拷贝再截断地轮转（launchd 持有描述符）
