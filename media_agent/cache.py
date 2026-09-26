@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from datetime import date, timedelta
@@ -51,13 +52,17 @@ def _eps_fail_key(tmdb_id, season) -> str:
     return f"tmdbepsfail:{tmdb_id}:{season}"
 
 
+_SECRET_Q = re.compile(r"((?:api_key|apikey|token|access_token)=)[^&\s'\"]+", re.IGNORECASE)
+
+
 def _brief(e: BaseException) -> str:
-    """取分集表失败的一句话。HTTP 错误只留状态码：httpx 的报错文本带着整个请求 URL（`api_key=` 就在里面），
-    这句话要进缓存与日志。"""
+    """TMDB 请求失败的一句话（分集表、扫描的断路器都用它）。HTTP 错误只留状态码：httpx 的报错文本带着整个请求 URL
+    （`TMDBClient._get` 把 `api_key` 放在查询参数里），这句话要进缓存、日志、`naming_hold`（→ 发现与发现历史）。
+    别的异常文本里碰巧带着 `api_key=` 之类的，也遮掉。"""
     status = getattr(getattr(e, "response", None), "status_code", None)
     if isinstance(status, int):
         return f"{type(e).__name__}: HTTP {status}"
-    return f"{type(e).__name__}: {e}"[:200]
+    return _SECRET_Q.sub(r"\1***", f"{type(e).__name__}: {e}")[:200]
 
 
 def _outage(e: BaseException) -> bool:

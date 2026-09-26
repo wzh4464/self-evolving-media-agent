@@ -45,6 +45,9 @@
   本来就没有条目的目录，扫描白花 8–10 秒。
 - 这一轮 TMDB 出过一次错（超时、连不上）→ 其余的不再打网络，全用缓存（一次 20 秒超时 × 几十部番）。"这一轮"是这个
   Context（2026-09-27 起 `run` 迭代到不动点，每次迭代重扫；断路器记在 `ctx.tmdb_scan_down`，后面的迭代同样不再打网络）。
+  断路器的原因经 `cache._brief`（HTTP 错误只留状态码，别的文本里的 `api_key=` 遮掉）：它会进日志、`naming_hold`（→
+  `naming_held` 的摘要与 evidence → 发现历史）。最初直接用 `f"{type(e).__name__}: {e}"`，httpx 的 HTTPStatusError 文本
+  带着整个请求 URL，`api_key` 明文跟着进去——v0.4.1 刚为 run.log 里的同一件事出过一版（2026-09-27 审查）。
 
 ## 标题稳定闸（`media_agent/titles.py`，`state/titles.json`）
 
@@ -99,3 +102,5 @@
 人钉的标题；`diagnose` 不推进计数；`cmd_run` 记录；一个标题都不知道 → 不改名；坏 sidecar → 不改名、不搜；
 模型选的这一轮不用、钉进 sidecar、下一轮不再问；预演不重复问；钉住的番从不问模型；`pin_tmdb` 不改已有的 id；
 旧版写的 tmdb_id 没有佐证（世界奇妙物语 2018 特别篇的形态）→ 不认、不改目录名 / 不写 NFO、报 `naming_held`；人写了 `tmdb_source`、钉了标题、旧缓存是它 → 照它认；稳定闸的单元测试与记录读不了；部署后第一轮 sidecar 的 `tmdb_title` 是旧的、目录与文件已是 TMDB 的（有 / 没有旧的按目录名缓存）→ 两轮都不改名，库里还用旧标题的仍要连看两轮。`tests/test_silent_excepts_report.py` 的注入点从 `official_title` 改成 `tv_detail`。
+TMDB 回 503 / 429（URL 带 api_key）：发现、evidence、`naming_hold`、日志、`ctx.tmdb_scan_down` 里都没有 key，状态码照说
+（改之前红）；`tests/test_episode_cache.py` 有 `_brief` 的单元测试。

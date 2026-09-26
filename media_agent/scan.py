@@ -492,12 +492,13 @@ def _tmdb_meta(ctx: Context, cache, tid: int, dir_name: str, net: dict) -> dict 
         return meta
     if net["broken"]:
         return None
+    from .cache import _brief
     from .clients import seasons_of, title_of
     try:
         d = ctx.tmdb.tv_detail(tid)
         title, seasons = title_of(d)[0], seasons_of(d)
     except Exception as e:
-        net["broken"] = f"{type(e).__name__}: {e}"
+        net["broken"] = _brief(e)
         ctx.log(f"[scan] TMDB 取条目 {tid} 的标题 / 季信息失败（{net['broken']}），用上次的；"
                 f"这一轮其余的也不再问 TMDB")
         return None
@@ -509,7 +510,7 @@ def _tmdb_meta(ctx: Context, cache, tid: int, dir_name: str, net: dict) -> dict 
 def _search_tmdb(ctx: Context, cache, state: LibraryState, show: Show, net: dict) -> int | None:
     """没钉住身份的番：找它的 tmdb_id。找到返回 id；搜不到、或要问模型的（进 `state.tmdb_proposals`，
     这一轮不用）返回 None。"""
-    from .cache import LOOKUP_TTL, TMDB_MISS_TTL
+    from .cache import LOOKUP_TTL, TMDB_MISS_TTL, _brief
 
     legacy = cache.get_tmdb(show.dir_name)
     if legacy and legacy.get("id"):
@@ -535,7 +536,7 @@ def _search_tmdb(ctx: Context, cache, state: LibraryState, show: Show, net: dict
         try:
             results = ctx.tmdb.search_tv(q)
         except Exception as e:
-            net["broken"] = f"{type(e).__name__}: {e}"
+            net["broken"] = _brief(e)
             ctx.log(f"[scan] TMDB 查询失败 {q}（{net['broken']}），这一轮其余的也不再问 TMDB")
             return None
         if not results:
@@ -557,7 +558,7 @@ def _search_tmdb(ctx: Context, cache, state: LibraryState, show: Show, net: dict
                 d = ctx.tmdb.tv_detail(hit["id"])
                 title, seasons = title_of(d)[0], seasons_of(d)
             except Exception as e:
-                net["broken"] = f"{type(e).__name__}: {e}"
+                net["broken"] = _brief(e)
                 ctx.log(f"[scan] TMDB 取标题 / 季信息失败 {show.dir_name}（id {hit['id']}），这一轮按没匹配处理："
                         f"{net['broken']}")
                 return None

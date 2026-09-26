@@ -213,3 +213,24 @@ def test_source_abandoned_failure_no_longer_poisons_the_cache_with_an_empty_list
     c = cache_mod.Cache(lib.cfg.cache_db)
     assert c.get_tmdb(f"tmdbeps:{TID}:1", ttl=10**9) is None     # 失败不当成"没有集"缓存
     assert c.get_episodes(TID, 1) is None
+
+
+# ------------------------------------------------------------------ 报错文本里不带 api_key
+def _http_error(status: int, key: str = "SECRETKEY123") -> httpx.HTTPStatusError:
+    req = httpx.Request("GET", f"https://api.themoviedb.org/3/tv/999?api_key={key}&language=zh-CN")
+    try:
+        httpx.Response(status, request=req).raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return e
+    raise AssertionError("raise_for_status 没抛")
+
+
+def test_brief_keeps_the_status_and_drops_the_url():
+    """httpx 的 HTTPStatusError 文本带着整个请求 URL（`TMDBClient._get` 把 `api_key` 放在查询参数里）：
+    `_brief` 只留状态码。别的异常文本里碰巧有 `api_key=` 的，也遮掉。"""
+    e = _http_error(503)
+    assert "SECRETKEY123" in str(e)                               # 前提：原文确实带着
+    assert cache_mod._brief(e) == "HTTPStatusError: HTTP 503"
+    odd = RuntimeError("GET https://api.themoviedb.org/3/search/tv?api_key=SECRETKEY123&query=x failed")
+    assert "SECRETKEY123" not in cache_mod._brief(odd) and "RuntimeError" in cache_mod._brief(odd)
+    assert cache_mod._brief(httpx.ConnectTimeout("connect timed out")) == "ConnectTimeout: connect timed out"

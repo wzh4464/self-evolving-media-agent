@@ -357,6 +357,40 @@ def test_no_known_title_at_all_holds_naming_for_that_show(lib):
     assert "999" in f.summary
 
 
+@pytest.mark.allow("tmdb_unknown", "log_failure")
+@pytest.mark.parametrize("where", ["tv_detail", "search_tv"])
+def test_a_tmdb_http_error_never_puts_the_api_key_into_findings_or_logs(lib, where):
+    """2026-09-27 审查：扫描的断路器原因是 `f"{type(e).__name__}: {e}"`——httpx 的 HTTPStatusError 文本带着整个请求 URL，
+    `api_key=` 就在里面。它进了 `naming_hold`（→ `naming_held` 发现的摘要与 evidence → 发现历史）、`ctx.tmdb_scan_down`、
+    run.err.log。v0.4.1 为同一件事（run.log 里的 api_key 明文）专门出过一版。"""
+    from test_episode_cache import _http_error
+
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.enabled = True
+    sh = lib.show("药屋少女的呢喃")
+    sh.season(1).single("[LoliHouse] Kusuriya no Hitorigoto - 01 [WebRip 1080p][简繁内封字幕].mkv")
+    if where == "tv_detail":
+        sh.sidecar(tmdb_id=999, tmdb_source="human")
+
+        def boom(tv_id):
+            raise _http_error(503)
+        lib.tmdb.tv_detail = boom
+    else:
+        def boom(q):
+            raise _http_error(429)
+        lib.tmdb.search_tv = boom
+
+    c = lib.cycle(dry_run=True)
+
+    leaked = [m for m in lib.logs if "SECRETKEY123" in m]
+    leaked += [f.summary for f in c.findings if "SECRETKEY123" in f.summary]
+    leaked += [str(f.evidence) for f in c.findings if "SECRETKEY123" in str(f.evidence)]
+    leaked += [s.naming_hold for s in c.state.shows if "SECRETKEY123" in s.naming_hold]
+    assert "SECRETKEY123" not in str(getattr(c.ctx, "tmdb_scan_down", ""))
+    assert leaked == []
+    assert any("HTTP 5" in m or "HTTP 4" in m for m in lib.logs)   # 状态码照样说出来
+
+
 def test_corrupt_sidecar_holds_naming(lib):
     lib.configure(qbit_allow_empty=True)
     lib.tmdb.enabled = True
