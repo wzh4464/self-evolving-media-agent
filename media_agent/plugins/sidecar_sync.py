@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .. import sidecar as sc_mod
-from ..cache import Cache, EPISODES_TTL, FEED_TTL
+from ..cache import Cache, FEED_TTL
 from ..kernel import Action, Context, Finding, LibraryState, have_episodes
 from ..naming import VIDEO_EXTS, parse_episode
 from .subscription import _fetch_rss_titles, _patterns_of, is_seasonal
@@ -99,9 +99,10 @@ class SidecarSyncDetector:
                 key = str(sn)
                 entry = {"have": sorted(got)}
                 if show.tmdb_id:
-                    ck = f"tmdbeps:{show.tmdb_id}:{sn}"
-                    cached = cache.get_tmdb(ck, ttl=EPISODES_TTL)
-                    eps = cached.get("eps", []) if cached else []
+                    # 只读缓存、不自己问 TMDB（排在前面的 incomplete-season 已经取过）。时效与取的一方同一个口径
+                    # （`episodes_ttl`）：以前按 6 小时读，播完的季缓存 7 天，6 小时后这里读不到、把 total / aired
+                    # 从档案里拿掉，下一轮又加回来——每轮都写一次档案
+                    eps = cache.get_episodes(show.tmdb_id, sn) or []
                     dated = []
                     for e in eps:
                         if e.get("air_date"):

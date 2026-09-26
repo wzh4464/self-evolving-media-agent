@@ -24,7 +24,7 @@ from datetime import date, timedelta
 from typing import Iterable
 
 from .. import preferences
-from ..cache import Cache, FEED_TTL, LOOKUP_TTL
+from ..cache import Cache, FEED_TTL, LOOKUP_TTL, season_episodes
 from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
                       tmdb_groups)
 from ..naming import declared_seasons, parse_episode, parse_pin, season_of_dir
@@ -422,11 +422,13 @@ class EpisodeAvailableDetector:
                 # 这跟 seasonal 标记那次是同一类问题：依赖会滞后一整轮的
                 # 持久化状态。凡是磁盘能直接回答的，就别问镜像。
                 have = set(info.get("have") or []) | disk_eps.get(int(season_key), set())
-                try:
-                    eps = ctx.tmdb.season_episodes(show.tmdb_id, int(season_key))
-                except Exception as e:
+                # 分集表走缓存（`cache.season_episodes`：在播 6 小时、播完 7 天、取不到 6 小时内不再问）。以前这里
+                # 每一遍都不带缓存地问：生产 129 个 sidecar、159 个季键，一次 diagnose 43.98 秒里 31.9 秒是它
+                # （runloop 调研 2026-09-26）——`run` 迭代到不动点时每次迭代都要再付一遍
+                eps, why = season_episodes(ctx, cache, show.tmdb_id, int(season_key))
+                if eps is None:
                     ctx.log(f"[episode-available] TMDB 第 {season_key} 季集表读取失败 {show.dir_name}，"
-                            f"这一季这一轮不抓：{type(e).__name__}: {e}")
+                            f"这一季这一轮不抓：{why}")
                     continue
                 air_of = {e["episode_number"]: e["air_date"] for e in eps
                           if e.get("air_date")}
