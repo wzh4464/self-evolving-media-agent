@@ -244,3 +244,79 @@ def test_bad_max_iterations_fails_loudly(monkeypatch, bad):
     monkeypatch.setenv("MAX_ITERATIONS", bad)
     with pytest.raises(ValueError, match="MAX_ITERATIONS"):
         load_config()
+
+
+# ------------------------------------------------------------------ 更多"以前要两轮"的现场
+LOLI_09 = "[LoliHouse] Yani Neko - 09 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv"
+ABEMA_09 = "[Dynamis One] Yani Neko - 09 (ABEMA 1920x1080 AVC AAC MKV).mkv"
+
+
+def test_run_grabs_and_renames_the_grab_in_one_run(offline_cli):
+    """(b) 抓取之后元数据没在等待时限内到：以前"下一轮会补"，文件在发布名上躺一轮（2026-09-03 最新三集刮削失败）。"""
+    from harness import MikanItem
+    lib = offline_cli
+    lib.configure(qbit_allow_empty=True, grab_metadata_timeout=0)
+    sh = lib.show(SHOW)
+    s1 = sh.season(1)
+    for n in range(1, 9):
+        s1.local(f"{SHOW} S01E{n:02d}.mkv")
+    schedule = weekly(12, first_days_ago=60)
+    sh.tmdb(1234, seasons={1: schedule})
+    sh.sidecar(tmdb_id=1234, tmdb_title=SHOW, mikan_id="3500", seasons={"1": {"have": list(range(1, 9))}})
+    title = "[LoliHouse] 尼古喵喵 / Yani Neko - 09 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"
+    item = MikanItem(title=title, pub=dict(schedule)[9])
+    lib.mikan("3500", [item], search=[SHOW])
+    lib.qbit.fail("files", hash=item.infohash, times=1)               # 加种后第一次读文件列表：元数据还没到
+
+    assert cli.cmd_run(_args(no_tmdb=False), lib.cfg) == 0
+
+    rep = _latest(lib)
+    recs = {r["op"]: r for r in lib.audit(rep["run_id"]) if r["status"] == "applied"}
+    assert recs["grab_episode"]["metadata"]["outcome"] == "timeout"
+    assert recs["rename"]["args"]["torrent_hash"] == item.infohash
+    assert lib.qbit.file_names(item.infohash) == [f"{SHOW} S01E09.mkv"]
+    assert rep["grab"]["proposed"] == 1 and rep["grab"]["applied"] == 1
+    assert rep["unrenamed"]["count"] == 0 and rep["status"] == "ok", rep["reasons"]
+
+
+def test_run_delete_quota_covers_the_whole_run(offline_cli):
+    """(d) 删除配额管整轮：第二次迭代才轮到的判重被「已达单轮删除数量上限」拦下、不再重试，健康报告照实说。"""
+    lib = offline_cli
+    lib.configure(max_delete_per_run=1)
+    s1 = lib.show(SHOW).season(1)
+    s1.single(f"{SHOW} S01E08.mkv", size=745_065_995, name=ABEMA_08, probe=video("h264"))
+    s1.single(LOLI_08, size=593_601_176, probe=TWO_SUBS)
+    raw9 = s1.single(f"{SHOW} S01E09.mkv", size=745_065_996, name=ABEMA_09, probe=video("h264"))
+    s1.single(LOLI_09, size=593_601_177, probe=TWO_SUBS, category="Bangumi")
+
+    assert cli.cmd_run(_args(), lib.cfg) == 0
+
+    rep = _latest(lib)
+    trashes = [r for r in lib.audit(rep["run_id"]) if r["op"] == "trash"]
+    assert [r["status"] for r in trashes] == ["applied", "skipped"]
+    assert trashes[1]["reason"] == "已达单轮删除数量上限 1"
+    assert lib.qbit.has(raw9.hash) and len(lib.trash_files()) == 1
+    assert rep["loop"]["stop"] == converge.FIXED_POINT
+
+
+def test_run_renames_a_show_dir_and_writes_its_sidecar_in_one_run(offline_cli):
+    """目录改名（op 8）排在写档案（op 10）前面：旧目录没了，档案"下一轮按新目录重算"。现在下一次迭代就按新目录写。"""
+    lib = offline_cli
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(77, "新名字", seasons={1: weekly(2, first_days_ago=900)})
+    sh = lib.show("旧名字")
+    for n in (1, 2):
+        sh.season(1).local(f"新名字 S01E{n:02d}.mkv")
+    sh.sidecar(tmdb_id=77, tmdb_title="新名字")
+
+    assert cli.cmd_run(_args(no_tmdb=False), lib.cfg) == 0
+
+    rep = _latest(lib)
+    ops = [(r["op"], r["status"]) for r in lib.audit(rep["run_id"])]
+    assert ("rename_show_dir", "applied") in ops
+    sidecars = [r for r in lib.audit(rep["run_id"]) if r["op"] == "write_sidecar"]
+    assert [(r["status"], r["args"]["show_dir"].rsplit("/", 1)[-1]) for r in sidecars] == \
+        [("skipped", "旧名字"), ("applied", "新名字")]                  # 第一次迭代：目录已不在；第二次：按新目录写
+    assert not (lib.media_root / "旧名字").exists()
+    assert lib.sidecar("新名字").seasons["1"]["have"] == [1, 2]
+    assert rep["status"] == "ok", rep["reasons"]
