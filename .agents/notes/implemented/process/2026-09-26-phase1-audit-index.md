@@ -64,6 +64,7 @@
 | 编号 | 是什么 |
 |---|---|
 | §2 | 调用关系核查：`grabber.add_and_name` 零调用方（本地两份克隆、tests / tools / deploy、生产机全部 `*.py` / `*.sh`），它的模块文档却自称"加种子的唯一入口"；真正的入口是 `QBitClient.add_torrent` |
+| §4 | 抓取后即时改名撞上别人集位名的两种入口：下面的 S1（停滞放行换源）与 S3（与 AutoBangumi 赛跑）。`tests/test_grab_claims.py` 的模块文档引用它 |
 | §5 | "两个种子一个路径"的闸门规格：盘上 `X` / `X.!qB` + qBittorrent 里别的种子的条目，NFC + casefold 比较，豁免问的人自己；接到抓取后改名、`_op_rename`、relink 等所有写路径。实现见 `architecture/2026-09-26-path-claims.md` |
 | S1 | 停滞放行换源：旧种子停滞超过 `DEAD_TORRENT_HOURS`，抓取放行新源；抓取（op 0）早于死种摘除（op 1），新种子被即时改名到旧种子仍声明、盘上还有它 `X.!qB` 的集位名上 |
 | S3 | 与 AutoBangumi 赛跑：诊断之后、加种之前 AB 下完并改名到 X；新种子被映射到 X，完成时 `X.!qB → X` 撞 EEXIST，偏好的版本（如邪竜解放版）作为孤儿 `.!qB` 静默留下 |
@@ -81,3 +82,26 @@
 | destructive I | `run` 末尾的时间清理：超过 30 天的日目录整个 `rmtree`、不写记录（生产 run.log 两次共 6 个文件 4.7 GB） | 8faf076 |
 | destructive J | `purge --apply`：替代者按名字认、`.!qB` 检查形同虚设 | 963f2bc、6e62bd8 |
 
+## 第 2 阶段审查（2026-09-26）：单点变异编号
+
+第 2 阶段分支（46c48d5）的测试视角审查：208 个单点变异（`if 条件:` → `if False:`、删掉一个过滤、换成拷贝……），
+53 个在全套测试下存活；另有 X01 这样的"可达探针"（把入口换成 `raise`，看有没有测试走到）。变异脚本不入库。
+测试与提交说明里引用的编号如下，"处理"是让它被杀的提交。
+
+| 编号 | 变异了什么 | 处理 |
+|---|---|---|
+| X01 / P32 / P33 / P34 | `purge._prove_duplicate` 无种子替代者的时长自证：入口换成 raise / 偏短、偏长、尾部解码三条判据各自关掉 | 31ff38c |
+| G37 / G36 / G33 / G38 | `gate.other_holders`：不滤孤儿 `.!qB` / 不滤 0 字节 / 不滤特典名 / 不先认钉子 | 363441a |
+| G17b | `gate._keeper_problem` 的 `fold(kp) == fold(path)` 改成逐字比较（只差大小写的保留方） | 99369f1 |
+| G46 | `gate.describe`：集位不再优先取动作给的 `slot` | ebda404 |
+| A13b | 逆改名盘上一侧（`if chk.claimants: 还原目标已存在`）关掉 | b1374a7 |
+| A31 / A32 / A34 | 执行器：`_audit` 不作废占用索引 / 加种后不作废 / 索引拷一份 `_removed_torrents` 而不是按引用 | 837e5a7 |
+| D09 / D10 / D14 / D15 / D16 / D16b | `naming.is_extra_of` 不剥剧名 / 剥剧名不看词边界；判重 / 改名 / 改名撞车 / 特典各自回到整名匹配 | 986ac45 |
+| T02 / T08 | `_op_trash` / `_op_drop_torrent` 忽略关口的 `v.failed`（T02 早有测试） | T08：42188da |
+| T05 | `_op_trash` 整种子作废时不记 `_removed_subjects` | ebda404 |
+| A10 / A11 | relink 换目录时不查连带搬走的条目 / relink 回退不查盘上 | 0acb827 |
+| A16 / A17 / A19 | 重加种子看不全照样加 / 没有候选路径照样加 / 忽略摘除时记下的 `paths` | 0acb827 |
+| A26 / A27 | 目录改名：邻居 `files()` 读失败照样搬 / 回退时旧目录已在盘上照样搬 | 0acb827 |
+| C18 / C19 | `claims` 读不了目录 / `lstat` 失败时当作不存在 | 0acb827 |
+| P03 / P06 / P13 | 意图不 fsync / `dispose` 不调 `recover` / 没有 qBittorrent 时 `dispose` 不拒绝 | ebda404 |
+| P22 / P51 / P53 | 记录没有原路径照删 / 不用 `deletion.slot` / 按文件名猜季号 | ebda404 |
