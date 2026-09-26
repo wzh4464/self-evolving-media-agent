@@ -22,6 +22,7 @@
 | N7 | `Finding.key()` = `(kind, path)`：同一目录两个死种的 `content_path` 相同，第二条被去重吞掉 | 3ef6825 |
 | N8 | 隔离区与媒体在同一个 APFS 容器（约 94% 满）：隔离不腾空间，跨卷搬运是先拷后删，磁盘满时搬到一半失败 | 仅作为风险引用；未改动 |
 | N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒） | 0b5a02e |
+| N15 | 抓取后的即时改名 `rename_single_video` 算目标名时丢掉条目的文件夹层（`_op_rename` 保留）：409 撞上一个已有的 Original 布局种子时，文件被挪到 save_path 根下 | 第 2 阶段，见 `architecture/2026-09-26-path-claims.md` |
 | N17 | `rescue.py` / `vpn-watchdog.sh` 重建 qBittorrent 容器时不看任何锁或维护窗口；运行锁应覆盖 `purge --apply`、`rollback`、`repair` 与手动会话 | 部分：0b5a02e（运行锁）；两个脚本仍不看锁 |
 | §3.6 | 运行锁不能等到后面的阶段：`purge` / `rollback` / `repair` / 手动会话今天就与 `run` 竞争 | 0b5a02e |
 | §3.7 | 锁文件变更与 launchd：plist 用 `uv run`，每轮按 `uv.lock` 联网同步，引入 pytest 后凌晨那轮就要装包；先把 plist 改成直接跑 `.venv/bin/media-agent` | d504b3c |
@@ -57,3 +58,11 @@
 |---|---|
 | §3 | 生产上 launchd 怎么跑：`uv run` 不带 `--frozen`，每轮同步依赖；全项目没有任何锁 |
 | §5 | 三处用 `Path(__file__).resolve()` 定位项目根，审计里存的是隔离区绝对路径：`releases/<sha>` + 软链的布局会让 `state/`、`.env`、规则、偏好"分家"，所以只能原地 checkout |
+
+## grab 调研：抓取链路（第 2 阶段引用）
+
+| 编号 | 是什么 |
+|---|---|
+| §5 | "两个种子一个路径"的闸门规格：盘上 `X` / `X.!qB` + qBittorrent 里别的种子的条目，NFC + casefold 比较，豁免问的人自己；接到抓取后改名、`_op_rename`、relink 等所有写路径。实现见 `architecture/2026-09-26-path-claims.md` |
+| S1 | 停滞放行换源：旧种子停滞超过 `DEAD_TORRENT_HOURS`，抓取放行新源；抓取（op 0）早于死种摘除（op 1），新种子被即时改名到旧种子仍声明、盘上还有它 `X.!qB` 的集位名上 |
+| S3 | 与 AutoBangumi 赛跑：诊断之后、加种之前 AB 下完并改名到 X；新种子被映射到 X，完成时 `X.!qB → X` 撞 EEXIST，偏好的版本（如邪竜解放版）作为孤儿 `.!qB` 静默留下 |
