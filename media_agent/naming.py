@@ -253,8 +253,8 @@ def release_slot(raw: str, *, dir_season: int | None = None, ab_season: int | No
                  declared=_AUTO, parsed: tuple | None = None) -> tuple[int, int] | None:
     """一个名字（文件名、种子显示名、番组页标题）→ 库内集位；认不出、换算不了返回 None。
 
-    判重分桶（`builtin._resolve`）、发布名独立确认（`builtin._release_slot`）、出处账本的补录与读取共用这一处，
-    不能各算各的：
+    判重分桶（`builtin._resolve`）、发布名独立确认（`builtin._release_slot`）共用这一处，不能各算各的
+    （出处账本里的**番组页标题**不走这里，走 `title_slot`：标题里的 `Sxx` 是发布方的编号，不定库内的季）：
     - 季：名字里写的 `Sxx` > 季目录 `Season N`（`dir_season`）> AutoBangumi 订阅的季（`ab_season`）> 1；
     - 发布方**声明**的季号（`declared`，默认按 `declared_season(raw)`）与库内季号不同：只有 sidecar 的
       `season_offsets` 有它才换算（`集号 <= 偏移` 才加上偏移——Fyy Raws 的 `3rd Season - 08` 是第 58 集，
@@ -288,13 +288,83 @@ def release_slot(raw: str, *, dir_season: int | None = None, ab_season: int | No
 def declared_seasons(title: str) -> set[int]:
     """番组页发布标题里明写的季号。按 ` / ` 分开的每一段各认一次：中文名、日文名、英文名常各写各的
     （`辉夜大小姐想让我告白 第三季 / Kaguya-sama wa Kokurasetai S3 - 03`），`declared_season` 只看最后一段。
-    抓取挑候选（`grab._slot_in_season`）与出处账本（`ledger.release_facts`）共用这一处。"""
+    抓取挑候选（`slot_in_season`）与出处账本（`ledger.release_facts`、`title_slot`）共用这一处。"""
     out = set()
     for part in re.split(r"\s+/\s+", title or ""):
         ds = declared_season(part)
         if ds:
             out.add(ds)
     return out
+
+
+# 特典位（第 0 季）只收标着特典的发布。只写集号的（`- 03`）是正片编号——辉夜那一页上别的组写
+# `Kaguya-sama wa Kokurasetai - Ultra Romantic - 03`，`Ultra Romantic` 就是第三季的副标题，不声明季号。
+SPECIAL_RE = re.compile(r"特别篇|特別篇|番外|总集篇|総集編|\bOVA\b|\bOAD\b|\bSP\s*\d|\bSpecials?\b",
+                        re.IGNORECASE)
+
+
+def slot_in_season(title: str, n: int, target: int,
+                   offsets: dict[int, int]) -> tuple[int | None, str]:
+    """集号为 `n` 的这个发布（番组页标题），落在库内第 `target` 季的第几集；不属于这一季返回 `(None, 为什么)`。
+
+    - 没声明季号、或声明的就是目标季：第 `n` 集；
+    - 声明了别的季、sidecar 的 `season_offsets` 有它：按偏移换算（`n <= 偏移` 才加，与改名 `_slot_from`
+      同一口径：Fyy Raws 的 `3rd Season - 08` 是第 58 集，Dynamis One 的 `4th Season - 79` 就是第 79 集）；
+      偏移只换算进正片季；
+    - 声明了别的季、没有换算：不是这一季的（LAT-03）。桜都把入间同学的第四季标成「第3季」这类错位，
+      在 sidecar 里登记 `season_offsets: {"3": 0}` 就收进来；
+    - 目标是第 0 季（特典位）：只收标着特别篇 / OVA / SP（或 `S00Exx`）的——带季号的特典（`第三季 OVA`）
+      也算；没有这些字样的是正片编号，不论声不声明季号。
+
+    **抓取挑候选（`grab._slot_in_season`）与出处账本读集位（`title_slot`）共用这一处**：同一个标题两边以前各算各的，
+    Re:Zero 的 `第四季 / … S04E15`（偏移 66）抓取算第 81 集、账本算 (4, 15)（2026-09-27 审查）。
+    """
+    declared = declared_seasons(title)
+    if target == 0:
+        if parse_episode(title)[0] == 0 or SPECIAL_RE.search(title):
+            return n, ""
+        if declared:
+            return None, f"标的是第 {'/'.join(map(str, sorted(declared)))} 季的正片"
+        return None, "正片编号（没有特别篇 / OVA / SP 字样）"
+    if not declared or target in declared:
+        return n, ""
+    for ds in sorted(declared):
+        off = offsets.get(ds)
+        if off is not None:
+            return (n + off if n <= off else n), ""
+    return None, f"标的是第 {'/'.join(map(str, sorted(declared)))} 季"
+
+
+def title_slot(title: str, *, target: int, offsets: dict | None = None,
+               episode_offset: int = 0) -> tuple[tuple[int, int] | None, str]:
+    """番组页发布标题 → 放在库内第 `target` 季（文件所在的季目录）时的集位；换算不了返回 `(None, 为什么)`。
+
+    出处账本读集位（`builtin.ledger_view`）与补录（`ledger_backfill`）用它。与文件名那一套（`release_slot`）的区别：
+    - **季由文件所在的库内季定，不由标题里的 `Sxx` 定。** 标题是发布方的编号：CR 系的 `第三季 / … S01E25` 里 `S01`
+      是 TMDB 的连续编号；以前让它定季，《超超超超超喜欢你的100个女朋友》`Season 3/… S03E01.mkv`（AB 订阅第三季、
+      `episode_offset -24` 改好的）被算成 (1, 25)、提议改成 `S01E25`（2026-09-27 生产快照，10 个文件）。账本永远不把
+      文件挪到别的季。
+    - **季内的换算与抓取同一套**（`slot_in_season`）：偏移只进正片季，特典位只认标着特典的。
+    - **声明了不止一个季号**（`第三季 / … S01E25`）说不清按哪一季编号：返回 None，不取其中一个。
+    - AutoBangumi 的 `episode_offset` 由调用方决定给不给（只有 AB 订阅的那一季、而且 AB 就是按这个标题下的才用；
+      给了就对标题里的原始集号换算——标题从来不是 AB 改出来的名字，`S01E25` 也照换，AB 自己就是这么做的）。
+      特典位不换算。
+    """
+    ep = parse_episode(title)[1]
+    if ep is None:
+        return None, "认不出集号"
+    declared = declared_seasons(title)
+    if len(declared) > 1:
+        return None, f"声明了不止一个季号（{'/'.join(map(str, sorted(declared)))}），说不清按哪一季编号"
+    offs = {int(k): int(v) for k, v in (offsets or {}).items() if str(k).strip().isdigit()}
+    n, why = slot_in_season(title, int(ep), int(target), offs)
+    if n is None:
+        return None, why
+    if episode_offset and target != 0:
+        n = int(n) + int(episode_offset)
+        if n <= 0:
+            return None, f"AutoBangumi 的 episode_offset {episode_offset} 换算出非正数"
+    return (int(target), int(n)), ""
 
 
 _SIMPLIFIED_RE = re.compile(

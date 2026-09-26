@@ -181,3 +181,100 @@ def test_a_broken_ledger_falls_back_and_says_so(lib):
 
     assert state.ledger_problem and ledger.LEDGER_NAME in state.ledger_problem
     assert all(f.ledger is None for s in state.shows for f in s.files)
+
+
+# ------------------------------------------------------------------ 账本只在文件所在的库内季里换算（2026-09-27 审查）
+GIRLS = "超超超超超喜欢你的100个女朋友"
+NIX_GIRLS = (f"[Nix-Raws] {GIRLS} 第三季 / Kimi no Koto ga Dai Dai Dai Dai Daisuki na 100-nin no S01E25 "
+             f"[CR WEB-DL 1080p AVC AAC][MKV]")
+
+
+def test_100_girlfriends_s3_keeps_its_ab_numbering(lib):
+    """生产快照：AB 订阅 37 是第三季、`episode_offset -24`，把 `… S01E25` 改名成 `Season 3/… S03E01.mkv`。番组页标题
+    `第三季 / … S01E25` 里发布方同时写了第 3 季与第 1 季（TMDB 的连续编号）。以前账本按标题里的 `S01` 定季、声明的季取
+    最小的 1，算出 (1, 25)、压过文件名——10 个名字正确的文件被提议改成 `S01E25`…`S01E36`，sidecar 的 S3 进度被清掉。
+    声明了不止一个季号的标题说不清是哪一季的编号：账本不说话，按文件名（与 AB 一致）。"""
+    sh = lib.show(GIRLS)
+    sh.bangumi(37, title_raw="Kimi no Koto ga Dai Dai Dai Dai Daisuki na 100-nin no Kanojo", season=3,
+               episode_offset=-24)
+    lib.ab_rows("torrent", [{"bangumi_id": 37, "name": NIX_GIRLS, "url": _url(H_AB)}])
+    t = sh.season(3).single(f"{GIRLS} S03E01.mkv", hash=H_AB, tags="ab:37",
+                            name="[Nix-Raws] Kimi no Koto ga Dai Dai Dai Dai Daisuki na 100-nin no Kanojo S01E25 "
+                                 "[CR WEB-DL 1080p AVC AAC].mkv")
+    lb.backfill(lib.context())
+
+    state = lib.scan()
+    s, f = _file(lib, state, t.path)
+    assert ledger_view(f, s) == ("", None) and _resolve(f, s) == (3, 1)
+    assert lib.diagnose(state, detectors=[UnrenamedDetector]) == []
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        row = led.get(H_AB)
+    assert row.slot is None and row.declared_season is None    # 补录也不替它定一个集位
+
+
+def test_a_flattened_show_maps_the_release_into_the_files_own_season_like_grab_does(lib):
+    """Re:Zero（TMDB 压平成一季，sidecar `{2: 25, 3: 50, 4: 66}`）：`第四季 / … S04E15` 在 Season 1 是第 81 集——
+    抓取（`grab._slot_in_season`）一直这么算；账本以前让标题里的 `S04` 定季，算出 (4, 15)。"""
+    from media_agent.plugins.grab import _slot_in_season
+
+    title = "[Nix-Raws] Re:从零开始的异世界生活 第四季 / Re:Zero kara Hajimeru Isekai Seikatsu S04E15 [CR WEB-DL 1080p]"
+    offsets = {"2": 25, "3": 50, "4": 66}
+    sh = lib.show(REZERO)
+    sh.sidecar(season_offsets=offsets)
+    sh.bangumi(9, title_raw="Re Zero kara Hajimeru Isekai Seikatsu", season=1)
+    lib.ab_rows("torrent", [{"bangumi_id": 9, "name": title, "url": _url(H_AB)}])
+    t = sh.season(1).single("Re:从零开始的异世界生活 S01E15.mkv", hash=H_AB, tags="ab:9",
+                            name="[Nix-Raws] Re Zero kara Hajimeru Isekai Seikatsu S04E15 [CR WEB-DL 1080p].mkv")
+    lb.backfill(lib.context())
+
+    state = lib.scan()
+    s, f = _file(lib, state, t.path)
+    assert ledger_view(f, s) == ("slot", (1, 81))
+    assert _slot_in_season(title, 15, 1, {int(k): v for k, v in offsets.items()}) == (81, "")
+
+
+def test_a_special_in_season_0_gets_no_main_season_offset(lib):
+    """`第三季 OVA - 01` 放在 Season 0 是特典第 1 集：季号偏移只换算进正片季（抓取一直如此）。以前账本把第 3 季的
+    偏移 24 加上去、改名提议 S00E25（药屋少女、Re:Zero 生产上都有 Season 0 + season_offsets）。"""
+    sh = lib.show("辉夜大小姐想让我告白")
+    sh.sidecar(season_offsets={"3": 24})
+    sh.bangumi(50, title_raw="Kaguya-sama", season=0)
+    lib.ab_rows("torrent", [{"bangumi_id": 50, "name": "[G] 辉夜大小姐想让我告白 第三季 OVA - 01 [1080p]",
+                             "url": _url(H_AB)}])
+    t = sh.season(0).single("辉夜大小姐想让我告白 S00E01.mkv", name="[G] Kaguya-sama OVA - 01 [1080p].mkv",
+                            hash=H_AB, tags="ab:50")
+    lb.backfill(lib.context())
+
+    state = lib.scan()
+    s, f = _file(lib, state, t.path)
+    assert ledger_view(f, s) == ("slot", (0, 1))
+    assert lib.diagnose(state, detectors=[UnrenamedDetector]) == []
+
+
+def test_a_main_episode_sitting_in_season_0_is_a_conflict(lib):
+    """LAT-03 的形态：第三季的正片（没有 OVA / 特别篇字样）躺在 Season 0——账本说它的名字不可信（与抓取同一个判据）。"""
+    sh = lib.show("辉夜大小姐想让我告白")
+    sh.sidecar(season_offsets={"3": 24})
+    title = "[LoliHouse] 辉夜大小姐想让我告白 第三季 / Kaguya-sama wa Kokurasetai S3 - 03 [WebRip 1080p]"
+    sh.bangumi(50, title_raw="Kaguya-sama", season=0)
+    lib.ab_rows("torrent", [{"bangumi_id": 50, "name": title, "url": _url(H_AB)}])
+    t = sh.season(0).single("辉夜大小姐想让我告白 S00E03.mkv", name="[LoliHouse] Kaguya-sama S3 - 03.mkv",
+                            hash=H_AB, tags="ab:50")
+    lb.backfill(lib.context())
+
+    state = lib.scan()
+    s, f = _file(lib, state, t.path)
+    assert ledger_view(f, s) == ("conflict", None)
+
+
+def test_ab_episode_offset_only_applies_to_the_subscriptions_own_season(lib):
+    """AB 订阅 37 是第三季（-24）；Season 1 里的 `第一季 - 05` 不是它下的，不减 24（以前减成负数、判成 conflict）。"""
+    sh = lib.show(GIRLS)
+    sh.bangumi(37, title_raw="Kimi no Koto ga", season=3, episode_offset=-24)
+    lib.ab_rows("torrent", [{"bangumi_id": 37, "name": f"[G] {GIRLS} 第一季 - 05 [1080p]", "url": _url(H_AB)}])
+    t = sh.season(1).single(f"{GIRLS} S01E05.mkv", name="[G] Kimi no Koto ga - 05 [1080p].mkv", hash=H_AB)
+    lb.backfill(lib.context())
+
+    state = lib.scan()
+    s, f = _file(lib, state, t.path)
+    assert ledger_view(f, s) == ("slot", (1, 5))

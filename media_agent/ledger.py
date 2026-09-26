@@ -16,7 +16,8 @@
 **账本记事实，不记结论。** 一行 = 一个 infohash：谁加的（`source`）、番组页标题与链接、发布日期、落在哪部番、
 **集位**（抓取器定的；补录的是按标题算的）、发布方声明的季号与原始集号、版本词（偏好关键词命中）、偏好评分、
 为什么选它、何时抓、AB 的番组 id、备注。补录的集位只是补录那一刻按当时的 `season_offsets` 算的——规则要用时
-按**此刻的**换算关系从标题重新算（`builtin.ledger_slot`），人后来补上的 `season_offsets` 立刻生效。
+按**此刻的**换算关系、放在文件此刻所在的季里从标题重新算（`builtin.ledger_view` → `naming.title_slot`），人后来补上的
+`season_offsets` 立刻生效。
 
 **写的人**：抓取（`record_grab`，定论，覆盖之前的补录）；补录（`upsert_backfill`，只填没有的，永不覆盖）；
 回退抓取（`retract`，只标"不再作保"，不删——它仍然是那个种子）。
@@ -121,11 +122,14 @@ def infohash_of_url(url: str) -> str | None:
 
 def release_facts(title: str) -> tuple[int | None, int | None]:
     """发布标题里**发布方自己写的**季号与原始集号 `(declared_season, raw_episode)`，与抓取同一套解析
-    （`naming.declared_seasons` 按 ` / ` 分段各认一次；集号 `naming.parse_episode`）。声明了不止一个季号取最小的。"""
+    （`naming.declared_seasons` 按 ` / ` 分段各认一次；集号 `naming.parse_episode`）。
+
+    声明了不止一个季号（CR 系的 `第三季 / … S01E25`：中文段是季、英文段是 TMDB 的连续编号）记 None——说不清是哪一季。
+    以前取最小的：《100个女朋友》第三季记成第 1 季，读账本时"声明的 = 库内的"，一个换算检查都没做（2026-09-27 审查）。"""
     from .naming import declared_seasons, parse_episode
 
     ds = declared_seasons(title or "")
-    return (min(ds) if ds else None), parse_episode(title or "")[1]
+    return (next(iter(ds)) if len(ds) == 1 else None), parse_episode(title or "")[1]
 
 
 def versions_of(title: str, rules: dict | None = None) -> set[str]:

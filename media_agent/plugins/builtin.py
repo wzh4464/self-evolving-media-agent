@@ -17,9 +17,10 @@ from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
 from ..probe import MediaInfo, probe, size_for_compare
 from ..naming import (
-    SUB_EXTS, VIDEO_EXTS, declared_season, is_extra_of,
+    SUB_EXTS, VIDEO_EXTS, declared_season, declared_seasons, is_extra_of,
     is_normalized, normalize, parse_episode,
     parse_pin, parse_quality, release_slot, season_of_dir, subtitle_lang_tag, target_filename,
+    title_slot,
     target_subtitle_filename,
 )
 
@@ -269,6 +270,24 @@ def _numbering_conflict(f: MediaFile, show: Show) -> tuple[int, int] | None:
     return dec, target
 
 
+def _library_season(f: MediaFile, show: Show) -> int:
+    """这个文件此刻在库里属于第几季：季目录 `Season N` > 文件名里的 `Sxx` > AutoBangumi 订阅的季 > 1。
+    出处账本只在这一季里换算集位——它永远不把一个文件挪到别的季（`ledger_view`）。"""
+    sn = season_of_dir(f.season_dir or "")
+    if sn is not None:
+        return sn
+    return _season_of(f, show, parse_episode(f.filename)[0])
+
+
+def _ab_offset_for(show: Show, season: int) -> int:
+    """AutoBangumi 的 `episode_offset` 只对它订阅的那一季有意义（AB 下的集都进 `Season <订阅季>`）。
+    《超超超超超喜欢你的100个女朋友》的订阅是第三季、-24：Season 1 里的 `第一季 - 05` 不是它下的，不减 24。"""
+    b = show.bangumi or {}
+    if not b or int(b.get("season") or 1) != season:
+        return 0
+    return _episode_offset(show)
+
+
 def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
     """出处账本对"这个文件是哪一集"怎么说：`("slot", 集位)` / `("conflict", None)` / `("", None)`（没话说）。
 
@@ -277,20 +296,30 @@ def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
     （没声明的，标题与文件名是同一套编号，账本不比文件名多知道什么）。
 
     - 抓取行（`Row.grabbed`）：集位是抓取器按番组页 + 播出日期定的，与 `ma:` 钉子同源——照它；
-    - 其余：按**此刻的** `season_offsets` / AB `episode_offset` 从番组页标题重算（`naming.release_slot`，与
-      `_resolve` 同一套换算）——人后来补的换算关系立刻生效。算得出是 `slot`；发布方声明的季号与库内不同、又没有
-      换算关系，是 `conflict`：文件名里的集位不可信（2026-08-31 AB 把 `3rd Season - 08` 改成 `S01E08`）。
+    - 声明了**不止一个**季号（CR 系的 `第三季 / … S01E25`：中文段是季、英文段是 TMDB 的连续编号）：说不清按哪一季
+      编号，没话说；
+    - 其余：放在文件**此刻所在的库内季**（`_library_season`），按此刻的 `season_offsets`、AB 的 `episode_offset`
+      （只对订阅的那一季）从番组页标题重算（`naming.title_slot`，季内换算与抓取挑候选同一处）——人后来补的换算关系
+      立刻生效。算得出是 `slot`；发布方声明的季号与库内不同、又没有换算关系（或者第三季的正片躺在特典位），是
+      `conflict`：文件名里的集位不可信（2026-08-31 AB 把 `3rd Season - 08` 改成 `S01E08`）。
+
+    2026-09-27 审查：以前按文件名那一套（`release_slot`）算——标题里的 `Sxx` 定季、声明的季号取最小的、特典位也加
+    正片季的偏移。生产快照里《100个女朋友》第三季 10 个名字正确的文件被算成 `S01E25`…`S01E36`、要改名；Re:Zero 的
+    `第四季 / … S04E15` 账本算 (4, 15)、抓取算第 81 集；`第三季 OVA - 01` 在 Season 0 被算成 S00E25。
     """
     row = getattr(f, "ledger", None)
     if row is None or not row.active or not f.torrent_hash or f.torrent_videos != 1:
         return "", None
-    if row.declared_season is None or not row.mikan_title:
+    declared = declared_seasons(row.mikan_title) if row.mikan_title else set()
+    if not declared:
         return "", None
     if row.grabbed:
         return "slot", row.slot
-    slot = release_slot(row.mikan_title, dir_season=season_of_dir(f.season_dir or ""),
-                        ab_season=(show.bangumi or {}).get("season"), offsets=_season_offsets(show),
-                        episode_offset=_episode_offset(show), declared=row.declared_season)
+    if len(declared) > 1:
+        return "", None
+    target = _library_season(f, show)
+    slot, _why = title_slot(row.mikan_title, target=target, offsets=_season_offsets(show),
+                            episode_offset=_ab_offset_for(show, target))
     return ("slot", slot) if slot else ("conflict", None)
 
 
@@ -335,8 +364,8 @@ def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
     raw, season, ep = _numbered_from(f, show)
     mine = _slot_from(raw, season, ep, f, show)
     kind, slot = ledger_view(f, show)
-    if kind == "slot" and slot != mine:
-        return slot
+    if kind == "slot" and slot != mine and slot[0] == _library_season(f, show):
+        return slot                                  # 账本只在文件所在的这一季里改口，不把它挪到别的季
     return mine
 
 

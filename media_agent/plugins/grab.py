@@ -27,7 +27,8 @@ from .. import preferences
 from ..cache import Cache, FEED_TTL, LOOKUP_TTL, season_episodes
 from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
                       tmdb_groups)
-from ..naming import declared_seasons, parse_episode, parse_pin, season_of_dir
+from ..naming import (SPECIAL_RE, declared_seasons, parse_episode, parse_pin, season_of_dir,
+                      slot_in_season)
 from ..sidecar import load as load_sidecar
 from .subscription import (MIKAN, _disk_episodes, _http_get,
                            _mikan_search_ids, is_seasonal)
@@ -188,10 +189,7 @@ def _season_fit(items: list[dict], air: list[str]) -> float:
     return ok / len(items)
 
 
-# 特典位（第 0 季）只收标着特典的发布。只写集号的（`- 03`）是正片编号——辉夜那一页上别的组写
-# `Kaguya-sama wa Kokurasetai - Ultra Romantic - 03`，`Ultra Romantic` 就是第三季的副标题，不声明季号。
-_SPECIAL_RE = re.compile(r"特别篇|特別篇|番外|总集篇|総集編|\bOVA\b|\bOAD\b|\bSP\s*\d|\bSpecials?\b",
-                         re.IGNORECASE)
+_SPECIAL_RE = SPECIAL_RE
 
 
 def _declared_seasons(title: str) -> set[int]:
@@ -201,31 +199,8 @@ def _declared_seasons(title: str) -> set[int]:
 
 def _slot_in_season(title: str, n: int, target: int,
                     offsets: dict[int, int]) -> tuple[int | None, str]:
-    """集号为 `n` 的这个发布，落在目标季（`target`）的第几集；不属于这一季返回 `(None, 为什么)`。
-
-    - 没声明季号、或声明的就是目标季：第 `n` 集；
-    - 声明了别的季、sidecar 的 `season_offsets` 有它：按偏移换算（`n <= 偏移` 才加，与改名 `_slot_from`
-      同一口径：Fyy Raws 的 `3rd Season - 08` 是第 58 集，Dynamis One 的 `4th Season - 79` 就是第 79 集）；
-      偏移只换算进正片季；
-    - 声明了别的季、没有换算：不是候选（LAT-03）。桜都把入间同学的第四季标成「第3季」这类错位，
-      在 sidecar 里登记 `season_offsets: {"3": 0}` 就收进来；
-    - 目标是第 0 季（特典位）：只收标着特别篇 / OVA / SP（或 `S00Exx`）的——带季号的特典（`第三季 OVA`）
-      也算；没有这些字样的是正片编号，不论声不声明季号。
-    """
-    declared = _declared_seasons(title)
-    if target == 0:
-        if parse_episode(title)[0] == 0 or _SPECIAL_RE.search(title):
-            return n, ""
-        if declared:
-            return None, f"标的是第 {'/'.join(map(str, sorted(declared)))} 季的正片"
-        return None, "正片编号（没有特别篇 / OVA / SP 字样）"
-    if not declared or target in declared:
-        return n, ""
-    for ds in sorted(declared):
-        off = offsets.get(ds)
-        if off is not None:
-            return (n + off if n <= off else n), ""
-    return None, f"标的是第 {'/'.join(map(str, sorted(declared)))} 季"
+    """集号为 `n` 的这个发布落在目标季的第几集（`naming.slot_in_season`，出处账本读集位用同一处）。"""
+    return slot_in_season(title, n, target, offsets)
 
 
 def _feed_cached(mid: str, cache) -> list[dict]:

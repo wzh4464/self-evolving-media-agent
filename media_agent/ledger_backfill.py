@@ -14,8 +14,9 @@
    `ledger.MISS_TTL` 之内不再为它们拉番组页（每轮开头的自动补录不能每 6 小时把同一批番组页拉一遍）。
 3. 最后只剩标签的：`ma:` 钉子（只有本项目的抓取打它，集位就是钉子）、`manual:`（人手加种时自己打的）。
 
-集位按同一套命名解析算（`naming.release_slot`：发布方声明的季号、sidecar 的 `season_offsets`、AB 的
-`episode_offset`）；钉着 `ma:` 的按钉子。换算不了的集位留空，声明的季号与原始集号照记。只补没有的：幂等。
+集位按读账本的同一套算（`naming.title_slot`：放在种子所在的季目录里、按 sidecar 的 `season_offsets` 与抓取同一套
+季内换算，AB 的 `episode_offset` 只对它订阅的那一季）；钉着 `ma:` 的按钉子。换算不了（含声明了不止一个季号的）的
+集位留空，声明的季号与原始集号照记。只补没有的：幂等。
 
 **不拦路**：qBittorrent / AB 库 / 番组页 / 账本任何一样读不了，说一句（`problems`），能补的照补。
 """
@@ -27,7 +28,7 @@ from pathlib import Path
 
 from . import ledger
 from .kernel import under
-from .naming import parse_pin, release_slot, season_of_dir
+from .naming import parse_pin, season_of_dir, title_slot
 
 
 @dataclass
@@ -231,10 +232,11 @@ def _fill(ctx, rep: BackfillReport, led, rows: dict, misses: set, torrents: list
         show_dir, dir_season = _where(t, media_root)
         pin = parse_pin(t.get("tags") or "")
         title = r.get("name") or ""
-        slot = pin or release_slot(title, dir_season=dir_season, ab_season=r.get("season"),
-                                   offsets=shows.intent(show_dir)["offsets"],
-                                   episode_offset=int(r.get("episode_offset") or 0),
-                                   declared=ledger.release_facts(title)[0])
+        ab_season = int(r.get("season") or 1)
+        target = dir_season if dir_season is not None else ab_season
+        slot = pin or title_slot(title, target=target, offsets=shows.intent(show_dir)["offsets"],
+                                 episode_offset=(int(r.get("episode_offset") or 0)
+                                                 if target == ab_season else 0))[0]
         put(h, source=ledger.MEDIA_AGENT if pin else ledger.AUTOBANGUMI, mikan_title=title,
             mikan_url=r.get("url") or "", show_dir=str(show_dir or ""),
             season=slot[0] if slot else None, episode=slot[1] if slot else None,
@@ -314,8 +316,8 @@ def _from_feeds(ctx, rep: BackfillReport, led, shows: _Shows, todo: dict, misses
             _, dir_season = _where(t, media_root)
             pin = parse_pin(t.get("tags") or "")
             title = it.get("title") or ""
-            slot = pin or release_slot(title, dir_season=dir_season, offsets=offsets,
-                                       declared=ledger.release_facts(title)[0])
+            slot = pin or title_slot(title, target=dir_season if dir_season is not None else 1,
+                                     offsets=offsets)[0]
             put(h, source=ledger.MEDIA_AGENT if pin else ledger.UNKNOWN, mikan_title=title,
                 mikan_url=it.get("url") or "", pub_date=it.get("pub") or "", show_dir=str(show_dir),
                 season=slot[0] if slot else None, episode=slot[1] if slot else None,
