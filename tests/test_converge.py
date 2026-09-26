@@ -445,3 +445,29 @@ def test_only_selects_by_op():
     trash = Finding(rule="r", kind="k", severity="minor", summary="s", action=Action(op="trash", args={}))
     assert pick(grab) and not pick(trash)
     assert not pick(Finding(rule="r", kind="k", severity="minor", summary="s"))
+
+
+# ------------------------------------------------------------------ 模型选的身份：这一轮不用
+def test_an_identity_pinned_from_a_model_pick_is_not_acted_on_in_the_same_run(lib):
+    """critic N4 的约定：模型在多个 TMDB 候选里选的条目**这一轮不用**——经 `pin_tmdb` 钉进 sidecar（有审计、能回退），
+    下一轮起才按它改名 / 改目录名 / 改分类 / 抓取。迭代到不动点时，第二次迭代的扫描已经照 sidecar 认它了：不拦的话，
+    模型的选择在钉进去的同一轮就改了目录名，人连看一眼 `tmdb_pick` 的机会都没有。"""
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(11, "葬送的芙莉莲", queries=["Frieren"], first_air_date="2023-09-29",
+                      seasons={1: weekly(3, first_days_ago=900)})
+    lib.tmdb.add_show(12, "葬送的芙莉莲 迷你剧场", queries=["Frieren"], first_air_date="2023-10-06")
+    sh = lib.show("Frieren")
+    sh.season(1).local("Frieren S01E01.mkv")
+    lib.llm.when(lambda s, u: "Frieren" in u, {"id": 11, "confidence": 0.9, "reason": "正篇"})
+
+    c = lib.loop()
+
+    ops = [r["op"] for r in c.applied()]
+    assert "pin_tmdb" in ops
+    assert not {"rename", "rename_show_dir", "write_nfo", "recategorize"} & set(ops), ops
+    assert sh.path.is_dir() and lib.disk() == {"Frieren/Season 1/Frieren S01E01.mkv": 600_000_000}
+    [held] = [f for f in c.findings if f.kind == "naming_held"]
+    assert "pin_tmdb" in held.summary
+
+    nxt = lib.loop()                                            # 下一轮：照钉住的认
+    assert "rename_show_dir" in [r["op"] for r in nxt.applied()]

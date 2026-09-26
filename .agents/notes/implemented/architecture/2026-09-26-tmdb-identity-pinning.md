@@ -25,6 +25,8 @@
    `state.tmdb_proposals`；`tmdb-identity` 检测器报 `tmdb_pick`（important）并带 `pin_tmdb` 动作。执行时只在
    sidecar 还没有 tmdb_id 时写（`tmdb_id` + `tmdb_source=llm` + 标题），有审计、逆操作 `restore_sidecar`；
    已有的一律不改（记 skipped，写明现有的是谁）。下一轮起照钉住的认，不再搜、不再问。模型说不知道的，按搜不到负缓存。
+   （2026-09-27 起 `run` 迭代到不动点：钉进去之后的迭代照 sidecar 认它，但这一轮仍不按它改名——`converge` 给这些番挂
+   `naming_hold`，见 `architecture/2026-09-27-converge-within-a-run.md`。）
 
 ## 缓存
 

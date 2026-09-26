@@ -265,6 +265,22 @@ def _oscillation(f: Finding, rec: dict, first_n: int, n: int) -> Finding:
         evidence={"reason": reason, "first": first, "second": second})
 
 
+# 这一轮刚由模型的选择钉进 sidecar 的 TMDB 身份（`pin_tmdb`）：后面的迭代照 sidecar 认它，但这一轮不按它改名
+HOLD_FRESH_PIN = ("TMDB 身份是这一轮刚由模型的选择钉进 sidecar 的（pin_tmdb）：这一轮不按它改名 / 改目录名 / 改分类 / 抓取，"
+                  "下一轮起才按它认——不对就改 sidecar 的 tmdb_id")
+
+
+def _hold_fresh_pins(state, guard: _Guard) -> None:
+    """critic N4 的约定："模型选的条目这一轮不用"（`scan._resolve_tmdb`）。以前一轮只诊断一次，钉进去的身份自然要等
+    下一轮；迭代时第二次扫描已经照 sidecar 认它了——不拦的话，模型的选择在钉进去的同一轮就改了文件名与目录名，人连看一眼
+    `tmdb_pick` 的机会都没有。`naming_hold` 让改名、目录名、分类、NFO、抓取这一轮都不按它做（`tmdb-identity` 报 `naming_held`）。"""
+    pinned = {str((rec.get("args") or {}).get("show_dir")) for _, rec in guard.applied_at
+              if rec.get("op") == "pin_tmdb"}
+    for show in (getattr(state, "shows", None) or []) if pinned else []:
+        if str(show.dir_path) in pinned and not show.naming_hold:
+            show.naming_hold = HOLD_FRESH_PIN
+
+
 def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
         select: Callable[[Finding], bool] | None = None,
         on_scan: Callable[[int, object], None] | None = None,
@@ -284,6 +300,7 @@ def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
     def diagnose(it: Iteration):
         t0 = time.monotonic()
         state = scan(it.n)
+        _hold_fresh_pins(state, guard)
         it.scan_s = round(time.monotonic() - t0, 2)
         it.degraded = bool(getattr(state, "qbit_errors", None))
         if on_scan:
