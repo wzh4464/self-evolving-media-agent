@@ -57,6 +57,15 @@
   正在用的名字。记录读不了说一句、按没有记录处理；写不进去说一句（最坏是新标题多等一轮）。
 - sidecar-sync 写进 sidecar 的 `tmdb_title` 是**采用的**，不是 TMDB 这一轮给的。
 
+## 运维要知道的
+
+- 部署后钉住的是 sidecar 里**此刻**的 `tmdb_id`——sidecar-sync 以前每次解析变了都跟着改，所以翻转过的番
+  （LAT-04 里 09-16 那一轮的 `终物语 下`、`续・终物语`）钉住的可能是翻转之后的那个条目。部署前后核对一遍这几部番的
+  `tmdb_id`，不对就直接改 sidecar（可写 `"tmdb_source": "human"`）；改了身份，下一轮起标题照常过稳定闸。
+- 回退一次 `pin_tmdb` 只是把 sidecar 还原成没有 `tmdb_id`：模型的答案缓存 7 天，下一轮会再提议同一个。
+  模型选错了，直接在 sidecar 里写对的 `tmdb_id`，比回退管用。
+- 要改回一个 30 天内刚换掉的标题（`tmdb_title_flip_blocked`）：sidecar 里写 `tmdb_title`、`pinned` 里加 `"tmdb_title"`。
+
 ## 没做的
 
 - `volumes` 组（物语系列）的文件仍按组标题命名（`物语系列 S01E0x`）：LAT-04 的另一条不变式"分卷的文件按自己的目录
