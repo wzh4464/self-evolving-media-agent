@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import disposal
 from .claims import ClaimCheck, ClaimIndex, ClaimsUnknown, fold
 from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
@@ -1346,6 +1347,14 @@ class Executor:
                 "reason": f"已达单轮删除体积上限 {self.cfg.max_delete_gb_per_run}GB", **extra})
             return
 
+        # 先看隔离区放不放得下（critic N8）：隔离区与媒体是同一个 APFS 容器里的两个卷，搬运是
+        # 先拷后删、要多占一整份。以前放不下要等拷到一半 ENOSPC 才知道——那时种子那一步已经做了
+        # （整种子摘掉或设为不下载），文件却还在原处，隔离区里还多半个拷贝。放不下就跳过、都不动。
+        room = disposal.room_problem(self.cfg.trash_dir, size, "隔离区")
+        if room:
+            self._audit("skipped", f, a, {"reason": room, **extra})
+            return
+
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run", "would_free_bytes": size,
                                           **extra})
@@ -2015,6 +2024,11 @@ class Executor:
                 return False, f"无法确认原位置的占用情况，未做任何改动：{chk.unknown}"
             if chk.claimants:
                 return False, f"原位置已被占用：{chk.describe()}"
+            # 搬回媒体库同样先拷后删（critic N8）：拷到一半 ENOSPC 会在库里留下一个截断的文件，
+            # 下一轮扫描把它当成这一集
+            room = disposal.room_problem(self.cfg.media_root, src.stat().st_size, "媒体库")
+            if room:
+                return False, room
             if self.dry_run:
                 return True, ""
             dst.parent.mkdir(parents=True, exist_ok=True)

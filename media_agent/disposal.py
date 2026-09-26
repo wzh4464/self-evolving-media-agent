@@ -51,6 +51,25 @@ _OPEN = "intent"
 _CLOSED = ("done", "failed", "abandoned")
 
 
+# 跨卷搬运（先拷后删）在目标卷上除了文件本身还要留的余量：拷到一半 ENOSPC 会留下半个拷贝，
+# 紧接着的审计写入也要空间。
+MOVE_HEADROOM = 10**9
+
+
+def room_problem(dest, size: int, what: str) -> str:
+    """把 `size` 字节拷到 `dest` 所在卷之前：放得下（含余量）返回空串，否则返回不搬的理由。
+
+    隔离区与媒体是同一个 APFS 容器里的两个卷（critic N8），`shutil.move` 跨卷是先拷后删，
+    拷的那一刻要多占一整份。同卷时其实只是改名、不占空间——这里不区分，一律按拷贝算（更保守）。"""
+    room = free_bytes(dest)
+    if room is None:
+        return f"读不到{what}所在卷的剩余空间，不搬（跨卷搬运是先拷后删，放不下会拷到一半失败）"
+    if room < size + MOVE_HEADROOM:
+        return (f"{what}所在卷剩 {room / 1e9:.2f} GB，放不下这个 {size / 1e9:.2f} GB 的文件"
+                f"（跨卷搬运先拷后删，另留 {MOVE_HEADROOM / 1e9:g} GB 余量）")
+    return ""
+
+
 def free_bytes(path) -> int | None:
     """`path` 所在卷此刻可用的字节数（`statvfs`：f_bavail × f_frsize）；读不到返回 None。"""
     try:
