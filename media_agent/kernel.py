@@ -119,6 +119,12 @@ class MediaFile:
     torrent_progress: float = 0.0
     torrent_tags: str = ""
     torrent_category: str = ""
+    # 出处账本里这个种子的那一行（`ledger.Row`）：番组页标题、抓取器定的集位、发布方声明的季号。扫描时挂上，
+    # 没有 / 账本读不了为 None。规则问"这个文件是哪一集、是什么版本"时先问它，再看名字（`builtin.ledger_view`）
+    ledger: Any = None
+    # 所属种子此刻要下载的视频条目有几个（扫描的来源 1 数的；0 = 不知道 / 纯本地）。番组页标题说的是整个发布，
+    # 只有单视频的种子才能拿它当"这个文件是哪一集"的证据——合集、合并发布说不了
+    torrent_videos: int = 0
 
     @property
     def ext(self) -> str:
@@ -344,6 +350,9 @@ class LibraryState:
     tmdb_proposals: list = field(default_factory=list)
     # `run` 开头出处账本增量补录的结果（`ledger_backfill.BackfillReport.to_dict()`）；没补过为 None
     ledger_backfill: dict | None = None
+    # 这一轮读到的出处账本（infohash → `ledger.Row`），已挂到各文件的 `ledger` 上；读不了时为空、原因在 `ledger_problem`
+    ledger_rows: dict = field(default_factory=dict)
+    ledger_problem: str = ""
 
     def all_files(self) -> Iterable[MediaFile]:
         for s in self.shows:

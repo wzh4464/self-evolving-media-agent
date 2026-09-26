@@ -215,22 +215,56 @@ def _numbering_conflict(f: MediaFile, show: Show) -> tuple[int, int] | None:
     return dec, target
 
 
+def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
+    """出处账本对"这个文件是哪一集"怎么说：`("slot", 集位)` / `("conflict", None)` / `("", None)`（没话说）。
+
+    账本说得上话的前提：文件有种子、账本里有这个种子的**有效**行（撤销了的不算）、种子只有**一个**要下载的视频
+    （番组页标题说的是整个发布，合集、合并发布说不了单个文件）、番组页标题里**发布方声明了季号**
+    （没声明的，标题与文件名是同一套编号，账本不比文件名多知道什么）。
+
+    - 抓取行（`Row.grabbed`）：集位是抓取器按番组页 + 播出日期定的，与 `ma:` 钉子同源——照它；
+    - 其余：按**此刻的** `season_offsets` / AB `episode_offset` 从番组页标题重算（`naming.release_slot`，与
+      `_resolve` 同一套换算）——人后来补的换算关系立刻生效。算得出是 `slot`；发布方声明的季号与库内不同、又没有
+      换算关系，是 `conflict`：文件名里的集位不可信（2026-08-31 AB 把 `3rd Season - 08` 改成 `S01E08`）。
+    """
+    row = getattr(f, "ledger", None)
+    if row is None or not row.active or not f.torrent_hash or f.torrent_videos != 1:
+        return "", None
+    if row.declared_season is None or not row.mikan_title:
+        return "", None
+    if row.grabbed:
+        return "slot", row.slot
+    slot = release_slot(row.mikan_title, dir_season=season_of_dir(f.season_dir or ""),
+                        ab_season=(show.bangumi or {}).get("season"), offsets=_season_offsets(show),
+                        episode_offset=_episode_offset(show), declared=row.declared_season)
+    return ("slot", slot) if slot else ("conflict", None)
+
+
 def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
     """解析出 (season, episode)，失败返回 None。
 
-    **文件名优先，种子名只作兜底。** 合集种子（一个种子含整季）的 `torrent_name`
-    对所有成员文件都相同（形如 `- 01-12 -`），拿它做逐文件集号识别会把整季
-    误判成同一集的重复——实测差点导致 12 集正片被当重复删掉。
+    **钉子 > 出处账本 > 文件名 > 种子名。**
 
-    **发布方声明的季号与库内季号不一致时，集号不可信。** 此时要么用 sidecar
-    的 `season_offsets` 换算，要么返回 None（宁可不处理，也不要把 `3rd Season
-    - 08` 写成 `S01E08` 去撞 2016 年真正的第 8 集）。
+    - `ma:` 钉子是抓取器的定论。
+    - 出处账本（`ledger_view`）认得出集位、又与文件名说的不同：按账本。2026-08-31 Re:Zero：AB 把
+      `[Fyy Raws] … 3rd Season - 08` 改名成 `S01E08`，文件名骗人；账本记着番组页标题，按 sidecar 的
+      `season_offsets {"3": 50}` 它是 S01E58。账本说"声明了别的季、换算不了"时这里仍按文件名——单独一个的
+      （正相反的你与我按连续编号改好的 `第二季 - 15` → S01E15）不能因此变成认不出；撞进同一个集位时由判重
+      把它剔出来、报 `season_numbering_conflict`（`DuplicateEpisodeDetector`）。
+    - **文件名优先，种子名只作兜底。** 合集种子（一个种子含整季）的 `torrent_name` 对所有成员文件都相同
+      （形如 `- 01-12 -`），拿它做逐文件集号识别会把整季误判成同一集的重复——实测差点导致 12 集正片被当重复删掉。
+    - **发布方声明的季号与库内季号不一致时，集号不可信。** 此时要么用 sidecar 的 `season_offsets` 换算，要么
+      返回 None（宁可不处理，也不要把 `3rd Season - 08` 写成 `S01E08` 去撞 2016 年真正的第 8 集）。
     """
     pin = _pinned(f)
     if pin:
         return pin
     raw, season, ep = _numbered_from(f, show)
-    return _slot_from(raw, season, ep, f, show)
+    mine = _slot_from(raw, season, ep, f, show)
+    kind, slot = ledger_view(f, show)
+    if kind == "slot" and slot != mine:
+        return slot
+    return mine
 
 
 def _slot_from(raw: str, season: int | None, ep: int | None, f: MediaFile,
@@ -422,9 +456,11 @@ class UnrenamedDetector:
                     # `is_normalized` 只看形式（`标题 SxxExx.ext`），不看集号对不对。
                     # 被别人按错口径改成 `S01E08.mkv` 的文件形式上完全合规，
                     # 就这么永远卡在错误集号上——除非种子上钉了 `ma:` 集号，
-                    # 那它就是权威，跟文件名不一致时必须改回来。
-                    pin = _pinned(f)
-                    if not (pin and parse_episode(stem)[1] not in (None, pin[1])):
+                    # 那它就是权威，跟文件名不一致时必须改回来。出处账本认得出的集位同理
+                    # （AB 把 `3rd Season - 08` 改成的 `S01E08`，按 `{"3": 50}` 是 S01E58）。
+                    kind, lslot = ledger_view(f, show)
+                    auth = _pinned(f) or (lslot if kind == "slot" else None)
+                    if not (auth and parse_episode(stem)[1] not in (None, auth[1])):
                         continue
                 real_ext = Path(stem).suffix.lower()
                 if real_ext not in VIDEO_EXTS and real_ext not in SUB_EXTS:
@@ -523,6 +559,33 @@ class DuplicateEpisodeDetector:
             for (season, ep), files in sorted(buckets.items()):
                 if len(files) < 2:
                     continue
+
+                # 出处账本说"发布方声明的是别的季、库内换算不了"的文件（`ledger_view` 的 conflict）：它叫这一集
+                # 只是某次改名的结果。2026-08-31 AB 把 `[Fyy Raws] … 3rd Season - 08` 改成 `S01E08`，分类交接之后
+                # 与 2016 年真正的第 8 集撞进这个桶，原片被当输家清进了隔离区。它不参与这一集的取舍——既不当
+                # 保留方、也不当输家——报 `season_numbering_conflict`，登记了换算关系就按换算后的集位认。
+                # 只在撞车时报：单独占着一个集位的（按连续编号改好名的）照旧按文件名认，不制造噪音。
+                doubtful = [f for f in files if ledger_view(f, show)[0] == "conflict"]
+                for f in doubtful:
+                    row = f.ledger
+                    dec = row.declared_season
+                    yield Finding(
+                        rule=self.id, kind="season_numbering_conflict", severity="important",
+                        classified=True, subject=f"S{season:02d}E{ep:02d}",
+                        summary=(f"{f.filename} 叫 S{season:02d}E{ep:02d}，但出处账本里它的番组页标题写的是"
+                                 f"第 {dec} 季第 {row.raw_episode} 集，库内是 Season {season}、没有换算关系——"
+                                 f"名字里的集号不可信，这一集的判重不带它。在该番 sidecar 的 season_offsets 里写 "
+                                 f'"{dec}": <第{dec}季之前的累计集数> 即可自动换算'),
+                        show=show.dir_name, path=str(f.path), torrent_hash=f.torrent_hash,
+                        evidence={"declared_season": dec, "library_season": season,
+                                  "raw_episode": row.raw_episode, "mikan_title": row.mikan_title,
+                                  "ledger_source": row.source,
+                                  "others": [x.filename for x in files if x is not f]},
+                    )
+                if doubtful:
+                    files = [f for f in files if f not in doubtful]
+                    if len(files) < 2:
+                        continue
 
                 # 归属权还没交接完的，不做不可逆的删除。
                 #

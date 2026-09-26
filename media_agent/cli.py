@@ -662,6 +662,10 @@ def _auto_backfill(ctx, state) -> None:
     state.ledger_backfill = rep.to_dict()
     if rep.inserted or rep.problems:
         _print_backfill(rep, limit=10)
+    if rep.inserted and not rep.dry_run:
+        from . import ledger
+        from .scan import attach_ledger
+        attach_ledger(state, *ledger.load_rows(ctx.config.state_dir))
 
 
 def cmd_health(args, cfg) -> int:

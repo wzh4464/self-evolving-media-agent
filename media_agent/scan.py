@@ -136,6 +136,14 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
             # 合集种子：content_path 是目录，成员文件挂在它下面
             by_path.setdefault(cp.rstrip("/"), t)
 
+    # --- 出处账本（`ledger`）：每个种子是什么，挂到它的文件上 ---
+    # 读不了（坏了、结构版本更新）不拦扫描：按没有账本走，原因记进 `ledger_problem`（健康报告说出来）
+    from . import ledger as ledger_mod
+    ledger_rows, state.ledger_problem = ledger_mod.load_rows(cfg.state_dir)
+    state.ledger_rows = ledger_rows
+    if state.ledger_problem:
+        ctx.log(f"[scan] 出处账本{state.ledger_problem}；这一轮按没有账本认集位与版本")
+
     # --- AutoBangumi ---
     if ctx.abdb:
         try:
@@ -191,6 +199,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
         # 进度高的、再退回已存在于磁盘的。判不出来也没关系——重点是只留一条。
         covered: set[Path] = set()
         claimed: dict[Path, tuple] = {}
+        videos_of: dict[str, int] = {}   # 种子 → 要下载的视频条目数（`MediaFile.torrent_videos`）
         for h, t in torrent_by_hash.items():
             sp = (t.get("save_path") or "").rstrip("/")
             if not sp or not under(sp, show_dir):
@@ -202,6 +211,8 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                 suffix = abs_p.suffix.lower()
                 if suffix not in VIDEO_EXTS and suffix not in SUB_EXTS:
                     continue
+                if suffix in VIDEO_EXTS:
+                    videos_of[h] = videos_of.get(h, 0) + 1
                 covered.add(abs_p)
                 covered.add(Path(str(abs_p) + ".!qB"))
                 try:
@@ -231,6 +242,8 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                 torrent_progress=t.get("progress", 0.0),
                 torrent_tags=t.get("tags", ""),
                 torrent_category=t.get("category", ""),
+                ledger=ledger_rows.get(h.lower()),
+                torrent_videos=videos_of.get(h, 0),
             ))
 
         # --- 来源 2：磁盘上没有种子覆盖的文件（纯本地内容）---
@@ -277,6 +290,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                 torrent_progress=(t or {}).get("progress", 0.0),
                 torrent_tags=(t or {}).get("tags", ""),
                 torrent_category=(t or {}).get("category", ""),
+                ledger=ledger_rows.get((t.get("hash") or "").lower()) if t else None,
             ))
 
         if show.files or show.extras_files:
@@ -321,6 +335,14 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
         _resolve_tmdb(ctx, state)
 
     return state
+
+
+def attach_ledger(state: LibraryState, rows: dict, problem: str = "") -> None:
+    """把（补录之后）重新读到的账本挂回这一轮的文件上：`run` 开头的增量补录在扫描之后才做。"""
+    state.ledger_rows, state.ledger_problem = rows, problem
+    for s in state.shows:
+        for f in (*s.files, *s.extras_files):
+            f.ledger = rows.get(f.torrent_hash.lower()) if f.torrent_hash else None
 
 
 def _id_key(tmdb_id: int) -> str:
