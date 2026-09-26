@@ -582,3 +582,34 @@ def test_a_tmdb_outage_costs_one_timeout_per_run_not_per_iteration(lib):
 
     assert len(c.iterations) >= 2
     assert calls == [77]
+
+
+@pytest.mark.allow("log_failure", match="feed 失败")
+def test_a_mikan_outage_costs_one_timeout_per_url_per_run(lib):
+    """番组页 / RSS 拉不到：本地动作修不好别人的网站。以前每次诊断都重新请求——迭代到不动点时，Mikan 挂着的一轮要
+    每次迭代把每个番组页各等一次 25 秒超时。同一个网址这一轮只请求一次，之后直接说"刚失败过"。"""
+    import urllib.error
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(SHOW)
+    s1 = sh.season(1)
+    for n in range(1, 8):
+        s1.local(f"{SHOW} S01E{n:02d}.mkv")
+    _ab_duplicate(lib)                                               # 让这一轮迭代不止一次
+    schedule = weekly(12, first_days_ago=60)
+    sh.tmdb(1234, seasons={1: schedule})
+    sh.sidecar(tmdb_id=1234, tmdb_title=SHOW, mikan_id="3500", seasons={"1": {"have": list(range(1, 9))}})
+    feed = lib.mikan("3500", [], search=[SHOW]) or "https://mikanani.me/RSS/Bangumi?bangumiId=3500"
+
+    def down(url):
+        raise urllib.error.URLError("timed out")
+
+    lib.web.route(feed, down)
+
+    c = lib.loop()
+
+    assert len(c.iterations) >= 2
+    assert [u for u in lib.web.calls if "RSS/Bangumi" in u] == [feed]
+    assert any("刚失败过" in m for m in lib.logs)
+
+    lib.loop()                                                       # 下一轮（新进程）照常再试
+    assert len([u for u in lib.web.calls if "RSS/Bangumi" in u]) == 2

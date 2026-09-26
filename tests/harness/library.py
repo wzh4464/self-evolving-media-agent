@@ -40,6 +40,7 @@ from media_agent.actions import ExecReport, Executor
 from media_agent.config import Config
 from media_agent.kernel import Context, Finding, LibraryState, Registry
 from media_agent.plugins import builtin as builtin_mod
+from media_agent.plugins import subscription as subscription_mod
 from media_agent.plugins import register_builtins
 from media_agent.scan import build_state
 
@@ -58,6 +59,7 @@ def reset_process_caches() -> None:
     """清掉进程级缓存，模拟"新起一个进程"。"""
     probe_mod._CACHE.clear()
     builtin_mod._OFFSET_CACHE.clear()
+    subscription_mod._FETCH_FAILED.clear()
 
 
 @dataclass

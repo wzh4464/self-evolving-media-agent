@@ -91,7 +91,10 @@
 （`cache.season_episodes`，见 [分集表缓存](../bug-fix/2026-09-27-season-episodes-cache.md)）、番组页与 RSS 1 小时、Mikan
 搜索 7 天——而本地动作改变不了其中任何一样。剩下的是 qBittorrent 的种子文件列表（必须是此刻的）与磁盘。TMDB 挂着时的两个断路器
 （扫描的 `ctx.tmdb_scan_down`、分集表的 `ctx.tmdb_episodes_down`）都跟着 Context 走——一轮 `run` 只等一次超时，不是每次迭代
-各等一次（`test_a_tmdb_outage_costs_one_timeout_per_run_not_per_iteration`：改之前 3 次迭代打了 3 次）。
+各等一次（`test_a_tmdb_outage_costs_one_timeout_per_run_not_per_iteration`：改之前 3 次迭代打了 3 次）。番组页 / RSS / Mikan
+搜索拉不到的网址同理：检测器的网页请求都经 `subscription._fetch`，失败的网址 30 分钟内（`FETCH_FAIL_TTL`，进程级——launchd
+每轮一个新进程）不再请求、直接报"刚失败过"，调用方照旧说出来、跳过（`test_a_mikan_outage_costs_one_timeout_per_url_per_run`：
+改之前 3 次迭代请求了 3 次；Mikan 挂着时约 35 条订阅 × 25 秒超时 × 每次迭代）。
 `test_iterations_after_the_first_diagnose_without_any_network_call` 钉住：第二次迭代起扫描 + 诊断的 TMDB / 网页 / 模型调用都是 0。
 
 离线基座按生产规模量（129 部番、159 个季键、1833 个种子、TMDB 0.05 秒一次，一处 AB 重复版本让这一轮要两次迭代）：
