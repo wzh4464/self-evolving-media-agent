@@ -437,3 +437,104 @@ def test_i1_extras_disposition_of_a_pinned_only_copy_is_refused(lib):
     [skip] = rep.skipped
     assert skip["reason"].startswith("删除关口：I1") and "ma:" in skip["reason"]
     assert t.path.exists()
+
+
+# ------------------------------------------------------------------ I4：封存
+from harness import video  # noqa: E402
+
+CHI = video("hevc", subs=["chi 简体中文", "chi 繁體中文"])
+RAW = video("h264")                                   # 零字幕轨
+LOLI = "[LoliHouse] Yani Neko - 08 [WebRip 1080p HEVC-10bit AAC ASSx2].mkv"
+
+
+def _sealed_pair(lib, *, loser_probe, loser_name=LOLI, loser_tags="ma:S01E08"):
+    s1 = lib.show("尼古喵喵").season(1)
+    keeper = s1.single("尼古喵喵 S01E08.mkv", size=GB, tags="ma:S01E08", probe=CHI,
+                       name="[K] Yani Neko - 08 [简繁内封].mkv")
+    loser = s1.single(loser_name, size=GB, tags=loser_tags, probe=loser_probe)
+    return s1, keeper, loser
+
+
+def test_i4_second_sealed_copy_from_another_torrent_is_not_trashed(lib):
+    """两个不同的种子都钉着 S01E08、都复核通过（停滞 48 小时放行换源后常见）：
+    以前只封存一个、另一个当输家删掉——哪个被封存取决于偏好分，两个都是择源的结论。"""
+    s1, keeper, loser = _sealed_pair(lib, loser_probe=CHI)
+    before = lib.snapshot()
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I4") and "封存" in skip["reason"]
+    assert lib.snapshot() == before
+
+
+def test_i4_probe_unavailable_keeps_the_seal(lib):
+    """昨天探到两条中文字幕轨封存了，今天 ffprobe 超时（探测返回 None）：只看名字，LoliHouse
+    的 `ASSx2` 过不了硬门槛——以前它就此失封、被当输家删掉。不知道 = 当作封存。"""
+    s1, keeper, loser = _sealed_pair(lib, loser_probe=None)
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I4") and "探测不可用" in skip["reason"]
+    assert loser.path.exists()
+
+
+def test_i4_pinned_copy_that_verifiably_fails_review_is_not_sealed(lib):
+    """探得到、而且确实没有中文字幕（ABEMA 生肉）：没封存，可以删。"""
+    s1, keeper, loser = _sealed_pair(
+        lib, loser_probe=RAW,
+        loser_name="[Dynamis One] Yani Neko - 08 (ABEMA 1920x1080 AVC AAC MKV).mkv")
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    assert len(rep.applied) == 1 and not loser.path.exists()
+
+
+def test_i4_bundled_sibling_of_the_sealed_keeper_is_trashed(lib):
+    """合并发布（TV 版 + 邪竜解放版同一个种子、同一个钉子）：封存由判重选中的那一份持有，
+    兄弟按用户偏好只留一份（2026-09-18 尼古喵喵 EP11）。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    bundle = s1.torrent({"【7月】尼古喵喵 11【TV版】.mp4": GB,
+                         "【7月】尼古喵喵 11【邪龙解放版】.mp4": GB},
+                        name="[TV版&无修版] 尼古喵喵 - EP11 [简／繁] (1080p H.264 AAC SRTx2)",
+                        layout="nosub", tags="ma:S01E11", probe=CHI)
+    tv, xie = bundle.paths
+    f = _trash(tv, bundle.hash, kind="bundled_version", file_only=True,
+               keep_path=str(xie), keep_hash=bundle.hash, slot=[1, 11])
+
+    rep = lib.apply([f])
+
+    [rec] = rep.applied
+    assert rec["deletion"]["gate"] == "passed"
+    assert _priorities(lib, bundle.hash) == {"【7月】尼古喵喵 11【TV版】.mp4": 0,
+                                             "【7月】尼古喵喵 11【邪龙解放版】.mp4": 1}
+
+
+def test_i4_extra_inside_a_pinned_torrent_is_not_a_seal(lib):
+    """钉子是整个种子的：抓来的合集里的 NCOP 也带着 `ma:S01E05`，但它不是那一集。"""
+    s1 = lib.show("银八").season(1)
+    t = s1.torrent({"银八 S01E05.mkv": GB, "NCOP1.mkv": 90_000_000}, name="[G] Gintama 05",
+                   layout="original", tags="ma:S01E05", probe=CHI)
+    ep, ncop = t.paths
+
+    rep = lib.apply([_trash(ncop, t.hash, rule="extras-in-library", kind="extra_content",
+                            show="银八", file_only=True)])
+
+    assert len(rep.applied) == 1 and not ncop.exists() and ep.exists()
+
+
+def test_i4_pinned_episode_misread_as_an_extra_is_sealed(lib):
+    """特典规则误判了一个钉着 `ma:` 的正片（它是种子里唯一的视频）：封存照样挡住。
+    集位里另有一份，I1 不挡——挡住它的只有 I4。"""
+    s1 = lib.show("银八").season(1)
+    t = s1.single("[G] Gintama Trailer Park - 05 [1080p].mkv", size=GB, tags="ma:S01E05",
+                  probe=CHI)
+    s1.local("银八 S01E05.mkv", size=GB)
+
+    rep = lib.apply([_trash(t.path, t.hash, rule="extras-in-library", kind="extra_content",
+                            show="银八", file_only=True)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I4")
+    assert t.path.exists()

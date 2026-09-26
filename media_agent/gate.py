@@ -38,8 +38,6 @@
 - 另外：**演进规则产出的删除一律不执行**（critic N5）。第 1 阶段在 `Executor._dispatch` 拦下
   所有演进动作，那道保留作纵深防御；删除的唯一执法点在这里（`screen`）。
 
-（施工中：I1、I2、I3 与演进规则已接线；I4 尚未接线。）
-
 **看不全就拒绝**：qBittorrent 读失败（`ClaimsUnknown`）记 failed「无法确认…占用情况，未做任何
 改动」，与占用闸门同口径。
 
@@ -250,7 +248,53 @@ def check_trash(ex, f: Finding, path: Path) -> Verdict:
             return v.fail(f"无法确认保留方 / 同集其它文件的占用情况，未做任何改动：{e}")
         if why:
             return v.refuse("I1", why)
+
+    # ---- I4：封存了集位的文件不删；探测不可用 = 不知道 = 当作封存
+    if pin and _is_video(path) and not _is_partial(path):
+        why = _seal_problem(v, f, path, h, t, pin, wanted)
+        if why:
+            return v.refuse("I4", why)
     return v
+
+
+def _seal_problem(v: Verdict, f: Finding, path: Path, h: str, t: dict, pin,
+                  wanted: list[dict]) -> str:
+    """要删的这个封存着集位吗？封存着就返回拒绝理由。
+
+    封存 = 钉着 `ma:SxxEyy`（抓取器按偏好挑中的那一份）且复核（`meets_requirements`）通过。
+    **探测不可用（`probe` 为 None：超时、出错）一律当作封存**：LoliHouse 的内部名只写
+    `ASSx2`，只看名字过不了硬门槛（`tests/test_seal_slot.py` 第 3 组），某一轮 ffprobe 超时
+    它就会失封、被当成输家——封存必须稳定。
+
+    钉子是整个种子的，特典处置的对象若不是那一集（名字认不出钉着的集号、种子里还有别的视频，
+    比如合集里的 NCOP），它不持有封存。唯一的例外是合并发布：保留方与要删的在同一个种子里、
+    钉着同一个钉子——封存由判重选中的那一份持有，兄弟按用户偏好只留一份。
+    """
+    from .kernel import MediaFile
+    from .plugins.builtin import meets_requirements
+    from .probe import probe
+
+    if v.disposition == "extras":
+        videos = [e for e in wanted if _base(Path(e["name"])).suffix.lower() in VIDEO_EXTS]
+        if len(videos) > 1 and parse_episode(path.name)[1] != pin[1]:
+            return ""                         # 钉着的种子里的周边，不是那一集
+    keeper_hash = (v.keeper or {}).get("hash") or ""
+    if keeper_hash and keeper_hash == h:
+        return ""                             # 合并发布的兄弟：封存在同种子的保留方手上
+    mf = MediaFile(path=path, size=path.stat().st_size, show_dir="", season_dir="",
+                   filename=path.name, torrent_hash=h, torrent_name=t.get("name", ""),
+                   torrent_state=t.get("state", ""),
+                   torrent_progress=float(t.get("progress") or 0),
+                   torrent_tags=t.get("tags", ""), torrent_category=t.get("category", ""))
+    info = probe(path)
+    ok, why = meets_requirements(mf)
+    if info is None:
+        return (f"{path.name} 钉着 ma:{_fmt(pin)}，探测不可用（超时或出错），复核结论不可知——"
+                f"封存按「已封存」处理，不删（{why}）")
+    if ok:
+        return (f"{path.name} 钉着 ma:{_fmt(pin)} 且复核通过（{why}），封存着这一集——"
+                f"两个种子都封存时交给人挑，不替择源随便删一个")
+    return ""
 
 
 def _keeper_problem(ex, v: Verdict, f: Finding, path: Path, pin, media_root: Path) -> str:
