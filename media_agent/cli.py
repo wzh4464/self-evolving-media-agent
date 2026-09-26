@@ -4,7 +4,8 @@
     media-agent diagnose  # 跑全部规则，出问题清单（不改动任何东西）
     media-agent apply     # 执行修复（--dry-run 预演）
     media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升（需 EVOLVE_MODE=propose）
-    media-agent run       # 一轮完整自治：diagnose → apply → [evolve] → 清理隔离区
+    media-agent purge     # 隔离区处置预演（--apply 真删，每个都先记 state/purge.jsonl）
+    media-agent run       # 一轮完整自治：diagnose → apply → [evolve] → 隔离区处置
                           # evolve 只在 EVOLVE_MODE=propose 时跑，默认 off（见 config.py）
 """
 from __future__ import annotations
@@ -15,8 +16,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from . import __version__, runlock
-from .actions import Executor
+from . import __version__, disposal, runlock
+from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
     AniListClient, AutoBangumiClient, AutoBangumiDB, LLMClient, QBitClient, TMDBClient,
@@ -235,6 +236,11 @@ def cmd_rollback(args, cfg) -> int:
     if res["torrent_records_lost"]:
         print(f"  ⚠️  种子记录已丢失: {res['torrent_records_lost']} 项"
               f"（文件可还原，但需重新添加种子才能继续做种）")
+    if res.get("priority_not_restored"):
+        print(f"  ⚠️  文件已搬回、合集条目的下载没恢复: {res['priority_not_restored']} 项"
+              f"（它此刻没有种子做种）")
+        for n in res.get("notes") or []:
+            print(f"    ⚠️  {n}")
     for d in res["skipped_detail"]:
         print(f"    ⏭️  {d.get('skip_reason','')}")
     for d in res["failed_detail"]:
@@ -268,80 +274,134 @@ def cmd_repair(args, cfg) -> int:
     return 1 if errors else 0
 
 
-def cmd_purge(args, cfg) -> int:
-    """清理隔离区里「绝对没问题」的那些。判定条件见 purge.py 的模块注释。"""
-    from .purge import build_pool
+_LABEL = {"duplicate": "判重", "extras": "特典", "dead_partial": "死种半成品",
+          "bundled_version": "合并发布的另一版本", "manual": "手动", "other": "其它"}
 
+
+def _trash_rel(cfg, p) -> str:
+    try:
+        return str(Path(p).relative_to(cfg.trash_dir))
+    except ValueError:
+        return str(p)
+
+
+def _print_overdue(cfg, rep, limit: int = 30) -> None:
+    """过了保留期、却没有（也不会）自动删的：逐个报给人。"""
+    over = rep.overdue
+    if not over:
+        return
+    print(f"\n═══ 隔离区：{len(over)} 个文件已过保留期 {cfg.trash_retention_days} 天、没有自动删 ═══")
+    for c in over[:limit]:
+        print(f"  ⏸️  [{_LABEL.get(c.disposition, c.disposition)}] {_trash_rel(cfg, c.trash_path)}"
+              f" —— {c.why}")
+    if len(over) > limit:
+        print(f"  …另 {len(over) - limit} 个（media-agent purge --verbose 看全部）")
+
+
+def _print_space(cfg, rep) -> None:
+    """媒体卷剩余空间低于 MIN_FREE_GB：stdout（run.log）与 stderr 各一份，大声说。"""
+    if rep.free_before is None:
+        msg = "⚠️  读不到媒体卷的剩余空间（statvfs 失败），容量闸这一轮不起作用"
+        print(f"\n{msg}")
+        _log(msg)
+        return
+    if not rep.low_space:
+        return
+    gb = 1e9
+    msg = (f"⚠️  媒体卷剩余 {rep.free_before / gb:.1f} GB，低于 MIN_FREE_GB={cfg.min_free_gb:g} GB"
+           f"（隔离区与媒体同一个 APFS 容器，只有硬删除腾空间）")
+    print(f"\n═══ {msg} ═══")
+    _log(msg)
+    if rep.early:
+        print(f"  已从最老的开始提前删掉 {len(rep.early)} 个已证明安全的判重"
+              f"（{sum(c.size for c in rep.early) / gb:.1f} GB）")
+    after = rep.free_after
+    if after is not None and after < rep.min_free:
+        gone = {id(c) for c in rep.deleted}
+        held = sum(c.size for c in rep.pool if id(c) not in gone)
+        msg = (f"⚠️  能证明安全的都删了，估计仍只剩 {after / gb:.1f} GB（还差 "
+               f"{(rep.min_free - after) / gb:.1f} GB）；隔离区里还有 {held / gb:.1f} GB 证明不了"
+               f"可删，需要人处置（media-agent purge --verbose 看每一份的理由）")
+        print(f"  {msg}")
+        _log(msg)
+
+
+def _print_disposal(cfg, rep) -> None:
+    """`run` 末尾的隔离区处置：删了哪几个、凭什么；过了保留期没删的是哪几个；空间够不够。"""
+    if rep.refused:
+        print(f"\n═══ 隔离区：未处置——{rep.refused} ═══")
+        return
+    _print_space(cfg, rep)
+    if rep.recovered:
+        print(f"\n  ↺ 补完上次中断的 {len(rep.recovered)} 条硬删除记录（{disposal.LOG_NAME}）")
+    if rep.deleted:
+        by = Counter(_LABEL.get(c.disposition, c.disposition) for c in rep.deleted)
+        head = "预演：将硬删除" if rep.dry_run else "硬删除"
+        print(f"\n═══ 隔离区：{head} {len(rep.deleted)} 个文件，释放 {rep.freed_bytes / 1e9:.1f}GB"
+              f"（{'、'.join(f'{k} {n}' for k, n in by.most_common())}） ═══")
+        early = {id(c) for c in rep.early}
+        for c in rep.deleted:
+            tag = "（空间不足，提前）" if id(c) in early else ""
+            print(f"  🗑️  [{_LABEL.get(c.disposition, c.disposition)}]{tag} "
+                  f"{_trash_rel(cfg, c.trash_path)} —— {c.why}")
+    for c, why in rep.changed:
+        print(f"  ⏭️  {_trash_rel(cfg, c.trash_path)} —— 评估之后变了，这次不删：{why}")
+    for c, why in rep.failed:
+        print(f"  ❌ {_trash_rel(cfg, c.trash_path)} —— 删除失败：{why}")
+    _print_overdue(cfg, rep)
+
+
+def cmd_purge(args, cfg) -> int:
+    """隔离区处置的手动入口：默认预演，`--apply` 真删。判据见 purge.py 的模块注释。
+
+    与 `run` 末尾的处置同一套判据（`disposal.dispose`），区别只在模式：这里是人要的，
+    证明安全的判重不必等满保留期；特典 / 死种半成品照样要过保留期，要人定的照样不删。
+    """
     ctx = build_context(cfg)
     if ctx.qbit is None:
-        # 没有 qBit，build_pool 拿不到任何"种子声明大小 / 进度"的证据（critic N3），
-        # 幸存者只能退回时长旁证，判定会偏松。硬删除没有下一层保险，拒绝。
+        # 没有 qBit 拿不到任何种子证据（critic N3）。硬删除没有下一层保险，拒绝。
         if args.apply:
             return _refuse("qBittorrent 不可用：拿不到种子证据，不做不可逆删除")
-        print("⚠️  qBittorrent 不可用：缺种子证据，以下判定偏松，仅供参考\n")
-    pool = build_pool(cfg, ctx.qbit, ctx.tmdb)
-    ok = [c for c in pool if c.eligible]
-    no = [c for c in pool if not c.eligible]
-    free = sum(c.size for c in ok)
+        print("⚠️  qBittorrent 不可用：缺种子证据，以下判定仅供参考\n")
+    rep = disposal.dispose(ctx, mode="manual", run_id=new_run_id(), dry_run=not args.apply)
+    if rep.refused:
+        return _refuse(rep.refused)
+    _print_space(cfg, rep)
+    pool = rep.pool
+    chosen = ({id(c) for c in rep.deleted} | {id(c) for c, _ in rep.failed}
+              | {id(c) for c, _ in rep.changed})
+    ok = [c for c in pool if id(c) in chosen]
+    no = [c for c in pool if id(c) not in chosen]
+    size = sum(c.size for c in ok)
 
     print(f"隔离区共 {len(pool)} 份文件，"
-          f"可安全删除 {len(ok)} 份（{free / 2**30:.2f} GB）\n")
+          f"可安全删除 {len(ok)} 份（{size / 2**30:.2f} GB）\n")
     for c in ok:
-        print(f"  ✓ {c.trash_path.name[:56]}")
+        print(f"  ✓ [{_LABEL.get(c.disposition, c.disposition)}] {c.trash_path.name[:56]}")
         print(f"      {c.why}")
     if no and args.verbose:
         print(f"\n保留 {len(no)} 份：")
-        import collections
-        by = collections.Counter(c.why.split("（")[0].split("——")[0] for c in no)
-        for why, n in by.most_common():
-            print(f"  ×{n:<4} {why}")
+        for c in no:
+            print(f"  · [{_LABEL.get(c.disposition, c.disposition)}] "
+                  f"{_trash_rel(cfg, c.trash_path)}")
+            print(f"      {c.why}")
     elif no:
-        print(f"\n保留 {len(no)} 份（加 --verbose 看原因）")
+        by = Counter(_LABEL.get(c.disposition, c.disposition) for c in no)
+        print(f"\n保留 {len(no)} 份（{'、'.join(f'{k} {n}' for k, n in by.most_common())}；"
+              f"加 --verbose 看原因）")
 
-    def _sweep_empty_dirs() -> int:
-        """删完文件会留下空目录，顺手扫掉。与有没有可删文件无关，所以无条件跑。"""
-        root = Path(cfg.trash_dir)
-        n = 0
-        for d in sorted(root.rglob("*"), key=lambda x: -len(x.parts)):
-            if d.is_dir() and not any(d.iterdir()):
-                d.rmdir()
-                n += 1
-        return n
-
-    if not ok:
-        if args.apply:
-            n = _sweep_empty_dirs()
-            if n:
-                print(f"\n清掉 {n} 个空目录")
-        return 0
     if not args.apply:
-        print("\n【预演】未删除任何东西。确认无误后加 --apply 执行。")
+        if ok:
+            print("\n【预演】未删除任何东西。确认无误后加 --apply 执行。")
         return 0
-
-    # 不可逆删除必须留痕。隔离区本身就是"删除"的可回退形态，从这里再删一次
-    # 就没有下一层保险了——至少要能事后回答"当时删了什么、凭什么判定安全"。
-    import time
-    log = Path(cfg.state_dir) / "purge.jsonl"
-    stamp = time.strftime("%Y%m%dT%H%M%S")
-    gone = 0
-    with log.open("a", encoding="utf-8") as fh:
-        for c in ok:
-            try:
-                c.trash_path.unlink()
-                gone += 1
-                fh.write(json.dumps({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "run": stamp,
-                    "deleted": str(c.trash_path), "bytes": c.size,
-                    "rule": c.rule, "origin": c.origin,
-                    "slot": list(c.slot) if c.slot else None,
-                    "survivor": str(c.survivor) if c.survivor else None,
-                    "why": c.why,
-                }, ensure_ascii=False) + "\n")
-            except OSError as e:
-                print(f"  !! 删除失败 {c.trash_path.name}: {e}")
-    print(f"  记录写入 {log}")
-    n = _sweep_empty_dirs()
-    print(f"\n已删除 {gone} 份，释放 {free / 2**30:.2f} GB，清掉 {n} 个空目录")
+    for c, why in rep.changed:
+        print(f"  ⏭️  没删 {c.trash_path.name}：评估之后变了——{why}")
+    for c, why in rep.failed:
+        print(f"  !! 删除失败 {c.trash_path.name}: {why}")
+    if rep.recovered:
+        print(f"  ↺ 补完上次中断的 {len(rep.recovered)} 条硬删除记录")
+    print(f"  记录写入 {Path(cfg.state_dir) / disposal.LOG_NAME}（批次 {rep.run_id}）")
+    print(f"\n已删除 {len(rep.deleted)} 份，释放 {rep.freed_bytes / 2**30:.2f} GB")
     return 0
 
 
@@ -407,7 +467,7 @@ def cmd_run(args, cfg) -> int:
     report = ex.apply(findings)
     if report.refused:
         # fail closed：不修、不演进（演进器会拿这份残缺快照去立规则）、
-        # 也不做隔离区的时间清理——降级的一轮不改动任何东西。
+        # 也不处置隔离区——降级的一轮不改动任何东西。
         return _refuse(report.refused)
     print(f"\n═══ 修复：{report.summary()} ═══")
 
@@ -433,10 +493,10 @@ def cmd_run(args, cfg) -> int:
             for r in promoted:
                 print(f"  🎉 {r['rule_id']}")
 
-    purge = ex.purge_trash()
-    if purge["purged_files"]:
-        print(f"\n═══ 隔离区：清理 {purge['purged_files']} 个过期文件，"
-              f"释放 {purge['freed_bytes']/1e9:.1f}GB ═══")
+    # 隔离区处置（disposal 模块文档）：以前这里按日期 rmtree 整个日目录、一行记录都不写
+    # （Executor.purge_trash，生产上删掉过 6 个文件 4.7GB，说不出是哪几个）。现在按处置类别
+    # 逐个判、逐个预写日志后删；要人定的过了保留期只报不删。
+    _print_disposal(cfg, disposal.dispose(ctx, mode="run", run_id=ex.run_id, dry_run=dry))
     return rc
 
 

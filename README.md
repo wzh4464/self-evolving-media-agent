@@ -94,8 +94,12 @@ written up in [an Agent Note](.agents/notes/implemented/architecture/2026-08-17-
 
 Even in full-auto mode:
 
-- **Quarantine, not deletion.** Removals move to `state/trash/<date>/`, restorable
-  for 30 days before being purged for real.
+- **Quarantine, not deletion.** Removals move to `state/trash/<date>/` and stay
+  restorable. A file is only deleted for real when its kind allows it: extras and
+  dead partial downloads after 30 days, duplicates only once a complete replacement
+  is proven. Anything that needs a human is kept and listed. Every hard delete is
+  written to `state/purge.jsonl` *before* it happens. When the disk gets low,
+  already-proven duplicates are released oldest first.
 - **Per-run caps.** More than 50 files or 200 GB in one pass? The whole batch is
   skipped and flagged — a wrong rule can't run away.
 - **Full audit trail.** Every action, skip, and failure lands in `state/audit.jsonl`.

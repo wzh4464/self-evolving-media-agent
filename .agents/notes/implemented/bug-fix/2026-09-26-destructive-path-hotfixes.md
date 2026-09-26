@@ -92,8 +92,9 @@ qBittorrent 与磁盘的快照不变（或如实记录）。
 - 逆操作 `readd_torrent` 记下 `no_subfolder`（`root_path` 为空即是），按原布局加回，
   半成品才对得上；旧记录没有该字段时保持原来的 False。
 
-**遗留**：死种的 `.!qB` 半成品仍留在盘上（与生产一直以来的实际效果相同），
+**遗留**（第 2 阶段已接上）：死种的 `.!qB` 半成品仍留在盘上（与生产一直以来的实际效果相同），
 清理它们需要"只搬本种子自己的、未被别的种子认领的文件"，留到统一删除闸门那一期。
+——已由删除关口处置：`bug-fix/2026-09-26-deletion-feeders.md` 第 5 节。
 
 **测试**：`tests/test_dead_torrent.py`——NoSubfolder 季目录里一个死种不连累兄弟
 （且 `converge` 收敛）、同目录两个死种都处理、老但近期活跃的不算死、刚见过完整
@@ -262,8 +263,10 @@ d08f05a7 成了幻影——`torrents/files` 报着 `朱音落语 S01E12.mp4`、�
 - `_op_rename`：盘上不在之外，再问活的 `torrents/files`：目标路径还被另一个种子
   （优先级非 0 的条目）声明着就跳过，理由写明是哪个种子（`_claimants`）。本地文件改名同样适用。
 
-**遗留**：critic N6 说的"集位占用"要成为所有写路径的共用闸门——`rename_single_video`
-（抓取后的即时改名）、`relink_torrent`、逆改名、`readd_torrent` 还没接上 `_claimants`。
+**遗留**（第 2 阶段已接上）：critic N6 说的"集位占用"要成为所有写路径的共用闸门——
+`rename_single_video`（抓取后的即时改名）、`relink_torrent`、逆改名、`readd_torrent` 当时还没接上
+`_claimants`。第 2 阶段把它换成共用原语 `media_agent/claims.py`、接到了全部写路径上（`_claimants`
+已删），见 `architecture/2026-09-26-path-claims.md`。
 
 **测试**：`tests/test_phantom_slot.py`——审查原样现场收敛后只剩 K 一个声明、隔离区为空；
 幻影名字更好 / 钉了 `ma:` 时真文件都不进隔离区；只跑改名规则时，有种子与本地文件都不会
@@ -304,7 +307,7 @@ d08f05a7 成了幻影——`torrents/files` 报着 `朱音落语 S01E12.mp4`、�
 这里也不放行）。`_inflight(ctx, show, by_hash)` 只对它放行。
 
 **测试**：`tests/test_grab_stale_bypass.py`——审查原样（72h 加入、10h 前活动）不换源；
-真死的换源且同轮摘掉旧种子、集位只剩新种子声明；刚见过完整副本的不换源；有已下完成员的
+真死的换源且同轮摘掉旧种子（第 2 阶段起新种子不再被改到旧种子仍声明的集位名上，见 `architecture/2026-09-26-path-claims.md` 第 4 节）；刚见过完整副本的不换源；有已下完成员的
 死合集不换源。
 
 ## 12. 登录成功却 0 个种子、而库里有视频：按数据不完整处理

@@ -45,12 +45,15 @@ def test_dead_nosubfolder_torrent_never_trashes_the_season(lib):
     s1, healthy, lone, dead = _nosub_season(lib)
     before = lib.disk()
     idents = {p: lib.ident(lib.path(p)) for p in before}
+    own = {"尼古喵喵/Season 1/尼古喵喵 S01E11.mkv.!qB", "尼古喵喵/Season 1/尼古喵喵 S01E12.mkv.!qB"}
 
     rounds = lib.converge()
 
-    assert lib.trash_files() == []
-    assert lib.disk() == before                               # 连死种自己的 .!qB 都不动
-    assert {p: lib.ident(lib.path(p)) for p in before} == idents
+    # 只有死种**自己的**半成品进了隔离区（tests/test_dead_partials.py），别的一个字节都不动
+    assert {lib.ident(p) for p in lib.trash_files()} == {idents[p] for p in own}
+    assert lib.disk() == {p: n for p, n in before.items() if p not in own}
+    assert {p: lib.ident(lib.path(p)) for p in lib.disk()} == \
+        {p: i for p, i in idents.items() if p not in own}
     assert lib.qbit.has(healthy.hash) and lib.qbit.has(lone.hash)
     assert not lib.qbit.has(dead.hash)                        # 只摘死种自己的记录
     [drop] = rounds[0].applied("drop_torrent")
@@ -70,7 +73,8 @@ def test_two_dead_torrents_in_one_season_are_both_handled(lib):
 
     assert sorted(r["args"]["torrent_hash"] for r in c.applied("drop_torrent")) == \
         sorted([a.hash, b.hash])
-    assert lib.trash_files() == []
+    assert sorted(p.name for p in lib.trash_files()) == sorted(
+        ["NCED.mkv.!qB", "NCOP.mkv.!qB", "尼古喵喵 S01E11.mkv.!qB", "尼古喵喵 S01E12.mkv.!qB"])
 
 
 def test_old_but_recently_active_torrent_is_not_dead(lib):
@@ -95,7 +99,8 @@ def test_long_stalled_single_file_torrent_is_dead(lib):
     t = _dead(s1, {"尼古喵喵 S01E11.mkv": GB}, "[A] Yani Neko - 11.mkv", layout="single",
               active_hours_ago=24 * 5)
 
-    [f] = lib.diagnose(detectors=[DeadTorrentDetector])
+    [f] = [x for x in lib.diagnose(detectors=[DeadTorrentDetector])
+           if x.kind == "dead_torrent"]
     assert f.torrent_hash == t.hash and f.action.op == "drop_torrent"
     assert f.show == "尼古喵喵"
 
@@ -151,7 +156,8 @@ def test_dead_drop_revalidates_live_state(lib):
 
     rep = lib.apply(findings)
 
-    assert not rep.applied and [r["op"] for r in rep.skipped] == ["drop_torrent"]
+    # 摘除跳过了；它自己的半成品也就不动（删除关口：死种还在）
+    assert not rep.applied and [r["op"] for r in rep.skipped] == ["drop_torrent", "trash"]
     assert lib.qbit.has(t.hash)
 
 
@@ -162,12 +168,12 @@ def test_dead_drop_rechecks_completed_members_at_execution_time(lib):
     t = _dead(s1, {"银八 S01E01.mkv": GB, "银八 S01E02.mkv": GB}, "[G] Gintama 01-02",
               layout="nosub")
     findings = lib.diagnose(detectors=[DeadTorrentDetector])
-    assert [f.action.op for f in findings] == ["drop_torrent"]
+    assert sorted(f.action.op for f in findings) == ["drop_torrent", "trash", "trash"]
     lib.qbit.raw(t.hash)["_files"][0]["progress"] = 1
 
     rep = lib.apply(findings)
 
-    [skip] = rep.skipped
+    [skip] = [r for r in rep.skipped if r["op"] == "drop_torrent"]
     assert "已下完" in skip["reason"]
     assert not rep.applied and lib.qbit.has(t.hash)
 
@@ -189,7 +195,8 @@ def test_future_activity_timestamp_falls_back_to_added_on(lib):
     t = _dead(s1, {"尼古喵喵 S01E11.mkv": GB}, "[A] Yani Neko - 11.mkv", layout="single")
     lib.qbit.raw(t.hash)["last_activity"] = int(time.time() + 10 * 86400)
 
-    [f] = lib.diagnose(detectors=[DeadTorrentDetector])
+    [f] = [x for x in lib.diagnose(detectors=[DeadTorrentDetector])
+           if x.kind == "dead_torrent"]
     assert f.torrent_hash == t.hash and f.evidence["stalled_hours"] >= 24 * 29
 
 
@@ -201,7 +208,7 @@ def test_dead_drop_rolls_back_with_the_same_layout(lib):
     assert not lib.qbit.has(dead.hash)
     res = lib.rollback(c.run_id)
 
-    assert res["reverted"] == 1
+    assert res["reverted"] == 3                               # 两份半成品搬回 + 重加种子
     assert lib.qbit.file_names(dead.hash) == names          # NoSubfolder 没长出根目录
     assert lib.qbit.torrent(dead.hash)["save_path"] == str(s1.path)
 
@@ -219,7 +226,7 @@ def test_dead_drop_of_one_file_in_a_folder_rolls_back_with_the_folder(lib):
     assert drop["undo"]["no_subfolder"] is False
     res = lib.rollback(c.run_id)
 
-    assert res["reverted"] == 1
+    assert res["reverted"] == 2                               # 半成品搬回 + 重加种子
     assert lib.qbit.file_names(t.hash) == names
 
 

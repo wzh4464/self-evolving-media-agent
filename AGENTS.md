@@ -19,6 +19,8 @@ media_agent/
   clients.py      capability 的 provider 实现（qBit/AutoBangumi/TMDB/AniList/LLM）
   plugins/        内置检测器
   actions.py      执行器 + 隔离区 + 配额上限 + 审计日志
+  purge.py        隔离区里每一份能不能真删（按处置类别的判据）
+  disposal.py     硬删除的唯一出口：预写 purge.jsonl、容量闸、run / purge 的处置
   evolution.py    自演进：残留检测 → 提议 → 影子验证 → 提升
   cli.py          命令行入口
 .agents/
@@ -39,7 +41,8 @@ uv run media-agent diagnose           # 跑全部规则，出问题清单（只�
 uv run media-agent apply --dry-run    # 预演修复
 uv run media-agent apply              # 执行修复
 uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
-uv run media-agent run                # 完整自治轮次（演进默认冻结）
+uv run media-agent run                # 完整自治轮次（演进默认冻结），末尾处置隔离区
+uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 
@@ -88,6 +91,32 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
 7. **修订阅时三步顺序不能反**：先改 `title_aliases`/`rss_link` → 再清"已登记但
    不在 qBittorrent"的 torrent 记录 → 最后刷新。`pull_rss` 只处理 `check_new()`
    筛出的新条目，顺序反了会让 AutoBangumi 用**仍然失效**的规则把条目重新登记一遍。
+8. **往媒体库里落一个名字之前，先问 `claims` 它此刻归谁。** 盘上看不到不等于没人占：
+   0% 的种子、只有 `X.!qB` 的下载、只差大小写的名字（生产卷是大小写不敏感的 APFS）
+   都算占用。改名、抓取后改名、relink、目录改名、回退里的每个写路径都走
+   `Executor._claims()`（`ClaimIndex.check` / `check_dir` / `claims_under`）；被占就跳过
+   并写明占用者，**看不全（qBittorrent 读失败）就拒绝**。新加的写路径同样要接，改完东西
+   要让索引作废（执行器在写非 skipped 审计时自动作废）。见
+   [路径占用](.agents/notes/implemented/architecture/2026-09-26-path-claims.md)。
+9. **删除之前过删除关口**（`media_agent/gate.py`）。每一次 `trash` / `drop_torrent` 在动手前、
+   按**此刻**的 qBittorrent 与磁盘、按目标本身（路径 + hash）复核，与产出它的规则无关：
+   I1 不让任何集位变成零个可播文件（点名的保留方此刻真在、下完了、没被截断、同批没被删；没点名的
+   ——特典也算——名字认得出集号时那一集得另有真能播的文件）；I2 不删别的种子仍声明的路径；I3 多文件种子只作废这一个
+   条目（按成员定：已不下载的条目不动种子）；I4 不删封存的文件，
+   **探测不可用当作封存**；演进规则的删除一律不执行。拒绝记 skipped「删除关口：Ix …」，看不全记
+   failed。新加删除类动作必须接关口；判重类检测器要在动作里给保留方与集位（`keep_path` /
+   `keep_hash` / `keep_size` / `keep_digest` / `slot`）。每条隔离记录带 `deletion`（给 purge）。见
+   [删除关口](.agents/notes/implemented/architecture/2026-09-26-deletion-gate.md)。
+10. **隔离区的硬删除只经 `disposal.hard_delete`**：先往 `state/purge.jsonl` 写意图并 fsync，再 unlink，
+    再记完成；只删普通文件、逐个删，空目录逐层 rmdir，**永不 `rmtree`**，也不按日期整批清。删不删由
+    `purge.build_pool` 按处置类别判（死种 `.!qB` 到期删；特典到期、按此刻再认仍是特典（认得出集号的，那一集
+    另有正片）才删；判重要证明替代者——按 `_resolve` 认、名字有名字之外的证据（钉子 / 按季号偏移换算后的
+    发布名 / 关口记下的无种子保留方）、完整、按现在的排序不输；原路径仍被种子要着的不删（名字的新主人除外）；
+    合并发布 / 手动 / 其它 / 没有记录的永不自动删），
+    不满 `QUARANTINE_MIN_AGE_DAYS` 的一律不删，unlink 之前按此刻再复核一遍（`purge.recheck`）。
+    `MIN_FREE_GB` 只在"已证明可删"的里面提前放，证明不了的不为空间删。搬进 / 搬出隔离区先看目标卷
+    放不放得下（跨卷是先拷后删）。见
+    [隔离区处置](.agents/notes/implemented/architecture/2026-09-26-quarantine-disposal.md)。
 
 ## 自演进的闭环
 

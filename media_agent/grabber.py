@@ -1,4 +1,4 @@
-"""加种子并在**下载过程中**就把它改成规范名。
+"""抓取加种之后的两步：等元数据、在**下载过程中**就把正片改成规范名。
 
 **为什么必须在下载中改，而不是下完再改**：从加种子到下载完成这段时间里，
 文件在磁盘上叫的是发布名。这段时间内——
@@ -13,16 +13,21 @@
 `torrents/files` 有内容的那一刻就能 `renameFile`，此时文件可能一个字节
 都还没下。qBittorrent 会把后续分片直接写进新名字。
 
-**这是加种子的唯一入口。** 2026-09-15 审计发现同一件事散落在三处手写
-HTTP（`actions.py` 两处 `torrents/add`、一处 `torrents/rename`），
-会话里的临时脚本又抄了四五份，各自的等待时长、409 处理、是否改显示名
-都不一样。
+**加种子本身不在这里。** 唯一的 HTTP 入口是 `QBitClient.add_torrent`
+（2026-09-15 把 `actions.py` 里两处手写的 `torrents/add` 收了进去），调用方只有
+`Executor._op_grab_episode` 与回退的 `readd_torrent`。这里原先还有一个
+"加种 → 等元数据 → 改名 → 改显示名"一条龙的 `add_and_name`，模块文档称它是
+"加种子的唯一入口"——实际零调用方（本地两份克隆、tests / tools / deploy、生产机
+全部 `*.py` / `*.sh` 都查过），与在用的路径还各有一套等待时长与改显示名的规则。
+2026-09-26 删除：两条路径并存，闸门只接一条等于没接。
 """
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
+from .claims import ClaimCheck, ClaimIndex, ClaimsUnknown
 from .naming import VIDEO_EXTS
 
 
@@ -50,64 +55,76 @@ def wait_metadata(qbit, torrent_hash: str, timeout: float = 30.0,
         time.sleep(interval)
 
 
+@dataclass
+class RenameOutcome:
+    """`rename_single_video` 的结果。以前返回 `str | None`，把"改了""不是单文件"
+    "已是目标名""集位被占"四种结局混成一个 None，被占的原因从来到不了审计。"""
+    renamed: str = ""                   # 改成的新条目名（种子内相对路径）；空 = 没改
+    skipped: str = ""                   # 没改的原因
+    check: ClaimCheck | None = None     # 占用查询结果（被占 / 看不全时才有）
+
+    @property
+    def blocked(self) -> bool:
+        """是被占用闸门拦下的（被占，或看不全）。"""
+        return self.check is not None and not self.check.free
+
+    def audit(self) -> dict:
+        """写进抓取审计记录的形状：`{"renamed": 新条目名|None, "skipped"?, "claims"?}`。"""
+        d: dict = {"renamed": self.renamed or None}
+        if self.skipped:
+            d["skipped"] = self.skipped
+        if self.blocked:
+            d["claims"] = self.check.audit()
+        return d
+
+
 def rename_single_video(qbit, torrent_hash: str, target_stem: str,
-                        files: list[dict] | None = None) -> str | None:
-    """把种子里**唯一**的正片文件改成 `target_stem + 原扩展名`，返回新文件名。
+                        files: list[dict] | None = None, *,
+                        claims: ClaimIndex | None = None) -> RenameOutcome:
+    """把种子里**唯一**的正片文件改成 `target_stem + 原扩展名`（保留它所在的文件夹）。
 
     只处理"恰好一个视频文件"的种子。合集、带特典的多文件种子在这里不猜——
     哪个文件对应哪一集需要逐个判断，那是 `unrenamed-file` 规则的职责。
-    返回 None 表示没改（不是单文件、已经是目标名、或元数据没到）。
+
+    **目标名被占就不改**（`claims`，critic N6）。新种子刚拿到元数据、一个字节都没下，
+    libtorrent 只改映射：目标名此刻若被别的种子声明着、或盘上有别人的 `X` / `X.!qB`，
+    改过去就是两个种子无声地宣称同一路径——2026-09-06 尼古喵喵 S01E08 丢片的形态。
+    被占时留在发布名上；调用方打的 `ma:` 钉子让判重认得出它，下完后由
+    duplicate-episode 封存、清走占位的（op 5），unrenamed-file 同一轮改名（op 6）。
+    看不全（qBittorrent 读失败）同样不改。
+
+    **保留文件夹层**（critic N15）：条目是 `文件夹/x.mkv` 时目标是 `文件夹/<stem>.mkv`，
+    与 `_op_rename` 一致。以前直接改成 `<stem>.mkv`：409 撞上一个已有的 Original 布局
+    种子时，文件被挪到 save_path 根下。
+
+    `claims` 是调用方这一批次的占用索引；不给就现建一个。改名之后作废它。
     """
+    if claims is None:
+        claims = ClaimIndex(qbit)
     if files is None:
         files = [f for f in (qbit.files(torrent_hash) or [])
                  if f.get("priority", 1) != 0]
     vids = [f for f in files if Path(f["name"]).suffix.lower() in VIDEO_EXTS]
     if len(vids) != 1:
-        return None
+        return RenameOutcome(skipped=f"不是单一正片（{len(vids)} 个视频文件），交给 unrenamed-file")
     cur = vids[0]["name"]
-    want = target_stem + Path(cur).suffix.lower()
+    want_name = target_stem + Path(cur).suffix.lower()
+    want = str(Path(cur).parent / want_name) if "/" in cur else want_name
     if cur == want:
-        return None
+        return RenameOutcome(skipped="已是目标名")
+    # save_path 问 qBittorrent 要，不用调用方算的：409（种子已存在）时它可能在别处。
+    try:
+        t = claims.torrent(torrent_hash)
+    except ClaimsUnknown as e:
+        return RenameOutcome(skipped="无法确认目标路径的占用情况",
+                             check=ClaimCheck(want, unknown=str(e)))
+    if t is None:
+        return RenameOutcome(skipped="种子不在 qBittorrent 的列表里")
+    sp = Path((t.get("save_path") or "").rstrip("/") or "/")
+    chk = claims.check(sp / want, own_hash=torrent_hash, own_path=sp / cur)
+    if not chk.free:
+        return RenameOutcome(
+            skipped=("无法确认目标路径的占用情况" if chk.unknown else "集位被占"), check=chk)
     qbit.rename_file(torrent_hash, cur, want)
-    return want
-
-
-def add_and_name(qbit, source: bytes | str, *, torrent_hash: str,
-                 target_stem: str, save_path: str, category: str = "",
-                 tags: str = "", metadata_timeout: float = 30.0,
-                 rename_torrent: bool = True, log=None) -> dict:
-    """加种子 → 等元数据 → 改文件名 → 改种子显示名。一条龙，失败不致命。
-
-    `torrent_hash` 必须由调用方给出（.torrent 可以算 infohash，磁力链里带着），
-    因为 `torrents/add` 不返回 hash。
-
-    `rename_torrent` 控制是否同时改**显示名**。改它是为了让 AutoBangumi
-    对这个种子的解析结果和我们一致——AB 读种子名不读文件名。自己抓的种子
-    已经落在独立分类里、AB 看不见，但改了没坏处；由别的渠道加进来的就必须改。
-
-    返回 `{"added", "renamed", "torrent_renamed", "error"}`，不抛异常：
-    改名失败不该让"已经下起来了"这件事算失败，下一轮规则会兜底。
-    """
-    out = {"added": False, "renamed": None, "torrent_renamed": False, "error": ""}
-    try:
-        out["added"] = qbit.add_torrent(
-            source, save_path=save_path, category=category, tags=tags)
-    except Exception as e:
-        out["error"] = "加种子失败: %s" % e
-        return out
-
-    try:
-        files = wait_metadata(qbit, torrent_hash, timeout=metadata_timeout)
-        if not files:
-            out["error"] = ("元数据未在 %.0f 秒内到达（多半是连不上 peer），"
-                            "改名交给 unrenamed-file 兜底" % metadata_timeout)
-            return out
-        out["renamed"] = rename_single_video(qbit, torrent_hash, target_stem, files)
-        if rename_torrent:
-            qbit.rename_torrent(torrent_hash, target_stem)
-            out["torrent_renamed"] = True
-    except Exception as e:
-        out["error"] = "改名失败（下一轮会补）: %s" % e
-        if log:
-            log("[grab] %s" % out["error"])
-    return out
+    claims.invalidate()
+    return RenameOutcome(renamed=want)

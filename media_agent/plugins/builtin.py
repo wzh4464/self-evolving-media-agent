@@ -17,8 +17,8 @@ from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
 from ..probe import MediaInfo, probe, size_for_compare
 from ..naming import (
-    SUB_EXTS, VIDEO_EXTS, declared_season, is_extra, is_normalized, normalize,
-    parse_episode,
+    SUB_EXTS, VIDEO_EXTS, apply_episode_offset, declared_season, is_extra_of,
+    is_normalized, normalize, parse_episode,
     parse_pin, parse_quality, season_of_dir, subtitle_lang_tag, target_filename,
     target_subtitle_filename,
 )
@@ -36,17 +36,19 @@ def _season_of(f: MediaFile, show: Show, parsed_season: int | None) -> int:
     return 1
 
 
-def _apply_offset(ep: int, show: Show) -> int:
-    """绝对集号 → 季内集号。
+def _episode_offset(show: Show) -> int:
+    """AutoBangumi 订阅行上的 `episode_offset`；没有订阅或为 0 时返回 0。"""
+    return int((show.bangumi or {}).get("episode_offset") or 0)
+
+
+def _apply_offset(raw: str, ep: int, show: Show) -> int | None:
+    """绝对集号 → 季内集号；**只换算发布名里的原始集号**（`naming.apply_episode_offset`）。
 
     出处：《超超超超超喜欢你的100个女朋友》第三季用绝对集号 25-36 发布，
-    实际是 S03E01-E12，靠 AutoBangumi 的 episode_offset=-24 换算。
+    实际是 S03E01-E12，靠 AutoBangumi 的 episode_offset=-24 换算。以前连已经
+    规范成 `S03E01` 的名字也再减一次，落进 `(3, -23)`（2026-09-26 修）。
     """
-    if show.bangumi:
-        off = show.bangumi.get("episode_offset") or 0
-        if off:
-            return ep + int(off)
-    return ep
+    return apply_episode_offset(raw, ep, _episode_offset(show))
 
 
 _OFFSET_CACHE: dict[str, dict] = {}
@@ -159,16 +161,25 @@ def _release_agrees(f: MediaFile, show: Show, season: int, ep: int) -> bool:
 
     「封存集位、当轮清理其余」是一条绕过所有权让位的快车道，走这条道之前
     必须让发布名独立确认一次。确认不了就走原来的慢车道，不急这一轮。
+
+    **按 `_resolve` 的同一套算法换算**（`_release_slot`），不是"声明的季在
+    `season_offsets` 里就放行"：生产上 Re:Zero 的 sidecar 带着 `{"3": 50}`，
+    `3rd Season - 08` 换算出来是 S01E58——以前拿它确认 S01E08（2026-09-26 审查）。
     """
+    return _release_slot(f, show) == (season, ep)
+
+
+def _release_slot(f: MediaFile, show: Show) -> tuple[int, int] | None:
+    """只凭种子**发布名**（显示名）解析出的集位，与 `_resolve` 同一套换算（季号偏移、
+    `episode_offset`）；没有发布名、认不出集号、声明的季换算不了返回 None。
+
+    `_resolve` 是文件名优先的（合集成员共用一个发布名），AB 改过的名字就在那里说了算；
+    要问"这个名字可信吗"，得拿改名权之外的那份证据独立算一遍。"""
     raw = (f.torrent_name or "").strip()
     if not raw:
-        return False
-    if parse_episode(raw)[1] != ep:
-        return False
-    dec = declared_season(raw)
-    if dec is not None and dec != season and str(dec) not in _season_offsets(show):
-        return False
-    return True
+        return None
+    season, ep = parse_episode(raw)
+    return _slot_from(raw, season, ep, f, show)
 
 
 def _season_offsets(show: Show) -> dict:
@@ -228,8 +239,14 @@ def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
     pin = _pinned(f)
     if pin:
         return pin
-
     raw, season, ep = _numbered_from(f, show)
+    return _slot_from(raw, season, ep, f, show)
+
+
+def _slot_from(raw: str, season: int | None, ep: int | None, f: MediaFile,
+               show: Show) -> tuple[int, int] | None:
+    """`parse_episode(raw)` 的结果 → 库内集位：季号偏移、`episode_offset` 的换算。
+    `_resolve`（文件名优先）与 `_release_slot`（只看发布名）共用，两边不能各算各的。"""
     if ep is None:
         return None
     target = _season_of(f, show, season)
@@ -245,7 +262,23 @@ def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
         if int(ep) <= int(off):
             ep = int(ep) + int(off)
 
-    return target, _apply_offset(ep, show)
+    ep = _apply_offset(raw, ep, show)
+    if ep is None:
+        return None                      # 换算出非正数：原始集号的口径不对，交给人
+    return target, ep
+
+
+def _titles(show: Show) -> list[str]:
+    """这部番可能出现在文件名里的标题：规范标题、目录名、TMDB 标题、AB 的两个标题。"""
+    b = show.bangumi or {}
+    return [t for t in (show.official_title, show.dir_name, show.tmdb_title,
+                        b.get("official_title"), b.get("title_raw")) if t]
+
+
+def _is_extra(f: MediaFile, show: Show) -> bool:
+    """特典 / 菜单 / PV 等周边：只看作品标题**之后**的那部分名字（`naming.is_extra_of`）。
+    所有检测器共用这一个判据——特典规则认定不是特典的，改名与判重也要把它当正片。"""
+    return is_extra_of(f.filename, _titles(show))
 
 
 def _is_video(f: MediaFile) -> bool:
@@ -262,6 +295,14 @@ def is_phantom(f: MediaFile) -> bool:
     """
     return (bool(f.torrent_hash) and not os.path.lexists(f.path)
             and not os.path.lexists(str(f.path) + ".!qB"))
+
+
+def _playable(f: MediaFile) -> bool:
+    """盘上真有这份、不是空的、有种子的不比声明的小（没被截断）。幻影一律不算。"""
+    if is_phantom(f) or os.path.islink(f.path) or not os.path.isfile(f.path):
+        return False
+    size = os.path.getsize(f.path)
+    return size > 0 and not (f.torrent_hash and size < f.size)
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +381,7 @@ class UnrenamedDetector:
                 # 并继续往新名字写入，不中断下载。
                 # 来源是 torrents/files，文件名本身已是干净的目标名，无需裁剪后缀。
                 stem = f.filename
-                if is_extra(stem):
+                if _is_extra(f, show):
                     continue                       # 交给 ExtrasDetector
                 if is_normalized(stem, title):
                     # `is_normalized` 只看形式（`标题 SxxExx.ext`），不看集号对不对。
@@ -425,7 +466,7 @@ class DuplicateEpisodeDetector:
                 continue
             buckets: dict[tuple[int, int], list[MediaFile]] = defaultdict(list)
             for f in show.files:
-                if not _is_video(f) or f.is_incomplete or is_extra(f.filename):
+                if not _is_video(f) or f.is_incomplete or _is_extra(f, show):
                     continue
                 r = _resolve(f, show)
                 if r:
@@ -494,14 +535,38 @@ class DuplicateEpisodeDetector:
                                   "torrents": [f.torrent_hash for f in files]},
                     )
                     continue
-                sealed = None
+                #
+                # **封存要稳定，也不替择源随手二选一**（删除关口 I4 的检测器一侧）：
+                # - 复核通过的封存候选来自**不止一个种子**（停滞 48 小时放行换源后、或手动加了
+                #   同钉子的种子）：以前只封存偏好分最高的、其余当输家删掉。两个都是择源的
+                #   结论，删哪个由人定——报 `seal_conflict`，封存候选一个都不删；偏好分最高的
+                #   那个仍当保留方，没封存的照常判输。
+                # - 钉着 `ma:`、复核没过，而**探测不可用**（`probe` 为 None：超时、出错）：只看
+                #   名字的结论不算数（LoliHouse 的 `ASSx2`，`tests/test_seal_slot.py` 第 3 组），
+                #   昨天封存的今天就失封被删。不知道 = 当作封存：它既不当输家、也不当赢家，
+                #   报 `seal_unknown` 给人看。探得到而且确实不合格的，照旧 `seal_failed`。
+                seals: list = []
+                protected: set[int] = set()
                 for f in sorted((f for f in files
                                  if _pinned(f) == (season, ep) and id(f) not in phantoms),
                                 key=_prefer_score, reverse=True):
                     ok, why = meets_requirements(f)
                     if ok:
-                        sealed = (f, why)
-                        break
+                        seals.append((f, why))
+                        continue
+                    if probe(f.path) is None:
+                        protected.add(id(f))
+                        yield Finding(
+                            rule=self.id, kind="seal_unknown", severity="minor",
+                            classified=True,
+                            summary=(f"S{season:02d}E{ep:02d} 抓来的这份探测不可用（{why}），"
+                                     f"封存与否不可知：本轮既不删它、也不拿它当保留方"),
+                            show=show.dir_name, path=str(f.path),
+                            torrent_hash=f.torrent_hash,
+                            evidence={"file": f.filename, "torrent_name": f.torrent_name,
+                                      "reason": why},
+                        )
+                        continue
                     yield Finding(
                         rule=self.id, kind="seal_failed", severity="important",
                         classified=True,
@@ -511,6 +576,21 @@ class DuplicateEpisodeDetector:
                         torrent_hash=f.torrent_hash,
                         evidence={"file": f.filename, "torrent_name": f.torrent_name,
                                   "reason": why},
+                    )
+                sealed = seals[0] if seals else None
+                seal_torrents = sorted({f.torrent_hash for f, _ in seals})
+                if len(seal_torrents) > 1:
+                    top = sealed[0].torrent_hash
+                    protected |= {id(f) for f, _ in seals if f.torrent_hash != top}
+                    yield Finding(
+                        rule=self.id, kind="seal_conflict", severity="important",
+                        classified=True,
+                        summary=(f"S{season:02d}E{ep:02d} 有 {len(seal_torrents)} 个不同的种子都钉着"
+                                 f"这一集且复核通过，封存不替择源二选一：都不删，需人工挑一个"),
+                        show=show.dir_name, path=str(sealed[0].path),
+                        evidence={"files": [f.filename for f, _ in seals],
+                                  "torrents": seal_torrents,
+                                  "reasons": [why for _, why in seals]},
                     )
 
                 pending = [f for f in files if f.torrent_category == "Bangumi"]
@@ -543,7 +623,7 @@ class DuplicateEpisodeDetector:
 
                 if sealed:
                     keeper, seal_why = sealed
-                    losers = [f for f in files if f is not keeper]
+                    losers = [f for f in files if f is not keeper and id(f) not in protected]
                     # 封存能绕过所有权让位，但绕不过集号可信度。还挂在
                     # `Bangumi` 下的文件，此刻叫什么只是"AB 认为的"；
                     # 要在本轮就清理它，得让它的**发布名**独立确认集位。
@@ -565,10 +645,13 @@ class DuplicateEpisodeDetector:
                         losers = [f for f in losers if f not in holdback]
                     reason = "集位已封存：%s" % seal_why
                 else:
-                    # 真文件永远排在幻影前面（见上文 phantoms 的注释）
-                    ranked = sorted(files, key=lambda f: (id(f) not in phantoms,
-                                                          _rank_for_keep(f)),
+                    # 真文件永远排在幻影前面（见上文 phantoms 的注释）；封存不可知的既不当
+                    # 赢家也不当输家
+                    ranked = sorted((f for f in files if id(f) not in protected),
+                                    key=lambda f: (id(f) not in phantoms, _rank_for_keep(f)),
                                     reverse=True)
+                    if not ranked:
+                        continue
                     keeper, losers = ranked[0], ranked[1:]
                     reason = ""
 
@@ -585,6 +668,14 @@ class DuplicateEpisodeDetector:
                 siblings = [l for l in losers
                             if l.torrent_hash and l.torrent_hash == keeper.torrent_hash]
                 losers = [l for l in losers if l not in siblings]
+                kd = content_digest(keeper.path, cache)
+                # 删除关口复核用的保留方与集位（`media_agent/gate.py` 的 I1 / I4）：执行那一刻
+                # 保留方还在不在、下完没有、是不是还归这一集，只有点名了才查得了。以前只给
+                # `{path, torrent_hash}`，`_op_trash` 从不看保留方——保留方是幻影、被截断、
+                # 或同批先被删掉时，输家照删，这一集就从库里消失了。
+                keep = {"slot": [season, ep], "keep_path": str(keeper.path),
+                        "keep_hash": keeper.torrent_hash, "keep_size": keeper.size,
+                        "keep_digest": kd}
                 for sib in siblings:
                     yield Finding(
                         rule=self.id, kind="bundled_version", severity="important",
@@ -599,13 +690,12 @@ class DuplicateEpisodeDetector:
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(sib.path),
                                             "torrent_hash": sib.torrent_hash,
-                                            "file_only": True,
+                                            "file_only": True, **keep,
                                             **({"phantom": True} if id(sib) in phantoms
                                                else {})},
                                       note="合并发布的另一版本：设为不下载并移入隔离区"),
                     )
 
-                kd = content_digest(keeper.path, cache)
                 for loser in losers:
                     ld = content_digest(loser.path, cache)
                     identical = bool(kd and ld and kd == ld)
@@ -629,9 +719,16 @@ class DuplicateEpisodeDetector:
                             "reason": ("字节完全相同" if identical
                                        else reason or "同集不同版本，按画质取舍"),
                         },
+                        # 输家一律 `file_only`：它若在多文件合集里（3年Z组银八老师
+                        # [01-12]），整种子作废会让其余集跟着失去做种、回退加不回来——
+                        # 生产审计 63 条 duplicate-episode 的整种子作废就是这么来的。
+                        # 种子只有这一个文件时，执行器自己退回整种子作废（删除关口 I3）。
                         action=Action(op="trash", reversible=True,
                                       args={"path": str(loser.path),
                                             "torrent_hash": loser.torrent_hash,
+                                            **({"file_only": True} if loser.torrent_hash
+                                               else {}),
+                                            **keep,
                                             **({"phantom": True} if phantom else {})},
                                       note=("幻影：只摘种子记录（可凭 magnet 回退）" if phantom
                                             else "移入隔离区，保留期内可恢复")),
@@ -652,7 +749,7 @@ class RenameCollisionDetector:
         for show in state.shows:
             targets: dict[str, list[MediaFile]] = defaultdict(list)
             for f in show.files:
-                if not _is_video(f) or is_extra(f.filename):
+                if not _is_video(f) or _is_extra(f, show):
                     continue
                 r = _resolve(f, show)
                 if not r:
@@ -720,12 +817,17 @@ def _library_show_of(save_path: str, media_root: Path) -> str | None:
     return None if not top or top.startswith(".") else top
 
 
-def completed_members(ctx: Context, torrent_hash: str) -> list[str] | None:
-    """种子里已经下完、仍要下载的成员文件；读不到文件列表返回 None（= 不知道）。"""
+def _entries_or_none(ctx: Context, torrent_hash: str) -> list[dict] | None:
+    """种子的文件列表；读不到返回 None（= 不知道）。"""
     try:
-        entries = ctx.qbit.files(torrent_hash) if ctx.qbit else None
+        return ctx.qbit.files(torrent_hash) if ctx.qbit else None
     except Exception:
         return None
+
+
+def completed_members(ctx: Context, torrent_hash: str) -> list[str] | None:
+    """种子里已经下完、仍要下载的成员文件；读不到文件列表返回 None（= 不知道）。"""
+    entries = _entries_or_none(ctx, torrent_hash)
     if entries is None:
         return None
     return [e["name"] for e in entries
@@ -788,9 +890,11 @@ class DeadTorrentDetector:
             if stalled < threshold:
                 continue
             h = t.get("hash", "")
-            done = completed_members(ctx, h)
-            if done is None:
+            entries = _entries_or_none(ctx, h)
+            if entries is None:
                 continue                  # 看不到文件列表就不下结论
+            done = [e["name"] for e in entries
+                    if e.get("priority", 1) != 0 and e.get("progress", 0) >= 1]
             evidence = {"num_seeds": t.get("num_seeds"),
                         "num_complete": t.get("num_complete"),
                         "availability": t.get("availability"),
@@ -818,8 +922,36 @@ class DeadTorrentDetector:
                                     "save_path": t.get("save_path", ""),
                                     "category": t.get("category", ""),
                                     "tags": t.get("tags", "")},
-                              note="只摘种子记录（可凭 magnet 回退），磁盘上的文件"
-                                   "（含 .!qB 半成品）一个字节都不动"),
+                              note="只摘种子记录（可凭 magnet 回退），磁盘上的文件一个字节都不动；"
+                                   "它自己的 .!qB 半成品另由 dead_partial 处置"),
+            )
+            yield from self._partials(show, t, entries)
+
+    def _partials(self, show: str, t: dict, entries: list[dict]) -> Iterable[Finding]:
+        """死种**自己的**半成品：没下完、优先级非 0 的条目在盘上的 `X.!qB`，逐个移进隔离区。
+
+        第 1 阶段只摘记录、半成品留在盘上：它占着 94% 满的 APFS 容器，更占着集位名——
+        停滞换源时新种子下完也改不过去（占用闸门按设计拦下，改过去就是接着往那份半成品里
+        写）。执行在摘记录（op 1）之后（op 5）；删除关口要求这个种子**同一批里真的被摘掉了**
+        （摘除被跳过——又有了做种——半成品就不动），另一个种子仍声明着 `X` 时不动（I2）。
+        """
+        sp = Path((t.get("save_path") or "").rstrip("/") or "/")
+        h = t.get("hash", "")
+        for e in entries:
+            if e.get("priority", 1) == 0 or e.get("progress", 0) >= 1:
+                continue
+            partial = Path(str(sp / e["name"]) + ".!qB")
+            if partial.is_symlink() or not partial.is_file():
+                continue
+            yield Finding(
+                rule=self.id, kind="dead_partial", severity="minor",
+                summary=f"死种的半成品：{partial.name}",
+                show=show, path=str(partial), torrent_hash=h,
+                evidence={"entry": e["name"], "entry_progress": e.get("progress"),
+                          "torrent": t.get("name", "")[:110]},
+                action=Action(op="trash", reversible=True,
+                              args={"path": str(partial), "torrent_hash": h},
+                              note="死种摘记录之后，它自己的 .!qB 半成品移入隔离区（可回退）"),
             )
 
 
@@ -912,17 +1044,69 @@ class ExtrasDetector:
 
     出处：TMDB 不把这些收录成 episode（实测《100个女朋友》《令和妖神斑小姐》
     都没有 Season 0），放在库里既刮不到元数据又污染剧集列表。
+
+    **只看标题之后的部分，而且三种不碰**（2026-09-26 修）。以前 `is_extra` 用在整个文件名上，
+    规范名是 `{TMDB 标题} SxxEyy.ext`：标题里带 trailer / preview / menu / PV / 特典 / 菜单的番，
+    每一集都会被当成特典移进隔离区（与"The Ghost **in** the Shell"同一类）。删除关口对"特典处置、
+    没钉 `ma:`"的文件放行，挡不住这一类，所以这里要自己收紧：
+    - 钉着 `ma:` 的**正片**（种子里唯一的视频，或名字认得出钉着的集号）：它是抓取器认定的那一集、
+      封存着，归判重管。钉着的合集里的 NCOP 不是那一集，照旧清理。
+    - 某集**唯一**的可播文件：名字认得出集号、而同一集没有别的下完了的正片——宁可留着一个真特典，
+      也不删掉唯一的一集（标题记号藏在认不出的罗马音标题里时靠这一条）。
     """
     id = "extras-in-library"
     kind = "extra_content"
 
+    @staticmethod
+    def _is_pinned_episode(f: MediaFile, show: Show) -> bool:
+        pin = _pinned(f)
+        if not pin:
+            return False
+        videos = [o for o in show.files if o.torrent_hash == f.torrent_hash and _is_video(o)]
+        return len(videos) <= 1 or parse_episode(f.filename)[1] == pin[1]
+
+    @staticmethod
+    def _only_copy(f: MediaFile, show: Show) -> bool:
+        """`f` 是它那一集唯一的可播文件吗（名字认得出集号、同一集没有别的正片）？
+
+        "别的正片"得**真能播**（`_playable`）：幻影（种子说下完了、盘上没有——LAT-01、用户经
+        Jellyfin 删文件）、0 字节、比种子声明小的都不算。以前只看"没标未完成"，一个幻影就让
+        唯一真实的那一集被当特典隔离，30 天后硬删（2026-09-26 审查）。
+
+        `f` 自己还没下完时（合集还在下），同一集**也还在下**的正片同样算数：BD 合集的特典常带
+        集号（药屋 `[menu][S01E03]`、Moozzi2 `Menu - 04`），那一集的正片就是合集自己的成员。
+        只数下完了的，特典就成了"唯一的一份"、照下不误（2026-09-26 审查，第 2 阶段的回归）——
+        设为不下载可回退、一个字节都不动，而正片自己没下完时 `f` 是不是它都不急这一轮。
+        """
+        slot = _resolve(f, show)
+        if not slot:
+            return False
+        for o in show.files:
+            if (o is f or not _is_video(o) or _is_extra(o, show)
+                    or _resolve(o, show) != slot):
+                continue
+            if o.is_incomplete:
+                if f.is_incomplete:
+                    return False
+                continue
+            if _playable(o):
+                return False
+        return True
+
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         for show in state.shows:
             for f in show.files:
-                if not is_extra(f.filename):
+                if not _is_extra(f, show):
                     continue
                 if not _is_video(f):
                     continue
+                if self._is_pinned_episode(f, show):
+                    continue
+                if self._only_copy(f, show):
+                    continue
+                # 集位交给删除关口：名字认得出集号的特典，关口要确认那一集此刻另有可播的正片
+                # （I1），按的是这里算的集位（钉子、季号偏移、episode_offset），不是关口只凭名字猜的
+                slot = _resolve(f, show)
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="minor",
                     summary=f"特典/周边内容，TMDB 无对应条目：{f.filename}",
@@ -931,7 +1115,8 @@ class ExtrasDetector:
                     action=Action(op="trash", reversible=True,
                                   args={"path": str(f.path),
                                         "torrent_hash": f.torrent_hash,
-                                        "file_only": True},
+                                        "file_only": True,
+                                        **({"slot": list(slot)} if slot else {})},
                                   note="种子内其余正片保留，仅该文件设为不下载并移入隔离区"),
                 )
 

@@ -91,6 +91,7 @@ def test_qbit_delete_failure_leaves_everything_as_it_was(lib):
     """以前只记一行日志就继续搬文件：种子还在 qBit 里、文件却进了隔离区。"""
     s1 = lib.show("朱音落语").season(1)
     t = s1.single("朱音落语 S01E12.mp4", size=508_000_000)
+    s1.local("朱音落语 S01E12 [BD].mp4", size=508_000_000)   # 集位里另有一份（删除关口 I1）
     lib.qbit.fail("delete", hash=t.hash)
     before = lib.snapshot()
 
@@ -172,6 +173,7 @@ def test_move_failure_after_torrent_delete_is_recorded_honestly(lib, monkeypatch
     """搬文件失败时种子记录已经删了——failed 记录必须写明这一点，不能只剩一句异常。"""
     s1 = lib.show("朱音落语").season(1)
     t = s1.single("朱音落语 S01E12.mp4", size=508_000_000)
+    s1.local("朱音落语 S01E12 [BD].mp4", size=508_000_000)   # 集位里另有一份（删除关口 I1）
 
     def boom(*a, **k):
         raise OSError(28, "No space left on device")
@@ -187,6 +189,7 @@ def test_move_failure_after_torrent_delete_is_recorded_honestly(lib, monkeypatch
 def test_normal_trash_still_moves_and_records_a_real_undo(lib):
     s1 = lib.show("朱音落语").season(1)
     t = s1.single("朱音落语 S01E12.mp4", size=508_000_000)
+    s1.local("朱音落语 S01E12 [BD].mp4", size=508_000_000)   # 集位里另有一份（删除关口 I1）
     ident = lib.ident(t.path)
 
     rep = lib.apply([_trash(t.path, t.hash)])

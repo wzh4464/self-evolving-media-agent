@@ -184,11 +184,17 @@ class Show:
 
 
 
-def episode_of_file(f: "MediaFile", *, allow_release_name: bool = True) -> tuple | None:
+def episode_of_file(f: "MediaFile", *, allow_release_name: bool = True,
+                    episode_offset: int = 0) -> tuple | None:
     """一个文件对应哪一 (季, 集)；认不出返回 None。**集号解析的唯一入口。**
 
     `allow_release_name=False` 时只认已改名成 `SxxExx` 的规范名。需要区分
     "库里已经规整好的" 与 "下完了但还没改名的" 时用它。
+
+    `episode_offset`：AutoBangumi 订阅的集号偏移，与判重的 `builtin._resolve` 同一口径
+    （`naming.apply_episode_offset`）——只换算发布名里的原始集号，已规范的 `SxxEyy` 不动；
+    换算出非正数就是认不出。以前这里完全不看偏移：生产 AB id 37 的 `- 25` 在判重里是
+    S03E01、在 `have` / 抓取 / 订阅健康里是第 25 集（2026-09-26 修）。
 
     2026-09-07 审计前，这段逻辑在 `kernel` / `sidecar_sync` / `subscription`
     里各写了一遍 `re.search(r"[Ss](\\d{1,2})[Ee](\\d{1,3})")`，`grab` 还另有
@@ -197,9 +203,11 @@ def episode_of_file(f: "MediaFile", *, allow_release_name: bool = True) -> tuple
     第 20 集（片名里的 20），`Isekai Quartet 3 - 08` 被读成第 3 集（季号），
     `Despicable Me 4` 这种电影还会凭空生出集号。
     """
-    from .naming import parse_episode
+    from .naming import apply_episode_offset, parse_episode
 
     sn, ep = parse_episode(f.filename)
+    if ep is not None:
+        ep = apply_episode_offset(f.filename, ep, episode_offset)
     if ep is not None and sn is not None:
         return sn, ep
     if ep is None or not allow_release_name:
@@ -226,10 +234,12 @@ def have_episodes(show: "Show", *, allow_release_names: bool = True) -> dict:
         return out
     from .naming import VIDEO_EXTS
 
+    offset = int((show.bangumi or {}).get("episode_offset") or 0)
     for f in show.files:
         if f.is_incomplete or f.path.suffix.lower() not in VIDEO_EXTS:
             continue
-        key = episode_of_file(f, allow_release_name=allow_release_names)
+        key = episode_of_file(f, allow_release_name=allow_release_names,
+                              episode_offset=offset)
         if key:
             out.setdefault(key[0], set()).add(key[1])
     return out

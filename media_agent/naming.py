@@ -64,8 +64,51 @@ def normalize(s: str) -> str:
 
 
 def is_extra(filename: str) -> bool:
-    """是否为特典/菜单/PV 等非正片内容。"""
+    """是否为特典/菜单/PV 等非正片内容。**只看整个名字**——判断库里的文件请用 `is_extra_of`，
+    它先去掉作品标题。"""
     return bool(_EXTRA_RE.search(filename))
+
+
+def is_extra_of(filename: str, titles) -> bool:
+    """去掉作品标题之后，名字里还有没有特典记号。
+
+    规范名是 `{TMDB 标题} SxxEyy.ext`：标题里带 `trailer` / `preview` / `menu` / `PV` / `特典` /
+    `菜单` / `creditless` 的番，整名匹配会把**每一集**都当成特典移进隔离区——与"The Ghost
+    **in** the Shell 整部被判成特典"同一类（那次只修了 `IN` 一个记号）。所以先把 `titles`
+    （TMDB 标题、目录名、AutoBangumi 的 official_title / title_raw）从名字里拿掉，只按词边界拿
+    （标题 `K` 不能把 `mkv` 里的 k 也拿掉），再看剩下的部分。认不出的标题（发布名里的罗马音）
+    拿不掉——由调用方的"某集唯一的文件不当特典"兜底。
+    """
+    s = normalize(filename)
+    for t in sorted({normalize(t) for t in titles if t and t.strip()}, key=len, reverse=True):
+        s = re.sub(r"(?<!\w)" + re.escape(t) + r"(?!\w)", " ", s)
+    return bool(_EXTRA_RE.search(s))
+
+
+_SXXEYY_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
+
+
+def explicit_slot(raw: str) -> tuple[int, int] | None:
+    """名字里显式写着的 `SxxEyy`（改过名的规范名）→ (季, 集)；没有返回 None。"""
+    m = _SXXEYY_RE.search(raw.rsplit("/", 1)[-1])
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def apply_episode_offset(raw: str, ep: int, offset: int) -> int | None:
+    """AutoBangumi 的 `episode_offset`（整条订阅一个值）换算成季内集号。
+
+    **只换算发布名里的原始集号，不碰已经是 `SxxEyy` 的名字**——那是换算过之后的结果。
+    生产 AB 订阅 id 37（《超超超超超喜欢你的100个女朋友》第三季，`-24`）：`- 25` 换算成
+    第 1 集，AB 据此改名成 `… S03E01.mkv`；以前判重再对 `S03E01` 减一次 24，落进
+    `(3, -23)`，与刚下完的 `- 25`（`(3, 1)`）永远不在同一个桶里。
+
+    换算出来不是正数（原始集号本来就是季内编号）返回 None——认不出，交给人，
+    不要提议改成 `S03E-23`。偏移为 0 时原样返回。
+    """
+    if not offset or _SXXEYY_RE.search(raw.rsplit("/", 1)[-1]):
+        return ep
+    ep = int(ep) + int(offset)
+    return ep if ep > 0 else None
 
 
 def parse_episode(raw: str) -> tuple[int | None, int | None]:
@@ -77,7 +120,7 @@ def parse_episode(raw: str) -> tuple[int | None, int | None]:
     base = raw.rsplit("/", 1)[-1]
 
     # 1) 显式 SxxExx —— 最可靠
-    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", base)
+    m = _SXXEYY_RE.search(base)
     if m:
         return int(m.group(1)), int(m.group(2))
 

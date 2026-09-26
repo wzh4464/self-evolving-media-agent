@@ -93,3 +93,47 @@ def test_completed_extra_is_still_moved_to_trash(lib):
     [rec] = c.applied("trash")
     assert rec["undo"]["op"] == "restore_from_trash"
     assert _priorities(lib, t)[1][1] == 0 and len(lib.trash_files()) == 1
+
+
+KUSURIYA = "Kusuriya no Hitorigoto"
+
+
+def _bd_pack(lib, progress, extra_files=None):
+    """药屋的 BD 合集：正片 `[01]`–`[03]`，特典带集号（生产上真有：`[menu][S01E03]`、
+    `[PV][S01E01]`；吊带袜 `[menu][01]` / `[PV][05]`；K-ON Moozzi2 `Menu - 01..09`）。"""
+    s1 = lib.show("药屋少女的呢喃").season(1)
+    files = {f"{KUSURIYA}[{n:02d}][1080P].mkv": GB for n in (1, 2, 3)}
+    files.update(extra_files if extra_files is not None else {
+        f"{KUSURIYA}[menu][S01E03][1080P].mkv": 90_000_000,
+        f"{KUSURIYA}[PV][S01E01][1080P].mkv": 90_000_000})
+    return s1, s1.torrent(files, name=f"[VCB-Studio] {KUSURIYA}", layout="original",
+                          progress=progress, state="downloading" if progress < 1 else None)
+
+
+def test_numbered_extras_inside_a_downloading_pack_are_set_to_skip_at_once(lib):
+    """2026-09-26 审查（回归）：`ExtrasDetector._only_copy` 只数**下完了的**同集正片。合集还在下时，
+    那一集的正片就是合集自己的成员、也没下完——带集号的特典于是被当成那一集唯一的文件，不提处置，
+    照下不误（main 上立刻设为不下载）。生产隔离区里就有这些特典的 `.!qB`（orphanqb-20260830）。"""
+    _, t = _bd_pack(lib, 0.5)
+
+    c = lib.cycle(detectors=[ExtrasDetector])
+
+    assert len(c.applied("trash")) == 2
+    zeroed = sorted(n.rsplit("/", 1)[-1] for n, p in _priorities(lib, t) if p == 0)
+    assert zeroed == [f"{KUSURIYA}[PV][S01E01][1080P].mkv",
+                      f"{KUSURIYA}[menu][S01E03][1080P].mkv"]
+
+
+def test_a_downloading_episode_with_a_marker_in_its_name_keeps_downloading(lib):
+    """对照：发布名的标题里带记号的**正片**（罗马音认不出标题），同一集没有别的——哪怕没下完，
+    也不能设为不下载。"""
+    s1 = lib.show("拖车公园").season(1)
+    t = s1.torrent({"[G] Trailer Park Boys - 05 [1080p].mkv": GB,
+                    "[G] Trailer Park Boys - 06 [1080p].mkv": GB},
+                   name="[G] Trailer Park Boys 05-06", layout="nosub", progress=0.5,
+                   state="downloading")
+
+    c = lib.cycle(detectors=[ExtrasDetector])
+
+    assert not c.actions("trash")
+    assert all(p == 1 for _, p in _priorities(lib, t))

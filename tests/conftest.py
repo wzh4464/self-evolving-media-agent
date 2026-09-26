@@ -41,7 +41,8 @@ _CONFIG_ENV = ("MEDIA_ROOT", "QBIT_URL", "QBIT_USER", "QBIT_PASS", "AB_URL", "AB
                "AB_PASS", "AB_DB", "AB_CONTAINER", "DOCKER_BIN", "TMDB_API_KEY",
                "TMDB_LANG", "LLM_BASE", "LLM_KEY", "LLM_MODEL", "AUTO_APPLY",
                "TRASH_RETENTION_DAYS", "MAX_DELETE_PER_RUN", "MAX_DELETE_GB_PER_RUN",
-               "DEAD_TORRENT_HOURS", "EVOLVE_MODE", "QBIT_ALLOW_EMPTY")
+               "DEAD_TORRENT_HOURS", "EVOLVE_MODE", "QBIT_ALLOW_EMPTY",
+               "QUARANTINE_MIN_AGE_DAYS", "MIN_FREE_GB")
 
 
 def _is_live(request) -> bool:
@@ -160,7 +161,12 @@ def _offline(request, monkeypatch, tmp_path, project_root, tripwire, web, fake_p
     if not allow_ff:
         monkeypatch.setattr(probe_mod, "_run", fake_probe.run)
 
-    # 5) tripwire 接线：failed 审计、被吞的检测器异常 / 失败日志
+    # 5) 磁盘剩余空间：固定为充足。容量闸（MIN_FREE_GB）与隔离前的空间检查读 statvfs——结果不能
+    #    随开发机 / CI 的磁盘而变；要测空间不足的用例自己再 monkeypatch `disposal.free_bytes`。
+    from media_agent import disposal as disposal_mod
+    monkeypatch.setattr(disposal_mod, "free_bytes", lambda path: 10**15)
+
+    # 6) tripwire 接线：failed 审计、被吞的检测器异常 / 失败日志
     real_audit = Executor._audit
 
     def audit(self, status, finding, action, extra=None, undo=None):
@@ -229,3 +235,29 @@ def make_file(tmp_path, fake_probe):
                          torrent_category=category)
 
     return _make
+
+
+# ------------------------------------------------------------------ 文件系统语义
+@pytest.fixture(params=["native", "case-sensitive"])
+def fs(request, monkeypatch):
+    """路径占用（`media_agent.claims`）盘上那一侧在两种文件系统语义下都要成立。
+
+    本机（macOS）的临时目录是大小写 / 规范化都不敏感的 APFS，直接 lstat 就认得出
+    `s01e08.MKV`；CI 的 Linux 区分大小写，只能靠列目录折叠比较。`case-sensitive`
+    把 lstat 换成"名字必须逐字节出现在父目录列表里"，在本机也把后一条路径跑一遍。
+    """
+    if request.param == "case-sensitive":
+        from media_agent import claims as claims_mod
+        real = claims_mod._lstat_key
+
+        def exact(p):
+            p = Path(p)
+            try:
+                if p.name not in os.listdir(p.parent):
+                    return None
+            except OSError:
+                return None
+            return real(p)
+
+        monkeypatch.setattr(claims_mod, "_lstat_key", exact)
+    return request.param

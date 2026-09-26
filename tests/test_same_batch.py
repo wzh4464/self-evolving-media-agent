@@ -61,19 +61,28 @@ def _trash(path, h, **kw):
 
 
 def test_second_trash_on_a_torrent_already_removed_this_batch(lib):
-    """合集里一集判重输了（整种子作废），同批又要只作废它的 NCOP：
-    种子已经没了，不能再去问它的文件列表（404 → failed），文件照常进隔离区。"""
+    """合集里只剩一集还要下载（NCOP 早先已设为不下载、文件还留在盘上）：那一集判重输了，
+    整种子作废（只剩它一个要下的文件，删除关口的 I3 不降级）；同批又要把 NCOP 移进隔离区——
+    种子已经没了，不能再去问它的文件列表（404 → failed），文件照常进隔离区。
+
+    （以前的现场是"合集里一集判重输了就整种子作废"——那正是 I3 堵上的洞，见
+    `tests/test_deletion_gate.py`；要下载的文件多于一个时不再整种子作废。）"""
     s1 = lib.show("尼古喵喵").season(1)
     pack = s1.torrent({"a/E05.mkv": 600_000_000, "b/NCOP.mkv": 90_000_000},
-                      name="[G] Yani Neko 01-12", layout="nosub")
+                      name="[G] Yani Neko 01-12", layout="nosub",
+                      priorities={"b/NCOP.mkv": 0})
     e05, ncop = pack.paths
+    s1.local("尼古喵喵 S01E05.mkv")                       # 这一集的保留方
 
     rep = lib.apply([_trash(e05, pack.hash), _trash(ncop, pack.hash, file_only=True)])
 
     assert not rep.failed and len(rep.applied) == 2
     assert not lib.qbit.has(pack.hash)
     assert not e05.exists() and not ncop.exists()
+    assert rep.applied[0]["undo"]["torrent_record_lost"] is True
     assert rep.applied[1]["undo"]["torrent_record_lost"] is False   # 丢记录只算一次
+    after = lib.qbit.calls[lib.qbit.calls.index(("delete", (pack.hash,), False)):]
+    assert ("files", pack.hash) not in after                       # 没去问已删种子
 
 
 def test_complete_torrent_file_missing_on_disk_is_not_renamed(lib):

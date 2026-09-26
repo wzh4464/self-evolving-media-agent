@@ -104,6 +104,24 @@ def test_ab_misrenamed_candidate_is_not_confirmed(unprobed, show):
     assert _release_agrees(lying, show, 1, 8) is False
 
 
+def test_the_season_offset_is_applied_not_just_looked_up(unprobed, tmp_path):
+    """6 的生产形态（2026-09-26 审查）：Re:Zero 的 sidecar 带着 `season_offsets {"3": 50}`。
+    以前"声明的季有偏移"就放行、从不换算——`3rd Season - 08` 被当成 S01E08 的确认，而按
+    `_resolve` 的算法它是 S01E58：封存快车道会把真正的第 58 集当第 8 集的输家清掉。"""
+    from media_agent import sidecar as sc_mod
+
+    d = tmp_path / "Re：从零开始的异世界生活"
+    d.mkdir()
+    sc_mod.save(d, sc_mod.Sidecar(season_offsets={"3": 50}))
+    show = Show(dir_name=d.name, dir_path=d)
+    lying = unprobed("Re：从零开始的异世界生活 S01E08.mkv",
+                     "[Fyy Raws] Re Zero kara Hajimeru Isekai Seikatsu 3rd Season - 08 [1080p]",
+                     category="Bangumi")
+
+    assert _release_agrees(lying, show, 1, 8) is False
+    assert _release_agrees(lying, show, 1, 58) is True
+
+
 def test_episode_mismatch_is_not_confirmed(unprobed, show):
     """7) 集号对不上的也拒绝。"""
     assert _release_agrees(unprobed("x.mkv", TV), show, 1, 9) is False

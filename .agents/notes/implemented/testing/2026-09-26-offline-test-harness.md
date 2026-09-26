@@ -28,6 +28,10 @@
   以前"一集装在文件夹里"报空 root_path，死种回退在基座里丢掉文件夹，而生产是对的）；
   标签排序 `", "` 连接；未知 hash 的 `files()` 抛与真客户端同文本的 404；
   优先级 0 文件留在盘上。可注入故障（某个 hash 的 `files()` 超时等）。
+  解析 .torrent 时种子名与每个路径元素里的 `/` 换成 `_`（libtorrent 的
+  `sanitize_append_path_element`，按源码，未在生产上逐条核对）：FakeWeb 用 Mikan
+  站点标题当单文件名，标题常带 ` / `，以前在 FakeQbit 里成了"文件夹/文件"条目——
+  生产上不会出现，而抓取后改名保留文件夹层（N15）之后它会让测试失真（2026-09-26）。
 - **FakeWeb**：只替换 `urllib.request.urlopen` 一处——三条网络路径都在调用时
   查它（grab.py 绑的是 `_http_get` 的引用，只补 `_http_get` 不够）。
 - **FakeProbe**：只替换 `probe._run`——`builtin` / `purge` 都按名字导入了
@@ -51,6 +55,11 @@
 4. **`PROJECT_ROOT` 打到临时目录、不读 `.env`**：`_load_dotenv` 写进 `os.environ`
    的东西 monkeypatch 撤不回来，而仓库里的 `.env` 有真凭据。
 5. **日期相对今天**：代码直接调 `date.today()`，不引入冻结时钟。
+6. **磁盘剩余空间固定为充足**（2026-09-26 隔离区容量闸加入时补）：`disposal.free_bytes`
+   （`statvfs`）在 conftest 里固定返回 1 PB——容量闸（`MIN_FREE_GB`）与隔离前的空间检查不能随
+   开发机 / CI 的磁盘而变。测空间不足的用例自己再 monkeypatch 它。另外，**不要在测试里调
+   `monkeypatch.undo()`**：它会连 conftest 的隔离（`PROJECT_ROOT`）一起撤掉，之后的写入落进仓库
+   的 `state/`；只撤自己设的那一处就重新 `setattr` 回原值。
 
 ## 依赖与部署的兼容
 
