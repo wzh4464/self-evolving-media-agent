@@ -70,6 +70,23 @@ def _bad_name(name, what: str) -> str | None:
     return None
 
 
+# renameFile 出错、原名还列着时再看几次（每次之前等这么多秒）。qBittorrent 5.2.3 的 `renameFile` 只是
+# `doRenameFile` → libtorrent `rename_file` 排进磁盘队列，`torrents/files` 的名字要等 `file_renamed` 告警回来
+# （`handleFileRenamed`）才变：磁盘队列积压（卷 94% 满、正在下载 / 校验）时，刚受理的改名在列表里还是原名。
+_RENAME_SETTLE_S = (0.3, 1.0)
+
+
+def _never_accepted(err: BaseException | None) -> bool:
+    """这个错误能不能说明请求没被 qBittorrent 受理：它回了错误码（HTTP 4xx / 5xx，同步拒绝），或请求根本没发出去
+    （连不上）。读超时、读到一半断开都不能——请求也许已经处理了，只是响应没回来。"""
+    import httpx
+
+    from .clients import QBitError
+    if isinstance(err, QBitError) and err.status is not None:
+        return True
+    return isinstance(err, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
 def _btih(magnet: str) -> str:
     """magnet 里的 v1 infohash（小写十六进制）；32 位 base32 形式先转成十六进制。"""
     m = re.search(r"xt=urn:btih:([0-9A-Za-z]+)", magnet or "")
@@ -301,13 +318,25 @@ class Executor:
             return True
         return False if cur == before else None
 
-    def _rename_landed(self, h: str, old_rel: str, new_rel: str) -> bool | None:
-        """`renameFile(old → new)` 之后，种子的条目里是新名字（True）、还是原名（False）。"""
-        names = {e.get("name") for e in self.ctx.qbit.files(h)}
-        if new_rel in names and old_rel not in names:
-            return True
-        if old_rel in names and new_rel not in names:
-            return False
+    def _rename_landed(self, h: str, old_rel: str, new_rel: str,
+                       err: BaseException | None = None) -> bool | None:
+        """`renameFile(old → new)` 出错之后：种子的条目里是新名字（True）、确认没改（False）、说不清（None）。
+
+        原名还列着**不等于**没生效：qBittorrent 5.2.3 的改名是异步的（见 `_RENAME_SETTLE_S`）。只有请求根本没发出去
+        （连不上）或被当场拒绝（HTTP 4xx：名字冲突、条目不存在——在排进队列之前）时，原名才说明没改。其余错误
+        （读超时、断连）先按 `_RENAME_SETTLE_S` 再看几次，还是原名就说不清——以前一律当"没生效"，记 failed、
+        不带逆操作，改名随后落地就是 2026-09-14 那种回退不了的记录（2026-09-26 复审）。
+        """
+        for wait in (0, *_RENAME_SETTLE_S):
+            if wait:
+                time.sleep(wait)
+            names = {e.get("name") for e in self.ctx.qbit.files(h)}
+            if new_rel in names and old_rel not in names:
+                return True
+            if not (old_rel in names and new_rel not in names):
+                return None
+            if _never_accepted(err):
+                return False
         return None
 
     @staticmethod
@@ -640,7 +669,7 @@ class Executor:
                 self.ctx.qbit.rename_file(h, old_rel, new_rel)
             except Exception as e:
                 # 读超时常常发生在 qBittorrent 已经改完之后（2026-09-14 run 20260914T100214）
-                if not self._settle(f, a, e, lambda: self._rename_landed(h, old_rel, new_rel),
+                if not self._settle(f, a, e, lambda e=e: self._rename_landed(h, old_rel, new_rel, e),
                                     what="renameFile ", undo=undo):
                     return
             via = "qbittorrent"
@@ -1466,7 +1495,7 @@ class Executor:
                 renamed.append(m)
             except Exception as e:
                 # 与 `_op_rename` 同理：超时时 qBittorrent 常常已经改了映射
-                landed = self._confirm(lambda m=m: self._rename_landed(h, m["old"], m["new"]))
+                landed = self._confirm(lambda m=m, e=e: self._rename_landed(h, m["old"], m["new"], e))
                 if landed is True:
                     renamed.append(m)
                     self._confirmed_after = _describe(e)

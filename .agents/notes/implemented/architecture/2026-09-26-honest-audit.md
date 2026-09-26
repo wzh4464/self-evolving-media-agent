@@ -127,14 +127,25 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
 这一节接上的核实（都读**此刻**的 qBittorrent，不走占用索引的缓存）：
 
 - 改名（`renameFile`）：种子条目里是新名字 / 原名（`_rename_landed`）；纯本地文件的 `Path.rename`：
-  盘上源 / 目标谁在（`_fs_moved`）。
+  盘上源 / 目标谁在（`_fs_moved`）。**原名还列着不等于没生效**（复审时补，qBittorrent 5.2.3 源码核过）：
+  `TorrentImpl::renameFile` → `doRenameFile` 只是 `++m_renameCount` 并调 libtorrent 的 `rename_file`，排进磁盘队列；
+  `torrents/files` 返回的 `m_filePaths` 要等 `file_renamed` 告警回来、在 `handleFileRenamed` 里才改。磁盘队列积压
+  （卷 94% 满、正在下载 / 校验）时，刚受理的改名在列表里还是原名。所以只有**请求没被受理**——连不上
+  （`ConnectError` / `ConnectTimeout`）或当场被拒（`QBitError` 带状态码：409 名字冲突等，在排队之前判）——时原名
+  才是 False；读超时、断连之类先按 `_RENAME_SETTLE_S`（0.3 s、1 s）再看两次，落地了照常 applied，还是原名就是 None
+  （unknown，带逆改名；回退时逆改名自己核对此刻的名字）。以前一律 False：记 failed、不带逆操作，还写着"核实过没
+  生效"——改名随后落地，正是 2026-09-14 那种回退不了的记录。setLocation（`moving`）与删除之前就按源码核过，改名
+  这时才补上。relink 的逐条改名同一个判据。
 - `retag`：标签都在 / 都不在（`_tags_landed`）；`recategorize`：分类是新的 / 原来的（`_category_landed`）。
 - `relocate`（只有演进规则会产出，分派处已拦）：`save_path` 是目标、或 `state == moving`（qBittorrent 5.2.3
   对有元数据的种子排异步搬运，`save_path` 搬完才变，`moving` 在处理请求时就置上——与正常返回同一口径）。
 
 **测试**：`tests/test_effect_recheck.py`。FakeQbit 新增 `fail(..., after=True)`：改动照常生效之后再抛
 （"响应丢了"）；默认仍是"请求没到"。生产那次改名原样：记 applied、带逆操作、能回退；请求没到：failed；
-改完之后 qBittorrent 读不到：unknown、带逆操作，回退照样还原；状态对不上：unknown。
+改完之后 qBittorrent 读不到：unknown、带逆操作，回退照样还原；状态对不上：unknown。异步改名（复审时补）：FakeQbit
+的 `rename_lag` 让受理了的改名晚几次 `files()` 才看得见（以前同步改名，"原名还在 = 没生效"的误判测不出来）——
+受理了、慢一拍：applied（改之前 failed）；连不上 / 409：failed；读超时而原名一直在：unknown、带逆改名（改之前 failed）；
+relink 的逐条改名慢一拍照样算重建成功（改之前整条 failed）。
 
 ## 5. 删除一侧的核实：摘种子、设为不下载、搬进隔离区
 

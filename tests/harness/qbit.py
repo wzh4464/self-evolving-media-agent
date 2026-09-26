@@ -61,6 +61,11 @@ class FakeQbit:
     - `async_deletes`：True 时 `delete` 只登记，种子（连同它的条目）照样出现在 `torrents()` /
       `files()` 里，`drain()` 才真正删——qBittorrent 的删除同样是异步的，刚删完的种子还会在
       列表里出现一会儿（`claims.ClaimIndex` 按引用拿执行器的 `_removed_torrents` 正是为此）。
+    - `rename_lag`（属性，默认 0）：> 0 时 `rename_file` 受理后只登记，之后第 `rename_lag + 1` 次
+      `files()` 才看得到新名字（`drain()` 立刻完成）。qBittorrent 5.2.3 的 `renameFile` 只是
+      `doRenameFile` → libtorrent `rename_file` 排进磁盘队列，`torrents/files` 的名字要等
+      `file_renamed` 告警回来（`handleFileRenamed`）才变——磁盘队列积压时，刚受理的改名在列表里
+      还是原名（2026-09-26 复审：以前这里同步改名，"原名还在 = 没生效"的误判测不出来）。
     """
 
     def __init__(self, tripwire=None, *, default_save_path: str | Path = "",
@@ -77,6 +82,8 @@ class FakeQbit:
         self._catalog: dict[str, dict] = {}     # hash → {"name", "files", "multi"}：磁力重加时恢复元数据
         self._faults: list[_Fault] = []
         self._pending_moves: list[tuple[str, str]] = []
+        self.rename_lag = 0
+        self._pending_renames: list[list] = []      # [hash, 条目, 新名, 还要几次 files() 才落地]
         self.categories: set[str] = set()
         self.calls: list[tuple] = []            # 所有 API 调用的有序记录
         self.overwrites: list[tuple[str, str]] = []
@@ -338,6 +345,23 @@ class FakeQbit:
         deletes, self._pending_deletes = self._pending_deletes, []
         for h, delete_files in deletes:
             self._do_delete(h, delete_files)
+        renames, self._pending_renames = self._pending_renames, []
+        for h, entry, new_path, _left in renames:
+            if h in self._t:
+                self._do_rename(self._t[h], entry, new_path)
+
+    def _tick_renames(self) -> None:
+        """一次 `files()`：挂起的改名各走一步，到点的落地（`rename_lag`）。"""
+        keep = []
+        for p in self._pending_renames:
+            h, entry, new_path, left = p
+            if left <= 0:
+                if h in self._t:
+                    self._do_rename(self._t[h], entry, new_path)
+                continue
+            p[3] = left - 1
+            keep.append(p)
+        self._pending_renames = keep
 
     def snapshot(self) -> dict:
         """规范化的全量状态，便于 `assert before == after`。"""
@@ -359,6 +383,7 @@ class FakeQbit:
         h = (torrent_hash or "").lower()
         self.calls.append(("files", h))
         self._maybe_fail("files", h)
+        self._tick_renames()
         return copy.deepcopy(self._files_view(self._get(h, "torrents/files")))
 
     def add_torrent(self, source: bytes | str, *, save_path: str = "",
@@ -420,12 +445,18 @@ class FakeQbit:
                 or any(f["name"] == new_path and f is not entry for f in t["_files"])):
             raise self._err(409, "torrents/renameFile",
                             "Invalid newPath or oldPath, or newPath already in use")
+        if self.rename_lag > 0:
+            self._pending_renames.append([h, entry, new_path, self.rename_lag])
+        else:
+            self._do_rename(t, entry, new_path)
+        self._maybe_fail("rename_file", h, after=True)
+
+    def _do_rename(self, t: dict, entry: dict, new_path: str) -> None:
         sp = Path(t["save_path"])
-        src, dst = sp / old_path, sp / new_path
+        src, dst = sp / entry["name"], sp / new_path
         self._move(src, dst)
         self._move(Path(str(src) + ".!qB"), Path(str(dst) + ".!qB"))
         entry["name"] = new_path                   # 注意：t["name"] 不变
-        self._maybe_fail("rename_file", h, after=True)
 
     def _do_move(self, t: dict, location: str) -> None:
         old = Path(t["save_path"])

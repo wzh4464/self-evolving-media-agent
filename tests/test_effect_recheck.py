@@ -22,7 +22,9 @@ import httpx
 import pytest
 from harness import video
 
+from media_agent import actions as actions_mod
 from media_agent.actions import Executor
+from media_agent.clients import QBitError
 from media_agent.kernel import Action, Finding
 from media_agent.plugins.builtin import UnrenamedDetector
 
@@ -73,17 +75,54 @@ def test_rename_timeout_after_qbit_applied_it_is_applied_with_undo(lib):
     assert lib.qbit.file_names(t.hash) == [RAW_11]
 
 
-@pytest.mark.allow("failed_record", match="ReadTimeout")
-def test_rename_timeout_before_qbit_applied_it_is_failed(lib):
-    """请求没到 qBittorrent：按此刻状态核实没有生效，才是 failed，且不带逆操作。"""
+@pytest.mark.allow("failed_record", match="ConnectError|409")
+@pytest.mark.parametrize("exc", [
+    httpx.ConnectError("connection refused (injected)"),              # 请求根本没发出去
+    QBitError("torrents/renameFile -> HTTP 409: newPath already in use", status=409),  # 同步拒绝
+], ids=["unsent", "rejected"])
+def test_rename_that_qbit_never_accepted_is_failed(lib, exc):
+    """请求没到 qBittorrent、或被它当场拒绝（HTTP 4xx 在排进改名队列之前）：原名还在才说明没生效——failed，
+    不带逆操作。"""
     _, t = _one_rename(lib)
-    lib.qbit.fail("rename_file", hash=t.hash)
+    lib.qbit.fail("rename_file", hash=t.hash, exc=exc)
 
     c = lib.cycle(detectors=[UnrenamedDetector])
 
     [rec] = c.failed("rename")
     assert "没有生效" in rec["effect"] and "undo" not in rec
     assert lib.qbit.file_names(t.hash) == [RAW_11]
+
+
+@pytest.mark.allow("unknown_record", match="renameFile")
+def test_rename_read_timeout_with_the_old_name_still_listed_is_unknown(lib, monkeypatch):
+    """读超时：请求也许已经被受理、改名排在 libtorrent 的磁盘队列里（qBittorrent 5.2.3 的 `renameFile` 是异步的，
+    `torrents/files` 要等 `file_renamed` 告警才变）。原名还列着说明不了"没生效"——以前记 failed、不带逆操作，
+    改名随后落地就是 2026-09-14 那种回退不了的记录，还多了一句"核实过没生效"的假话（2026-09-26 复审）。"""
+    monkeypatch.setattr(actions_mod, "_RENAME_SETTLE_S", (0, 0))
+    s1, t = _one_rename(lib)
+    lib.qbit.fail("rename_file", hash=t.hash)
+
+    c = lib.cycle(detectors=[UnrenamedDetector])
+
+    [rec] = c.unknown("rename")
+    assert rec["undo"] == {"op": "rename", "path": str(s1.path / CANON_11),
+                           "new_name": RAW_11, "torrent_hash": t.hash}
+    assert "ReadTimeout" in rec["error"]
+    assert lib.rollback(c.run_id)["reverted"] == 0                   # 逆改名核对此刻状态：没改就跳过
+
+
+def test_rename_accepted_but_not_yet_listed_is_confirmed_after_a_short_wait(lib, monkeypatch):
+    """受理了、磁盘队列里慢了一拍：出错后再看几次（`_RENAME_SETTLE_S`），落地了就是 applied、带逆操作。"""
+    monkeypatch.setattr(actions_mod, "_RENAME_SETTLE_S", (0, 0))
+    _, t = _one_rename(lib)
+    lib.qbit.rename_lag = 1
+    lib.qbit.fail("rename_file", hash=t.hash, after=True)
+
+    c = lib.cycle(detectors=[UnrenamedDetector])
+
+    [rec] = c.applied("rename")
+    assert "ReadTimeout" in rec["confirmed_after_error"] and rec["undo"]["new_name"] == RAW_11
+    assert lib.qbit.file_names(t.hash) == [CANON_11]
 
 
 @pytest.mark.allow("unknown_record", match="renameFile")
@@ -425,6 +464,21 @@ def test_relink_whose_rename_timed_out_after_mapping_counts_it(lib):
     assert (rec["relinked"], rec["failed"]) == (1, 0)
     assert rec["undo"]["mapping"] == [{"old": GN_SLOT, "new": GN_OLD}]
     assert lib.qbit.torrent(t.hash)["progress"] == 1
+
+
+def test_relink_whose_rename_lands_a_moment_after_the_timeout_counts_it(lib, monkeypatch):
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+
+    monkeypatch.setattr(actions_mod, "_RENAME_SETTLE_S", (0, 0))
+    _, t = _stale_moved(lib)
+    lib.qbit.rename_lag = 1
+    lib.qbit.fail("rename_file", hash=t.hash, after=True)
+
+    c = lib.cycle(detectors=[StaleTorrentPathDetector])
+
+    [rec] = c.applied("relink_torrent")
+    assert (rec["relinked"], rec["failed"]) == (1, 0)
+    assert lib.qbit.file_names(t.hash) == [GN_SLOT]
 
 
 @pytest.mark.allow("unknown_record", match="renameFile")
