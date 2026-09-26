@@ -26,6 +26,7 @@ media_agent/
   health.py       运行健康：种子数基线（骤降且审计解释不了 → 整轮拒绝）、每轮健康报告
   notify.py       通知邮件：健康报告有变化才发（一轮最多一封），去重在 state/notify.json，永不带密钥
   runlog.py       run 的输出每行带时间与批次 ID；run.log / run.err.log 先拷贝再截断地轮转（launchd 持有描述符）
+  pause.py        维护暂停：VPN 救援标记或 state/PAUSE 在时 run / apply 以 75 结束（diagnose 照常）
   evolution.py    自演进：残留检测 → 提议 → 影子验证 → 提升
   cli.py          命令行入口
 .agents/

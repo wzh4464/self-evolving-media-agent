@@ -269,3 +269,26 @@ URL / Bearer / userinfo 里的）不进信也不进健康报告；发送失败�
 `main run` 的输出带它自己的批次 ID、第一行是轮次分隔，别的命令不加；轮转在 `O_APPEND` 与不带两种描述符下都让之后的写
 落在新的 run.log 开头（去掉 `lseek`，后者红）；改名式轮转的对照；5 代、最老的丢掉；5 MB 以内不动；两个文件各自
 判断；拷不出去不截断；`main run` 在打印之前轮转并说一句。
+
+## 10. 维护暂停（`media_agent/pause.py`）
+
+**现场**（critic N17）：`rescue.py` 与 `vpn-watchdog.sh` 会重建 qBittorrent 容器；救援期间做种被暂停、分享率上限改成
+1.0、流量走按量计费的 VPS。media-agent 什么都不看：一轮 run 可以正好落在重建中途，也可以在救援期间摘种子、抓新的。
+
+**做法**：
+
+- 暂停条件：救援标记 `~/gluetun/.rescue-active`（`deploy/rescue.py` 的 `MARKER = DIR / ".rescue-active"`，
+  `vpn-watchdog.sh` 避让看的也是它；`RESCUE_MARKER` 可改），或 `state/PAUSE`（人手动放的，里面可写一句为什么）。
+- 声明 `pause=True` 的子命令（`run`、`apply`，以后的抓取模式同样声明）一开始就以 **75** 结束——与"运行锁被占"同一个
+  退出码（EX_TEMPFAIL，"被挡住了，下轮再来"）——stdout 与 stderr 各说一遍：为什么暂停、已经多久、怎么恢复。
+  `diagnose` / `scan` / `health` / `runs` 照常；人手动的 `rollback` / `repair` / `purge` / `evolve` 不拦（维护期间正是人在
+  操作）。
+- **不拿运行锁就返回**：救援脚本重建容器时自己拿着那把锁（第 11 节），暂停的 run 不去等那 10 秒。
+- 暂停的 `run` 照样写健康报告（warn，原因 `paused`，退出码 75），ok → warn 发一封通知：一个忘了删的 `state/PAUSE`
+  不能让 agent 悄悄停摆——这一阶段要解决的正是这种停摆。
+- 直接构造的 `Config`（测试基座）`rescue_marker=None` = 不看；conftest 另把 `RESCUE_MARKER` 指到临时目录——开发机上
+  真有 `~/gluetun` 时测试也不会被暂停。
+
+**测试**：`tests/test_pause.py`——救援标记让 `run` / `apply` 以 75 结束、说清原因；`state/PAUSE` 的内容与怎么恢复；
+`diagnose` 照常；不暂停照常；暂停的 run 不等锁；暂停的 run 写 warn 健康报告；时长；默认路径；测试基座不看；哪些子命令
+声明了暂停。把 `run` 的 `pause=True` 去掉，5 个红。

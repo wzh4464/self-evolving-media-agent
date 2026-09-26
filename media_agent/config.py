@@ -142,6 +142,9 @@ class Config:
     notify_smtp_port: int = 465
     notify_smtp_user: str = ""
     notify_smtp_pass: str = ""
+    # 维护暂停（`pause`）：这个文件在就说明 VPN 救援进行中（`deploy/rescue.py` 的 MARKER），`run` / `apply` 暂停。
+    # `load_config` 默认 `~/gluetun/.rescue-active`；直接构造的 Config（测试基座）为 None = 不看。
+    rescue_marker: Path | None = None
 
     @property
     def state_dir(self) -> Path:
@@ -202,4 +205,5 @@ def load_config(env_file: Path | None = None) -> Config:
         notify_smtp_port=_int_at_least(g("NOTIFY_SMTP_PORT", "465"), "NOTIFY_SMTP_PORT", 1),
         notify_smtp_user=g("NOTIFY_SMTP_USER", ""),
         notify_smtp_pass=g("NOTIFY_SMTP_PASS", ""),
+        rescue_marker=Path(g("RESCUE_MARKER", "") or Path.home() / "gluetun" / ".rescue-active"),
     )

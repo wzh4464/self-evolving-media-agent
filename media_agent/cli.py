@@ -19,7 +19,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, disposal, health, history, notify, runlock, runlog
+from . import __version__, disposal, health, history, notify, pause, runlock, runlog
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -831,7 +831,7 @@ def main() -> int:
     s.add_argument("--kind", nargs="*", help="只处理指定类型的问题")
     s.add_argument("--show", nargs="*", help="只处理指定番剧（目录名）")
     s.add_argument("--limit", type=int, help="最多处理多少条（受控试跑用）")
-    s.set_defaults(func=cmd_apply, lock=True)
+    s.set_defaults(func=cmd_apply, lock=True, pause=True)
 
     s = sub.add_parser("runs", help="列出历史批次（回退用）")
     s.set_defaults(func=cmd_runs)
@@ -879,7 +879,8 @@ def main() -> int:
     s.add_argument("--no-evolve", action="store_true",
                    help="本轮不演进（EVOLVE_MODE=propose 时才有意义，默认 off 本来就不跑）")
     s.add_argument("--max-proposals", type=int, default=3)
-    s.set_defaults(func=cmd_run, lock=True)
+    # 维护暂停（`pause` 模块文档）：run / apply 与以后的抓取模式声明 pause=True
+    s.set_defaults(func=cmd_run, lock=True, pause=True)
 
     args = p.parse_args()
     try:
@@ -887,12 +888,33 @@ def main() -> int:
     except ValueError as e:
         _log(f"配置错误：{e}")
         return 2
+    paused = pause.reason(cfg) if getattr(args, "pause", False) else ""
     if args.cmd == "run":
         # launchd 把这些输出追加进 state/run.log / run.err.log：每一行带时间与批次 ID（`runlog`）
         args.run_id = new_run_id()
         with runlog.stamped(args.run_id):
+            if paused:
+                return _paused_run(args, cfg, paused)
             return _locked(args, cfg, before=_run_banner)
+    if paused:
+        return _paused(paused)
     return _locked(args, cfg)
+
+
+def _paused(why: str) -> int:
+    """维护暂停（`pause`）：不拿锁、什么都不做，stdout 与 stderr 各说一遍，退出码 75。"""
+    msg = f"⏸️  维护暂停，本次不执行任何操作：{why}"
+    print(f"\n═══ {msg} ═══")
+    _log(msg)
+    return EXIT_LOCKED
+
+
+def _paused_run(args, cfg, why: str) -> int:
+    """暂停的 `run` 也写健康报告（warn）：忘了删的 state/PAUSE 不能让 agent 悄悄停摆。"""
+    rh = health.RunHealth(cfg, run_id=args.run_id, cmd="run",
+                          dry_run=args.dry_run or not cfg.auto_apply)
+    rh.paused(why)
+    return _finish_run(cfg, rh, _paused(why))
 
 
 def _run_banner(args, cfg) -> None:

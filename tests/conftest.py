@@ -45,7 +45,7 @@ _CONFIG_ENV = ("MEDIA_ROOT", "QBIT_URL", "QBIT_USER", "QBIT_PASS", "AB_URL", "AB
                "QUARANTINE_MIN_AGE_DAYS", "MIN_FREE_GB", "GRAB_METADATA_TIMEOUT",
                "STUCK_RUNS", "TORRENT_DROP_MIN", "TORRENT_DROP_PCT", "UNRENAMED_ALERT_HOURS",
                "NOTIFY_EMAIL_TO", "NOTIFY_SMTP_HOST", "NOTIFY_SMTP_PORT", "NOTIFY_SMTP_USER",
-               "NOTIFY_SMTP_PASS")
+               "NOTIFY_SMTP_PASS", "RESCUE_MARKER")
 
 
 def _is_live(request) -> bool:
@@ -120,6 +120,8 @@ def _offline(request, monkeypatch, tmp_path, project_root, tripwire, web, fake_p
     monkeypatch.setattr(config_mod, "_load_dotenv", lambda path: None)
     for k in _CONFIG_ENV:
         monkeypatch.delenv(k, raising=False)
+    # 开发机上可能真有 ~/gluetun/.rescue-active：load_config() 的默认值不能让测试被"维护暂停"
+    monkeypatch.setenv("RESCUE_MARKER", str(tmp_path / "no-rescue-marker"))
     monkeypatch.setattr(evolution_mod, "RULES_DIR", project_root / ".agents" / "rules")
     monkeypatch.setattr(evolution_mod, "NOTES_ROOT", project_root / ".agents" / "notes")
 

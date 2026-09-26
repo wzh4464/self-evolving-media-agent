@@ -189,7 +189,7 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
 - 进程被 kill 锁自动释放，不会留下要人去删的锁。**不要删 `run.lock` 文件**——
   删了之后持有者锁住的是一个没有名字的 inode，下一个进程会拿到另一把锁。
 - `deploy.sh` 用 `/usr/bin/lockf -k`（Linux 上是 `flock(1)`）拿同一把锁，切换期间一直持有。
-- 手工维护时想让 agent 暂停，就自己拿着锁干活：
+- 手工维护时想让 agent 暂停：`touch ~/media-agent/state/PAUSE`（里面可以写一句为什么），`run` / `apply` 就以 75 结束、健康报告 warn；维护完 `rm` 掉。VPN 救援期间（`~/gluetun/.rescue-active` 在）自动暂停。要在自己干活的那几分钟里连手动命令也挡住，就自己拿着锁：
   `/usr/bin/lockf -k ~/media-agent/state/run.lock zsh`（退出这个 shell 即释放）。
 - 还没覆盖的：`vpn-watchdog.sh` 与 `rescue.py` 重建 qBittorrent 容器时不看这把锁
   （critic N17）。一轮运行中途 qBittorrent 消失时，qBittorrent 读不全的闸门会让这一轮拒绝改动。
@@ -217,7 +217,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zihan.media-agent.pl
 | 3 | 降级、整批拒绝改动（qBittorrent 不可用、读不全，或种子数比上一轮骤降而审计解释不了——确认是人为删除的用 `media-agent health --accept-torrent-count`），什么都没改 |
 | 4 | 改动照常做了，但有审计记录没能原样写进 `state/audit.jsonl`（磁盘满、权限……）——已转写到 run.err.log 与 `state/audit.fallback.jsonl`，`rollback` / `runs` 会一起读；先腾空间 |
 | 5 | 这一轮跑完了，但健康报告 critical：隔离区处置之后媒体卷剩余仍低于 `MIN_FREE_GB`——要人腾空间 |
-| 75 | 另一个进程持有运行锁，这一轮什么都没做 |
+| 75 | 另一个进程持有运行锁，或维护暂停中（VPN 救援进行中 / 有 `state/PAUSE`），这一轮什么都没做 |
 
 ## 部署脚本自己的测试
 
