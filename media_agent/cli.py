@@ -866,7 +866,7 @@ def main() -> int:
 
     s = sub.add_parser("evolve", help="自演进：为规则盲区提议新规则")
     s.add_argument("--max-proposals", type=int, default=3)
-    # 会写 .agents/，影子验证还会跑全部检测器（含写 sidecar 的抓取规则）
+    # 会写 .agents/，影子验证还会跑全部检测器（检测本身只读媒体根，但会写 state/ 的缓存）
     s.set_defaults(func=cmd_evolve, lock=True)
 
     s = sub.add_parser("ack", help="确认一个卡住的问题：先不提醒（写 .agents/acks.json，要提交入库）")

@@ -55,8 +55,10 @@ class Sidecar:
     # --- 订阅 ---
     bangumi_id: int | None = None   # AutoBangumi 记录 id（可能失效，故不作唯一依据）
     mikan_id: str = ""              # Mikan 番组页 id。先到先得的抓取盯的是整个番组页
-                                    # （不带 subgroupid = 全字幕组），解析一次就存下来，
-                                    # 省得每轮重新搜。
+                                    # （不带 subgroupid = 全字幕组）。抓取把它当候选之一、
+                                    # 按播出日期打分；**代码不再写它**（以前检测期写回，
+                                    # 2026-09-26 起选中的页记在 state/ 的缓存里），
+                                    # 现存的值是历史记录或人填的。
     sources: list[dict] = field(default_factory=list)  # SourceRecord 列表，含历史
 
     # --- 编号 ---

@@ -139,6 +139,11 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     不放摘要**。要人处理、短期不会动的卡住问题用 `media-agent ack` 确认（`.agents/acks.json` 是版本化的用户意图）。见
     [运行健康](.agents/notes/implemented/architecture/2026-09-26-run-health.md)。
 
+13. **检测只读媒体根。** `scan` 与检测器只许读媒体库；要记下来的决策放 `state/` 的缓存，要改媒体库里的东西
+    （含 `.media-agent.json`）就产出动作、经执行器写（有审计、有逆操作）。`diagnose` / `apply --dry-run` /
+    影子验证之后媒体根下一个字节都不变（`tests/test_diagnose_purity.py` 守着）。见
+    [diagnose 改写 sidecar](.agents/notes/implemented/bug-fix/2026-09-26-diagnose-writes-sidecars.md)。
+
 ## 自演进的闭环
 
 ```
