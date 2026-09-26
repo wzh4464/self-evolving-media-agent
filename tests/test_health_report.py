@@ -373,3 +373,34 @@ def test_unrenamed_alert_hours_config(monkeypatch):
     monkeypatch.setenv("UNRENAMED_ALERT_HOURS", "-1")
     with pytest.raises(ValueError, match="UNRENAMED_ALERT_HOURS"):
         load_config()
+
+
+@pytest.mark.allow("failed_record")
+def test_failures_repeating_across_runs_are_called_out(offline_cli, capsys, monkeypatch):
+    """2026-09-16 … 09-26 的抓取：每轮抓的是不同的集（指纹各不相同，卡住检测连不起来），错误却是同一个
+    NameError。`find_failure_patterns`（以前只在 evolve 里打印）按"同一个规则、动作、错误在几个批次里出现"数，
+    健康报告把"这一轮的失败里哪些是老毛病"写出来。"""
+    lib = offline_cli
+    _clean(lib)
+    n = {"i": 0}
+
+    class _Grab:
+        id = "episode-available"
+
+        def detect(self, ctx, state):
+            n["i"] += 1
+            yield Finding(rule=self.id, kind="episode_grabbable", severity="important",
+                          summary=f"S01E{n['i']:02d} 可抓取", show="测试番", subject=f"S01E{n['i']:02d}",
+                          action=Action(op="trash", args={"path": f"/not/in/library/{n['i']}.mkv"}))
+
+    monkeypatch.setattr(cli, "build_registry", lambda: Registry(detectors=[_Grab()]))
+
+    cli.cmd_run(_args(), lib.cfg)
+    assert _latest(lib)["actions"]["repeated"] == []                 # 第一次：还不是"反复"
+    cli.cmd_run(_args(), lib.cfg)
+
+    rep = _latest(lib)
+    [r] = rep["actions"]["repeated"]
+    assert r["rule"] == "episode-available" and r["op"] == "trash" and r["runs"] == 2
+    [reason] = [x for x in rep["reasons"] if x["code"] == "failed_actions"]
+    assert "2 个批次" in reason["text"]

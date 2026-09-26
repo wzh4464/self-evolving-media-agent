@@ -201,6 +201,23 @@ def unrenamed_old(findings, report, torrents: list, threshold_hours: float,
     return out
 
 
+def repeated_failures(audit_log, report) -> list[dict]:
+    """这一轮的 failed / unknown 里，哪些是"老毛病"：同一个规则、动作、错误（前 60 字）在最近 14 天的至少两个批次里
+    出现过（`evolution.find_failure_patterns`，以前只在 `evolve` 里打印）。每轮抓的是不同的集、指纹各不相同时，卡住
+    检测连不起来它们——2026-09-16 … 09-26 的 12 次抓取 NameError 就是这种。读审计出错时返回空（这是附加信息）。"""
+    mine = {(r.get("status"), str(r.get("rule") or ""), str(r.get("op") or ""),
+             str(r.get("error") or "")[:60]) for r in [*report.failed, *report.unknown]}
+    if not mine:
+        return []
+    from .evolution import find_failure_patterns
+    try:
+        pats = find_failure_patterns(audit_log)
+    except Exception:                               # noqa: BLE001 —— 附加信息，读不了就不报
+        return []
+    return [{k: p[k] for k in ("status", "rule", "op", "error", "runs", "count")}
+            for p in pats if (p["status"], p["rule"], p["op"], p["error"]) in mine][:10]
+
+
 class RunHealth:
     """一轮 `run` 的健康信息，边跑边记，收尾时 `finish(rc)` 定状态与退出码。
 
@@ -279,7 +296,8 @@ class RunHealth:
             "failed": len(report.failed), "unknown": len(report.unknown),
             "audit_problems": len(report.audit_problems),
             "failed_detail": brief(report.failed), "unknown_detail": brief(report.unknown),
-            "audit_problem_detail": [str(p)[:200] for p in report.audit_problems[:10]]}
+            "audit_problem_detail": [str(p)[:200] for p in report.audit_problems[:10]],
+            "repeated": repeated_failures(self.cfg.audit_log, report)}
         self.data["grab"] = grab_stats(findings, report)
         old = unrenamed_old(findings, report, state.torrents, self.cfg.unrenamed_alert_hours)
         self.data["unrenamed"] = {"threshold_hours": self.cfg.unrenamed_alert_hours,
@@ -354,9 +372,15 @@ class RunHealth:
         if det.get("load_errors"):
             add("warn", "rule_load_failed", f"{len(det['load_errors'])} 个演进规则文件加载失败、没挂上")
         if act.get("failed"):
-            add("warn", "failed_actions", f"{act['failed']} 个动作失败（没生效）")
+            rep_ = [r for r in act.get("repeated") or [] if r["status"] == "failed"]
+            add("warn", "failed_actions", f"{act['failed']} 个动作失败（没生效）" + (
+                "；其中 " + "、".join(f"[{r['rule']}] {r['op']} 已在 {r['runs']} 个批次里出现"
+                                     for r in rep_[:3]) if rep_ else ""))
         if act.get("unknown"):
-            add("warn", "unknown_actions", f"{act['unknown']} 个动作未确认（也许生效了，要人核对）")
+            rep_ = [r for r in act.get("repeated") or [] if r["status"] == "unknown"]
+            add("warn", "unknown_actions", f"{act['unknown']} 个动作未确认（也许生效了，要人核对）" + (
+                "；其中 " + "、".join(f"[{r['rule']}] {r['op']} 已在 {r['runs']} 个批次里出现"
+                                     for r in rep_[:3]) if rep_ else ""))
         st = d["stuck"] or {}
         if st.get("open"):
             add("warn", "stuck", f"{len(st['open'])} 个问题连续 ≥{self.cfg.stuck_runs} 轮都在")

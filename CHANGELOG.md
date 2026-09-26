@@ -29,7 +29,8 @@
   输出末尾打印一小节：客户端（qBit / AB / TMDB / LLM）、种子数（此刻 / 上一轮）、执行结果（含失败、未确认、
   审计转写）、抓取（提议 / 加上 / 409 已存在 / 元数据超时）、检测器崩溃、隔离区大小与剩余空间与处置结果、卡住、
   超过 `UNRENAMED_ALERT_HOURS`（新配置，默认 12）还是发布名的文件、日志里的报错行数、耗时，以及总体状态
-  ok / warn / critical 和每条原因。`media-agent health [--run ID] [--json]` 看最近（或指定）一轮。
+  ok / warn / critical 和每条原因。`media-agent health [--run ID] [--json]` 看最近（或指定）一轮。这一轮的失败 / 未确认
+  里哪些是"老毛病"（同一个规则、动作、错误在 14 天内 ≥2 个批次出现过）单独点名。
 - **通知邮件**（可选，`NOTIFY_EMAIL_TO` / `NOTIFY_SMTP_HOST` / `NOTIFY_SMTP_PORT`=465 / `NOTIFY_SMTP_USER` /
   `NOTIFY_SMTP_PASS`，SMTP over SSL；都不配 = 关闭）：只在**变化**时发、一轮最多一封——健康状态变坏或从 critical
   恢复、新的卡住问题、新进入整批拒绝、审计开始转写到备用文件。去重状态在 `state/notify.json`；发不出去只在 stderr

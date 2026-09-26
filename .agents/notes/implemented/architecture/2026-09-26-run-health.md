@@ -174,6 +174,10 @@ run.err.log 的人认它），末尾加上位置。健康报告（第 6 节）�
   `StartInterval` 任务只记下退出码、6 小时后照常起下一轮（plist 里没有 `KeepAlive`，非零不会触发重启节流），
   所以 5 只是让 `launchctl list` 看得见。
 - `media-agent health [--run ID] [--json]`：最近一轮（或指定那一轮）的报告；没有就退出码 1。
+- **反复出现的失败**（`health.repeated_failures`，复审时补）：这一轮的 failed / unknown 里，同一个规则、动作、错误（前 60 字）
+  在最近 14 天的至少两个批次里出现过的（`evolution.find_failure_patterns`，以前只在 `evolve` 里打印；runloop §8b 把它列为
+  健康摘要该收的信号），写进 `actions.repeated`，`failed_actions` / `unknown_actions` 的原因里点名。每轮抓的是不同的集、指纹
+  各不相同时卡住检测连不起来——2026-09-16 … 09-26 的 12 次抓取 NameError 就是这种。
 
 **测试**：`tests/test_health_report.py`——干净的一轮 ok、与发现历史 / 审计同一个批次 ID；第二轮带上一轮的种子数；
 整批拒绝 critical / 3；`disposal.dispose` 抛异常时报告照写、critical / 1、traceback 进 stderr；审计写不进去 critical / 4；
