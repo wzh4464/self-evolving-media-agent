@@ -668,6 +668,49 @@ def _auto_backfill(ctx, state) -> None:
         attach_ledger(state, *ledger.load_rows(ctx.config.state_dir))
 
 
+def cmd_subscribe(args, cfg) -> int:
+    """`media-agent subscribe --tmdb ID [--season N] [--mikan ID] [--dir NAME] [--require-any WORD …] [--offset N]`：
+    不经 AutoBangumi 订阅一部番的一季（`subscribe` 模块文档）。经执行器写（有审计、能 rollback），然后说出下一次抓取会做什么。
+    参数不对、和 sidecar 里人写的东西冲突：什么都不写，退出码 2。预演（`--dry-run` / AUTO_APPLY=false）不写。"""
+    from . import subscribe
+
+    ctx = build_context(cfg)
+    try:
+        p = subscribe.plan(ctx, tmdb_id=args.tmdb, season=args.season, mikan=args.mikan or "",
+                           dir_name=args.dir or "", require_any=args.require_any or [], offset=args.offset)
+    except subscribe.SubscribeError as e:
+        print(f"❌ {e}")
+        return 2
+    for n in p.notes:
+        print(f"⚠️  {n}")
+    dry = args.dry_run or not cfg.auto_apply
+    if p.finding is not None:
+        ex = Executor(ctx, dry_run=dry)
+        report = ex.apply([p.finding])
+        if report.refused:
+            return _refuse(report.refused)
+        print(("【预演】" if dry else "【已执行】") + report.summary()
+              + (f"   批次 ID: {ex.run_id}（media-agent rollback --run {ex.run_id} 撤销）" if not dry else ""))
+        for rec in report.applied:
+            print(f"  ✅ [{rec['op']}] {rec['summary']}")
+        for rec in report.skipped:
+            print(f"  ⏭️  [{rec['op']}] {rec['summary']} —— {rec.get('reason', '')}")
+        for rec in report.failed:
+            print(f"  ❌ [{rec['op']}] {rec['summary']} —— {rec.get('error', '')}")
+        _print_unknown(report.unknown)
+        if _report_audit_problems(report.audit_problems, cfg.state_dir):
+            return EXIT_AUDIT_INCOMPLETE
+        if report.failed or report.unknown or (report.skipped and not dry):
+            return 1
+        if dry:
+            print("\n（预演：订阅还没写进去，下一次抓取看不到它；去掉 --dry-run 再跑一次）")
+            return 0
+    print("\n═══ 下一次抓取（`media-agent grab`，launchd 每 30 分钟；或 6 小时一轮的 run）会做什么 ═══")
+    for line in subscribe.preview(ctx, p.show_dir, p.season):
+        print(line)
+    return 0
+
+
 def cmd_health(args, cfg) -> int:
     """最近一轮（或 `--run` 指定那一轮）的健康报告；`--json` 原样输出。
 
@@ -1023,6 +1066,19 @@ def main() -> int:
     s.add_argument("--accept-torrent-count", action="store_true",
                    help="把此刻 qBittorrent 的种子数认作新基线（在 qBit 里手动批量删除之后）")
     s.set_defaults(func=cmd_health)
+
+    s = sub.add_parser("subscribe", help="不经 AutoBangumi 订阅一部番的一季：建番目录 + sidecar（有审计、能回退），"
+                                         "并说出下一次抓取会做什么")
+    s.add_argument("--tmdb", type=int, required=True, help="TMDB 剧集条目 id")
+    s.add_argument("--season", type=int, help="订哪一季（库内季号）；省略 = TMDB 上最新的一季")
+    s.add_argument("--mikan", help="这一季的 Mikan 番组页 id（RSS 链接里的 bangumiId）；省略 = 按标题搜、按播出日期挑")
+    s.add_argument("--dir", help="番目录名；省略 = 已有这部番的目录（sidecar 的 tmdb_id），没有就用 TMDB 标题新建")
+    s.add_argument("--require-any", nargs="+", metavar="WORD",
+                   help="只要发布标题含其中任一词的版本（sidecar 的 require_any，如 邪竜解放版）")
+    s.add_argument("--offset", type=int, help="这一季的集号偏移（sidecar 的 episode_offsets：连续编号的 - 25 是第 1 集就写 -24）")
+    s.add_argument("--dry-run", action="store_true", help="只说会写什么，不写")
+    # 写媒体根（建目录）与 sidecar：与 run 排队。人手的命令，不看维护暂停（与 rollback / repair 一样）
+    s.set_defaults(func=cmd_subscribe, lock=True)
 
     s = sub.add_parser("ledger", help="出处账本（state/ledger.sqlite）：补录、查一个种子")
     lsub = s.add_subparsers(dest="ledger_cmd", required=True)

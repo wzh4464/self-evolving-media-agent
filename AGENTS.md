@@ -60,6 +60,8 @@ uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题、�
 uv run media-agent health               # 最近一轮的健康报告（--run ID 指定一轮，--json 原样）
 uv run media-agent ledger backfill      # 补录出处账本（--dry-run 只报覆盖率；run 开头自动补增量）
 uv run media-agent ledger show <hash>   # 账本里某个种子是什么
+uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID] [--dir 名] [--require-any 词 …] [--offset N]
+                                        # 不经 AutoBangumi 订阅一季：建目录 + sidecar（有审计、能回退），说出下一次抓取会做什么
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 

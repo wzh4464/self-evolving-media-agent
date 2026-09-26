@@ -46,12 +46,32 @@
   - **不登记**库内编号与 TMDB 对不上的：sidecar 有 `season_offsets`（压平 / 换算进来的番），或库里最大那一季的集数比 TMDB
     那一季还多（库里按连续编号）——TMDB 的"下一季"多半就是库里已有的后半段，登记了只会再抓一遍。要就自己在 sidecar 里写。
   - 要停：在 AB 里停用订阅，并删掉 sidecar 的 `subscriptions`。
+- **人手的 `media-agent subscribe`**（`media_agent/subscribe.py`，source `cli`）：AB 不在、或不想经 AB 时。
+  `--tmdb ID [--season N] [--mikan ID] [--dir NAME] [--require-any WORD …] [--offset N] [--dry-run]`：
+  - 季省略 = TMDB 上最新的一季；TMDB 上还没有的季照样记下、提醒一句。
+  - 目录：某个目录的 sidecar 记着这个 tmdb_id 就订进那个目录（不另建——两个目录抓同一部番，抓取只认文件多的）；有两个就要
+    `--dir`；`--dir` 指向别的目录而这部番已有目录 → 拒绝。都没有就按 TMDB 标题（斜杠换全角）新建，大小写不同的同名目录算已有。
+  - 写的是人的意图：`subscriptions[季] = {source: cli, since, mikan_id?}`、新目录的 `tmdb_id` + `tmdb_source: human`（已有
+    目录只在还没有时补）、`mikan_id`、`require_any`、`episode_offsets[季]`。**经同一套动作与审计**（规则名 `subscribe`：新目录
+    `create_show_dir`、已有目录 `subscribe_season`），能 `rollback`；qBittorrent 读不全照样整批拒绝（退出码 3）。
+  - **不覆盖人写的**：已有目录的 sidecar 里 `tmdb_id` 不同、`require_any` 不同、这一季的 `episode_offsets` 不同 → 拒绝、什么都
+    不写（退出码 2），要改就直接编辑 sidecar。这一季已经订阅 → 什么都不写，照样给预览。
+  - 然后说出下一次抓取会做什么（`subscribe.preview`：扫描一遍、抓取检测器对这部番原样跑一遍，只读）：可抓的集、为什么不抓
+    （找不到番组页、编号对不上、都没过硬门槛……）；**不在播的季说清楚不会抓**——抓取只补在播 / 刚播完的季（`is_seasonal`），
+    老番的整季补档不在这一步。
+  - 预演（`--dry-run` / `AUTO_APPLY=false`，与 `apply` 同一个口径）不写，也不给预览（订阅还没写，抓取看不到它）。
+  - 拿运行锁（与 `run` / `grab` 排队），不看维护暂停（人手的命令，与 `rollback` / `repair` 一样）。
 
 ## 测试
 
 `tests/test_subscriptions.py`：只有订阅档案的目录被扫描登记（不是电影、TMDB 按 sidecar 认）；没有订阅的空目录、坏档案的
 空目录照旧不登记；订阅的季盘上一集都没有也抓；订阅的季与盘上的季一起看；订阅里的番组页先于搜索（搜到的别的页日期
 对不上）；端到端（迭代）种子加进 `<番目录>/Season 1`、`have` 记上。改之前 5 条红（另两条是"照旧不登记"的对照）。
+
+`tests/test_cli_subscribe.py`：新番建目录（经执行器，审计规则是 `subscribe`）、sidecar 里是人的意图、预览列出可抓的集；
+季省略取 TMDB 上最新的；`--require-any` / `--offset` 写进去；已有这部番的目录订进那里、不另建；`--dir`；与人写的
+`require_any` / `episode_offsets` / `tmdb_id` 冲突时拒绝、什么都不写；两个目录都记着它要 `--dir`；TMDB 查不到拒绝；预演不写；
+已经订阅的什么都不写；不在播的季说清楚不会抓；`rollback` 撤掉建的目录；子命令接好、拿运行锁（被占 75）。
 
 `tests/test_new_season.py`：AB 订阅着的番第二季三天前开播 → 登记（参数、来源、开播日）；一周内开播的登记、更晚的等着；只有
 sidecar 订阅的也算；没人订着（档案里只剩旧 bangumi_id）的不登记；老早播完的"下一季"不算新；TMDB 上没有下一季时什么都不说；

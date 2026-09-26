@@ -35,6 +35,10 @@
   不会来。sidecar 有订阅、或 AB 里有它的有效订阅的番，TMDB 上的下一季一周内开播（或已开播）且在播，就登记下一季的订阅
   （`subscribe_season`，来源 `new-season`）。人在 AB 里停用了的（档案里只剩旧 id）不替人订；库内编号与 TMDB 对不上的
   （`season_offsets`、库里一季比 TMDB 长）不登记。下一季的分集表走 6 小时缓存，不等 30 天的条目缓存过期。
+- **`media-agent subscribe --tmdb ID [--season N] [--mikan ID] [--dir NAME] [--require-any WORD …] [--offset N]`**：不经
+  AutoBangumi 订阅一季。已有这部番的目录（sidecar 的 tmdb_id）就订进去，没有就按 TMDB 标题新建；人的意图（订阅、TMDB 身份、
+  番组页、版本要求、集号偏移）经同一套动作与审计写进 sidecar，能 `rollback`；与 sidecar 里人写的不同就拒绝、什么都不写（退出
+  码 2）。然后说出下一次抓取会做什么（可抓的集、为什么不抓；不在播的季说清楚不会抓）。`--dry-run` 只说会写什么。
 
 ### 修复
 - **抓取认集号偏移、找不到候选时说出来**（critic N13）：AB 37《超超超超超喜欢你的100个女朋友》第三季的发布按连续集号编

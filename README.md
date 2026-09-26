@@ -196,6 +196,7 @@ uv run media-agent run                 # one full autonomous cycle, iterated to 
 uv run media-agent health              # the last run's health report
 uv run media-agent ack <fp> --reason … # acknowledge a stuck finding (commit .agents/acks.json)
 uv run media-agent ledger backfill --dry-run   # provenance coverage (every run backfills new torrents)
+uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID]   # subscribe without AutoBangumi
 ```
 
 Start with `diagnose`, then `apply --dry-run`. Only flip `AUTO_APPLY=true` once
@@ -208,7 +209,7 @@ A launchd plist for a 6-hourly cycle is in [`deploy/`](deploy/). Production is d
 | Service | Required? | Without it |
 |---|---|---|
 | qBittorrent WebUI | yes | — |
-| AutoBangumi | optional | Loses `ab:` tag rules and subscription awareness |
+| AutoBangumi | optional | Loses `ab:` tag rules and AB-subscription adoption; subscribe with `media-agent subscribe` instead |
 | TMDB API key | optional | Title-alignment rules skip (free at [themoviedb.org](https://www.themoviedb.org/settings/api)) |
 | LLM (OpenAI-compatible) | optional | Self-evolution skips; everything else works |
 
