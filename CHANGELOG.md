@@ -13,6 +13,20 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-26
+
+**删除只在事实确认后发生。** 整改第 2 阶段：任何写路径、任何删除，都在动手那一刻按此刻的
+qBittorrent 与磁盘复核，而不是信诊断时的快照；隔离区的硬删除从「按日期整目录 rmtree」
+改为逐个文件、按处置类别、先落日志再删。
+
+- 路径占用原语（`claims.py`）：改名、抓取后即时改名、relink、回退、目录改名之前统一问「谁占着」
+  （盘上的 X / X.!qB、其它种子的条目，按大小写不敏感的 APFS 口径比较）；看不全就不做。
+- 删除关口（`gate.py`）I1–I4：不删某集唯一可播的文件、不删别的种子仍声明的路径、合集只作废一集、
+  封存的集位不删（探测不可用当作封存）。拒绝记 skipped，理由写明是哪条闸。
+- 隔离区处置（`disposal.py`）：判重项须证明安全才硬删、特典与死种半成品到期删、其余不自动删；
+  最短隔离期、容量闸、每次硬删先写 `purge.jsonl` 意图。
+- 测试 292 → 607。
+
 ### 修复
 - **删除前统一过删除关口**（新模块 `media_agent/gate.py`）：每一次移入隔离区之前，按此刻的
   qBittorrent 与磁盘复核，不管是哪条规则提的：
@@ -335,7 +349,8 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wzh4464/self-evolving-media-agent/releases/tag/v0.1.0
