@@ -1,0 +1,28 @@
+{
+  "id": "majo-no-tabitabi-preview-shorts-untracked-v4",
+  "kind": "preview_episode_unrenamed",
+  "severity": "minor",
+  "summary": "捕获魔女之旅 .shorts 目录下所有无 torrent 关联的 Preview 预览集文件",
+  "match": {
+    "all": [
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "\\[Preview\\d{2}\\]"
+      },
+      {
+        "field": "parent_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "torrent_name",
+        "op": "eq",
+        "value": ""
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

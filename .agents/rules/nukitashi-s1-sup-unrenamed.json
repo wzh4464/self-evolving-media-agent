@@ -1,0 +1,29 @@
+{
+  "id": "nukitashi-s1-sup-unrenamed",
+  "kind": "subtitle_unrenamed",
+  "severity": "minor",
+  "summary": "识别《住在拔作岛上的我应该如何是好？》中未规范命名的 NUKITASHI .sup 字幕文件",
+  "match": {
+    "all": [
+      {
+        "field": "ext",
+        "op": "eq",
+        "value": ".sup"
+      },
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "住在拔作岛上的我应该如何是好？"
+      },
+      {
+        "field": "filename",
+        "op": "contains",
+        "value": "【7月】NUKITASHI住在拔作岛上的我该如何是好？"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true,
+  "resolution": "classified"
+}

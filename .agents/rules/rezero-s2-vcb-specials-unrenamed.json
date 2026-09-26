@@ -1,0 +1,28 @@
+{
+  "id": "rezero-s2-vcb-specials-unrenamed",
+  "kind": "special_episode_unrenamed",
+  "severity": "minor",
+  "summary": "捕获 Re:从零开始的异世界生活 第二季 VCB-Studio 发布且位于 .other 或 .shorts 目录下未按规范命名的特典文件",
+  "match": {
+    "all": [
+      {
+        "field": "official_title",
+        "op": "eq",
+        "value": "Re:从零开始的异世界生活"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "\\[VCB-Studio\\].*(NCED|SP\\d{2}_\\d{2}).*\\.mkv$"
+      },
+      {
+        "field": "parent_dir",
+        "op": "in",
+        "value": ".other|.shorts"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

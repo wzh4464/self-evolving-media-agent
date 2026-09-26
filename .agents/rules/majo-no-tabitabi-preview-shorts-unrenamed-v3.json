@@ -1,0 +1,28 @@
+{
+  "id": "majo-no-tabitabi-preview-shorts-unrenamed-v3",
+  "kind": "preview_episode_unrenamed",
+  "severity": "minor",
+  "summary": "捕获《魔女之旅》.shorts 目录下文件名含 [PreviewXX] 且未按规范重命名的预览短片",
+  "match": {
+    "all": [
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "魔女之旅"
+      },
+      {
+        "field": "season_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "\\[Preview\\d+\\]"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

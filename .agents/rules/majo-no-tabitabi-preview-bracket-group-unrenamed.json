@@ -1,0 +1,33 @@
+{
+  "id": "majo-no-tabitabi-preview-bracket-group-unrenamed",
+  "kind": "preview_episode_unrenamed",
+  "severity": "minor",
+  "summary": "命中魔女之旅 .shorts 中带 [Airota&VCB-Studio] 与 [PreviewNN] 标记但未按规范重命名的预览视频",
+  "match": {
+    "all": [
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "魔女之旅"
+      },
+      {
+        "field": "season_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "official_title",
+        "op": "eq",
+        "value": "魔女之旅"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "^\\[Airota&VCB-Studio\\] Majo no Tabitabi \\[Preview(0[1-9]|1[0-2])\\]\\[Ma10p_1080p\\]\\[x265_flac\\]\\.mkv$"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

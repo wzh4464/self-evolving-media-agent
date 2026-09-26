@@ -1,0 +1,33 @@
+{
+  "id": "majo-no-tabitabi-preview-shorts-unrenamed",
+  "kind": "preview_episode_unrenamed",
+  "severity": "minor",
+  "summary": "识别《魔女之旅》.shorts 目录下未按规范命名的 Preview 预览短片",
+  "match": {
+    "all": [
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "魔女之旅"
+      },
+      {
+        "field": "season_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "\\[Preview\\d{2}\\]"
+      },
+      {
+        "field": "filename",
+        "op": "not_regex",
+        "value": "^魔女之旅 S\\d{2}E\\d{2}"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

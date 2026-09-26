@@ -1,0 +1,28 @@
+{
+  "id": "rezero-s2-vcb-nced-sp-leftover",
+  "kind": "special_episode_unrenamed",
+  "severity": "minor",
+  "summary": "识别 [VCB-Studio] Re:从零开始的异世界生活 第二季中未被现有规则覆盖的 NCED/SP 系列残留文件",
+  "match": {
+    "all": [
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "^\\[VCB-Studio\\] Re Zero kara Hajimeru Isekai Seikatsu 2nd Season \\[(NCED|SP)\\d+"
+      },
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "Re:从零开始的异世界生活"
+      },
+      {
+        "field": "season_dir",
+        "op": "in",
+        "value": ".other|.shorts"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

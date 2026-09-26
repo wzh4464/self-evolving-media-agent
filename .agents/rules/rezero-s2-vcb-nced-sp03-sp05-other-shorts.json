@@ -1,0 +1,28 @@
+{
+  "id": "rezero-s2-vcb-nced-sp03-sp05-other-shorts",
+  "kind": "special_episode_unrenamed",
+  "severity": "minor",
+  "summary": "抓取 Re:从零开始异世界生活第二季 VCB-Studio 片源中散落在 .other/.shorts 目录、命名含 NCED 或 SP03/SP05 的未重命名特典文件",
+  "match": {
+    "all": [
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "Re:从零开始的异世界生活"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "\\[VCB-Studio\\] Re Zero kara Hajimeru Isekai Seikatsu 2nd Season \\[(NCED|SP03|SP05)"
+      },
+      {
+        "field": "season_dir",
+        "op": "in",
+        "value": ".other|.shorts"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}

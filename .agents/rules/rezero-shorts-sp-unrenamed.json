@@ -1,0 +1,28 @@
+{
+  "id": "rezero-shorts-sp-unrenamed",
+  "kind": "special_episode_unrenamed",
+  "severity": "minor",
+  "summary": "标记 Re:从零开始的异世界生活 .shorts 目录下未重命名的 SP 编号特典短片",
+  "match": {
+    "all": [
+      {
+        "field": "show_dir",
+        "op": "eq",
+        "value": "Re:从零开始的异世界生活"
+      },
+      {
+        "field": "season_dir",
+        "op": "eq",
+        "value": ".shorts"
+      },
+      {
+        "field": "filename",
+        "op": "regex",
+        "value": "^\\[VCB-Studio\\].*\\[SP\\d{2}_\\d{2}\\]"
+      }
+    ]
+  },
+  "action": null,
+  "source": "evolved",
+  "enabled": true
+}
