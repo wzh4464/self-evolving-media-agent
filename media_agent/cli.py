@@ -899,6 +899,13 @@ def main() -> int:
     except ValueError as e:
         _log(f"配置错误：{e}")
         return 2
+    # 所有子命令的输出（print、_log、ctx.log、run 的时间戳层）先过打码：日志里不许出现密钥
+    # （2026-09-27：TMDB 报错把 api_key 明文带进了 run.log，见 runlog.Redacting）。
+    with runlog.redacting(lambda s: notify.redact(cfg, s)):
+        return _dispatch(args, cfg)
+
+
+def _dispatch(args, cfg) -> int:
     paused = pause.reason(cfg) if getattr(args, "pause", False) else ""
     if args.cmd == "run":
         # launchd 把这些输出追加进 state/run.log / run.err.log：每一行带时间与批次 ID（`runlog`）
