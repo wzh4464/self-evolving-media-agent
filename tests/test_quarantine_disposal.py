@@ -691,6 +691,36 @@ def test_a_dead_partial_whose_name_a_new_download_wants_is_kept(lib, no_rmtree):
     assert moved.exists() and not rep.deleted
 
 
+def test_a_dead_partial_whose_name_a_finished_torrent_claims_but_lacks_is_kept(lib, no_rmtree):
+    """新下载说自己下完了、盘上却没有 `X`（幻影）：它仍在等这个名字，删不删这份半成品都不对劲——
+    交给人。只有新主人真把 `X` 完整地放在盘上，那份不相干的半成品才能删。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    s1.torrent({"尼古喵喵 S01E11.mkv": GB}, name="[B] Yani Neko - 11.mkv", layout="single",
+               on_disk=False)
+    moved = legacy(lib, "尼古喵喵 S01E11.mkv.!qB", rule="dead-torrent", kind="dead_partial",
+                   days_ago=40)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+
+
+def test_an_origin_its_own_torrent_still_wants_is_kept_even_when_the_file_is_back(lib, no_rmtree):
+    """声明着原路径的正是它当初所属的种子（隔离没做完，qBittorrent 又把它下了回来）：不是"新主人"，
+    照旧不删、交给人。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    pack = s1.torrent({"尼古喵喵 S01E01.mkv": GB, "尼古喵喵 NCOP.mkv": 90_000_000},
+                      name="[G] Yani Neko 01+NCOP", layout="nosub")
+    moved = legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=40,
+                   args={"torrent_hash": pack.hash})
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert pack.hash[:8] in c.why
+
+
 def test_nothing_is_eligible_when_qbittorrent_cannot_be_asked(lib):
     """预演在 qBittorrent 不可用时照样能看，但原路径问不了——一个都不算可删。"""
     legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=40)

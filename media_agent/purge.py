@@ -458,6 +458,11 @@ def _origin_problem(claims, c: Candidate, surv_path: Path | None = None,
     两种都该留着给人看。优先级 0 的声明不算：`file_only` 隔离之后种子照样列着那个条目，那正是
     隔离做完了的样子。替代者自己的种子声明着原路径也不算（输家当初就叫规范名，赢家同一批改名到了
     这个名字上）。`.!qB` 按它的正名问（种子声明的是 `X`）。qBittorrent 问不了 → 不删。
+
+    **名字的新主人也不算**（`_new_owner`，2026-09-26 审查）：声明者不是它当初所属的种子、自己已经
+    下完、而且 `X` 完整地在盘上——它要的文件就在那里，隔离区这份与它无关。停滞换源正是这个形态：
+    死种的 40% `X.!qB` 进了隔离区，新种子下完、改到 `X` 上；以前这份半成品永远不删、每 6 小时报一次
+    "那个种子就指着一个不存在的文件"（并不存在）。
     """
     if not c.origin:
         return "原路径不明（审计记录里没有 path），无法确认有没有种子还要它"
@@ -468,10 +473,43 @@ def _origin_problem(claims, c: Candidate, surv_path: Path | None = None,
     chk = claims.check(base, own_hash=own_hash, own_path=own_path, disk=False)
     if chk.unknown:
         return f"无法确认原路径此刻有没有种子声明（{chk.unknown}），不删"
-    if chk.claimants:
-        return (f"原路径仍被种子以优先级非 0 声明（{chk.describe()}）：当初的隔离没做完，或又有种子"
-                f"要往那里写——删了它，那个种子就指着一个不存在的文件")
+    from .claims import ClaimCheck, ClaimsUnknown
+    try:
+        live = [cl for cl in chk.claimants if not _new_owner(claims, c, cl)]
+    except ClaimsUnknown as e:
+        return f"无法确认原路径此刻有没有种子声明（{e}），不删"
+    if live:
+        return (f"原路径仍被种子以优先级非 0 声明（{ClaimCheck(chk.target, live).describe()}）：当初的"
+                f"隔离没做完，或又有种子要往那里写——删了它，那个种子就指着一个不存在的文件")
     return ""
+
+
+def _new_owner(claims, c: Candidate, cl) -> bool:
+    """声明着原路径的 `cl` 是这个名字的**新主人**（与隔离区这份无关），而不是"隔离没做完 / 正要
+    往那写"吗？三条都满足才算：
+
+    - 它不是这份文件当初所属的种子（`deletion.subject.torrent_hash`，旧记录看 `args.torrent_hash`）；
+    - 它的这个条目下完了（合集里别的集还在下不要紧），声明的是 `X` 本身而不是 `X.!qB`；
+    - `X` 此刻是盘上的普通文件、不比它声明的小。
+
+    读 qBittorrent 失败抛 `ClaimsUnknown`（调用方按看不全处理）。"""
+    rec = c.record or {}
+    mine = {h.lower() for h in (((rec.get("deletion") or {}).get("subject") or {}).get("torrent_hash"),
+                                (rec.get("args") or {}).get("torrent_hash")) if h}
+    if cl.kind != "qbit" or cl.partial or not cl.hash or cl.hash.lower() in mine:
+        return False
+    t = claims.torrent(cl.hash)
+    if t is None:
+        return False
+    sp = Path((t.get("save_path") or "").rstrip("/") or "/")
+    e = next((e for e in claims.entries(cl.hash) if fold(sp / e["name"]) == fold(cl.path)), None)
+    if e is None or float(e.get("progress", 0) or 0) < 1:
+        return False
+    try:
+        st = os.lstat(cl.path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_size > 0 and st.st_size >= int(e.get("size") or 0)
 
 
 def _human_why(c: Candidate) -> str:

@@ -98,6 +98,28 @@ def test_replacement_takes_the_slot_once_the_dead_partial_is_disposed_of(lib):
     assert not (s1.path / (SLOT + ".!qB")).exists()
 
 
+def test_the_dead_partial_is_disposed_of_once_the_replacement_owns_the_name(lib):
+    """故事的结尾（2026-09-26 审查，复现 7/7）：换源的新种子下完、改到集位名上，它以优先级 1 声明
+    `X`、`X` 完整地在盘上。隔离区里那份 40% 的 `X.!qB` 属于另一个早已摘掉的死种——以前"原路径
+    仍被种子声明"把它永远留着，每 6 小时在 run.log 里报一次"删了它那个种子就指着一个不存在的
+    文件"（并不存在），94% 满的容器上这份空间永远腾不出来。"""
+    from datetime import datetime, timedelta
+
+    from media_agent import disposal
+
+    s1, old, item = _scene(lib, active_hours_ago=72)
+    lib.cycle()
+    lib.qbit.complete(item.infohash)
+    lib.converge()
+    assert lib.qbit.file_names(item.infohash) == [SLOT]
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p900",
+                           now=datetime.now() + timedelta(days=31))
+
+    assert [c.trash_path.name for c in rep.deleted] == [SLOT + ".!qB"]
+    assert (s1.path / SLOT).exists() and not rep.overdue
+
+
 def test_stalled_but_seen_complete_recently_is_not_replaced(lib):
     s1, old, item = _scene(lib, active_hours_ago=72)
     lib.qbit.raw(old.hash)["seen_complete"] = int(time.time() - 3600)
