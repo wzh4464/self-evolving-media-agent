@@ -259,6 +259,29 @@ def test_cmd_rollback_exits_nonzero_when_qbit_down(offline_cli, capsys):
     assert lib.snapshot() == after
 
 
+def test_cmd_repair_exits_nonzero_when_qbit_down(offline_cli, capsys):
+    """以前 CLI 层没有测试：删掉 `if res.get("refused")` 这一句，repair 就打印
+    「分裂目录 0 对」并返回 0——正是 launchd 上看不见的"降级还 rc 0"。"""
+    lib = offline_cli
+    old = lib.show("旧名").season(1)
+    old.local("旧名 S01E01.mkv", size=1000)
+    new = lib.show("新名").season(1)
+    rec = {"ts": "2026-09-20T00:00:00", "run_id": "r2", "status": "applied",
+           "dry_run": False, "rule": "title-drift", "kind": "title_drift",
+           "op": "rename_show_dir", "args": {}, "summary": "x",
+           "undo": {"op": "rename_show_dir", "path": str(new.show.path), "new_name": "旧名"}}
+    lib.cfg.audit_log.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
+    lib.qbit_down()
+    before = lib.disk()
+
+    rc = cli.cmd_repair(_args(run="r2"), lib.cfg)
+
+    out = capsys.readouterr().out
+    assert rc == cli.EXIT_DEGRADED
+    assert "拒绝" in out and "分裂目录" not in out
+    assert lib.disk() == before
+
+
 def test_cmd_purge_apply_refuses_when_qbit_down(offline_cli, capsys):
     lib = offline_cli
     victim = lib.cfg.trash_dir / "2026-09-20" / "测试番" / "Season 1" / "测试番 S01E01.mkv"
