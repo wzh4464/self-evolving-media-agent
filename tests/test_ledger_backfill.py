@@ -144,15 +144,44 @@ def test_a_torrent_nobody_knows_is_reported_and_not_looked_up_again_soon(lib):
 
     rep = lb.backfill(lib.context())
     calls = len(lib.web.calls)
-    from media_agent.cache import Cache
-    Cache(lib.cfg.cache_db).conn.execute("DELETE FROM llm")             # feed 缓存过期了也一样
-    Cache(lib.cfg.cache_db).conn.commit()
+    _expire_feed_cache(lib)                             # feed 缓存过期了也一样
     rep2 = lb.backfill(lib.context())
 
     assert [r["hash"] for r in rep.remaining] == [H_NONE] and rep.covered == 0
     assert rep.remaining[0]["show"] == "尼古喵喵"
     assert len(lib.web.calls) == calls                  # MISS_TTL 之内不再为它拉番组页
     assert [r["hash"] for r in rep2.remaining] == [H_NONE]
+
+
+def _expire_feed_cache(lib) -> None:
+    """番组页 feed 的缓存过期（删掉）。**同一条连接上**删、提交：以前 `Cache(db).conn.execute(...)` 与
+    `Cache(db).conn.commit()` 是两条连接，删除从没提交、被回滚，缓存一直是热的——"不再拉番组页"于是与 `lookup_miss`
+    无关地成立，这条测试什么都没钉住（2026-09-27 审查：去掉 `if h in misses` 或 `note_miss` 的变异都存活）。"""
+    from media_agent.cache import Cache
+    c = Cache(lib.cfg.cache_db)
+    c.conn.execute("DELETE FROM llm")
+    c.conn.commit()
+    assert c.conn.execute("SELECT count(*) FROM llm").fetchone()[0] == 0
+    c.conn.close()
+
+
+def test_a_miss_is_looked_up_again_after_miss_ttl(lib):
+    """`MISS_TTL`（7 天）过了，番组页里没找到的种子再找一次：新的一集可能后来才出现在番组页上。"""
+    sh = lib.show("尼古喵喵")
+    sh.sidecar(mikan_id="4102")
+    sh.season(1).single("[X] Yani Neko - 10.mkv", hash=H_NONE)
+    lib.mikan("4102", [MikanItem(title=LOLI, pub="2026-08-22", url=_url(H_FEED))])
+    lb.backfill(lib.context())
+    calls = len(lib.web.calls)
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.conn.execute("UPDATE lookup_miss SET checked_at = checked_at - ?", (ledger.MISS_TTL + 60,))
+        led.conn.commit()
+    _expire_feed_cache(lib)
+
+    rep = lb.backfill(lib.context())
+
+    assert len(lib.web.calls) == calls + 1              # 过期了：再拉一次番组页
+    assert [r["hash"] for r in rep.remaining] == [H_NONE]
 
 
 def test_backfill_is_idempotent(lib):
