@@ -1256,11 +1256,20 @@ class Executor:
         逆操作是 magnet 重加 / 恢复优先级，**绝不**写 `restore_from_trash`——
         隔离区里没有东西，那正是 LAT-02 空 `trash_path` 的来源。
 
+        **还没下完的 `file_only` 条目**（extras-in-library 对合集里的 NCOP / PV，
+        判重对合并发布的另一版本）：盘上只有 `.!qB` 或什么都没有，本来就不该"在"。
+        立刻设为不下载——main 一直是这么做的；第 2 条修复之后它被当成"文件不在"
+        跳过，特典照下不误（占带宽、占 94% 满的容器，critic N8），下完下一轮才隔离，
+        停滞的合集则每轮写一条误导的跳过记录。种子只剩这一个要下的文件时（单文件
+        PV / CM 种子）摘掉记录，半成品留在原地（与 main 相同）。
+
         其余情形一律跳过、种子与文件都不动：诊断之后才被挪走的（种子多半该
-        relink 而不是摘）、种子已不再声明这个路径的、又开始下载的。
+        relink 而不是摘）、种子已不再声明这个路径的、又开始下载的幻影。
         """
         h = a.args.get("torrent_hash") or ""
-        if not (h and a.args.get("phantom")) or h in self._removed_torrents:
+        file_only = bool(a.args.get("file_only"))
+        if (not h or not (a.args.get("phantom") or file_only)
+                or h in self._removed_torrents):
             self._audit("skipped", f, a, {"reason": self._GONE})
             return
         if not self.ctx.qbit:
@@ -1281,13 +1290,25 @@ class Executor:
         entry = next((e for e in entries if sp / e["name"] == path), None)
         if entry is None or entry.get("priority", 1) == 0:
             self._audit("skipped", f, a, {
-                "reason": "种子已不再声明这个路径（改过名或已设为不下载），不是幻影了"})
+                "reason": "种子已不再声明这个路径（改过名或已设为不下载），不用再处置"})
+            return
+        wanted = [e for e in entries if e.get("priority", 1) != 0]
+        if file_only and entry.get("progress", 0) < 1:
+            if len(wanted) > 1:
+                self._zero_priority(f, a, h, entry,
+                                    "还没下完：设为不下载，不必等它下完再隔离")
+            else:
+                self._drop_record(f, a, victim,
+                                  "种子只剩这一个要下的文件且还没下完：摘掉记录，"
+                                  "半成品留在原地")
+            return
+        if not a.args.get("phantom"):
+            self._audit("skipped", f, a, {"reason": self._GONE})
             return
         if entry.get("progress", 0) < 1 or os.path.lexists(str(path) + ".!qB"):
             self._audit("skipped", f, a, {"reason": "种子又在下载这个文件，不是幻影了"})
             return
-        wanted = [e for e in entries if e.get("priority", 1) != 0]
-        if a.args.get("file_only") and len(wanted) > 1:
+        if file_only and len(wanted) > 1:
             self._zero_priority(f, a, h, entry,
                                 "幻影：盘上没有这个文件，只把这个条目设为不下载，种子其余部分照常做种")
         else:
