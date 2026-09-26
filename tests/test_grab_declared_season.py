@@ -10,7 +10,7 @@ sidecar 的 S0 `have` 变成 `[1, 2, 3, 4]`。
 
 不变式：目标是第 N 季，声明第 M 季（M ≠ N）的发布不是候选——除非 sidecar 的 `season_offsets` 把 M 换算进来
 （Re:Zero 按 TMDB 压平成一季，`3rd Season - 08` 是 S01E58）；特典位（第 0 季）只从标着特别篇 / OVA / SP 的发布里抓。
-被排除的照样报「明显属于别季」，不悄悄跳过。标题用生产上的真名字（辉夜、入间），其余合成。
+被排除的照样报「明显属于别季」，不悄悄跳过。标题用生产上的真名字（辉夜、入间），其余（TMDB / 番组页 id、日期）合成。
 """
 from __future__ import annotations
 
@@ -34,16 +34,16 @@ def _kaguya(lib, extra_items=()):
     lib.configure(qbit_allow_empty=True)
     specials = [(1, "2019-05-01"), (2, "2020-06-01"), (3, "2021-05-19"), (4, "2021-05-26"),
                 (5, days_ago(20))]
-    lib.tmdb.add_show(83121, KAGUYA, seasons={0: specials, 1: weekly(12, first_days_ago=2700),
+    lib.tmdb.add_show(1101, KAGUYA, seasons={0: specials, 1: weekly(12, first_days_ago=2700),
                                                2: weekly(12, first_days_ago=2300),
                                                3: weekly(13, first_days_ago=1650)})
     sh = lib.show(KAGUYA)
     for n in (1, 2):
         sh.folder("Season 0").local(f"{KAGUYA} S00E{n:02d}.mkv")
-    sh.sidecar(tmdb_id=83121, tmdb_title=KAGUYA, mikan_id="2699", seasons={"0": {"have": [1, 2]}})
+    sh.sidecar(tmdb_id=1101, tmdb_title=KAGUYA, mikan_id="4101", seasons={"0": {"have": [1, 2]}})
     items = [MikanItem(title=LOLI_S3.format(3), pub="2022-04-26"),
              MikanItem(title=LOLI_S3.format(4), pub="2022-05-07"), *extra_items]
-    lib.mikan("2699", items, search=[KAGUYA])
+    lib.mikan("4101", items, search=[KAGUYA])
     return sh
 
 
@@ -89,14 +89,14 @@ def _iruma(lib, titles: list[str], offsets: dict | None = None):
     """桜都把 TMDB 的第四季标成「第3季 / 3rd Season」（生产 2026-09 的真名字）；Nix-Raws 写 S04E20。"""
     lib.configure(qbit_allow_empty=True)
     schedule = weekly(21, first_days_ago=140)
-    lib.tmdb.add_show(91801, IRUMA, seasons={4: schedule})
+    lib.tmdb.add_show(1102, IRUMA, seasons={4: schedule})
     sh = lib.show(IRUMA)
     for n in range(1, 20):
         sh.season(4).local(f"{IRUMA} S04E{n:02d}.mkv")
-    sh.sidecar(tmdb_id=91801, tmdb_title=IRUMA, mikan_id="3918",
+    sh.sidecar(tmdb_id=1102, tmdb_title=IRUMA, mikan_id="4102",
                season_offsets=offsets or {}, seasons={"4": {"have": list(range(1, 20))}})
     pub = dict(schedule)
-    lib.mikan("3918", [MikanItem(title=t.format(ep=e), pub=pub[e]) for t in titles for e in (20, 21)],
+    lib.mikan("4102", [MikanItem(title=t.format(ep=e), pub=pub[e]) for t in titles for e in (20, 21)],
               search=[IRUMA])
     return sh
 
@@ -140,12 +140,12 @@ def test_flattened_numbering_only_lands_on_the_mapped_episode(lib):
     start = date.today() - timedelta(days=60)
     eps = [(n, (date(2016, 4, 1) + timedelta(days=7 * n)).isoformat()) for n in range(1, 51)]
     eps += [(50 + i, (start + timedelta(days=7 * (i - 1))).isoformat()) for i in range(1, 10)]
-    lib.tmdb.add_show(65942, "Re:从零开始的异世界生活", seasons={1: eps})
+    lib.tmdb.add_show(1103, "Re:从零开始的异世界生活", seasons={1: eps})
     sh = lib.show("Re:从零开始的异世界生活")
     have = [n for n in range(1, 58) if n != 8]                  # 第 8 集也缺着
     for n in have:
         sh.season(1).local(f"Re:从零开始的异世界生活 S01E{n:02d}.mkv")
-    sh.sidecar(tmdb_id=65942, tmdb_title="Re:从零开始的异世界生活", mikan_id="3300",
+    sh.sidecar(tmdb_id=1103, tmdb_title="Re:从零开始的异世界生活", mikan_id="3300",
                season_offsets={"3": 50}, seasons={"1": {"have": have}})
     lib.mikan("3300", [MikanItem(title="[Fyy Raws] Re:Zero kara Hajimeru Isekai Seikatsu 3rd Season - 08 [1080p][简繁内封]",
                                  pub=dict(eps)[58])], search=["Re:从零开始的异世界生活"])

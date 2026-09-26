@@ -88,13 +88,13 @@ def test_payload_user_intent_never_overwrites_the_file(lib, show):
 
 def test_existing_tmdb_id_is_never_changed_by_code(lib, show):
     """TMDB 身份：代码只在还没有时填一次；填上之后只有人改（扫描照它认，见 TMDB 钉住）。"""
-    show.sidecar(tmdb_id=46195, tmdb_title="物语系列")
+    show.sidecar(tmdb_id=1201, tmdb_title="物语系列")
 
     lib.apply([_write_finding(show.path, {"tmdb_id": 99, "tmdb_title": "别的番",
                                           "tmdb_source": "search"})])
 
     after = _raw(show.path)
-    assert (after["tmdb_id"], after["tmdb_title"]) == (46195, "物语系列")
+    assert (after["tmdb_id"], after["tmdb_title"]) == (1201, "物语系列")
 
 
 def test_sidecar_sync_does_not_propose_a_different_tmdb_id(lib, show):

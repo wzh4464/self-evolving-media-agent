@@ -20,7 +20,7 @@ from media_agent import cli, titles
 from media_agent import sidecar as sc_mod
 from media_agent.cache import Cache
 
-ID = 46195
+ID = 1201                                 # 合成的；生产上是物语系列的条目
 
 
 def _age_cache(lib, key: str, days: float) -> None:
@@ -48,7 +48,7 @@ def _search_calls(lib) -> list:
 
 # ------------------------------------------------------------------ LAT-04
 def _monogatari(lib, title: str = "物语系列"):
-    """物语系列：TMDB 把多部作品收成一个条目（46195），库里按作品分目录——两个目录都钉在 46195 上。"""
+    """物语系列：TMDB 把多部作品收成一个条目，库里按作品分目录——两个目录都钉在这一个条目上。"""
     lib.configure(qbit_allow_empty=True)
     lib.tmdb.add_show(ID, title, seasons={1: weekly(10, first_days_ago=4000)})
     host = lib.show("化物语")
