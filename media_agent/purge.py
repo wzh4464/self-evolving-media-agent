@@ -255,8 +255,9 @@ def _identity_problem(f, show, slot) -> str:
 class _Pool:
     """一次 `build_pool` 的上下文：配置、此刻、按需建的库快照。"""
 
-    def __init__(self, ctx, now: datetime):
+    def __init__(self, ctx, now: datetime, early: bool = True):
         self.ctx = ctx
+        self.early = early
         self.cfg = ctx.config
         self.now = now
         self.media_root = Path(self.cfg.media_root)
@@ -286,9 +287,12 @@ class _Pool:
         return self._shows
 
 
-def build_pool(ctx, *, now: datetime | None = None) -> list[Candidate]:
-    """扫描隔离区，逐份给出处置类别与"此刻能否安全删除"。只读：不删、不写任何东西。"""
-    pool = _Pool(ctx, now or datetime.now())
+def build_pool(ctx, *, now: datetime | None = None, early: bool = True) -> list[Candidate]:
+    """扫描隔离区，逐份给出处置类别与"此刻能否安全删除"。只读：不删、不写任何东西。
+
+    `early=False`：保留期内的判重不去证明（记"还在保留期里"、不算可删）。`run` 在空间充足时这样用——
+    它们这一轮反正不删，证明要重扫整个库、探测、读头尾摘要，每 6 小时白做一遍。"""
+    pool = _Pool(ctx, now or datetime.now(), early)
     audit = _audit_by_trash_path(Path(pool.cfg.audit_log))
     manual = _manual_by_trash_path(Path(pool.cfg.state_dir) / "purge.jsonl", pool.trash_root)
 
@@ -338,6 +342,10 @@ def _judge(pool: _Pool, c: Candidate) -> None:
                  f"（QUARANTINE_MIN_AGE_DAYS）：这一批还可能要回退")
         return
     if d == "duplicate":
+        if not c.expired and not pool.early:
+            c.why = (f"判重：还在保留期里（隔离 {c.age_days:.1f} 天，保留 {pool.retention:g} 天）；"
+                     f"空间充足，run 不提前删，这一轮也不去证明")
+            return
         _prove_duplicate(pool, c)
         return
     left = pool.retention - (c.age_days or 0)

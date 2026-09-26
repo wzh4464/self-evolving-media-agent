@@ -238,7 +238,17 @@ APFS 容器（critic N8：`/System/Volumes/Data` 与 `/Volumes/Backup` 共用约
 **测试**：`tests/test_trash_space.py`——放不下（刚好一份、没有余量）与读不到剩余空间时判重输家的隔离跳过，
 种子与文件都不动；对照：放得下照常隔离；回退时媒体库放不下，文件留在隔离区。改前三条红。
 
-## 10. 写进约束
+## 10. `run` 空间充足时不证明保留期内的判重
+
+证明一个判重要重扫整个库（`build_state`，生产约 539 次 `files()`）、探测两份、读两份头尾 8 MB 摘要。测绘时
+隔离区里常年躺着 19 个判重，都在保留期内——`run` 这一轮反正不删它们（第 2 节），却每 6 小时把这些白做一遍
+（约 600 MB 读、一次整库扫描）。`build_pool(early=False)`：保留期内的判重记「还在保留期里…这一轮也不去证明」、
+不算可删。`run` 只在空间不足（要提前删）时 `early=True`；`purge`（手动，本来就要提前放）总是证明。
+
+**测试**：`tests/test_quarantine_disposal.py` 末条——空间充足时 `run` 对保留期内的判重一次 `build_state` 都不调、
+不删；空间不足时调一次并提前删。第 2 节那条"等满保留期"的用例改用 `purge` 预演看"证明得了"。改前红。
+
+## 11. 写进约束
 
 AGENTS.md「不可动摇的约束」第 10 条：隔离区的硬删除只经 `disposal.hard_delete`（先写意图、逐个文件、永不
 `rmtree`），删不删由 `purge.build_pool` 按处置类别判，unlink 前 `purge.recheck`，容量闸只在已证明可删的里面

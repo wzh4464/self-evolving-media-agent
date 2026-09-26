@@ -276,7 +276,8 @@ def dispose(ctx, *, mode: str, run_id: str, dry_run: bool = False,
         rep.recovered = recover(log)
     rep.min_free = int(float(cfg.min_free_gb) * 1e9)
     rep.free_before = free_bytes(cfg.media_root)
-    rep.pool = purge.build_pool(ctx, now=now)
+    # run 在空间充足时不删保留期内的判重，也就不必为它们重扫整个库（purge.build_pool 的 early）
+    rep.pool = purge.build_pool(ctx, now=now, early=(mode == "manual" or rep.low_space))
     for c, early in select(rep.pool, mode, low_space=(mode == "run" and rep.low_space)):
         if early:
             if rep.free_after >= rep.min_free:

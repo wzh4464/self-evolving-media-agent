@@ -228,9 +228,10 @@ def test_new_extras_record_from_a_real_cycle_expires(lib, no_rmtree):
 def test_run_deletes_a_verified_duplicate_only_after_retention(lib, no_rmtree):
     s1, good, moved = _trash_the_raw_one(lib)
 
-    rep = disposal.dispose(lib.context(), mode="run", run_id="p001", now=_later(10))
-    [c] = rep.pool
+    [c] = disposal.dispose(lib.context(), mode="manual", run_id="p000", now=_later(10),
+                           dry_run=True).pool
     assert c.disposition == "duplicate" and c.eligible      # 证明得了……
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001", now=_later(10))
     assert moved.exists() and not rep.deleted               # ……但还在保留期里：留着给回退
 
     rep = disposal.dispose(lib.context(), mode="run", run_id="p002", now=_later(31))
@@ -739,3 +740,26 @@ def test_min_free_gb_comes_from_the_environment(monkeypatch):
     assert load_config().min_free_gb == 50
     monkeypatch.setenv("MIN_FREE_GB", "80")
     assert load_config().min_free_gb == 80
+
+
+def test_run_with_room_does_not_rescan_for_duplicates_it_would_keep_anyway(lib, monkeypatch,
+                                                                            no_rmtree):
+    """保留期内的判重 `run` 反正不删（空间充足时）：不为它们重扫整个库、不探测、不读摘要。
+    生产隔离区里常年躺着十几个这样的判重，每 6 小时白扫一遍库、白读几百 MB。"""
+    s1, good, moved = _trash_the_raw_one(lib)
+    from media_agent import scan
+    calls = []
+    real = scan.build_state
+    monkeypatch.setattr(scan, "build_state", lambda *a, **k: calls.append(1) or real(*a, **k))
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001", now=_later(10))
+
+    assert calls == [] and moved.exists()
+    [c] = rep.pool
+    assert not c.eligible and "保留期" in c.why
+
+    _free(monkeypatch, 0)                               # 空间不足：这时才值得证明
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p002", now=_later(10))
+
+    assert calls == [1] and [c.trash_path for c in rep.deleted] == [moved]
+
