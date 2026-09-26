@@ -27,7 +27,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 FINDINGS_DIR = "findings"
@@ -151,3 +151,140 @@ def load_snapshots(state_dir) -> list[Snapshot]:
                             cmd=str(head.get("cmd") or ""), degraded=bool(head.get("degraded")),
                             findings=recs))
     return out
+
+
+# ---------------------------------------------------------------------------
+# 卡住检测
+# ---------------------------------------------------------------------------
+# 只有这些严重度、或带动作的发现才会被认作"卡住"：minor 的（「均在 7 天内播出，等发布即可」）挂多久都正常。
+STUCK_SEVERITIES = ("critical", "important")
+
+
+def qualifies(rec: dict) -> bool:
+    """这条快照里的发现算不算"该收敛却没收敛"的那一类：带动作，或严重度 ≥ important。"""
+    return bool(rec.get("op")) or rec.get("severity") in STUCK_SEVERITIES
+
+
+@dataclass
+class Stuck:
+    """一个连续 `runs` 轮都在的问题。`ack` 是 `.agents/acks.json` 里仍有效的确认（没有为 None）。"""
+    fp: str
+    rule: str
+    kind: str
+    severity: str
+    show: str
+    target: str
+    summary: str
+    op: str | None
+    runs: int
+    first_seen: str
+    ack: dict | None = None
+
+    def to_dict(self) -> dict:
+        return {"fp": self.fp, "rule": self.rule, "kind": self.kind, "severity": self.severity,
+                "show": self.show, "target": self.target, "summary": self.summary, "op": self.op,
+                "runs": self.runs, "first_seen": self.first_seen, "ack": self.ack}
+
+
+def find_stuck(state_dir, run_id: str, *, min_runs: int, acks: dict | None = None,
+               today=None) -> list[Stuck]:
+    """本轮（`run_id` 的快照）里、连续至少 `min_runs` 轮 `run` 都在的问题，按连续轮数从多到少。
+
+    - 只数 `cmd == "run"` 的快照：手动 diagnose 几次不该让它提前升级，也不打断；
+    - 读 qBittorrent 不完整（`degraded`）的一轮不算数也不打断——那一轮的发现不可信；本轮就是降级的，
+      返回空（残缺快照里"不在了"不代表解决了，"还在"也不可信）；
+    - 连续 = 按批次 ID 排好的 run 快照里一轮不缺；中间哪一轮没有它（解决过又复发）就从那之后重新数。
+    - 确认过（`acks`，`until` 含当天）的照样返回，`ack` 字段带上确认，由调用方决定只计数不列出。
+    """
+    runs = [s for s in load_snapshots(state_dir) if s.cmd == "run" and not s.degraded]
+    idx = next((i for i, s in enumerate(runs) if s.run_id == run_id), None)
+    if idx is None:
+        return []
+    today = today or datetime.now().date()
+    history_ = runs[:idx + 1]
+    current = {r["fp"]: r for r in history_[-1].findings if r.get("fp") and qualifies(r)}
+    out: list[Stuck] = []
+    for fp, rec in current.items():
+        streak, first = 0, history_[-1]
+        for snap in reversed(history_):
+            if not any(r.get("fp") == fp and qualifies(r) for r in snap.findings):
+                break
+            streak, first = streak + 1, snap
+        if streak < min_runs:
+            continue
+        out.append(Stuck(fp=fp, rule=str(rec.get("rule") or ""), kind=str(rec.get("kind") or ""),
+                         severity=str(rec.get("severity") or ""), show=str(rec.get("show") or ""),
+                         target=str(rec.get("target") or ""), summary=str(rec.get("summary") or ""),
+                         op=rec.get("op"), runs=streak, first_seen=first.ts,
+                         ack=active_ack(acks or {}, fp, today)))
+    out.sort(key=lambda s: (-s.runs, s.show, s.kind, s.fp))
+    return out
+
+
+def seen_fingerprints(state_dir) -> dict[str, dict]:
+    """发现历史里出现过的每个指纹 → 最近一次的那条记录（`ack` 命令用来核对、补全说明）。"""
+    out: dict[str, dict] = {}
+    for snap in load_snapshots(state_dir):
+        for r in snap.findings:
+            if r.get("fp"):
+                out[r["fp"]] = r
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 确认：`.agents/acks.json`（版本化的用户意图）
+# ---------------------------------------------------------------------------
+# 形如 {指纹: {"reason": 为什么先不管, "until"?: "YYYY-MM-DD"（含当天，过了重新提醒）,
+#            "added": "YYYY-MM-DD", "what": "规则 / 类型 / 目标（给人看的）"}}。
+# 为什么放 `.agents/` 而不是 `state/`：它和 `preferences.json` 一样是**人的决定**，生产行为要能从 git
+# 完整复现（CHANGELOG「版本与发布约定」）；在生产上改了，部署的漂移闸门会拦下它，要带回来提交。
+ACKS_NAME = "acks.json"
+
+
+def acks_path() -> Path:
+    from . import config
+    return config.PROJECT_ROOT / ".agents" / ACKS_NAME
+
+
+def load_acks(path: Path | None = None) -> tuple[dict, list[str]]:
+    """读确认文件。不存在 = 没有确认；读不了 / 格式不对返回空并说明——宁可多提醒，不静默吞掉。"""
+    p = Path(path or acks_path())
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, []
+    except (OSError, UnicodeDecodeError) as e:
+        return {}, [f"读不了 {p.name}（{type(e).__name__}: {e}），这一轮按没有确认处理"]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return {}, [f"{p.name} 不是合法 JSON（{e}），这一轮按没有确认处理"]
+    if not isinstance(data, dict):
+        return {}, [f"{p.name} 顶层应是 {{指纹: {{reason, until?}}}}，这一轮按没有确认处理"]
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}, []
+
+
+def active_ack(acks: dict, fp: str, today) -> dict | None:
+    """`fp` 此刻仍有效的确认；`until`（YYYY-MM-DD，含当天）过了、或写错了都算无效。"""
+    ack = acks.get(fp)
+    if not ack:
+        return None
+    until = ack.get("until")
+    if until:
+        try:
+            if today > date.fromisoformat(str(until)):
+                return None
+        except ValueError:
+            return None
+    return ack
+
+
+def save_acks(acks: dict, path: Path | None = None) -> Path:
+    """按指纹排序、缩进 2 写回（git diff 干净）。先写临时文件再改名。"""
+    p = Path(path or acks_path())
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.tmp")
+    tmp.write_text(json.dumps(dict(sorted(acks.items())), ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, p)
+    return p

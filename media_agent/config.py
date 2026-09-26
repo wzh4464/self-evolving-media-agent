@@ -55,6 +55,17 @@ def _seconds(v: str, name: str) -> float:
     return x
 
 
+def _int_at_least(v: str, name: str, minimum: int) -> int:
+    """不小于 `minimum` 的整数。写错了大声失败，理由同 `_seconds`。"""
+    try:
+        x = int(v.strip())
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} 要写成整数，收到 {v!r}") from None
+    if x < minimum:
+        raise ValueError(f"{name} 至少是 {minimum}，收到 {v!r}")
+    return x
+
+
 @dataclass
 class Config:
     media_root: Path
@@ -93,6 +104,9 @@ class Config:
     # （`grabber.wait_metadata`）；等不到交给 unrenamed-file 下一轮兜底。以前写死 10 秒，而 wait_metadata
     # 的默认值与文档一直是 30 秒（磁力 / 连不上 peer 时元数据可能要几分钟）。每次等的结局写进抓取审计。
     grab_metadata_timeout: float = 30.0
+    # 同一个问题（发现历史里的同一个指纹，带动作或严重度 ≥ important）连续这么多轮 `run` 都在，就报成
+    # "卡住"（`history.find_stuck`）。默认 4 = 6 小时一轮的 24 小时。至少 2——1 轮就叫卡住没有意义。
+    stuck_runs: int = 4
 
     @property
     def state_dir(self) -> Path:
@@ -144,4 +158,5 @@ def load_config(env_file: Path | None = None) -> Config:
         quarantine_min_age_days=float(g("QUARANTINE_MIN_AGE_DAYS", "3")),
         min_free_gb=float(g("MIN_FREE_GB", "50")),
         grab_metadata_timeout=_seconds(g("GRAB_METADATA_TIMEOUT", "30"), "GRAB_METADATA_TIMEOUT"),
+        stuck_runs=_int_at_least(g("STUCK_RUNS", "4"), "STUCK_RUNS", 2),
     )

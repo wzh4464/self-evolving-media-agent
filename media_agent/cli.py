@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__, disposal, history, runlock
@@ -466,6 +468,109 @@ def cmd_purge(args, cfg) -> int:
     return 0
 
 
+def _stuck(cfg, run_id: str) -> list:
+    """本轮之前连续 STUCK_RUNS 轮都在的问题（`history.find_stuck`），确认文件读不了就在 stderr 说一句。"""
+    acks, problems = history.load_acks()
+    for p in problems:
+        _log(f"⚠️  确认文件：{p}")
+    return history.find_stuck(cfg.state_dir, run_id, min_runs=cfg.stuck_runs, acks=acks)
+
+
+def _print_stuck(cfg, stuck: list, limit: int = 20) -> None:
+    """卡住的问题：同一个指纹连续 STUCK_RUNS 轮 run 都在。确认过的只计数（`.agents/acks.json`）。"""
+    open_ = [s for s in stuck if not s.ack]
+    acked = len(stuck) - len(open_)
+    if not open_:
+        if acked:
+            print(f"\n═══ 卡住：没有未确认的（{acked} 个已确认、不再提醒，见 .agents/acks.json） ═══")
+        return
+    tail = f"（另有 {acked} 个已确认、不再提醒）" if acked else ""
+    print(f"\n═══ 卡住：{len(open_)} 个问题连续 ≥{cfg.stuck_runs} 轮都在{tail} ═══")
+    for s in open_[:limit]:
+        where = "" if s.target == s.show else f" {s.target}"
+        print(f"  ⏳ 连续 {s.runs} 轮（自 {s.first_seen}）[{s.rule}] {s.kind}【{s.show or '-'}】{where}")
+        print(f"      {s.summary[:160]}")
+        print(f"      指纹 {s.fp}——要人处理、先不提醒：media-agent ack {s.fp} --reason \"…\"")
+    if len(open_) > limit:
+        print(f"  …另 {len(open_) - limit} 个（media-agent health 看全部）")
+
+
+_FP = re.compile(r"[0-9a-f]{6,16}")
+
+
+def cmd_ack(args, cfg) -> int:
+    """确认一个卡住的问题：写进 `.agents/acks.json`（版本化的用户意图，要提交入库）。"""
+    path = history.acks_path()
+    acks, problems = history.load_acks(path)
+    if problems:
+        # 读不了就不写：覆盖一个坏掉的文件会丢掉里面别的确认
+        print(f"❌ {problems[0]}——先修好它再确认")
+        return 2
+    if args.list:
+        if not acks:
+            print("还没有任何确认（.agents/acks.json）")
+        today = datetime.now().date()
+        for fp, a in sorted(acks.items()):
+            state = "有效" if history.active_ack(acks, fp, today) else "已过期"
+            print(f"  {fp}  [{state}] {a.get('what', '')}")
+            print(f"      {a.get('reason', '')}" + (f"（至 {a['until']}）" if a.get("until") else ""))
+        return 0
+    fp = (args.fingerprint or "").strip().lower()
+    if not _FP.fullmatch(fp):
+        print(f"❌ 指纹要写成 6–16 位十六进制（media-agent health / run 输出里的「指纹 …」），收到 {fp!r}")
+        return 2
+    if args.remove:
+        hit = [k for k in acks if k.startswith(fp)]
+        if len(hit) != 1:
+            print(f"❌ .agents/acks.json 里{'没有' if not hit else '有不止一个'}以 {fp} 开头的确认")
+            return 1
+        acks.pop(hit[0])
+        history.save_acks(acks, path)
+        print(f"已撤销确认 {hit[0]}")
+        _remind_commit(path)
+        return 0
+    if not (args.reason or "").strip():
+        print("❌ 要写 --reason：为什么先不管它（半年后读到的人要看得懂）")
+        return 2
+    if args.until:
+        try:
+            datetime.strptime(args.until, "%Y-%m-%d")
+        except ValueError:
+            print(f"❌ --until 要写成 YYYY-MM-DD，收到 {args.until!r}")
+            return 2
+    seen = history.seen_fingerprints(cfg.state_dir)
+    hits = [k for k in seen if k.startswith(fp)]
+    if len(hits) > 1:
+        print(f"❌ 以 {fp} 开头的指纹不止一个：{', '.join(sorted(hits)[:5])}——多写几位")
+        return 2
+    if hits:
+        fp = hits[0]
+        r = seen[fp]
+        what = f"{r.get('rule')} / {r.get('kind')} / {r.get('target')}"
+    elif args.force and len(fp) == 16:
+        what = "（确认时发现历史里还没有）"
+    else:
+        print(f"❌ 最近的发现历史里没有指纹 {fp}（state/findings/）——打错了？"
+              "要预先确认一个还没出现的问题，写全 16 位并加 --force")
+        return 1
+    entry = {"reason": args.reason.strip(), "added": datetime.now().date().isoformat(),
+             "what": what}
+    if args.until:
+        entry["until"] = args.until
+    acks[fp] = entry
+    history.save_acks(acks, path)
+    print(f"已确认 {fp}：{what}" + (f"，至 {args.until}" if args.until else ""))
+    _remind_commit(path)
+    return 0
+
+
+def _remind_commit(path) -> None:
+    print(f"\n⚠️  {path} 是版本化的用户意图，要提交入库：\n"
+          f"    git add .agents/acks.json && git commit -m \"chore: 确认 …\"\n"
+          "  在生产机上改的：下一次部署时漂移闸门会拦下它——用 deploy.sh --harvest 带回开发机提交、打 tag"
+          "（deploy/README.md「用户意图放在哪」）")
+
+
 def cmd_evolve(args, cfg) -> int:
     if cfg.evolve_mode != "propose":
         # 手动 evolve 同样往 .agents/ 写规则和笔记——冻结期间工作区要与部署的 tag 一致
@@ -563,6 +668,7 @@ def cmd_run(args, cfg) -> int:
     # （Executor.purge_trash，生产上删掉过 6 个文件 4.7GB，说不出是哪几个）。现在按处置类别
     # 逐个判、逐个预写日志后删；要人定的过了保留期只报不删。
     _print_disposal(cfg, disposal.dispose(ctx, mode="run", run_id=ex.run_id, dry_run=dry))
+    _print_stuck(cfg, _stuck(cfg, run_id))
     # 审计写不进去不中止这一轮（上面的处置照跑——磁盘满时它是唯一腾空间的一步），但在最后大声说
     if _report_audit_problems(report.audit_problems, cfg.state_dir):
         return EXIT_AUDIT_INCOMPLETE
@@ -615,6 +721,15 @@ def main() -> int:
     s.add_argument("--max-proposals", type=int, default=3)
     # 会写 .agents/，影子验证还会跑全部检测器（含写 sidecar 的抓取规则）
     s.set_defaults(func=cmd_evolve, lock=True)
+
+    s = sub.add_parser("ack", help="确认一个卡住的问题：先不提醒（写 .agents/acks.json，要提交入库）")
+    s.add_argument("fingerprint", nargs="?", help="指纹（run / health 输出里的「指纹 …」，可写前 6 位以上）")
+    s.add_argument("--reason", help="为什么先不管它")
+    s.add_argument("--until", help="到哪天（YYYY-MM-DD，含当天）为止，过了重新提醒")
+    s.add_argument("--remove", action="store_true", help="撤销这个确认")
+    s.add_argument("--force", action="store_true", help="发现历史里还没有这个指纹也确认（要写全 16 位）")
+    s.add_argument("--list", action="store_true", help="列出全部确认")
+    s.set_defaults(func=cmd_ack)
 
     s = sub.add_parser("run", help="完整自治轮次")
     s.add_argument("--dry-run", action="store_true")

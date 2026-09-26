@@ -28,6 +28,7 @@ media_agent/
 .agents/
   notes/          Agent Notes，路径编码 {lifecycle}/{class}/日期-标题.md
   rules/          演进出来的声明式规则（JSON），下轮自动挂载
+  acks.json       已确认、先不提醒的"卡住"问题（指纹 → 理由 / 期限），版本化的用户意图
 tests/
   harness/        离线测试基座：FakeQbit/FakeWeb/FakeProbe/… + LibraryBuilder
   conftest.py     自动隔离（断网、state/ 进临时目录）+ tripwire
@@ -45,6 +46,7 @@ uv run media-agent apply              # 执行修复
 uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
 uv run media-agent run                # 完整自治轮次（演进默认冻结），末尾处置隔离区
 uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
+uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题、先不提醒（写 .agents/acks.json，要提交）
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 

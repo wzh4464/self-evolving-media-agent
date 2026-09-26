@@ -25,6 +25,7 @@
 | `media_agent/`、`tests/`、`pyproject.toml`、`uv.lock` | git（tag） | 代码与锁定的依赖 |
 | `.agents/preferences.json` | git（tag） | 全局择源偏好，**版本化**的行为输入，见下节 |
 | `.agents/rules/`、`.agents/notes/` | git（tag） | 演进规则与 Agent Notes |
+| `.agents/acks.json` | git（tag） | 已确认、先不提醒的"卡住"问题（`media-agent ack` 写），与偏好同理是版本化的用户意图 |
 | `.env` | 只在生产（600） | 凭据与开关；`.env.*`（含 `.env.bak-*`）被忽略 |
 | `.venv/` | 只在生产 | 由部署用 `uv sync --frozen` 维护，运行时不再同步 |
 | `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`audit.fallback.jsonl`（审计写不进主文件时的转写，回退一起读）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`deploy.log`、`backups/`、`harvest/` |
@@ -40,6 +41,8 @@
   `--harvest` 打包带回开发机，提交、打 tag，再部署那个 tag；不要就
   `git -C ~/media-agent checkout -- .agents/preferences.json`。生产行为必须能从 git 完整复现
   （CHANGELOG「版本与发布约定」）。
+- **卡住问题的确认** `.agents/acks.json` 同样是版本化的：生产上 `media-agent ack …` 改了当轮就生效，下一次部署
+  漂移闸门会拦下它——`--harvest` 带回开发机提交，或在开发机上 `ack` 之后提交、打 tag 再部署。
 - **演进**默认冻结（`.env` 里 `EVOLVE_MODE=off`）：`run` 不再往 `.agents/` 写东西。
   设成 `propose` 会写 `.agents/rules|notes`，同样要提交入库才能再部署。
 
