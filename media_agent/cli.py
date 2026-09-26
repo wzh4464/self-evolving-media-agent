@@ -823,6 +823,7 @@ def _run(args, cfg, rh) -> int:
     # 出处账本的增量补录（`ledger_backfill`）：这一轮还没有出处的种子，从抓取审计、AB 库（只读）、番组页找回
     # 它是什么，诊断之前挂到文件上
     _auto_backfill(ctx, state)
+    rh.ledger(state)
     reg = build_registry()
 
     findings = reg.run_all(ctx, state)

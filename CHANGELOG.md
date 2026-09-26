@@ -22,6 +22,9 @@
   AutoBangumi 库的 `torrent` 表（只读，URL 里就是 infohash）、番组页 feed（按 enclosure 文件名认，7 天内不重复拉），
   最后是 `ma:` / `manual:` 标签；报覆盖率与仍没有出处的种子。每轮 `run` 扫描之后自动补一次增量（只看新的）。
   `media-agent ledger show <infohash>` 看某个种子那一行。
+- **健康报告带出处覆盖率**：`ledger` 一节（有出处 / 没有 / 其中加进来超过 24 小时的、本轮补录了什么），输出里一行
+  「出处」。两条新的 warn：`ledger_unavailable`（账本读不了，这一轮按没有账本认集位与版本）、`provenance_unknown_grew`
+  （超过 24 小时还查不到出处的种子比上一轮多了，写明新冒出来的是哪几个——只看增长，开张时就查不到的那二十来个不每轮报）。
 - **TMDB 身份钉住**（critic N4、LAT-04）：扫描照 sidecar 里的 `tmdb_id` 认、不再按目录名重新搜；条目的标题与季
   按 tmdb_id 缓存（目录改名不再换键重查，一次 `tv_detail` 同时取两样）。模型在多个候选里选的条目这一轮不用，
   报 `tmdb_pick` 并由新动作 `pin_tmdb` 钉进 sidecar（`tmdb_source: llm`，有审计、能回退），下一轮起不再搜、不再问；

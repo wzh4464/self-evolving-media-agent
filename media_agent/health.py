@@ -31,6 +31,11 @@ HEALTH_DIR = "health"
 BASELINE_NAME = "torrent-count.json"
 
 
+# 加进来多久还查不到出处才算数（`RunHealth.ledger`）：AB 登记、抓取记账都在加种的同一刻，补录每轮开头跑，
+# 刚加的种子一轮之内就该有出处；24 小时还没有，多半是有人绕开 AB 与本项目手动加的
+PROVENANCE_GRACE_H = 24.0
+
+
 def health_dir(state_dir) -> Path:
     return Path(state_dir) / HEALTH_DIR
 
@@ -242,6 +247,7 @@ class RunHealth:
             "crash": None, "paused": "", "locked": "", "detectors": None, "findings": None, "actions": None,
             "grab": None, "stuck": None, "unrenamed": None, "trash": None, "torrents": None,
             "evolve": None, "logged_errors": {"count": 0, "by_tag": {}, "samples": []},
+            "ledger": None,
         }
 
     # ---- 各阶段 ----
@@ -279,6 +285,32 @@ class RunHealth:
         self.data["torrents"] = {"current": len(state.torrents) if listed else None,
                                  "previous": (prev_baseline or {}).get("count"),
                                  "previous_run": (prev_baseline or {}).get("run_id")}
+
+    def ledger(self, state, now: float | None = None) -> None:
+        """出处账本的覆盖率（`ledger`）：这一轮的种子里有出处的、没有的（其中加进来超过 `PROVENANCE_GRACE_H`
+        小时的），本轮补录的结果，账本读不了的原因。上一轮报告里的"超时没出处"数一并记下，`reasons` 只在它增长时报。
+
+        没读到种子列表（qBittorrent 不可用）就不记——"0 个没出处"会被当成下一轮的比较基准。"""
+        import time
+        if not getattr(state, "qbit_listed", False):
+            return
+        now = time.time() if now is None else now
+        rows = getattr(state, "ledger_rows", None) or {}
+        unknown = [t for t in state.torrents if (t.get("hash") or "").lower() not in rows]
+        old = [t for t in unknown
+               if (t.get("added_on") or 0) and now - float(t["added_on"]) > PROVENANCE_GRACE_H * 3600]
+        prev = (load_report(self.cfg.state_dir) or {}).get("ledger") or {}
+        self.data["ledger"] = {
+            "torrents": len(state.torrents), "covered": len(state.torrents) - len(unknown),
+            "unknown": len(unknown), "unknown_old": len(old),
+            # 全部超时没出处的（短 hash），下一轮据此说出"新冒出来的是哪几个"
+            "unknown_old_hashes": [(t.get("hash") or "")[:8] for t in old],
+            "unknown_old_sample": [{"hash": (t.get("hash") or "")[:8], "name": str(t.get("name") or "")[:80]}
+                                   for t in sorted(old, key=lambda t: -float(t.get("added_on") or 0))[:10]],
+            "previous_unknown_old": prev.get("unknown_old"),
+            "previous_unknown_old_hashes": list(prev.get("unknown_old_hashes") or []),
+            "problem": getattr(state, "ledger_problem", "") or "",
+            "backfill": getattr(state, "ledger_backfill", None)}
 
     def diagnosed(self, reg, findings) -> None:
         by_sev: dict = {}
@@ -405,6 +437,20 @@ class RunHealth:
             add("warn", "ab_container_maybe_stopped",
                 f"{len(act['ab_maybe_stopped'])} 次改 AutoBangumi 数据库之后 docker start 报了错（库已改好）："
                 "容器也许还停着、订阅不走——要人确认（docker ps）")
+        lg = d["ledger"] or {}
+        if lg.get("problem"):
+            add("warn", "ledger_unavailable",
+                f"出处账本{lg['problem']}：这一轮按没有账本认集位与版本（判重、改名、复核照旧能跑）——要人看")
+        prev_old = lg.get("previous_unknown_old")
+        if isinstance(prev_old, int) and lg.get("unknown_old", 0) > prev_old:
+            seen = set(lg.get("previous_unknown_old_hashes") or [])
+            sample = lg.get("unknown_old_sample", [])
+            fresh = [x for x in sample if x["hash"] not in seen] or sample   # 新冒出来的排前面（样本按加入时间倒序）
+            new_ones = "、".join(f"{x['hash']} {x['name'][:40]}" for x in fresh[:3])
+            add("warn", "provenance_unknown_grew",
+                f"查不到出处（抓取审计、AB 库、番组页、标签里都没有）且加进来超过 {PROVENANCE_GRACE_H:g} 小时的种子"
+                f"从 {prev_old} → {lg['unknown_old']} 个：有人绕开了 AB 与本项目加种？（如 {new_ones}）"
+                f"——`media-agent ledger backfill --dry-run` 看全部")
         st = d["stuck"] or {}
         if st.get("open"):
             add("warn", "stuck", f"{len(st['open'])} 个问题连续 ≥{self.cfg.stuck_runs} 轮都在")
@@ -545,6 +591,13 @@ def render(rep: dict, path=None) -> list[str]:
     un = rep.get("unrenamed")
     if un and un.get("count"):
         lines.append(f"  未改名  {un['count']} 个发布名文件超过 {un['threshold_hours']:g} 小时")
+    lg = rep.get("ledger")
+    if lg:
+        ins = sum(((lg.get("backfill") or {}).get("inserted") or {}).values())
+        lines.append(f"  出处    有出处 {lg['covered']}/{lg['torrents']} · 没有 {lg['unknown']}"
+                     f"（超过 {PROVENANCE_GRACE_H:g} 小时 {lg['unknown_old']}）"
+                     + (f" · 本轮补录 {ins}" if ins else "")
+                     + (" · 账本读不了" if lg.get("problem") else ""))
     le = rep.get("logged_errors") or {}
     if le.get("count"):
         top = "、".join(f"[{k}] {v}" for k, v in sorted(le["by_tag"].items(), key=lambda kv: -kv[1])[:4])
