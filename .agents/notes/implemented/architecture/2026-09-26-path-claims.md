@@ -126,6 +126,8 @@ tests / tools / deploy、生产机上全部 `*.py` / `*.sh` 都查过（grab 调
 **S1 还没收敛**（有意为之）：死种只摘记录，`X.!qB` 留在盘上；新种子下完也改不过去——闸门
 按设计拦下，改过去就是往那份半成品里写。处置"种子已摘、没人认领的 `.!qB`"属于删除闸门。
 `test_grab_stale_bypass.py` 里有一条 `xfail(strict=True)` 记着它，那边落地后应当转绿。
+（已转绿：删除关口把死种自己的 `.!qB` 移进隔离区，见 `bug-fix/2026-09-26-deletion-feeders.md`
+第 5 节。）
 
 **基座**：FakeWeb 拿 Mikan 站点标题当单文件名，标题常带 ` / `；libtorrent 把路径元素里的
 分隔符换成 `_`，FakeQbit 以前没做，出现了生产上不存在的"文件夹/文件"条目（前一个提交已对齐）。
@@ -264,5 +266,5 @@ qBittorrent 就又要往那个路径写。此后若另一个种子映射到了�
 - `disk=False` 只用于目标文件按设计就该在盘上的场合（relink 正向、重加种子、恢复优先级）。
 - 仍然没接的写路径与留作后续的事项见各节"不做的"与 CHANGELOG；目前有：加种本身
   （`add_torrent` 时 .torrent 里的文件名可能与别人的声明重名）、`relocate`（只有演进规则会发，
-  已被 N5 的闸门整条拦下）、正向 `_merge_tree` 与异步 setLocation 的竞速、死种留下的孤儿
-  `.!qB` 挡住换源新种子改名（`test_grab_stale_bypass.py` 的 xfail）。
+  已被 N5 的闸门整条拦下）、正向 `_merge_tree` 与异步 setLocation 的竞速。（死种留下的孤儿
+  `.!qB` 挡住换源新种子改名一项已由删除关口收掉，那条 xfail 已转绿。）

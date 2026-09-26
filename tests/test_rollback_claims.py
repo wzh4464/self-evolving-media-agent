@@ -96,7 +96,8 @@ def test_readd_of_a_dead_torrent_is_refused_when_its_path_is_now_claimed(lib):
     """死种被摘；之后换源抓来的新种子占了同一个名字。回退加回死种 = 两个种子争一个文件。"""
     s1 = lib.show("尼古喵喵").season(1)
     dead = _dead(s1, {SLOT: GB}, SLOT, layout="single")
-    c = lib.cycle(detectors=[DeadTorrentDetector])
+    c = lib.cycle(detectors=[DeadTorrentDetector],
+                  select=lambda f: f.action.op == "drop_torrent")   # 只看摘记录这一步
     [drop] = c.applied("drop_torrent")
     assert drop["undo"]["paths"] == [str(s1.path / SLOT)]      # 摘的时候记下它声明的路径
     newcomer = s1.torrent({SLOT: GB}, name="[LoliHouse] Yani Neko - 09.mkv", layout="single",
@@ -117,7 +118,8 @@ def test_readd_of_an_old_record_without_paths_falls_back_to_the_display_name(lib
     """第 2 阶段之前写下的记录没有 `paths`：单文件种子的显示名就是它的文件名，照样查得到。"""
     s1 = lib.show("尼古喵喵").season(1)
     dead = _dead(s1, {SLOT: GB}, SLOT, layout="single")
-    c = lib.cycle(detectors=[DeadTorrentDetector])
+    c = lib.cycle(detectors=[DeadTorrentDetector],
+                  select=lambda f: f.action.op == "drop_torrent")   # 只看摘记录这一步
     lines = lib.cfg.audit_log.read_text(encoding="utf-8").splitlines()
     recs = [json.loads(x) for x in lines]
     for r in recs:
@@ -135,7 +137,8 @@ def test_readd_of_an_old_record_without_paths_falls_back_to_the_display_name(lib
 def test_readd_of_a_dead_torrent_still_works_when_nothing_claims_its_path(lib):
     s1 = lib.show("尼古喵喵").season(1)
     dead = _dead(s1, {SLOT: GB}, SLOT, layout="single")
-    c = lib.cycle(detectors=[DeadTorrentDetector])
+    c = lib.cycle(detectors=[DeadTorrentDetector],
+                  select=lambda f: f.action.op == "drop_torrent")   # 只看摘记录这一步
 
     res = lib.rollback(c.run_id)
 

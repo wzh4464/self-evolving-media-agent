@@ -794,12 +794,17 @@ def _library_show_of(save_path: str, media_root: Path) -> str | None:
     return None if not top or top.startswith(".") else top
 
 
-def completed_members(ctx: Context, torrent_hash: str) -> list[str] | None:
-    """种子里已经下完、仍要下载的成员文件；读不到文件列表返回 None（= 不知道）。"""
+def _entries_or_none(ctx: Context, torrent_hash: str) -> list[dict] | None:
+    """种子的文件列表；读不到返回 None（= 不知道）。"""
     try:
-        entries = ctx.qbit.files(torrent_hash) if ctx.qbit else None
+        return ctx.qbit.files(torrent_hash) if ctx.qbit else None
     except Exception:
         return None
+
+
+def completed_members(ctx: Context, torrent_hash: str) -> list[str] | None:
+    """种子里已经下完、仍要下载的成员文件；读不到文件列表返回 None（= 不知道）。"""
+    entries = _entries_or_none(ctx, torrent_hash)
     if entries is None:
         return None
     return [e["name"] for e in entries
@@ -862,9 +867,11 @@ class DeadTorrentDetector:
             if stalled < threshold:
                 continue
             h = t.get("hash", "")
-            done = completed_members(ctx, h)
-            if done is None:
+            entries = _entries_or_none(ctx, h)
+            if entries is None:
                 continue                  # 看不到文件列表就不下结论
+            done = [e["name"] for e in entries
+                    if e.get("priority", 1) != 0 and e.get("progress", 0) >= 1]
             evidence = {"num_seeds": t.get("num_seeds"),
                         "num_complete": t.get("num_complete"),
                         "availability": t.get("availability"),
@@ -892,8 +899,36 @@ class DeadTorrentDetector:
                                     "save_path": t.get("save_path", ""),
                                     "category": t.get("category", ""),
                                     "tags": t.get("tags", "")},
-                              note="只摘种子记录（可凭 magnet 回退），磁盘上的文件"
-                                   "（含 .!qB 半成品）一个字节都不动"),
+                              note="只摘种子记录（可凭 magnet 回退），磁盘上的文件一个字节都不动；"
+                                   "它自己的 .!qB 半成品另由 dead_partial 处置"),
+            )
+            yield from self._partials(show, t, entries)
+
+    def _partials(self, show: str, t: dict, entries: list[dict]) -> Iterable[Finding]:
+        """死种**自己的**半成品：没下完、优先级非 0 的条目在盘上的 `X.!qB`，逐个移进隔离区。
+
+        第 1 阶段只摘记录、半成品留在盘上：它占着 94% 满的 APFS 容器，更占着集位名——
+        停滞换源时新种子下完也改不过去（占用闸门按设计拦下，改过去就是接着往那份半成品里
+        写）。执行在摘记录（op 1）之后（op 5）；删除关口要求这个种子**同一批里真的被摘掉了**
+        （摘除被跳过——又有了做种——半成品就不动），另一个种子仍声明着 `X` 时不动（I2）。
+        """
+        sp = Path((t.get("save_path") or "").rstrip("/") or "/")
+        h = t.get("hash", "")
+        for e in entries:
+            if e.get("priority", 1) == 0 or e.get("progress", 0) >= 1:
+                continue
+            partial = Path(str(sp / e["name"]) + ".!qB")
+            if partial.is_symlink() or not partial.is_file():
+                continue
+            yield Finding(
+                rule=self.id, kind="dead_partial", severity="minor",
+                summary=f"死种的半成品：{partial.name}",
+                show=show, path=str(partial), torrent_hash=h,
+                evidence={"entry": e["name"], "entry_progress": e.get("progress"),
+                          "torrent": t.get("name", "")[:110]},
+                action=Action(op="trash", reversible=True,
+                              args={"path": str(partial), "torrent_hash": h},
+                              note="死种摘记录之后，它自己的 .!qB 半成品移入隔离区（可回退）"),
             )
 
 

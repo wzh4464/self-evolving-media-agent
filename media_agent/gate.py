@@ -37,6 +37,8 @@
   （`probe` 返回 None：超时、出错）一律当作封存**——封存不能因为某一轮 ffprobe 超时就丢；
   唯一的例外是合并发布里同一个种子的兄弟文件：封存由判重选中的那一份（同一个种子、同一个
   钉子）持有，兄弟按用户偏好只留一份。
+- **死种半成品**（处置类别 `dead_partial`）：只许动 `.!qB`，而且那个死种此刻已不在 qBittorrent 里
+  （同一批里被摘掉了，或已被删）——摘除没发生，它就仍在声明这份半成品（归入 I2）。
 - 另外：**演进规则产出的删除一律不执行**（critic N5）。第 1 阶段在 `Executor._dispatch` 拦下
   所有演进动作，那道保留作纵深防御；删除的唯一执法点在这里（`screen`）。
 
@@ -211,6 +213,14 @@ def check_trash(ex, f: Finding, path: Path) -> Verdict:
     wanted = [e for e in entries if e.get("priority", 1) != 0]
     media_root = Path(ex.cfg.media_root)
     pin = describe(v, f, path, h, t, wanted, media_root)
+
+    # ---- 死种半成品：只许动 `.!qB`，而且那个死种必须已经不在了（同一批里被摘掉，或已被删）
+    if v.disposition == "dead_partial":
+        if not _is_partial(path):
+            return v.refuse("I1", f"死种处置只许动半成品（.!qB），{path.name} 不是")
+        if t is not None:
+            return v.refuse("I2", f"所属的死种 {h[:8]} 此刻还在 qBittorrent 里（摘除没发生：又有了"
+                                  f"做种、或有成员下完了），它仍声明着这份半成品")
 
     # ---- I3：种子的形状决定怎么处置它（先算出来，后面的检查都按它来）
     if t is not None:
