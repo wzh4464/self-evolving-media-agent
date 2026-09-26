@@ -498,3 +498,20 @@ def test_a_torrent_relinked_this_run_is_not_dropped_as_dead_in_the_same_run(lib)
 
     nxt = lib.loop(detectors=[StaleTorrentPathDetector, DeadTorrentDetector])   # 下一轮：照常按死种处置
     assert nxt.applied("drop_torrent")
+
+
+# ------------------------------------------------------------------ 整轮仍是一个回退单元
+def test_a_run_that_iterated_rolls_back_as_one_unit(lib):
+    """一轮一个批次 ID：`rollback` 按审计序号倒着撤——先撤第二次迭代的改名与隔离，再撤第一次迭代的分类交接。"""
+    s1, raw, sub = _ab_duplicate(lib)
+    before = lib.disk()
+
+    c = lib.loop()
+    assert len(c.iterations) == 3
+    res = lib.rollback(c.run_id)
+
+    assert res["failed"] == 0 and res["skipped"] == 0
+    assert res["torrent_records_lost"] == 1                    # 整种子作废的输家：记录回不来（与单次一样）
+    assert lib.disk() == before
+    assert lib.qbit.torrent(sub.hash)["category"] == "Bangumi"
+    assert lib.qbit.file_names(sub.hash) == [LOLI_08]
