@@ -842,10 +842,20 @@ def _run(args, cfg, rh) -> int:
 
     # 扫描 → 诊断 → 执行，重复到不动点（`converge` 模块文档）：一个执行器（一个批次 ID、配额跨迭代累计）、
     # 每次迭代一份新扫描、TMDB 身份照常解析、试过的不再试、撤销本轮已执行动作的拒绝
-    out = converge.run(ctx, reg, ex, max_iterations=cfg.max_iterations,
-                       scan=lambda n: build_state(ctx, resolve_tmdb=not args.no_tmdb),
-                       on_scan=on_scan, on_diagnose=on_diagnose,
-                       on_iteration=lambda it: print(it.line(cfg.max_iterations)))
+    out = converge.Outcome(max_iterations=cfg.max_iterations)
+    try:
+        converge.run(ctx, reg, ex, max_iterations=cfg.max_iterations, out=out,
+                     scan=lambda n: build_state(ctx, resolve_tmdb=not args.no_tmdb),
+                     on_scan=on_scan, on_diagnose=on_diagnose,
+                     on_iteration=lambda it: print(it.line(cfg.max_iterations)))
+    except BaseException:
+        # 半路冲出（后面迭代的扫描出错、Ctrl-C）：前面迭代已经改了的东西审计里都有，健康报告也要有——
+        # "执行"一节是 null 的意思是"没跑到"，而它跑了。异常照常往外抛（`cmd_run` 记 crash）
+        if out.iterations:
+            out.stop = out.stop or converge.CRASHED
+            rh.loop(out)
+            rh.actions(ex.report)
+        raise
     report, state, findings = ex.report, out.state, out.findings
     rh.loop(out)
     # 发现历史、卡住检测、健康报告的"发现"按**最后一次**诊断算：已经在这一轮修好的不算"还在"
@@ -925,7 +935,7 @@ def _run(args, cfg, rh) -> int:
 
 
 _STOP = {converge.FIXED_POINT: "不动点", converge.CAP: "到上限", converge.DRY_RUN: "预演只跑一次",
-         converge.REFUSED: "拒绝"}
+         converge.REFUSED: "拒绝", converge.CRASHED: "半路冲出"}
 
 
 def _loop_brief(out) -> str:

@@ -320,3 +320,31 @@ def test_run_renames_a_show_dir_and_writes_its_sidecar_in_one_run(offline_cli):
     assert not (lib.media_root / "旧名字").exists()
     assert lib.sidecar("新名字").seasons["1"]["have"] == [1, 2]
     assert rep["status"] == "ok", rep["reasons"]
+
+
+# ------------------------------------------------------------------ 半路冲出
+def test_a_crash_in_a_later_iteration_still_reports_what_earlier_iterations_did(offline_cli, monkeypatch,
+                                                                                capsys):
+    """第二次迭代的扫描抛了异常：第一次迭代已经改了东西（审计里有）。健康报告不能把"执行"一节写成 null——那是
+    "没跑到"，而它跑了。"""
+    lib = offline_cli
+    _ab_duplicate(lib)
+    real, n = cli.build_state, []
+
+    def scan(ctx, **kw):
+        n.append(1)
+        if len(n) == 2:
+            raise OSError("媒体卷掉线了")
+        return real(ctx, **kw)
+
+    monkeypatch.setattr(cli, "build_state", scan)
+
+    rc = cli.cmd_run(_args(), lib.cfg)
+
+    rep = _latest(lib)
+    assert rc == cli.EXIT_CRASH and rep["reasons"][0]["code"] == "crash"
+    assert rep["actions"]["applied"] == 3
+    assert [it["applied"] for it in rep["loop"]["iterations"]] == [3]
+    assert rep["loop"]["stop"] == converge.CRASHED
+    out, err = capsys.readouterr()
+    assert "Traceback" in err and "迭代    1 次 · 半路冲出" in out

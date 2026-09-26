@@ -52,6 +52,7 @@ FIXED_POINT = "fixed_point"      # 某次迭代没有做成任何新动作（到
 CAP = "cap"                      # 到了上限，下一次迭代还有要做的
 REFUSED = "refused"              # 某次迭代的扫描读 qBittorrent 不完整，执行器整批拒绝
 DRY_RUN = "dry_run"              # 预演：只跑一次
+CRASHED = "crashed"              # 半路抛了异常（调用方记下；`run` 自己不接住）
 
 # 这些跳过是"此刻被别的东西挡着"，本轮别的动作可能把它挪开：后面的迭代再试。其余跳过（删除关口、配额、演进规则、
 # 坏 sidecar、目标目录要人合并、种子已不在……）同一轮里再试结果也一样，按"已试过"处理。
@@ -321,13 +322,17 @@ def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
         select: Callable[[Finding], bool] | None = None,
         on_scan: Callable[[int, object], None] | None = None,
         on_diagnose: Callable[[int, object, list[Finding]], None] | None = None,
-        on_iteration: Callable[[Iteration], None] | None = None) -> Outcome:
+        on_iteration: Callable[[Iteration], None] | None = None,
+        out: Outcome | None = None) -> Outcome:
     """迭代到不动点。`scan(n)` 返回第 n 次迭代的 LibraryState；`ex` 是这一轮唯一的执行器。
+    `out`：调用方自己建的 `Outcome`（边跑边填）——中途抛异常时，已经做完的迭代调用方照样看得到。
 
     回调（都可省）：`on_scan(n, state)` 扫描之后、诊断之前（`cmd_run` 在第一次迭代挂账本补录、记种子数基线）；
     `on_diagnose(n, state, findings)` 执行之前；`on_iteration(it)` 每次迭代（含收尾诊断）结束时。"""
     max_iterations = max(1, int(max_iterations))
-    out = Outcome(max_iterations=max_iterations)
+    if out is None:
+        out = Outcome(max_iterations=max_iterations)
+    out.max_iterations = max_iterations
     guard = _Guard(ex)
     seen: set[tuple] = set()
     errors: dict[tuple, dict] = {}

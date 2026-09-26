@@ -334,6 +334,15 @@ class RunHealth:
     def applied(self, report, findings, state, proposed: list | None = None) -> None:
         """`report` 是整轮的（各次迭代累计）；`findings` / `state` 是最后一次诊断的（未改名的看它）；`proposed`：各次迭代
         提过的动作合起来（抓取"提议了几集"看它，不给就用 `findings`）。"""
+        self.actions(report)
+        self.data["grab"] = grab_stats(findings if proposed is None else proposed, report)
+        old = unrenamed_old(findings, report, state.torrents, self.cfg.unrenamed_alert_hours)
+        self.data["unrenamed"] = {"threshold_hours": self.cfg.unrenamed_alert_hours,
+                                  "count": len(old), "old": old[:50]}
+
+    def actions(self, report) -> None:
+        """执行报告的计数与明细。`run` 半路冲出时只记这一节（前面迭代已经做了的，审计里都有），抓取统计与未改名要
+        最后一次诊断，没有就留 null。"""
         def brief(recs):
             return [{"op": r.get("op"), "rule": r.get("rule"), "summary": str(r.get("summary"))[:100],
                      "error": str(r.get("error") or r.get("reason") or "")[:200]} for r in recs[:10]]
@@ -348,10 +357,6 @@ class RunHealth:
             "repeated": repeated_failures(self.cfg.audit_log, report),
             # 改 AB 数据库之后 docker start 报了错、库已改好（`Executor._ab_write`）：容器也许还停着
             "ab_maybe_stopped": brief([r for r in report.applied if r.get("after_error_note")])}
-        self.data["grab"] = grab_stats(findings if proposed is None else proposed, report)
-        old = unrenamed_old(findings, report, state.torrents, self.cfg.unrenamed_alert_hours)
-        self.data["unrenamed"] = {"threshold_hours": self.cfg.unrenamed_alert_hours,
-                                  "count": len(old), "old": old[:50]}
 
     def rescan_degraded(self, why: str) -> None:
         self.data["degraded"]["rescan"] = why
@@ -622,7 +627,8 @@ def render(rep: dict, path=None) -> list[str]:
     if lp:
         its = [it for it in lp.get("iterations") or [] if not it.get("final")]
         stop = {"fixed_point": "不动点", "cap": f"到上限，待做 {lp.get('pending_count', 0)}",
-                "refused": "读不全，拒绝", "dry_run": "预演"}.get(lp.get("stop"), str(lp.get("stop")))
+                "refused": "读不全，拒绝", "dry_run": "预演", "crashed": "半路冲出"}.get(lp.get("stop"),
+                                                                                     str(lp.get("stop")))
         lines.append(f"  迭代    {len(its)} 次 · {stop}"
                      + (f" · 反向拒绝 {len(lp['oscillations'])}" if lp.get("oscillations") else "")
                      + "（每次执行 " + " / ".join(str(it.get("applied", 0)) for it in its) + "）")
