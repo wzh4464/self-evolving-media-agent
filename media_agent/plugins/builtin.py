@@ -192,14 +192,50 @@ def _release_slot(f: MediaFile, show: Show) -> tuple[int, int] | None:
 
 def _season_offsets(show: Show) -> dict:
     """sidecar 里记的 `season_offsets`：发布方季号 → 该季之前的累计集数。"""
+    return _show_intent(show)["season_offsets"]
+
+
+def _show_intent(show: Show) -> dict:
+    """这部番 sidecar 里人写的、规则要用的两样：`season_offsets` 与 `require_any`。一次扫描读一次
+    （`_OFFSET_CACHE`，扫描开头清空）。"""
     key = str(show.dir_path)
     if key not in _OFFSET_CACHE:
         from .. import sidecar as sc_mod
         try:
-            _OFFSET_CACHE[key] = dict(sc_mod.load(show.dir_path).season_offsets or {})
+            sc = sc_mod.load(show.dir_path)
+            _OFFSET_CACHE[key] = {"season_offsets": dict(sc.season_offsets or {}),
+                                  "require_any": [str(w) for w in (sc.require_any or []) if w]}
         except Exception:   # 坏 JSON / 读不了 sidecar.load 自己兜了；到这里是格式怪异：没有偏移 = 声明季对不上就不认（安全一侧）
-            _OFFSET_CACHE[key] = {}
+            _OFFSET_CACHE[key] = {"season_offsets": {}, "require_any": []}
     return _OFFSET_CACHE[key]
+
+
+def requirement_problem(f: MediaFile, require_any) -> str:
+    """这部番的 `require_any`（只保留某个版本）按出处账本里的**番组页标题**核对：标题里一个要求的词都没有，
+    返回理由；满足、没有要求、或账本里没有这个种子的标题（内部名里常常没有版本词，凭它判"不满足"会误伤），返回空串。
+
+    判重的封存（`_seal_candidates`、`DuplicateEpisodeDetector`）与删除关口的 I4（`gate._seal_problem`）共用这一处：
+    两边对"谁封存着这一集"必须是同一个结论。"""
+    want = [w for w in (require_any or []) if w]
+    row = getattr(f, "ledger", None)
+    title = (getattr(row, "mikan_title", "") or "") if row is not None else ""
+    if not want or not title:
+        return ""
+    text = f"{title} {f.torrent_name or ''} {f.filename}"
+    if any(w in text for w in want):
+        return ""
+    return (f"番组页标题（出处账本）里没有这部番要求的「{'/'.join(want)}」（{title[:70]}），"
+            f"不算这一集的封存")
+
+
+def _meets_show(f: MediaFile, require_any) -> bool:
+    """判重排序的第一档：名字证据（番组页标题 + 显示名 + 文件名）里有这部番要求的词（没有要求时都算满足）。
+    与 `requirement_problem` 不同，没有账本的也按名字算——排序不删任何东西，只决定谁更该留。"""
+    want = [w for w in (require_any or []) if w]
+    if not want:
+        return True
+    text = f"{release_text(f)} {f.filename}"
+    return any(w in text for w in want)
 
 
 def _numbered_from(f: MediaFile, show: Show):
@@ -335,15 +371,17 @@ def _playable(f: MediaFile) -> bool:
     return size > 0 and not (f.torrent_hash and size < f.size)
 
 
-def _seal_candidates(files: list, season: int, ep: int) -> list:
-    """这一集的封存候选：钉着 `ma:SxxEyy` 的就是这一集、不是幻影、复核通过（`meets_requirements`），
-    按偏好从高到低（`_prefer_score`）。`files` 是这一集的桶（已按路径去重）。
+def _seal_candidates(files: list, season: int, ep: int, show: Show | None = None) -> list:
+    """这一集的封存候选：钉着 `ma:SxxEyy` 的就是这一集、不是幻影、复核通过（`meets_requirements`）、番组页标题
+    满足这部番的 `require_any`（`requirement_problem`），按偏好从高到低（`_prefer_score`）。`files` 是这一集的桶
+    （已按路径去重）。
 
     判重的封存与 `seal_conflicts` 共用这一处——两边对"谁封存着这一集"必须是同一个结论。"""
+    req = _show_intent(show)["require_any"] if show is not None else []
     out = []
     for f in sorted((f for f in files if _pinned(f) == (season, ep) and not is_phantom(f)),
                     key=_prefer_score, reverse=True):
-        if meets_requirements(f)[0]:
+        if meets_requirements(f)[0] and not requirement_problem(f, req):
             out.append(f)
     return out
 
@@ -371,7 +409,7 @@ def seal_conflicts(show: Show) -> dict[tuple[int, int], list[MediaFile]]:
     for (season, ep), files in _episode_buckets(show).items():
         if not any(_pinned(f) == (season, ep) for f in files):
             continue                                  # 没有钉子就没有封存：不必探测
-        seals = _seal_candidates(files, season, ep)
+        seals = _seal_candidates(files, season, ep, show)
         if len({f.torrent_hash for f in seals}) > 1:
             out[(season, ep)] = seals
     return out
@@ -659,13 +697,30 @@ class DuplicateEpisodeDetector:
                 #   报 `seal_unknown` 给人看。探得到而且确实不合格的，照旧 `seal_failed`。
                 seals: list = []
                 protected: set[int] = set()
-                passed = {id(f) for f in _seal_candidates(files, season, ep)}
+                passed = {id(f) for f in _seal_candidates(files, season, ep, show)}
+                require_any = _show_intent(show)["require_any"]
                 for f in sorted((f for f in files
                                  if _pinned(f) == (season, ep) and id(f) not in phantoms),
                                 key=_prefer_score, reverse=True):
                     ok, why = meets_requirements(f)
                     if id(f) in passed:
                         seals.append((f, why))
+                        continue
+                    # 番组页标题不满足这部番的 `require_any`（只保留某个版本）：版本不对与探不探得到轨无关，
+                    # 不封存、也不当"封存不可知"护着——交回排序，排序先看版本（`_meets_show`）
+                    req = requirement_problem(f, require_any)
+                    if req:
+                        yield Finding(
+                            rule=self.id, kind="seal_failed", severity="important",
+                            classified=True,
+                            summary=(f"S{season:02d}E{ep:02d} 抓来的这份钉着这一集，但{req}，"
+                                     f"交回排序取舍"),
+                            show=show.dir_name, path=str(f.path),
+                            torrent_hash=f.torrent_hash,
+                            evidence={"file": f.filename, "torrent_name": f.torrent_name,
+                                      "reason": req, "require_any": list(require_any),
+                                      "mikan_title": f.ledger.mikan_title},
+                        )
                         continue
                     if probe(f.path) is None:
                         protected.add(id(f))
@@ -773,8 +828,11 @@ class DuplicateEpisodeDetector:
                 else:
                     # 真文件永远排在幻影前面（见上文 phantoms 的注释）；封存不可知的既不当
                     # 赢家也不当输家
+                    # 这部番登记了 `require_any`（只保留某个版本）：满足的排在前面，再比画质——用户要的是那个版本，
+                    # 不是画质最好的那份（尼古喵喵：720p 的邪竜解放版该压过 1080p 的 TV 版）
                     ranked = sorted((f for f in files if id(f) not in protected),
-                                    key=lambda f: (id(f) not in phantoms, _rank_for_keep(f)),
+                                    key=lambda f: (id(f) not in phantoms,
+                                                   _meets_show(f, require_any), _rank_for_keep(f)),
                                     reverse=True)
                     if not ranked:
                         continue
