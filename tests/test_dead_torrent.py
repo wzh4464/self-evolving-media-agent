@@ -12,6 +12,8 @@ testinfra B1 / critic N7：`DeadTorrentDetector` 把 `content_path` 当作要移
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from media_agent.plugins.builtin import DeadTorrentDetector
@@ -83,7 +85,6 @@ def test_old_but_recently_active_torrent_is_not_dead(lib):
 def test_recently_seen_complete_is_not_dead(lib):
     s1 = lib.show("尼古喵喵").season(1)
     t = _dead(s1, {"尼古喵喵 S01E11.mkv": GB}, "[A] Yani Neko - 11.mkv", layout="single")
-    import time
     lib.qbit.raw(t.hash)["seen_complete"] = int(time.time() - 3600)
 
     assert lib.diagnose(detectors=[DeadTorrentDetector]) == []
@@ -100,14 +101,30 @@ def test_long_stalled_single_file_torrent_is_dead(lib):
 
 
 def test_torrents_outside_the_library_are_not_ours(lib):
-    """生产 2026-09-08：dead-torrent 删了 Media/.staging/opm-oad/ 下三个手动种子。"""
+    """生产 2026-09-08：dead-torrent 删了 Media/.staging/opm-oad/ 下三个手动种子。
+
+    库外那个种子必须真的"死够了"（加入 30 天、从没动过），否则它本来就不会被判死，
+    这半条测试就是空转——以前 `added_on=0` 让 `last_sign_of_life` 退回 `now`，
+    停滞 0 小时，删掉"只管媒体库"的前缀判断测试照样绿。"""
     staging = lib.show(".staging").folder("opm-oad")
     _dead(staging, {"OPM OAD.mkv": GB}, "OPM OAD.mkv", layout="single")
+    month_ago = time.time() - 30 * 86400
     lib.qbit.seed("f" * 40, name="elsewhere", save_path=lib.root / "downloads",
                   files={"x.mkv": GB}, progress=0.2, state="stalledDL",
-                  added_on=0, num_complete=0, availability=0)
+                  added_on=month_ago, num_complete=0, availability=0)
 
     assert lib.diagnose(detectors=[DeadTorrentDetector]) == []
+
+
+def test_the_outside_torrent_above_would_be_dead_if_it_were_ours(lib):
+    """对照组：同样的种子放进媒体库，就是死种——上一条测试的"不管"才有意义。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    lib.qbit.seed("f" * 40, name="elsewhere", save_path=s1.path,
+                  files={"x.mkv": GB}, progress=0.2, state="stalledDL",
+                  added_on=time.time() - 30 * 86400, num_complete=0, availability=0)
+
+    [f] = lib.diagnose(detectors=[DeadTorrentDetector])
+    assert f.torrent_hash == "f" * 40
 
 
 def test_dead_pack_with_completed_members_is_only_reported(lib):
@@ -136,6 +153,44 @@ def test_dead_drop_revalidates_live_state(lib):
 
     assert not rep.applied and [r["op"] for r in rep.skipped] == ["drop_torrent"]
     assert lib.qbit.has(t.hash)
+
+
+def test_dead_drop_rechecks_completed_members_at_execution_time(lib):
+    """诊断时没有已下完的成员，执行前有一个下完了：它是可播的正片、还在做种，不摘。
+    （检测器总是先把这种情况滤掉，执行器这道复核以前从没被走到过。）"""
+    s1 = lib.show("银八").season(1)
+    t = _dead(s1, {"银八 S01E01.mkv": GB, "银八 S01E02.mkv": GB}, "[G] Gintama 01-02",
+              layout="nosub")
+    findings = lib.diagnose(detectors=[DeadTorrentDetector])
+    assert [f.action.op for f in findings] == ["drop_torrent"]
+    lib.qbit.raw(t.hash)["_files"][0]["progress"] = 1
+
+    rep = lib.apply(findings)
+
+    [skip] = rep.skipped
+    assert "已下完" in skip["reason"]
+    assert not rep.applied and lib.qbit.has(t.hash)
+
+
+def test_detector_draws_no_conclusion_when_it_cannot_read_the_file_list(lib):
+    """"看不到文件列表就不下结论"：files() 出错不能当成"没有已下完的成员"。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    t = _dead(s1, {"尼古喵喵 S01E11.mkv": GB}, "[A] Yani Neko - 11.mkv", layout="single")
+    state = lib.scan(resolve_tmdb=False)                  # 扫描时一切正常
+    lib.qbit.fail("files", hash=t.hash, times=None)       # 诊断时这个种子的 files() 超时
+
+    assert lib.diagnose(state, detectors=[DeadTorrentDetector]) == []
+
+
+def test_future_activity_timestamp_falls_back_to_added_on(lib):
+    """`last_activity` 在未来（时钟错乱 / 字段语义不符）：不能让它把死种"续命"，
+    退回按加入时间算（`last_sign_of_life` 的 `<= now + 60` 上界）。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    t = _dead(s1, {"尼古喵喵 S01E11.mkv": GB}, "[A] Yani Neko - 11.mkv", layout="single")
+    lib.qbit.raw(t.hash)["last_activity"] = int(time.time() + 10 * 86400)
+
+    [f] = lib.diagnose(detectors=[DeadTorrentDetector])
+    assert f.torrent_hash == t.hash and f.evidence["stalled_hours"] >= 24 * 29
 
 
 def test_dead_drop_rolls_back_with_the_same_layout(lib):
