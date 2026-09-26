@@ -102,6 +102,7 @@ def screen(f: Finding) -> str:
 class Verdict:
     """一次删除的关口结论，以及执行器该怎么做。"""
     disposition: str
+    rule: str = ""                       # 产出这次删除的规则 id（与审计记录的 `rule` 相同）
     gate: str = "passed"                 # passed | I1..I4 | evolved | unknown | mismatch
     refused: str = ""                    # 非空 = 拒绝（skipped），已带「删除关口：」前缀
     failed: str = ""                     # 非空 = 看不全 / 参数与现场对不上（failed）
@@ -126,7 +127,7 @@ class Verdict:
         return self
 
     def audit(self) -> dict:
-        d: dict = {"gate": self.gate, "disposition": self.disposition,
+        d: dict = {"gate": self.gate, "disposition": self.disposition, "rule": self.rule,
                    "slot": list(self.slot) if self.slot else None,
                    "keeper": self.keeper, "subject": self.subject}
         if self.notes:
@@ -183,6 +184,11 @@ def _slot_arg(v) -> tuple[int, int] | None:
         return None
 
 
+def _removed(ex) -> set[str]:
+    """本批次已摘掉的种子（小写 hash；qBittorrent 给的本来就是小写，这里只是不信任调用方）。"""
+    return {h.lower() for h in ex._removed_torrents}
+
+
 def _entry_at(t: dict, entries: list[dict], abs_path: Path) -> dict | None:
     sp = Path((t.get("save_path") or "").rstrip("/") or "/")
     return next((e for e in entries if sp / e["name"] == abs_path), None)
@@ -206,13 +212,13 @@ def check_trash(ex, f: Finding, path: Path) -> Verdict:
     h = (a.args.get("torrent_hash") or "").lower()
     base = _base(path)
     try:
-        t = claims.torrent(h) if h and h not in ex._removed_torrents else None
+        t = claims.torrent(h) if h and h not in _removed(ex) else None
         entries = claims.entries(h) if t is not None else []
     except ClaimsUnknown as e:
         return v.fail(f"无法确认种子文件列表与路径占用情况，未做任何改动：{e}")
     wanted = [e for e in entries if e.get("priority", 1) != 0]
     media_root = Path(ex.cfg.media_root)
-    pin = describe(v, f, path, h, t, wanted, media_root)
+    pin = describe(v, f, path, h, t, wanted, media_root, ex._removed_subjects)
 
     # ---- 死种半成品：只许动 `.!qB`，而且那个死种必须已经不在了（同一批里被摘掉，或已被删）
     if v.disposition == "dead_partial":
@@ -328,7 +334,7 @@ def _keeper_problem(ex, v: Verdict, f: Finding, path: Path, pin, media_root: Pat
     if fold(kp) in {fold(p) for p in ex._trashed_paths}:
         return f"保留方 {kp.name} 本批次已被移进隔离区，{_fmt(slot) if slot else '这一集'} 会一个不剩"
     kh = (args.get("keep_hash") or "").lower()
-    if kh and kh in ex._removed_torrents:
+    if kh and kh in _removed(ex):
         return f"保留方的种子 {kh[:8]} 本批次已被摘掉，它不再替这一集作保"
     if not os.path.lexists(kp) or kp.is_symlink() or not kp.is_file():
         return f"保留方 {kp.name} 此刻不在盘上（幻影，或诊断之后被挪走）"
@@ -390,7 +396,7 @@ def other_holders(ex, path: Path, slot, media_root: Path) -> list[str]:
     if show_dir is None or not show_dir.is_dir():
         return []
     claims = ex._claims()
-    owners = _owners_under(claims, show_dir, ex._removed_torrents)
+    owners = _owners_under(claims, show_dir, _removed(ex))
     trashed = {fold(p) for p in ex._trashed_paths}
     me = fold(path)
     out = []
@@ -441,17 +447,30 @@ def _owners_under(claims, show_dir: Path, removed) -> dict[str, list[tuple[dict,
     return out
 
 
-def describe(v: Verdict, f: Finding, path: Path, h: str, t: dict | None,
-             wanted: list[dict], media_root: Path | None = None) -> tuple[int, int] | None:
-    """把审计要的事实填进 `v`（`subject`、`slot`、`keeper`），返回此刻种子上的 `ma:` 钉子。
-
-    集位：动作给的 `slot`（检测器解析过偏移、钉子）> 此刻的钉子 > 名字。"""
-    args = f.action.args
+def subject_of(h: str, t: dict | None, wanted_count: int | None) -> dict:
+    """审计里"被删的是谁"：所属种子此刻的名字 / 钉子 / 标签 / 分类 / 要下载的文件数。"""
     pin = parse_pin((t or {}).get("tags") or "")
-    v.subject = {"torrent_hash": h, "name": (t or {}).get("name", ""),
-                 "pin": _fmt(pin) if pin else None,
-                 "tags": (t or {}).get("tags", ""), "category": (t or {}).get("category", ""),
-                 "torrent_files": len(wanted) if t is not None else None}
+    return {"torrent_hash": h, "name": (t or {}).get("name", ""),
+            "pin": _fmt(pin) if pin else None,
+            "tags": (t or {}).get("tags", ""), "category": (t or {}).get("category", ""),
+            "torrent_files": wanted_count if t is not None else None}
+
+
+def describe(v: Verdict, f: Finding, path: Path, h: str, t: dict | None,
+             wanted: list[dict], media_root: Path | None = None,
+             removed: dict | None = None) -> tuple[int, int] | None:
+    """把审计要的事实填进 `v`（`rule`、`subject`、`slot`、`keeper`），返回此刻种子上的 `ma:` 钉子。
+
+    集位：动作给的 `slot`（检测器解析过偏移、钉子）> 此刻的钉子 > 名字。
+    所属种子本批次早先已被摘掉时（`removed`：执行器摘除那一刻记下的 subject），审计照样记下它
+    是谁——purge 要的事实在删除那一刻最全，之后就查不到了。"""
+    args = f.action.args
+    v.rule = f.rule
+    pin = parse_pin((t or {}).get("tags") or "")
+    if t is None and h and removed and h in removed:
+        v.subject = {**removed[h], "removed_this_batch": True}
+    else:
+        v.subject = subject_of(h, t, len(wanted))
     season_dir = _show_dir(media_root, path)[1] if media_root else path.parent.name
     v.slot = _slot_arg(args.get("slot")) or pin or name_slot(path, season_dir)
     if args.get("keep_path"):
@@ -483,17 +502,14 @@ def check_drop(ex, f: Finding, victim: dict) -> Verdict:
         v.gate, v.refused = "evolved", why
         return v
     h = (victim.get("hash") or "").lower()
-    v.torrent_hash = h
-    pin = parse_pin(victim.get("tags") or "")
-    v.subject = {"torrent_hash": h, "name": victim.get("name", ""),
-                 "pin": _fmt(pin) if pin else None, "tags": victim.get("tags", ""),
-                 "category": victim.get("category", ""), "torrent_files": None}
+    v.torrent_hash, v.rule = h, f.rule
+    v.subject = subject_of(h, victim, None)
     kh = (a.args.get("keep_hash") or "").lower()
     if not kh:
         return v
     shared = a.args.get("path") or ""
     v.keeper = {"path": shared or None, "hash": kh, "digest": None}
-    if kh in ex._removed_torrents:
+    if kh in _removed(ex):
         return v.refuse("I1", f"保留方的种子 {kh[:8]} 本批次已被摘掉，它不再替那个文件作保")
     if not shared:
         return v

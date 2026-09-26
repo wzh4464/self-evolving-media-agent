@@ -140,3 +140,21 @@ def test_rollback_brings_the_partial_back_and_readds_the_torrent(lib):
 
     assert res["reverted"] == 2, res
     assert lib.ident(partial) == ident and lib.qbit.has(t.hash)
+
+
+def test_partial_record_remembers_the_torrent_that_was_dropped_before_it(lib):
+    """purge 要的事实在删除那一刻最全：半成品进隔离区时它的种子已经在同一批里被摘了，
+    `deletion.subject` 仍记着那个种子是谁（名字 / 钉子 / 标签 / 分类 / 文件数）。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    t = _dead(s1, {"尼古喵喵 S01E11.mkv": GB}, "[A] Yani Neko - 11.mkv", layout="single",
+              tags="ab:32, ma:S01E11")
+
+    c = lib.cycle(detectors=[DeadTorrentDetector])
+
+    [rec] = c.applied("trash")
+    d = rec["deletion"]
+    assert d["rule"] == "dead-torrent"
+    assert d["subject"] == {"torrent_hash": t.hash, "name": "[A] Yani Neko - 11.mkv",
+                            "pin": "S01E11", "tags": "ab:32, ma:S01E11",
+                            "category": "尼古喵喵", "torrent_files": 1,
+                            "removed_this_batch": True}

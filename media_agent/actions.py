@@ -149,6 +149,9 @@ class Executor:
         # （testinfra B2，生产 5 次）。后面的动作要先认一认这里。
         self._removed_torrents: set[str] = set()
         self._trashed_paths: set[str] = set()
+        # 本批次摘掉的种子在摘的那一刻是谁（`gate.subject_of` 的形状）。同一批后面的隔离
+        # （死种的半成品、合集里剩下的条目）问不到它了，审计的 `deletion.subject` 用这里的。
+        self._removed_subjects: dict[str, dict] = {}
         # 路径占用索引（`claims.ClaimIndex`），一批次一份、按需建。每做完一次改动
         # （任何不是 skipped 的审计，见 `_audit`）就作废，下一次查询重新问 qBittorrent。
         self._claim_index: ClaimIndex | None = None
@@ -909,7 +912,8 @@ class Executor:
         if refused:
             self._audit("skipped", f, a, {
                 "reason": refused,
-                "deletion": {"gate": "evolved", "disposition": gate.disposition_of(f)}})
+                "deletion": {"gate": "evolved", "disposition": gate.disposition_of(f),
+                             "rule": f.rule}})
             return
         h = a.args["torrent_hash"]
         keep_hash = a.args.get("keep_hash", "")
@@ -964,6 +968,7 @@ class Executor:
         paths = self._claimed_paths(victim)          # 摘之前记下：摘了就问不到了
         self.ctx.qbit.delete([h], delete_files=False)
         self._removed_torrents.add(h)
+        self._removed_subjects[h.lower()] = {**v.subject, "torrent_files": len(paths)}
 
         self._audit("applied", f, a,
                     {"dropped": victim.get("name", ""),
@@ -1295,7 +1300,8 @@ class Executor:
         if refused:
             self._audit("skipped", f, a, {
                 "reason": refused,
-                "deletion": {"gate": "evolved", "disposition": gate.disposition_of(f)}})
+                "deletion": {"gate": "evolved", "disposition": gate.disposition_of(f),
+                             "rule": f.rule}})
             return
         path, why = _inside(a.args.get("path"), Path(self.cfg.media_root), "path")
         if why:
@@ -1360,6 +1366,7 @@ class Executor:
                 return
             record_lost = True
             self._removed_torrents.add(h)
+            self._removed_subjects[h] = v.subject
         elif h:
             # 只作废种子里的某个文件：设为不下载，保留其余部分
             try:
@@ -1448,7 +1455,7 @@ class Executor:
         wanted = [e for e in entries if e.get("priority", 1) != 0]
         from . import gate
         v = gate.Verdict(gate.disposition_of(f), torrent_hash=h, entry=entry)
-        gate.describe(v, f, path, h, victim, wanted)
+        gate.describe(v, f, path, h, victim, wanted, Path(self.cfg.media_root))
         if file_only and entry.get("progress", 0) < 1:
             if len(wanted) > 1:
                 self._zero_priority(f, a, h, entry,
@@ -1516,6 +1523,8 @@ class Executor:
                 "error": f"删除种子记录失败，未做任何改动：{type(e).__name__}: {e}", **extra})
             return
         self._removed_torrents.add(h)
+        if (extra.get("deletion") or {}).get("subject"):
+            self._removed_subjects[h.lower()] = extra["deletion"]["subject"]
         self._audit("applied", f, a,
                     {"dropped": victim.get("name", ""), "files_untouched": True, "note": note,
                      **({} if magnet else {"irreversible": "无 magnet_uri，此条不可回退"}),

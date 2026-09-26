@@ -178,3 +178,32 @@ purge 要判断"隔离区里的这个能不能真删"，需要删除那一刻的
 
 **测试**：`tests/test_deletion_gate.py` 末尾——正常的撞车照摘；保留方改了名、共享文件不在盘上、
 被截断都不摘；演进规则直接调 `_op_drop_torrent` 也被拒。改前 5 条红（第一条只因缺 `deletion`）。
+
+## 5. 审计补全：`deletion` 自成一体，种子同批早先被摘也记得它是谁
+
+第 1.3 节的 `deletion` 少两样 purge 要的东西：
+
+- `rule`：规则 id 本来就在记录顶层，但 purge 只拿 `deletion` 往下传时要再回头找——放一份进来。
+- **所属种子本批次早先已被摘掉时**，`subject` 以前只剩 hash（名字、钉子、标签、分类都查不到了）。
+  最常见的就是死种的半成品：摘记录（op 1）在前、隔离半成品（op 5）在后。执行器现在在摘除的那一刻
+  （整种子作废的 trash、`drop_torrent`、幻影的摘记录）把被摘种子的 subject 记进 `_removed_subjects`，
+  后面同一批的删除用它，并标 `removed_this_batch: true`。
+
+**最终形状**（每条 trash 记录；drop_torrent 记录同形，`subject` 是被摘的种子、`keeper` 是撞车的保留方）：
+
+    "deletion": {
+      "gate": "passed" | "I1" | "I2" | "I4" | "evolved" | "unknown" | "mismatch",
+      "disposition": "duplicate" | "extras" | "bundled_version" | "dead_partial" | "manual" | "other",
+      "rule": "<规则 id>",
+      "slot": [季, 集] | null,
+      "keeper": {"path", "hash", "digest"} | null,
+      "subject": {"torrent_hash", "name", "pin", "tags", "category", "torrent_files",
+                  "removed_this_batch"?: true},
+      "notes": [...]?
+    }
+
+`gate` 不是 `passed` 的记录一定是 skipped（I1 / I2 / I4 / evolved）或 failed（unknown / mismatch）。
+演进规则被拒的记录只有 `gate` / `disposition` / `rule` 三个键（没看现场）。旧记录没有 `deletion`。
+
+**测试**：`tests/test_dead_partials.py` 末条——死种半成品的记录里，`subject` 仍是那个已被摘掉的种子
+（名字、`ma:` 钉子、标签、分类、文件数）并标着 `removed_this_batch`。改前红。
