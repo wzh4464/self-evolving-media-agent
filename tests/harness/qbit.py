@@ -13,8 +13,8 @@
 - 没有元数据（metaDL，`files()` 为空）时 `content_path` 与 `root_path` 都是空串，
   不回落到 save_path（release-5.2.3 torrentimpl.cpp:556-578 的 `hasMetadata()` 分支）。
 - `tags` 排序后用 `", "` 连接；`progress` 完成时是 1。
-- `files()` 对未知 hash 抛 `QBitError("torrents/files -> HTTP 404: Not Found")`，
-  与真客户端的报错类型、文本一致（B2 就是这个 404）。
+- `files()` 对未知 hash 抛 `QBitError("torrents/files -> HTTP 404: Not Found", status=404)`，
+  与真客户端的报错类型、文本、状态码一致（B2 就是这个 404；判断按 `clients.is_not_found`）。
 - `set_file_priority(…, 0)` 只改优先级，文件留在盘上（`use_unwanted_folder=False`）。
 - `delete(delete_files=False)` 只摘记录；未知 hash 静默忽略（真 API 也是 200）。
 
@@ -86,8 +86,8 @@ class FakeQbit:
             self.tripwire.record(kind, detail)
 
     def _err(self, status: int, path: str, text: str) -> QBitError:
-        """与 `QBitClient._get/_post` 同一格式的错误，并记 tripwire。"""
-        e = QBitError(f"{path} -> HTTP {status}: {text}")
+        """与 `QBitClient._get/_post` 同一格式、同一状态码（`QBitError.status`）的错误，并记 tripwire。"""
+        e = QBitError(f"{path} -> HTTP {status}: {text}", status=status)
         self._trip("qbit_error", str(e))
         return e
 

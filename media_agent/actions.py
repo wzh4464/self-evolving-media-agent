@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import disposal
 from .claims import PARTIAL, ClaimCheck, ClaimIndex, ClaimsUnknown, fold
+from .clients import is_not_found
 from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
 
@@ -356,7 +357,7 @@ class Executor:
             try:
                 entries = self.ctx.qbit.files(h)
             except Exception as e:
-                if "404" in str(e):
+                if is_not_found(e):
                     self._audit("skipped", f, a, gone)
                     return
                 raise
@@ -2075,7 +2076,7 @@ class Executor:
         try:
             entries = self.ctx.qbit.files(h)
         except Exception as e:
-            if "404" in str(e):
+            if is_not_found(e):
                 return False, "所属种子已不在 qBittorrent 里"
             raise
         entry = next((e for e in entries if e.get("index") == u["index"]), None)

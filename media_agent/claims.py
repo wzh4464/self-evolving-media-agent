@@ -127,7 +127,10 @@ class ClaimsUnknown(Exception):
 
 
 def _is_404(e: BaseException) -> bool:
-    return "404" in str(e)
+    # 按状态码认（`clients.is_not_found`），不按文本：一次读失败被当成"种子已不在"，
+    # 这里就会把它当作不声明任何东西——占用查询本该 fail closed 的地方放行了。
+    from .clients import is_not_found
+    return is_not_found(e)
 
 
 def _lstat_key(p: Path) -> tuple[int, int] | None:

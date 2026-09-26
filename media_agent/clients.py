@@ -12,7 +12,26 @@ import httpx
 
 
 class QBitError(RuntimeError):
-    pass
+    """qBittorrent WebUI 返回了错误。`status` 是 HTTP 状态码（不是来自一次 HTTP 响应时为 None）。
+
+    文本（`torrents/files -> HTTP 404: Not Found`）保持不变——日志与审计里的 `error` 照旧可读；
+    **判断用 `status`，不用文本**。以前执行器与占用索引各自写 `"404" in str(e)` 认"种子已不在"：
+    文本里碰巧出现 404 三个字符（响应体里一段 hash、端口号）的读失败会被当成"种子没了"，
+    本该 fail closed 的占用查询就此放行（2026-09-26 第 3 阶段，见 `is_not_found`）。
+    """
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+def is_not_found(e: BaseException) -> bool:
+    """这个异常是不是 qBittorrent 的 HTTP 404（`torrents/files` 等对未知 hash 的回答）。
+
+    只认 `QBitError.status`：没有状态码的（超时、连接错误、老式构造的 QBitError）一律不是——
+    把一次读失败当成"种子已不在"，比把"种子已不在"当成读失败危险得多。
+    """
+    return isinstance(e, QBitError) and e.status == 404
 
 
 class QBitClient:
@@ -39,18 +58,21 @@ class QBitClient:
         )
         ok = (r.status_code == 200 and r.text.strip() == "Ok.") or r.status_code == 204
         if not ok:
-            raise QBitError(f"qBittorrent 登录失败: HTTP {r.status_code} {r.text[:100]!r}")
+            raise QBitError(f"qBittorrent 登录失败: HTTP {r.status_code} {r.text[:100]!r}",
+                            status=r.status_code)
 
     def _post(self, path: str, data: dict | None = None) -> httpx.Response:
         r = self._client.post(f"{self.base}/api/v2/{path}", data=data or {})
         if r.status_code >= 400:
-            raise QBitError(f"{path} -> HTTP {r.status_code}: {r.text[:200]}")
+            raise QBitError(f"{path} -> HTTP {r.status_code}: {r.text[:200]}",
+                            status=r.status_code)
         return r
 
     def _get(self, path: str, params: dict | None = None) -> Any:
         r = self._client.get(f"{self.base}/api/v2/{path}", params=params or {})
         if r.status_code >= 400:
-            raise QBitError(f"{path} -> HTTP {r.status_code}: {r.text[:200]}")
+            raise QBitError(f"{path} -> HTTP {r.status_code}: {r.text[:200]}",
+                            status=r.status_code)
         return r.json() if r.text.strip() else None
 
     # --- 查询 ---
@@ -101,7 +123,8 @@ class QBitClient:
         if r.status_code == 409:
             return False
         if r.status_code != 200:
-            raise QBitError("torrents/add -> HTTP %d: %s" % (r.status_code, r.text[:200]))
+            raise QBitError("torrents/add -> HTTP %d: %s" % (r.status_code, r.text[:200]),
+                            status=r.status_code)
         return True
 
     def rename_torrent(self, torrent_hash: str, name: str) -> None:
