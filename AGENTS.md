@@ -23,6 +23,7 @@ media_agent/
   converge.py     一轮之内收敛：扫描 → 诊断 → 执行重复到不动点（一个执行器、试过的不再试、撤销本轮动作的拒绝）
   grabmode.py     抓取模式（media-agent grab，每 30 分钟）：同一套 converge，只补缺的集、接手 AB 新订的番、给刚抓的收尾
   subscribe.py    media-agent subscribe：不经 AB 订阅一季（建目录 + sidecar，经执行器），预览下一次抓取会做什么
+  abmode.py       AutoBangumi 的模式（AB_MODE / media-agent ab-mode）：full = AB 下载、改名；subscription = AB 只当订阅前端。切换（经执行器）、state/ab_mode.json、切换之后的核对
   audit.py        audit.jsonl 的读写：写永不抛（降级 / 转写 audit.fallback.jsonl），读两个文件一起读
   purge.py        隔离区里每一份能不能真删（按处置类别的判据）
   disposal.py     硬删除的唯一出口：预写 purge.jsonl、容量闸、run / purge 的处置
@@ -65,6 +66,8 @@ uv run media-agent ledger backfill      # 补录出处账本（--dry-run 只报�
 uv run media-agent ledger show <hash>   # 账本里某个种子是什么
 uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID] [--dir 名] [--require-any 词 …] [--offset N]
                                         # 不经 AutoBangumi 订阅一季：建目录 + sidecar（有审计、能回退），说出下一次抓取会做什么
+uv run media-agent ab-mode [show|subscription|full] [--dry-run]
+                                        # AutoBangumi 的模式：看两边各认什么 / 可逆地切 AB 的下载与改名（有审计、能回退）
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 

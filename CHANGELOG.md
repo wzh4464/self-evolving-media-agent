@@ -45,6 +45,15 @@
   两个任务每 6 小时同一秒起来）；认维护暂停；健康报告写 `state/health/grab/`（`media-agent health --grab`），通知只为抓取
   相关的事发（崩溃、整批拒绝、审计、抓取动作失败），去重状态单独一份；不写发现历史；日志 `state/grab.log`，与 run.log
   一样轮转。番组页 feed 的缓存从 1 小时改成 20 分钟，比抓取的节奏短。
+- **`media-agent ab-mode [show|subscription|full] [--dry-run]`：可逆地关掉 AutoBangumi 的下载与改名，只留它当订阅的前端**
+  （新配置 `AB_MODE`，默认 `full`——部署这个版本什么都不变，直到人切）。`subscription`：AB 的 `rss_parser.enable` 与
+  `bangumi_manage.enable` 都关（不拉 RSS、不改名），WebUI 里的订阅照旧。切换读 AB 的整份配置、只改这两个开关、整份发回
+  （漏掉的段 AB 会退回默认值）、重启它的程序（不是容器）、等它回来读回核对，然后把模式记进 `state/ab_mode.json`（盖过
+  `AB_MODE`；`.env` 代码不写），切到 `subscription` 时一并记下核对用的基线（每个 rssitem 的 `last_checked_at`、已有的订阅）。
+  经执行器（动作 `set_ab_mode`）：有审计、逆操作是原来的开关，`media-agent rollback` 能退（人后来改过的不动）。接口连不上拒绝
+  （配了 `AB_CONFIG` 就只读 AB 的 config.json 说一句看到了什么）；重启之后等不到它回来记 unknown、本项目的模式不动、说清怎么
+  核对与退回；切回 `full` 提醒补下载（AB 按 URL 判新，停着期间发布的一口气下）。`show` 说两边各认什么、一不一致，切换之后
+  AB 还拉没拉 RSS、在订阅之外加没加种子（不一致 / 有问题退出码 1）。`AB_MODE` 写错、状态文件坏了大声失败。
 - **第二个 launchd 任务 `com.zihan.media-agent-grab`**（`deploy/com.zihan.media-agent-grab.plist`：每 30 分钟
   `media-agent grab`，加载时不跑，低优先级与主任务相同，日志 `state/grab.log`）。`deploy.sh` 两份都装、各自只在变了时
   重新加载；任何一份装不上两份一起退回；tag 里没有抓取任务（回滚到更早的版本）就卸掉它；装着的任务与 tag 里的对不上时

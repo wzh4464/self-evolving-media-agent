@@ -6,6 +6,7 @@
     media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升（需 EVOLVE_MODE=propose）
     media-agent purge     # 隔离区处置预演（--apply 真删，每个都先记 state/purge.jsonl）
     media-agent ledger backfill  # 补录出处账本（--dry-run 只报覆盖率）；run 开头自动补增量
+    media-agent ab-mode   # AutoBangumi 的模式：show / subscription（只当订阅前端）/ full（可逆，见 abmode.py）
     media-agent run       # 一轮完整自治：(diagnose → apply) 迭代到不动点 → [evolve] → 隔离区处置
                           # evolve 只在 EVOLVE_MODE=propose 时跑，默认 off（见 config.py）
 """
@@ -711,6 +712,137 @@ def cmd_subscribe(args, cfg) -> int:
     return 0
 
 
+def cmd_ab_mode(args, cfg) -> int:
+    """`media-agent ab-mode [show|subscription|full] [--dry-run]`（`abmode` 模块文档）：看 / 切 AutoBangumi 的模式。
+
+    切换经执行器（`set_ab_mode`：审计、逆操作、`rollback`）。接口连不上拒绝（只读 config.json 说一句看到了什么）、退出码 3；
+    切成了 0；没核对上（unknown）/ 失败 1，并说清怎么核对、怎么退回。预演（`--dry-run` / AUTO_APPLY=false）什么都不改。"""
+    from . import abmode
+    from .kernel import Action, Finding
+
+    ctx = build_context(cfg)
+    if args.mode == "show":
+        return _ab_mode_show(ctx, cfg)
+    want = args.mode
+    flags, config, where = abmode.read_ab_flags(ctx)
+    if config is None:
+        seen = f"{where}：{abmode.describe_flags(flags)}" if flags else where
+        return _refuse(f"AutoBangumi 的接口不可用，不切换——改配置、重启、读回核对都要接口（{seen}）")
+    if flags == abmode.flags_for(want) and cfg.ab_mode == want and cfg.ab_mode_source == "state":
+        print(f"已经是 {want}：AB 的开关 {abmode.describe_flags(flags)}，本项目也认 {want}"
+              f"（state/ab_mode.json）。media-agent ab-mode show 看核对")
+        return 0
+    before = abmode.mode_of(flags) or abmode.describe_flags(flags)
+    f = Finding(rule="ab-mode", kind="ab_mode_switch", severity="important",
+                summary=(f"AutoBangumi 切到 {want}：{abmode.describe_flags(flags)} → "
+                         f"{abmode.describe_flags(abmode.flags_for(want))}"),
+                evidence={"before": flags, "media_agent_mode": cfg.ab_mode, "source": cfg.ab_mode_source},
+                action=Action(op="set_ab_mode", args={"mode": want}))
+    dry = args.dry_run or not cfg.auto_apply
+    ex = Executor(ctx, dry_run=dry)
+    report = ex.apply([f], need_qbit=False)
+    if _report_audit_problems(report.audit_problems, cfg.state_dir):
+        return EXIT_AUDIT_INCOMPLETE
+    if report.applied:
+        rec = report.applied[0]
+        print(f"【已执行】AutoBangumi 切到 {want}（{rec.get('restart', '')}）   批次 ID: {ex.run_id}"
+              f"（media-agent rollback --run {ex.run_id} 撤销）")
+        for line in _ab_mode_next(want, rec, before):
+            print(line)
+        if rec.get("state_error"):
+            msg = (f"⚠️  AB 已切到 {want}，但本项目没记下：{rec['state_error']}——它仍按 {cfg.ab_mode} 对待 AB；"
+                   f"修好之后再跑一次 media-agent ab-mode {want}（开关已对的只重启、核对、记录）")
+            print(msg)
+            _log(msg)
+            return 1
+        return 0
+    if report.skipped:
+        rec = report.skipped[0]
+        if rec.get("reason") == "dry-run":
+            print(f"【预演】会把 AutoBangumi 的开关改成 {abmode.describe_flags(abmode.flags_for(want))}（此刻 "
+                  f"{abmode.describe_flags(flags)}）、重启它的程序、读回核对，本项目的模式记进 state/ab_mode.json。"
+                  f"去掉 --dry-run 再跑一次")
+            return 0
+        print(f"⏭️  没有切：{rec.get('reason', '')}")
+        return 1
+    for rec in report.failed:
+        print(f"❌ 没有切：{rec.get('error', '')}（{rec.get('effect', '')}）")
+    for rec in report.unknown:
+        print(f"❓ AutoBangumi 切到 {want} 没核对上：{rec.get('reason') or rec.get('error', '')}")
+        print(f"   AB 的 config.json 也许已是新开关、线程要到下一次重启才换；本项目的模式没动（仍是 {cfg.ab_mode}）。")
+        print("   核对：media-agent ab-mode show（AB 此刻的开关、程序起来没有）")
+        print(f"   AB 回来之后再跑一次 media-agent ab-mode {want}（开关已对的只重启、核对、记录）")
+        back = before if before in abmode.MODES else "full"
+        print(f"   要退回原来的（{before}）：media-agent ab-mode {back}；或 AB 的 WebUI 设置里把「RSS 解析」「番剧管理」"
+              f"两个开关改回去再点应用（会重启程序）；或 media-agent rollback --run {ex.run_id}")
+    return 1
+
+
+def _ab_mode_next(want: str, rec: dict, before: str) -> list[str]:
+    """切成了之后该知道的：之后怎么订阅、怎么核对、怎么退回。"""
+    if want == "full":
+        return ["  AB 重新拉 RSS、下载、改名；Bangumi 分类重新归它（判重让位）、只为 AB 存在的规则恢复。",
+                "  ⚠️  预计会有一波补下载：AB 按 URL 判新，停着期间发布的条目全算新的，下一次拉 RSS（15 分钟之内）就一口气下——"
+                "与本项目已经抓的重复，分类交接之后判重会清（deploy/README.md「AutoBangumi 的模式」）。"]
+    base = rec.get("baseline") or {}
+    return [
+        "  AB 不再拉 RSS、不再改名；抓取（media-agent grab，每 30 分钟）与改名全归本项目。",
+        "  订阅照旧：AB 的 WebUI（或 autobangumi-subscribe-verify 流程）、或 media-agent subscribe。在 AB 里订阅的那一刻它会把"
+        "已发布的集补进 Bangumi 分类，本项目接手改名；之后的集由本项目抓。",
+        ("  核对基线：" + (f"{base.get('rss_items', 0)} 个 rssitem 的 last_checked_at、{base.get('subscriptions', 0)} 条订阅"
+                         if base else f"没记下（{rec.get('baseline_problem', '')}）"))
+        + "；每轮 run / grab 的健康报告核对 AB 之后还拉不拉 RSS、在订阅之外加没加种子（media-agent ab-mode show 随时看）。",
+        f"  退回：media-agent ab-mode full（原来是 {before}；会有一波补下载，见 deploy/README.md）。",
+    ]
+
+
+def _ab_mode_show(ctx, cfg) -> int:
+    """两边各认什么模式、一不一致；subscription 模式下切换之后 AB 还做了什么（`abmode.activity`）。不一致 / 有问题退出码 1。"""
+    from . import abmode
+
+    rec = abmode.read_state(cfg.state_dir)
+    src = {"state": f"state/ab_mode.json，{(rec or {}).get('since')} 由 media-agent ab-mode 切换，批次 "
+                    f"{(rec or {}).get('run_id')}",
+           "env": "AB_MODE", "default": "AB_MODE 没配"}.get(cfg.ab_mode_source, cfg.ab_mode_source)
+    print(f"本项目认的模式：{cfg.ab_mode}（{cfg.ab_mode_source}：{src}）")
+    flags, _config, where = abmode.read_ab_flags(ctx)
+    ab_mode = abmode.mode_of(flags)
+    rc = 0
+    if flags is None:
+        print(f"AutoBangumi 的开关：读不到（{where}）")
+        rc = 1
+    else:
+        print(f"AutoBangumi 的开关（{where}）：{abmode.describe_flags(flags)} → {ab_mode or '一开一关'}")
+        if ab_mode == cfg.ab_mode:
+            print("  ✓ 两边一致")
+        else:
+            print(f"  ⚠️  两边不一致：本项目按 {cfg.ab_mode} 对待 AB，AB 的开关是 {ab_mode or '一开一关'}——"
+                  f"让两边一致：media-agent ab-mode {cfg.ab_mode}" + (f"（或 {ab_mode}）" if ab_mode else ""))
+            rc = 1
+    if ctx.ab is not None:
+        try:
+            up = bool((ctx.ab.status() or {}).get("status"))
+            print(f"AutoBangumi 程序：{'运行中' if up else '没起来（status=false）'}")
+        except Exception as e:                       # noqa: BLE001 —— 只是看一眼，照实说
+            print(f"AutoBangumi 程序：问不到（{type(e).__name__}: {e}）")
+    if cfg.ab_mode != abmode.SUBSCRIPTION:
+        return rc
+    rss_rows = bangumi_rows = torrents = []
+    try:
+        if ctx.abdb is not None:
+            rss_rows, bangumi_rows = ctx.abdb.rss_items(), ctx.abdb.bangumi()
+        if ctx.qbit is not None:
+            torrents = ctx.qbit.torrents()
+    except Exception as e:                           # noqa: BLE001 —— 只是看一眼，照实说
+        print(f"  ⚠️  读 AB 库 / qBittorrent 出错（{type(e).__name__}: {e}），下面的核对不全")
+        rc = 1
+    act = abmode.activity(rec, rss_rows=rss_rows, bangumi_rows=bangumi_rows, torrents=torrents,
+                          media_root=cfg.media_root)
+    for line in abmode.activity_lines(act):
+        print(line)
+    return 1 if abmode.activity_problems(act) else rc
+
+
 def cmd_health(args, cfg) -> int:
     """最近一轮（或 `--run` 指定那一轮）的健康报告；`--json` 原样输出。
 
@@ -1168,6 +1300,13 @@ def main() -> int:
     s.add_argument("--dry-run", action="store_true", help="只说会写什么，不写")
     # 写媒体根（建目录）与 sidecar：与 run 排队。人手的命令，不看维护暂停（与 rollback / repair 一样）
     s.set_defaults(func=cmd_subscribe, lock=True)
+
+    s = sub.add_parser("ab-mode", help="AutoBangumi 的模式：show 看两边各认什么；subscription = AB 只当订阅前端（不拉 RSS、"
+                                       "不改名）；full = 切回 AB 下载、改名。可逆，有审计、能 rollback")
+    s.add_argument("mode", nargs="?", default="show", choices=("show", "subscription", "full"))
+    s.add_argument("--dry-run", action="store_true", help="只说会改什么，不改")
+    # 切换改的是 AB 与 state/ab_mode.json（下一轮 run / grab 按它行事）：与 run 排队。人手的命令，不看维护暂停
+    s.set_defaults(func=cmd_ab_mode, lock=lambda a: a.mode != "show" and not a.dry_run)
 
     s = sub.add_parser("ledger", help="出处账本（state/ledger.sqlite）：补录、查一个种子")
     lsub = s.add_subparsers(dest="ledger_cmd", required=True)

@@ -511,6 +511,7 @@ class Executor:
         "adopt_episode_offset": 10,   # 把 AB 的集号偏移搬进 sidecar：同上（写档案按写的那一刻合并、不碰人的意图）
         "subscribe_season": 10,       # 登记要抓的季：同上
         "create_show_dir": 0,         # 新订阅的番建目录：只建一个谁都没占着的新目录，与别的动作互不干扰
+        "set_ab_mode": 0,             # 切 AutoBangumi 的两个开关（`media-agent ab-mode`，单独成批）：不碰媒体库与种子
         "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
         "drop_torrent": 1,       # 撞车的种子越早摘掉越好：它占着一条路径的
                                  # 所有权，后面的改名/归位都要以此为前提
@@ -561,8 +562,10 @@ class Executor:
                     f"种子视图有缺口时不能改动任何东西")
         return ""
 
-    def apply(self, findings: list[Finding]) -> ExecReport:
-        blocked = self.qbit_blocker()
+    def apply(self, findings: list[Finding], *, need_qbit: bool = True) -> ExecReport:
+        """`need_qbit=False` 只给不碰媒体库、不碰种子的批次用（`media-agent ab-mode` 切 AB 的开关）：qBittorrent 连不上
+        不该挡住它。回退照旧要 qBittorrent（`rollback` 是整批的闸）。"""
+        blocked = self.qbit_blocker() if need_qbit else ""
         if blocked:
             # 不逐条写审计：这些动作一个都没有尝试。拒绝本身由调用方大声报告
             # （cli 打印到 stdout/stderr 并以 EXIT_DEGRADED 退出）。
@@ -1179,6 +1182,79 @@ class Executor:
         `save` 的原子替换一旦发生就不会再抛，变了多半是别人同时写的。"""
         now = p.read_text(encoding="utf-8") if p.exists() else None
         return False if now == before else None
+
+    def _op_set_ab_mode(self, f: Finding, a: Action) -> None:
+        """切 AutoBangumi 的两个开关（`abmode` 模块文档）：读整份配置 → 只改两个布尔 → 发回整份 → 重启程序 → 等它回来、
+        读回核对 → 写 `state/ab_mode.json`（本项目从此认这个模式；切到 subscription 带核对用的基线）。
+
+        - 逆操作 `set_ab_mode {flags: 原来的开关, set: 切成的开关, prev_state: 原来的状态文件}`：动手之前登记。
+        - PATCH 出错：按读回的开关核实（`_settle`）——还是原来的记 failed、不重启；说不清记 unknown。
+        - 重启之后等不到它回来、或读回的开关对不上：unknown（config.json 也许已是新开关、线程要到下一次重启才换），状态文件
+          不写——本项目的模式不跟着一个说不清的切换走。
+        - AB 已经是这两个开关（人在 WebUI 里关过、或 PATCH 之后没重启）：不 PATCH，照样重启一次让线程对上配置、核对、记录。
+        """
+        from . import abmode
+
+        target = abmode.parse(a.args.get("mode", ""), "mode")
+        want = abmode.flags_for(target)
+        if self.dry_run:
+            self._audit(auditlog.SKIPPED, f, a, {"reason": "dry-run", "would_set": want})
+            return
+        ab = self.ctx.ab
+        if ab is None:
+            self._audit(auditlog.SKIPPED, f, a, {"reason": "AutoBangumi 接口不可用：没法改它的配置、也没法核对"})
+            return
+        config = ab.get_config()
+        before = abmode.flags_of(config)
+        if before is None:
+            self._audit(auditlog.SKIPPED, f, a, {"reason": "AutoBangumi 的配置里认不出 rss_parser.enable / "
+                                                           "bangumi_manage.enable（版本不同？），不动"})
+            return
+        try:
+            prev_state = abmode.read_state(self.cfg.state_dir)
+        except ValueError as e:
+            self._audit(auditlog.SKIPPED, f, a, {"reason": f"{e}；先修好状态文件再切"})
+            return
+        undo = {"op": "set_ab_mode", "flags": before, "set": want, "prev_state": prev_state}
+        self._intend(undo)
+        patched = before != want
+        if patched:
+            self._effect("ab.update_config")
+            try:
+                ab.update_config(abmode.with_flags(config, want))
+            except Exception as e:
+                def landed() -> bool | None:
+                    now = abmode.flags_of(ab.get_config())
+                    return True if now == want else False if now == before else None
+                if not self._settle(f, a, e, landed, what="改 AutoBangumi 的配置（PATCH config/update）", undo=undo):
+                    return
+        self._effect("ab.restart")
+        ok, detail = abmode.restart_and_wait(ab, want)
+        if not ok:
+            self._audit(auditlog.UNKNOWN, f, a, {
+                "reason": f"重启 AutoBangumi 之后没核对上：{detail}", "before": before, "patched": patched,
+                "effects_attempted": list(self._effects)}, undo=undo)
+            return
+        now = datetime.now()
+        record = {"mode": target, "since": now.isoformat(timespec="seconds"),
+                  "switched_at_epoch": round(now.timestamp(), 3), "run_id": self.run_id,
+                  "previous_flags": before, "previous_mode": (prev_state or {}).get("mode")}
+        extra: dict = {"before": before, "after": want, "patched": patched, "restart": detail}
+        if target == abmode.SUBSCRIPTION:
+            base, why = abmode.baseline(self.ctx.abdb)
+            record["baseline"] = base
+            if why:
+                extra["baseline_problem"] = why
+            else:
+                extra["baseline"] = {"rss_items": len(base["rss_last_checked"]),
+                                     "subscriptions": len(base["bangumi_ids"])}
+        self._effect("fs.state_ab_mode")
+        try:
+            abmode.write_state(self.cfg.state_dir, record)
+        except OSError as e:
+            # AB 已切（读回核实过），本项目却没记下：它仍按原来的模式对待 AB——要人补上（再跑一次命令即可）
+            extra["state_error"] = f"{abmode.state_path(self.cfg.state_dir)} 写不进去（{type(e).__name__}: {e}）"
+        self._audit(auditlog.APPLIED, f, a, extra, undo=undo)
 
     def _wait_ab_ready(self, timeout: float = 45.0) -> bool:
         """等 AutoBangumi 重新起来再调它的接口。
@@ -2673,6 +2749,17 @@ class Executor:
                 except (KeyError, TypeError, ValueError):
                     return "season / episode 缺失或不是整数"
             return None
+        if op == "set_ab_mode":
+            from . import abmode
+            for key in ("flags", "set"):
+                v = u.get(key)
+                if not (isinstance(v, dict) and set(v) == set(abmode.FLAG_KEYS)
+                        and all(isinstance(x, bool) for x in v.values())):
+                    return f"{key} 不是 {'/'.join(abmode.FLAG_KEYS)} 两个布尔：{v!r}"
+            prev = u.get("prev_state")
+            if prev is not None and not (isinstance(prev, dict) and prev.get("mode") in abmode.MODES):
+                return f"prev_state 不合法：{prev!r}"
+            return None
         if op in ("restore_title_aliases", "restore_rss_link"):
             if not u.get("bangumi_id"):
                 return "缺 bangumi_id"
@@ -2895,6 +2982,9 @@ class Executor:
         if op == "remove_show_dir":
             return self._remove_show_dir(u)
 
+        if op == "set_ab_mode":
+            return self._undo_ab_mode(u, rec)
+
         if op == "restore_title_aliases":
             if self.dry_run:
                 return True, ""
@@ -3109,6 +3199,46 @@ class Executor:
             return True, ""
 
         return False, f"未知逆操作 {op}"
+
+    def _undo_ab_mode(self, u: dict, rec: dict | None) -> tuple[bool, str]:
+        """逆操作 `set_ab_mode`：AB 的两个开关改回原来的（`flags`）、重启核对，状态文件还原成切之前的（`prev_state`，没有就删）。
+
+        只在它们此刻还是这一步切成的样子（`set`）时动：人后来在 WebUI 里改过的整步跳过并说明。状态文件还是这一步写下的
+        （`run_id` 对得上；被人删了也行）才动——之后又切过一次的，只退这一步会让两边对不上，整步跳过。重启之后没核对上
+        抛异常：改动已经发出，回退的这一步记 unknown。"""
+        from . import abmode
+
+        ab = self.ctx.ab
+        if ab is None:
+            return False, "AutoBangumi 接口不可用：没法把开关改回去（也可以在 WebUI 设置里改、或 media-agent ab-mode）"
+        config = ab.get_config()
+        cur = abmode.flags_of(config)
+        if cur != u["set"]:
+            return False, (f"AutoBangumi 的开关此刻是 {abmode.describe_flags(cur)}，不是这一步切成的 "
+                           f"{abmode.describe_flags(u['set'])}：有人改过，不动")
+        try:
+            state = abmode.read_state(self.cfg.state_dir)
+        except ValueError as e:
+            return False, f"{e}；先修好状态文件再回退"
+        if state is not None and (rec is None or state.get("run_id") != rec.get("run_id")):
+            return False, (f"state/ab_mode.json 已不是这一步写的（此后又切过，现在是 {state.get('mode')}，批次 "
+                           f"{state.get('run_id')}）：只回退这一步会让两边对不上——回退最近那一次，或直接用 "
+                           f"media-agent ab-mode")
+        if self.dry_run:
+            return True, ""
+        if cur != u["flags"]:
+            self._effect("ab.update_config")
+            ab.update_config(abmode.with_flags(config, u["flags"]))
+        self._effect("ab.restart")
+        ok, detail = abmode.restart_and_wait(ab, u["flags"])
+        if not ok:
+            raise RuntimeError(f"开关已改回、重启 AutoBangumi 之后没核对上：{detail}")
+        self._effect("fs.state_ab_mode")
+        if u.get("prev_state") is None:
+            abmode.remove_state(self.cfg.state_dir)
+        else:
+            abmode.write_state(self.cfg.state_dir, u["prev_state"])
+        return True, ""
 
     def _unset_sidecar(self, u: dict) -> tuple[bool, str]:
         """逆操作 `unset_sidecar`：摘掉正向动作往 sidecar 里**补**的那几项（`_set_intent`）。

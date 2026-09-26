@@ -149,6 +149,13 @@ class Config:
     # 维护暂停（`pause`）：这个文件在就说明 VPN 救援进行中（`deploy/rescue.py` 的 MARKER），`run` / `apply` 暂停。
     # `load_config` 默认 `~/gluetun/.rescue-active`；直接构造的 Config（测试基座）为 None = 不看。
     rescue_marker: Path | None = None
+    # AutoBangumi 的模式（`abmode` 模块文档）：`full` = AB 拉 RSS、下载、改名（一直以来的样子）；`subscription` = AB 只当
+    # 订阅的前端，抓取与改名全归本项目。来源（`ab_mode_source`）：`state`（`media-agent ab-mode` 切换时写的
+    # state/ab_mode.json，优先）> `env`（`.env` 的 AB_MODE）> `default`（full）。部署这个版本什么都不变，直到人切。
+    ab_mode: str = "full"
+    ab_mode_source: str = "default"
+    # AB 的 config.json 在宿主上的路径（AB_CONFIG，可不配）：`ab-mode` 在 AB 接口连不上时只读它，看一眼两个开关
+    ab_config: Path | None = None
 
     @property
     def state_dir(self) -> Path:
@@ -211,4 +218,21 @@ def load_config(env_file: Path | None = None) -> Config:
         notify_smtp_user=g("NOTIFY_SMTP_USER", ""),
         notify_smtp_pass=g("NOTIFY_SMTP_PASS", ""),
         rescue_marker=Path(g("RESCUE_MARKER", "") or Path.home() / "gluetun" / ".rescue-active"),
+        **_ab_mode(g("AB_MODE", "")),
+        ab_config=Path(g("AB_CONFIG")) if g("AB_CONFIG") else None,
     )
+
+
+def _ab_mode(env: str) -> dict:
+    """AB 的模式与来源：state/ab_mode.json（`media-agent ab-mode` 写的）> AB_MODE > full。两处写错了都大声失败。
+
+    `.env` 代码不写（它是人的，部署按 git tag），所以命令把切换的结果记在 state 里、这里优先认它；想让 AB_MODE 重新说了算，
+    删掉 state/ab_mode.json（或用 `media-agent ab-mode` 切成想要的）。"""
+    from . import abmode
+
+    rec = abmode.read_state(PROJECT_ROOT / "state")
+    if rec is not None:
+        return {"ab_mode": rec["mode"], "ab_mode_source": "state"}
+    if env.strip():
+        return {"ab_mode": abmode.parse(env, "AB_MODE"), "ab_mode_source": "env"}
+    return {"ab_mode": abmode.FULL, "ab_mode_source": "default"}
