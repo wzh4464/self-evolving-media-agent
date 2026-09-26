@@ -287,3 +287,38 @@ def test_health_and_notify_word_a_degraded_record_by_kind(lib):
                             "actions": rh.data["actions"]}, {"last_status": "critical", "active": {}})
     [ev] = evs
     assert "按字符串降级写进 audit.jsonl" in ev["text"] and "转写" not in ev["text"]
+
+
+# ------------------------------------------------------------------ apply / rollback 同样以 4 结束（2026-09-26 复审）
+@pytest.mark.allow("audit_fallback")
+def test_cmd_apply_exits_4_when_audit_is_lost(lib, monkeypatch, capsys):
+    """约束 11：有记录没原样进 audit.jsonl，退出码 4。以前只测了 run（而 run 还有健康报告那一层兜着），
+    apply 去掉 `return EXIT_AUDIT_INCOMPLETE` 全套照绿（复审变异 B1j）。"""
+    monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
+    _two_renames(lib)
+    _disk_full(monkeypatch, lib, times=None)
+
+    rc = cli.cmd_apply(_args(kind=None, show=None, limit=None), lib.cfg)
+
+    out = capsys.readouterr()
+    assert rc == cli.EXIT_AUDIT_INCOMPLETE
+    assert "audit.fallback.jsonl" in out.out and "审计" in out.err
+    assert len(_fallback_records(lib)) >= 2
+
+
+def test_cmd_rollback_exits_4_and_names_the_undo_steps_that_were_lost(lib, monkeypatch, capsys):
+    """回退时磁盘满：逐步记录只剩 stderr 与备用文件——退出码 4，输出点名是哪几步（复审变异 B1k：去掉
+    rollback 的 `return EXIT_AUDIT_INCOMPLETE`；B1l：`_write_step` 丢掉自己的写盘问题——都全套照绿）。"""
+    _two_renames(lib)
+    c = lib.cycle()
+    monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
+    _disk_full(monkeypatch, lib, times=None)
+
+    rc = cli.cmd_rollback(argparse.Namespace(run=c.run_id, last=False, dry_run=False), lib.cfg)
+
+    out = capsys.readouterr().out
+    assert rc == cli.EXIT_AUDIT_INCOMPLETE
+    assert "[undo:rename]" in out
+    steps = [r for r in _fallback_records(lib) if r.get("rollback_of") == c.run_id]
+    assert len(steps) == len([r for r in c.report.applied if r.get("undo")])
+    assert [r for r in _fallback_records(lib) if r.get("status") == "rollback"]   # 汇总也在
