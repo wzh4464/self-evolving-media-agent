@@ -9,6 +9,12 @@
 # 每次运行：判断隧道状态 -> 断了就重新解析域名 -> IP 变了就改配置 -> 重建容器 -> 复验。
 # 隧道正常时什么都不做。
 #
+# 重建之前先拿 media-agent 的运行锁（state/run.lock，与 media-agent、deploy.sh 同一把 flock），
+# 最多等 RUNLOCK_WAIT 秒（默认 900；一轮 run 约 2 分钟）：qBittorrent 与 gluetun 共用网络命名空间，
+# 一起被重建——在一轮 run 中途消失，扫描读到一半、改名改到一半（critic N17）。等不到就这一轮不重建、
+# 退出码 75，下一轮（6 小时后）再来。拿锁的办法是在锁里把本脚本重新跑一遍（MA_RUNLOCK_HELD=1）：
+# 等锁的那几分钟里隧道可能自己好了，重跑会先重新看健康状态。
+#
 # ---------------------------------------------------------------------------
 # 检测手段为什么不用 `docker exec ... wget`：
 # 隧道断开时 gluetun 的 killswitch 会拦掉容器内所有出网流量，wget 卡死在
@@ -21,9 +27,12 @@
 export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 set -uo pipefail
 
-DOCKER=/usr/local/bin/docker
+DOCKER="${DOCKER_BIN:-/usr/local/bin/docker}"
 DIG=/usr/bin/dig
 DIR="${HOME}/gluetun"
+RUNLOCK="${MEDIA_AGENT_HOME:-${HOME}/media-agent}/state/run.lock"
+RUNLOCK_WAIT="${RUNLOCK_WAIT:-900}"
+POLL="${WATCHDOG_POLL:-5}"          # 重建后查健康的间隔（秒）；测试里设 0
 OVPN="${DIR}/expressvpn.ovpn"
 HOSTFILE="${DIR}/.vpn-hostname"      # 存原始域名，解析的唯一可靠来源
 LOG="${DIR}/vpn-watchdog.log"
@@ -39,6 +48,34 @@ if [ -f "${LOG}" ] && [ "$(/usr/bin/stat -f%z "${LOG}" 2>/dev/null || echo 0)" -
 fi
 
 health() { ${DOCKER} inspect --format '{{.State.Health.Status}}' "${GLUETUN}" 2>/dev/null; }
+
+# with_runlock <锁文件> <最多等几秒> <命令...>：拿不到返回 75。与 media_agent/runlock.py、deploy.sh 的
+# with_lock 是同一种锁（flock）；锁文件一律保留（删了它，下一个按路径打开的人会拿到另一把锁）。
+with_runlock() {
+    local file=$1 wait=$2
+    shift 2
+    if [ -x /usr/bin/lockf ]; then                          # macOS（生产）
+        /usr/bin/lockf -k -s -t "${wait}" "${file}" "$@"
+    elif command -v flock >/dev/null 2>&1; then             # Linux
+        ( exec 9>>"${file}" || exit 75; flock -w "${wait}" 9 || exit 75; "$@" )
+    else
+        python3 -c '
+import fcntl, os, subprocess, sys, time
+path, wait, cmd = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+end = time.time() + wait
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        if time.time() >= end:
+            sys.exit(75)
+        time.sleep(0.5)
+sys.exit(subprocess.call(cmd))
+' "${file}" "${wait}" "$@"
+    fi
+}
 
 # 出口 IP 从 gluetun 自己的日志里读，不发网络请求——同样是为了不可能卡住
 exit_ip() {
@@ -76,6 +113,20 @@ fi
 
 log "BROKEN 隧道不通 (health=${H:-无容器})，开始恢复"
 
+# --- 重建会连 qBittorrent 一起拆掉：先拿 media-agent 的运行锁（见文件头）---
+if [ -z "${MA_RUNLOCK_HELD:-}" ]; then
+    if [ -d "$(dirname "${RUNLOCK}")" ]; then
+        log "WAIT 先拿 media-agent 的运行锁（最多 ${RUNLOCK_WAIT}s），免得在一轮 run 中途重建 qBittorrent"
+        MA_RUNLOCK_HELD=1 with_runlock "${RUNLOCK}" "${RUNLOCK_WAIT}" "${BASH:-/bin/bash}" "$0" "$@"
+        rc=$?
+        if [ "${rc}" -eq 75 ]; then
+            log "SKIP media-agent 持有运行锁超过 ${RUNLOCK_WAIT}s（$(cat "${RUNLOCK}" 2>/dev/null)），这一轮不重建，下轮再来"
+        fi
+        exit "${rc}"
+    fi
+    log "WARN 找不到 media-agent 的 state 目录（${RUNLOCK} 所在），不拿锁直接重建"
+fi
+
 # --- 重新解析域名，拿当前有效 IP ---
 HOST=$(cat "${HOSTFILE}" 2>/dev/null || true)
 if [ -z "${HOST}" ]; then
@@ -104,9 +155,9 @@ fi
 log "容器已重建，等待隧道建立"
 
 for i in $(seq 1 24); do
-    sleep 5
+    sleep "${POLL}"
     if [ "$(health)" = "healthy" ]; then
-        log "RECOVERED 隧道恢复，出口 IP=$(exit_ip)（耗时 $((i * 5))s）"
+        log "RECOVERED 隧道恢复，出口 IP=$(exit_ip)（耗时 $((i * POLL))s）"
         exit 0
     fi
 done

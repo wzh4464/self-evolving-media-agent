@@ -191,8 +191,8 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
 - `deploy.sh` 用 `/usr/bin/lockf -k`（Linux 上是 `flock(1)`）拿同一把锁，切换期间一直持有。
 - 手工维护时想让 agent 暂停：`touch ~/media-agent/state/PAUSE`（里面可以写一句为什么），`run` / `apply` 就以 75 结束、健康报告 warn；维护完 `rm` 掉。VPN 救援期间（`~/gluetun/.rescue-active` 在）自动暂停。要在自己干活的那几分钟里连手动命令也挡住，就自己拿着锁：
   `/usr/bin/lockf -k ~/media-agent/state/run.lock zsh`（退出这个 shell 即释放）。
-- 还没覆盖的：`vpn-watchdog.sh` 与 `rescue.py` 重建 qBittorrent 容器时不看这把锁
-  （critic N17）。一轮运行中途 qBittorrent 消失时，qBittorrent 读不全的闸门会让这一轮拒绝改动。
+- `vpn-watchdog.sh` 与 `rescue.py` 重建 qBittorrent 容器之前同样拿这把锁（critic N17）：最多等 900 秒
+  （`RUNLOCK_WAIT` / `RESCUE_LOCK_WAIT`），等不到就这次不重建、退出码 75。见下文「vpn-watchdog.sh / rescue.py」。
 
 ## launchd
 
@@ -237,13 +237,44 @@ bash 3.2 会把多字节字符当成变量名的一部分（`$APP，` → `APP\x
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MEDIA_AGENT_HOME` | `~/media-agent` | media-agent 仓库位置 |
-| `DOCKER_BIN` | `/usr/local/bin/docker` | docker 可执行文件 |
+| `MEDIA_AGENT_HOME` | `~/media-agent` | media-agent 仓库位置（运行锁在它的 `state/run.lock`） |
+| `DOCKER_BIN` | `/usr/local/bin/docker` | docker 可执行文件（`vpn-watchdog.sh` 以前写死，现在也读它） |
+| `RUNLOCK_WAIT` | `900` | `vpn-watchdog.sh` 重建前等 media-agent 运行锁的秒数，等不到这一轮不重建（退出码 75） |
+| `RESCUE_LOCK_WAIT` | `900` | `rescue.py start` / `stop` 切换前等运行锁的秒数，等不到不切换（退出码 75） |
 | `~/gluetun/.env.vps` 里的 `WIREGUARD_ENDPOINT_IP` | — | 救援隧道对端，`rescue.py` 用来核对出口 IP |
 
 `.env` / `.env.vps` 由 `.gitignore` 挡在仓库外——它们装着 WireGuard 密钥和
 服务器地址，不该进版本控制。`rescue.py` 要用 venv 里的解释器跑
 （`~/media-agent/.venv/bin/python deploy/rescue.py …`）：系统的 `/usr/bin/python3` 没有 httpx。
+
+## 重建容器与 media-agent 的协调（critic N17）
+
+两个脚本都会 `docker compose up -d --force-recreate`，qBittorrent（与 gluetun 共用网络命名空间）跟着被拆掉重建。
+
+- **重建之前拿 media-agent 的运行锁**（`state/run.lock`，与 media-agent、`deploy.sh` 同一把 flock）：一轮 `run` 正在跑
+  就等它结束（一轮约 2 分钟），最多等 900 秒；等不到就这次不重建 / 不切换，退出码 75。`vpn-watchdog.sh` 在锁里把自己
+  重跑一遍（等锁期间隧道可能自己好了，重跑会先重新看健康状态），`vpn-watchdog.log` 里记 `WAIT` / `SKIP`。
+  `rescue.py` 只在切换的那几分钟里拿锁（`auto` 等下载的几个小时不拿）。
+- **救援期间 media-agent 自己暂停**：`rescue.py start` 写下的 `~/gluetun/.rescue-active` 在，`run` / `apply` 就以 75 结束、
+  健康报告 warn（`media_agent/pause.py`）；`stop` 删掉它之后自动恢复。`stop` 拿不到锁时标记留着——安全一侧，稍后再跑
+  一次 `rescue.py stop`。
+
+### 生产上的副本要手动同步
+
+生产跑的是 **`~/gluetun/` 下的拷贝**（`vpn-watchdog.sh` 由它自己的 launchd 任务每 6 小时跑，`rescue.py` 人手动跑），
+`deploy.sh` 不碰它们。仓库里的这两个文件改了，部署完 media-agent 之后手动同步一次：
+
+```sh
+cd ~/media-agent
+diff -u ~/gluetun/vpn-watchdog.sh deploy/vpn-watchdog.sh    # 先看清楚差在哪（生产上有没有手改过）
+diff -u ~/gluetun/rescue.py deploy/rescue.py
+cp deploy/vpn-watchdog.sh ~/gluetun/vpn-watchdog.sh
+cp deploy/rescue.py ~/gluetun/rescue.py
+/bin/bash -n ~/gluetun/vpn-watchdog.sh && echo ok            # bash 3.2 下能解析
+```
+
+`rescue.py` 需要 media-agent 里有 `media_agent/runlock.py`（v0.2.0 起都有）。先部署 media-agent、再同步脚本：
+反过来的话旧版 media-agent 不认救援标记（不会暂停），但锁照样起作用。
 
 ## rescue.py 的分享率策略
 

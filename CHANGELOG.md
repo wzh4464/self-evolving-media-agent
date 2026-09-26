@@ -41,6 +41,10 @@
 - **维护暂停**（critic N17）：VPN 救援进行中（`~/gluetun/.rescue-active`，`RESCUE_MARKER` 可改）或有 `state/PAUSE`
   时，`run` / `apply` 一开始就以 75 结束、什么都不做，说清为什么暂停、多久了、怎么恢复；`diagnose` 照常。暂停的 `run`
   照样写健康报告（warn），忘了删的 `state/PAUSE` 会被看见。
+- `deploy/rescue.py`（`start` / `stop`）与 `deploy/vpn-watchdog.sh` 重建 qBittorrent 容器之前先拿 media-agent 的运行锁，
+  最多等 900 秒（`RESCUE_LOCK_WAIT` / `RUNLOCK_WAIT`），等不到就这次不重建、退出码 75——不再在一轮 `run` 中途把
+  qBittorrent 拆掉。`vpn-watchdog.sh` 的 docker 路径也改成读 `DOCKER_BIN`（手册一直这么写，脚本却写死了）。
+  **生产用的是 `~/gluetun/` 下的拷贝，要按 deploy/README.md 手动同步。**
 - 检测器崩溃不再只留一行日志：`Registry` 记下这一轮哪条规则崩了、异常、崩在哪（最后三层调用的文件:行），
   日志行末尾也带上位置（critic N9：一个被吞掉的 "database is locked" 让诊断静默地少一截）。
 

@@ -26,7 +26,7 @@
 | N11 | 没有结构化的发现历史：无动作的发现只以文字进 run.log；没有路径的发现去重键退回 `(show, summary)`，摘要里嵌着计数，跨轮认不出同一个问题——"卡住"检测无从谈起 | 第 3 阶段：发现历史与稳定指纹（`history.py`），见 `architecture/2026-09-26-run-health.md` 第 1 节 |
 | N12 | 回退只写一条汇总：逐步还原了什么没有审计，健康摘要看不见回退改了什么 | 第 3 阶段 8c901f5（逐步记录；回退记录不带逆操作，回退不能再回退）。见 `architecture/2026-09-26-honest-audit.md` 第 8 节 |
 | N15 | 抓取后的即时改名 `rename_single_video` 算目标名时丢掉条目的文件夹层（`_op_rename` 保留）：409 撞上一个已有的 Original 布局种子时，文件被挪到 save_path 根下 | 8a0dec9，见 `architecture/2026-09-26-path-claims.md` 第 4 节 |
-| N17 | `rescue.py` / `vpn-watchdog.sh` 重建 qBittorrent 容器时不看任何锁或维护窗口；运行锁应覆盖 `purge --apply`、`rollback`、`repair` 与手动会话 | 部分：0b5a02e（运行锁）；两个脚本仍不看锁 |
+| N17 | `rescue.py` / `vpn-watchdog.sh` 重建 qBittorrent 容器时不看任何锁或维护窗口；运行锁应覆盖 `purge --apply`、`rollback`、`repair` 与手动会话 | 0b5a02e（运行锁）；第 3 阶段：维护暂停（`pause.py`，救援标记 / `state/PAUSE`）与两个脚本重建容器前拿运行锁，见 `architecture/2026-09-26-run-health.md` 第 10、11 节 |
 | §2（对 executor 调研的更正） | executor 调研以为 `list_runs` 把"已回退"标在 `rollback-of-X` 上、`rollback --last` 会再选 X；其实汇总里的字面量 `rollback-of-…` 被随后的 `**result` 覆盖回原批次号，一直标对了（生产 4 条历史汇总都是原批次号） | 第 3 阶段 8c901f5 明写汇总的 `run_id`，逐步记录另用 `rollback-of-…` |
 | §3.5 | 审计的状态要向后兼容地扩展（约 9.6k 行、好几代格式）：执行器报告分桶 `{...}[status]` 遇到新状态就 KeyError；`_read_audit` / `list_runs` / `purge._audit_by_trash_path` / `find_failure_patterns` 都读状态 | 第 3 阶段 ba842c5（`unknown` 与各读者），契约见 `architecture/2026-09-26-honest-audit.md` 第 10 节 |
 | §3.6 | 运行锁不能等到后面的阶段：`purge` / `rollback` / `repair` / 手动会话今天就与 `run` 竞争 | 0b5a02e |

@@ -292,3 +292,30 @@ URL / Bearer / userinfo 里的）不进信也不进健康报告；发送失败�
 **测试**：`tests/test_pause.py`——救援标记让 `run` / `apply` 以 75 结束、说清原因；`state/PAUSE` 的内容与怎么恢复；
 `diagnose` 照常；不暂停照常；暂停的 run 不等锁；暂停的 run 写 warn 健康报告；时长；默认路径；测试基座不看；哪些子命令
 声明了暂停。把 `run` 的 `pause=True` 去掉，5 个红。
+
+## 11. 救援脚本与看门狗重建容器时拿运行锁（`deploy/rescue.py`、`deploy/vpn-watchdog.sh`）
+
+**现场**（critic N17）：两个脚本都 `docker compose up -d --force-recreate`，qBittorrent（与 gluetun 共用网络命名空间）
+跟着被拆掉重建，不看任何锁。第 1 阶段"读不全就整批拒绝"只挡得住扫描那一刻；重建落在执行阶段中途，改名 / 隔离
+就停在半路。
+
+**做法**：
+
+- `rescue.py`：`start` / `stop` 的主体包在 `media_agent_held()` 里——`media_agent.runlock.RunLock` 拿
+  `$MEDIA_AGENT_HOME/state/run.lock`，最多等 `RESCUE_LOCK_WAIT`（默认 900）秒，等不到就不切换、以 75 结束、打印持有者。
+  同一个进程里重入放行：`start` 的 compose 失败时它在锁里调用 `stop` 回滚，不能自己把自己锁死。`auto` 等下载的几个小时
+  不拿锁（那期间救援标记让 media-agent 自己暂停，第 10 节）；`stop` 等不到锁时标记留着——安全一侧，人稍后再跑一次。
+- `vpn-watchdog.sh`：判定 BROKEN 之后、重建之前，`with_runlock`（macOS `/usr/bin/lockf -k -s -t`，Linux `flock -w`，
+  都没有退回 python3 的 `fcntl.flock`；与 `deploy.sh` 的 `with_lock` 同一种锁、锁文件永不删除）在锁里带
+  `MA_RUNLOCK_HELD=1` 把自己重跑一遍——等锁的几分钟里隧道可能自己好了，重跑先重新看健康状态。等不到退出码 75、
+  日志记 `SKIP` 与持有者；media-agent 的 state 目录不在就记 `WARN`、不拿锁直接重建（隧道要紧）。顺带：docker 路径读
+  `DOCKER_BIN`（deploy/README 的配置表一直这么写，脚本却写死了），重建后查健康的间隔读 `WATCHDOG_POLL`（测试用 0）。
+- 等锁上限 900 秒：一轮 run 约 2 分钟（runloop §6），deploy.sh 的 `DEPLOY_LOCK_WAIT` 也是 900。
+- **生产上跑的是 `~/gluetun/` 下的拷贝**，`deploy.sh` 不碰它们：deploy/README「生产上的副本要手动同步」写了 diff → cp →
+  `bash -n` 的步骤。本阶段没有动生产。
+
+**测试**：`tests/test_rescue_scripts_lock.py`——`rescue.py`（按文件导入，docker / qBit 换成替身）：start 只在拿着锁时重建、
+用完即放；media-agent 占着锁时 75、没暂停做种、没写标记、说清持有者；stop 在锁里重建并删标记；start 失败回滚时同一个
+锁里重入。`vpn-watchdog.sh`（真 `/bin/bash` 跑，替身 docker 在 compose 那一刻用 `flock(LOCK_NB)` 看锁有没有被拿着）：
+重建时锁被拿着、恢复；media-agent 占着锁时 75、没重建、日志记 SKIP 与持有者；隧道健康时什么都不做；读 `DOCKER_BIN`。
+`test_deploy_scripts` 的 bash 3.2 解析与"变量名后紧跟中文"检查照样覆盖 watchdog。
