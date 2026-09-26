@@ -35,3 +35,31 @@ sidecar；`repair` 按审计里的空 `path` 在 cwd 里 `_merge_tree`；`relink
 **测试**：`tests/test_rollback_guards.py`——合成一条 `trash_path=""` 的生产形态
 记录，在一个装着 `.env` / `state/audit.jsonl` 的假 cwd 里回退，断言 cwd 与媒体库
 一个字节都没动；并对每个逆操作逐一喂坏参数。
+
+## 2. `_op_trash`：先核对文件，再碰种子；种子那一步失败就停手（N1 根因）
+
+**症状**：`_op_trash` 先 `qbit.delete`，再看 `path.exists()`。scan 会为"种子声明了、
+盘上没有"的文件产出条目（`on_disk=None`，大小用声明值），路径也可能在诊断与执行
+之间被挪走——这两种情况下种子记录丢了、文件一个没搬、审计写 `trashed_to: null`
+和一条 `trash_path: ""` 的逆操作，也就是第 1 条那 6 颗定时炸弹的来源。
+生产实例：20260920T170126 删掉朱音落语 S01E12 所属种子 d08f05a7 的记录，`freed 0`。
+
+另外两处"只记日志照样往下走"：`qbit.delete` / `set_file_priority` 失败时文件照搬
+（种子还要这个文件，下一次校验就重新下回来）；`file_only` 时 `_torrent_rel_path`
+认不出条目就静默不设优先级、照搬文件。
+
+**修法**（顺序即安全性）：
+1. 路径必须在媒体库之下、`lexists`、是普通文件。不存在 → `skipped`（种子与文件都不动）；
+   是目录或不是普通文件 → `failed`（这是检测器违约，要进 `find_failure_patterns`）。
+   目录一律拒绝：死种 content_path 对 NoSubfolder 多文件种子就是整个 Season 目录，
+   且目录的 `st_size` 让体积配额形同虚设。
+2. 配额、dry-run。
+3. 处理种子：`files()` / `delete` / `set_file_priority` 任何一步失败 → `failed`，
+   其余一切保持原样。`file_only` 按**完整相对路径**认条目（不再按文件名），
+   认不出或不唯一就拒绝。
+4. 搬文件；失败时 `failed` 记录里写明 `torrent_record_lost` / `priority_zeroed`。
+   于是 `applied` 的 trash 记录永远带着一个真实的 `trash_path`。
+
+**测试**：`tests/test_trash_guards.py`——幻影路径、诊断后被挪走、目录、媒体库外、
+delete / set_file_priority / files 各自失败、条目认不出、搬运失败；每个都断言
+qBittorrent 与磁盘的快照不变（或如实记录）。

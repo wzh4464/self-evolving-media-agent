@@ -903,9 +903,41 @@ class Executor:
                           "torrent_savepaths": affected})
 
     def _op_trash(self, f: Finding, a: Action) -> None:
-        """删除 = 移入隔离区。受配额上限保护。"""
-        path = Path(a.args["path"]) if a.args.get("path") else None
-        size = path.stat().st_size if path and path.exists() else 0
+        """删除 = 移入隔离区。受配额上限保护。
+
+        **顺序就是这个动作的安全性所在**，每一步都只在前一步确定成功后才走：
+
+        1. 要搬的必须是媒体库里一个**真实存在的普通文件**——在碰 qBittorrent 之前核对。
+           以前先 `qbit.delete` 后看 `path.exists()`：路径是幻影（种子声明了、
+           盘上没有）或诊断后被挪走时，种子记录丢了、文件一个没搬，还写下一条
+           `trash_path: ""` 的逆操作（critic N1）。生产实例：20260920T170126
+           删掉朱音落语 S01E12 所属种子 d08f05a7 的记录，`freed 0`。
+           目录一律拒绝：死种的 content_path 对 NoSubfolder 多文件种子就是整个
+           Season 目录（生产 10 个），`st_size` 还只有目录项那点大，体积配额拦不住。
+        2. 配额、dry-run。
+        3. 处理种子：整种子摘记录，或只把这一个文件设为不下载。**失败就停手**——
+           以前只记一行日志照样搬文件，结果是种子还在、文件没了（qBittorrent
+           会把它重新下回来），或种子记录的状态与审计对不上。
+        4. 最后搬文件。搬失败时如实记下种子记录是否已经删掉。
+        """
+        path, why = _inside(a.args.get("path"), Path(self.cfg.media_root), "path")
+        if why:
+            self._audit("failed", f, a,
+                        {"error": f"拒绝移入隔离区：{why}（只处置媒体库里的文件）"})
+            return
+        if not os.path.lexists(path):
+            self._audit("skipped", f, a, {
+                "reason": "文件已不在原位（种子声明了但盘上没有，或诊断后被挪走），"
+                          "种子与文件都不动"})
+            return
+        if path.is_dir():
+            self._audit("failed", f, a, {
+                "error": f"拒绝整目录移入隔离区：{path} 是目录——隔离只处置单个文件"})
+            return
+        if not path.is_file():
+            self._audit("failed", f, a, {"error": f"拒绝移入隔离区：{path} 不是普通文件"})
+            return
+        size = path.stat().st_size
 
         # 配额检查
         if self._deleted_count >= self.cfg.max_delete_per_run:
@@ -929,50 +961,72 @@ class Executor:
         # 报成"路径失效且无法自动定位"——攻壳机动队实测留下 6 个，全都修不了，
         # 因为磁盘上根本没有对应体积的文件可供重新关联。
         # 所以在这里按种子的**实际文件数**复核，只含一个就退化成整种子作废。
-        if h and self.ctx.qbit and file_only:
-            try:
-                wanted = [e for e in self.ctx.qbit.files(h)
-                          if e.get("priority", 1) != 0]
-                if len(wanted) <= 1:
+        record_lost = zeroed = False
+        if h and self.ctx.qbit:
+            entry = None
+            if file_only:
+                try:
+                    entries = self.ctx.qbit.files(h)
+                except Exception as e:
+                    self._audit("failed", f, a, {
+                        "error": f"读取种子文件列表失败，未做任何改动：{type(e).__name__}: {e}"})
+                    return
+                if len([e for e in entries if e.get("priority", 1) != 0]) <= 1:
                     file_only = False
-            except Exception as e:
-                self.ctx.log(f"[trash] 读取种子文件列表失败 {h}: {e}")
+                else:
+                    # 按完整相对路径认条目，不按文件名：合集里不同子目录下
+                    # 同名的文件（NCOP.mkv）会被认错。认不出就不搬——文件搬走了
+                    # qBittorrent 却仍要它，下一次校验就会把它重新下回来。
+                    hits = [e for e in entries if str(path).endswith("/" + e["name"])]
+                    if len(hits) != 1:
+                        self._audit("failed", f, a, {
+                            "error": "种子文件列表里找不到该文件（或不止一条匹配），"
+                                     "拒绝只搬文件、不改种子"})
+                        return
+                    entry = hits[0]
 
-        if h and self.ctx.qbit and not file_only:
-            # 整个种子作废：先删种子记录（不删文件），文件再单独进隔离区
-            try:
-                self.ctx.qbit.delete([h], delete_files=False)
-            except Exception as e:
-                self.ctx.log(f"[trash] 删除种子记录失败 {h}: {e}")
-        elif h and self.ctx.qbit and file_only:
-            # 只作废种子里的某个文件：设为不下载，保留其余部分
-            try:
-                rel = self._torrent_rel_path(h, path) if path else None
-                if rel is not None:
-                    idx = next(e["index"] for e in self.ctx.qbit.files(h)
-                               if e["name"] == rel)
-                    self.ctx.qbit.set_file_priority(h, [idx], 0)
-            except Exception as e:
-                self.ctx.log(f"[trash] 设置文件不下载失败 {h}: {e}")
+            if not file_only:
+                # 整个种子作废：先删种子记录（不删文件），文件再单独进隔离区
+                try:
+                    self.ctx.qbit.delete([h], delete_files=False)
+                except Exception as e:
+                    self._audit("failed", f, a, {
+                        "error": f"删除种子记录失败，文件未动：{type(e).__name__}: {e}"})
+                    return
+                record_lost = True
+            else:
+                # 只作废种子里的某个文件：设为不下载，保留其余部分
+                try:
+                    self.ctx.qbit.set_file_priority(h, [entry["index"]], 0)
+                except Exception as e:
+                    self._audit("failed", f, a, {
+                        "error": f"设为不下载失败，文件未动：{type(e).__name__}: {e}"})
+                    return
+                zeroed = True
 
-        moved = None
-        if path and path.exists():
-            day = datetime.now().strftime("%Y-%m-%d")
-            dest_dir = self.cfg.trash_dir / day / f.show / (path.parent.name or "")
+        day = datetime.now().strftime("%Y-%m-%d")
+        dest_dir = self.cfg.trash_dir / day / f.show / (path.parent.name or "")
+        dest = dest_dir / path.name
+        if os.path.lexists(dest):
+            dest = dest_dir / f"{path.stem}.{int(time.time())}{path.suffix}"
+        try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / path.name
-            if dest.exists():
-                dest = dest_dir / f"{path.stem}.{int(time.time())}{path.suffix}"
             shutil.move(str(path), str(dest))
-            moved = str(dest)
-            self._deleted_count += 1
-            self._deleted_bytes += size
+        except Exception as e:
+            # 种子那一步已经做了、文件没搬走：如实记下，别只剩一句异常
+            # （跨卷搬运是先拷后删，磁盘满时就会在这里失败，critic N8）。
+            self._audit("failed", f, a, {
+                "error": f"搬入隔离区失败：{type(e).__name__}: {e}",
+                "torrent_record_lost": record_lost, "priority_zeroed": zeroed,
+                "path_still_at": str(path)})
+            return
+        self._deleted_count += 1
+        self._deleted_bytes += size
 
         # 文件可从隔离区还原；但被删掉的种子记录还原不了（种子文件本身已不在）
-        undo = {"op": "restore_from_trash", "path": str(path) if path else "",
-                "trash_path": moved or "",
-                "torrent_record_lost": bool(h and not file_only)}
-        self._audit("applied", f, a, {"trashed_to": moved, "freed_bytes": size},
+        undo = {"op": "restore_from_trash", "path": str(path),
+                "trash_path": str(dest), "torrent_record_lost": record_lost}
+        self._audit("applied", f, a, {"trashed_to": str(dest), "freed_bytes": size},
                     undo=undo)
 
     # ---------------- 回退 ----------------
