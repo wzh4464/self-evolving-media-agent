@@ -16,6 +16,7 @@ import pytest
 from media_agent import gate
 from media_agent.actions import Executor
 from media_agent.kernel import DSL_ORIGIN, Action, Finding
+from media_agent.plugins.builtin import ExtrasDetector
 
 GB = 600_000_000
 
@@ -416,14 +417,64 @@ def test_i1_another_copy_trashed_earlier_in_the_batch_does_not_count(lib):
 
 
 def test_i1_extras_disposition_of_an_unpinned_file_is_allowed(lib):
-    """特典处置是明确的"它不是正片"：名字碰巧认得出集号也可以删（没钉 `ma:`）。"""
+    """特典处置是明确的"它不是正片"：名字认得出集号、而那一集另有真能播的正片时照删（没钉 `ma:`）。"""
     s1 = lib.show("朱音落语").season(1)
     t = s1.single("朱音落语 S01E12 [NCOP].mp4", size=GB)
+    s1.local("朱音落语 S01E12.mp4", size=GB)
 
     rep = lib.apply([_trash(t.path, t.hash, rule="extras-in-library", kind="extra_content",
                             show="朱音落语", file_only=True)])
 
     assert len(rep.applied) == 1 and not t.path.exists()
+
+
+def test_i1_extras_disposition_of_an_unpinned_only_copy_is_refused(lib):
+    """2026-09-26 审查：没钉子的特典以前不问集位——名字认得出集号、那一集此刻又没有别的可播文件时，
+    它可能就是那一集（发布名的罗马音标题里带 Trailer / Menu，检测器认不出标题）。检测器诊断时
+    另一份还在、执行前被删了，或检测器的"唯一一份"兜底被幻影骗过（审查复现），关口都得拦下。"""
+    s1 = lib.show("拖车公园").season(1)
+    ep = s1.single("[G] Trailer Park Boys - 05 [1080p].mkv", size=GB)
+    other = s1.local("拖车公园 S01E05.mkv", size=GB)
+    findings = [f for f in lib.diagnose() if f.rule == "extras-in-library"]
+    assert [f.path for f in findings] == [str(ep.path)]
+    other.unlink()                                      # 诊断之后另一份没了
+
+    rep = lib.apply(findings)
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "S01E05" in skip["reason"]
+    assert ep.path.exists() and lib.trash_files() == []
+
+
+def test_i1_extras_in_a_show_whose_title_carries_a_marker_count_its_episodes(lib):
+    """同集的正片是规范名 `异世界食堂的菜单 S01E01.mkv`：标题里的「菜单」不能让它在关口那里也被当成
+    特典、不算可播的那一份（与检测器同一口径：只看标题之后的部分）。"""
+    title = "异世界食堂的菜单"
+    s1 = lib.show(title).season(1)
+    for n in (1, 2):
+        s1.single(f"{title} S01E{n:02d}.mkv", size=GB, name=f"[G] Isekai - {n:02d}.mkv")
+    nced = s1.single("[G] Isekai Shokudou NCED - 01 [1080p].mkv", size=90_000_000)
+
+    c = lib.cycle()
+
+    [rec] = [r for r in c.applied("trash") if r["rule"] == "extras-in-library"]
+    assert rec["args"]["path"] == str(nced.path) and rec["deletion"]["slot"] == [1, 1]
+
+
+def test_i1_extras_slot_comes_from_the_detector_not_the_raw_number(lib):
+    """episode_offset -24 那一季的 NCOP 发布名写 `- 25`：检测器解析成 S03E01（库里有），关口若只凭
+    名字猜成 S03E25（库里没有）就会每轮拒绝一次。动作里带上检测器算的集位。"""
+    title = "超超超超超喜欢你的100个女朋友"
+    sh = lib.show(title)
+    s3 = sh.season(3)
+    sh.bangumi(37, title_raw="Hyakkano", season=3, episode_offset=-24)
+    s3.single(f"{title} S03E01.mkv", size=GB, name="[ANi] Hyakkano - 25 [1080P].mp4")
+    ncop = s3.single("[ANi] Hyakkano NCOP - 25 [1080P].mkv", size=90_000_000)
+
+    c = lib.cycle(detectors=[ExtrasDetector])
+
+    [rec] = c.applied("trash")
+    assert rec["args"]["path"] == str(ncop.path) and rec["deletion"]["slot"] == [3, 1]
 
 
 def test_i1_extras_disposition_of_a_pinned_only_copy_is_refused(lib):

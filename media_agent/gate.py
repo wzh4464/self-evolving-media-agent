@@ -24,8 +24,8 @@
     文件、下完了（种子进度 1、不是 `.!qB`、盘上大小不小于种子声明的；纯本地的不小于诊断时的
     大小）、本批次没有被删掉（路径没进隔离区、种子没被摘）、仍然归这个集位（钉子 / 显式
     `SxxEyy` 没变）；要删的那个也仍然归这个集位。
-  - 没点名保留方（特典、死种半成品、手写的删除）：要删的若是某个集位**唯一**的可播文件就拒绝——
-    除非这是明确的特典 / 半成品处置，且它没钉 `ma:`、也没封存。
+  - 没点名保留方（特典、手写的删除）：要删的若是某个集位**唯一**的可播文件就拒绝——特典也不例外
+    （名字认得出集号的特典可能是标题里带记号的正片；认不出集号的没有集位，不问）。
   - `drop_torrent`（只摘记录）：撞车的受害者被摘之前，保留方此刻仍以优先级非 0 声明那个共享的
     文件、文件在盘上、没被截断（`check_drop`）。
 - **I2 不删另一个保留着的种子仍然声明的路径**（`claims.ClaimIndex.check(disk=False)`，
@@ -72,7 +72,7 @@ from pathlib import Path
 
 from .claims import PARTIAL, ClaimsUnknown, fold
 from .kernel import DSL_ORIGIN, Finding
-from .naming import (VIDEO_EXTS, explicit_slot, is_extra, parse_episode, parse_pin,
+from .naming import (VIDEO_EXTS, explicit_slot, is_extra_of, parse_episode, parse_pin,
                      season_of_dir)
 
 PREFIX = "删除关口："
@@ -382,17 +382,23 @@ def _keeper_problem(ex, v: Verdict, f: Finding, path: Path, pin, media_root: Pat
 
 
 def _last_copy_problem(ex, v: Verdict, path: Path, pin, media_root: Path) -> str:
-    """没点名保留方（特典、半成品、手写的删除）：要删的是不是某个集位唯一的可播文件。"""
+    """没点名保留方（特典、手写的删除）：要删的是不是某个集位唯一的可播文件。
+
+    **特典处置也问**（2026-09-26 审查）。以前没钉 `ma:` 的特典直接放行："它不是正片"是检测器
+    说的，而检测器认不出罗马音标题里的记号（`[G] Trailer Park Boys - 05`），只靠"某集唯一的文件
+    不当特典"兜底——那道兜底曾被一个幻影骗过，诊断之后另一份被删了它也不知道。名字认得出集号、
+    那一集此刻又没有别的可播文件，它就可能是那一集：留着一个真特典，好过删掉唯一的一集。认不出
+    集号的（`NCOP.mkv`）照旧放行。死种半成品是 `.!qB`、不是可播文件，走不到 I1。"""
     slot = v.slot
     if not slot:
         return ""                             # 认不出集位：不是某一集的正片
-    if v.disposition in ("extras", "dead_partial") and not pin:
-        return ""                             # 明确的特典 / 半成品处置，且没钉 ma:
     if other_holders(ex, path, slot, media_root):
         return ""
     why = f"{_fmt(slot)} 此刻只剩这一个可播文件"
     if pin:
         why += f"（种子钉着 ma:{_fmt(pin)}，是抓取器认定的正片）"
+    elif v.disposition == "extras":
+        why += "（特典规则认定它不是正片，但名字认得出这一集：可能是发布名的标题里带记号的正片）"
     return why + "，删了这一集就没了"
 
 
@@ -402,6 +408,9 @@ def other_holders(ex, path: Path, slot, media_root: Path) -> list[str]:
     算数的：剧目录下（不在 `.xxx` 隐藏目录里）的视频文件、不是半成品、不是特典、本批次没进
     隔离区；有种子声明的要那个条目下完了、盘上大小不小于声明的（种子本批次已摘的按纯本地算）；
     集位按种子的 `ma:` 钉子，没有就按名字。认不出集位的不算——宁可少算。
+
+    "不是特典"只看剧名之后的部分（`naming.is_extra_of`，标题取剧目录名 = 规范标题）：规范名
+    `异世界食堂的菜单 S01E01.mkv` 不能因为标题里的「菜单」就不算那一集的可播文件。
     """
     show_dir, _ = _show_dir(media_root, path)
     if show_dir is None or not show_dir.is_dir():
@@ -418,7 +427,7 @@ def other_holders(ex, path: Path, slot, media_root: Path) -> list[str]:
         if p.is_symlink() or not p.is_file() or not _is_video(p) or _is_partial(p):
             continue
         fp = fold(p)
-        if fp == me or fp in trashed or is_extra(p.name):
+        if fp == me or fp in trashed or is_extra_of(p.name, [show_dir.name]):
             continue
         size = p.stat().st_size
         hpin = None

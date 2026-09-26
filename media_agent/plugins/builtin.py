@@ -1104,6 +1104,9 @@ class ExtrasDetector:
                     continue
                 if self._only_copy(f, show):
                     continue
+                # 集位交给删除关口：名字认得出集号的特典，关口要确认那一集此刻另有可播的正片
+                # （I1），按的是这里算的集位（钉子、季号偏移、episode_offset），不是关口只凭名字猜的
+                slot = _resolve(f, show)
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="minor",
                     summary=f"特典/周边内容，TMDB 无对应条目：{f.filename}",
@@ -1112,7 +1115,8 @@ class ExtrasDetector:
                     action=Action(op="trash", reversible=True,
                                   args={"path": str(f.path),
                                         "torrent_hash": f.torrent_hash,
-                                        "file_only": True},
+                                        "file_only": True,
+                                        **({"slot": list(slot)} if slot else {})},
                                   note="种子内其余正片保留，仅该文件设为不下载并移入隔离区"),
                 )
 
