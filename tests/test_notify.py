@@ -182,7 +182,7 @@ def test_secrets_never_reach_the_mail(offline_cli, smtp, capsys, monkeypatch):
 
     def leaky(self, ctx):
         real(self, ctx)
-        self.data["clients"]["qbit"] = ("down: ConnectError: http://u:hunter2-qbit@10.0.0.1/ "
+        self.data["clients"]["qbit"] = ("down: ConnectError: http://u:hunter2-qbit@qbit.invalid/ "
                                         "api_key=tmdbkey123456&x=1 Bearer sk-llm-9999")
 
     monkeypatch.setattr(health.RunHealth, "clients", leaky)
