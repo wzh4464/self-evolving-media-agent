@@ -26,8 +26,16 @@
   改动之后）。`error` 是异常，`reason` 说明为什么确认不了；`effects_attempted` 列出已发出的改动；
   有"如果生效了该怎么撤"时照样带 `undo`——回退会按此刻状态核对后尝试它（每个逆操作动手前都核对）。
 
-回退另写 `rollback`（汇总，`run_id` 是被回退的批次——历史记录也是这个形状）。不认识的状态
-一律当作"不是已生效"读：不计入回退、不计入已隔离。
+回退另写两种记录：
+
+- **逐步**（每一步逆操作一条）：`run_id` = `rollback-of-<被回退的批次>`，`rollback_of` = 被回退的批次，
+  `rollback_id` = 这一次回退自己的 ID，`op` = `undo:<逆操作>`，`args` = 逆操作，`undoes` 指回原记录
+  （`seq` / `ts` / `op` / `status`）；`status` 同上四种（还原了 / 核对后跳过 / 没动就出错 / 动了之后出错）。
+  不带 `undo`：回退不能再回退。
+- **汇总**（一次回退一条）：`status` = `rollback`，`run_id` 是被回退的批次（生产上 4 条历史汇总也是这个形状，
+  `list_runs` 靠它标"已回退"），`rollback_run_id` 指向逐步记录的批次号，另有计数。
+
+不认识的状态一律当作"不是已生效"读：不计入回退、不计入已隔离。
 """
 from __future__ import annotations
 
@@ -46,6 +54,8 @@ STATUSES = (APPLIED, SKIPPED, FAILED, UNKNOWN)
 UNDOABLE = (APPLIED, UNKNOWN)
 # 回退汇总记录的状态
 ROLLBACK = "rollback"
+# 回退逐步记录的批次号前缀：`rollback-of-<被回退的批次>`（记录里另有 `rollback_of` 字段）
+ROLLBACK_PREFIX = "rollback-of-"
 
 
 def fallback_path(audit_log: Path) -> Path:

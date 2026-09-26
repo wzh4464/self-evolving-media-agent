@@ -15,6 +15,7 @@ import re
 import shutil
 import time
 from collections.abc import Collection
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -480,12 +481,7 @@ class Executor:
             (f for f in findings if f.action),
             key=lambda f: (self._OP_ORDER.get(f.action.op, 99), f.show, f.path),
         )
-        # 本批次期间记下每个动作发出的写调用（见 `_Tracked`）。包的是 Context 上的客户端，结束后还原。
-        qbit, abdb = self.ctx.qbit, self.ctx.abdb
-        self.ctx.qbit = _Tracked(qbit, self._effects, _QBIT_WRITES, "qbit")
-        if abdb is not None:
-            self.ctx.abdb = _Tracked(abdb, self._effects, _ABDB_WRITES, "abdb")
-        try:
+        with self._tracking():
             for f in ordered:
                 self._effects.clear()
                 self._would_undo = None
@@ -494,9 +490,21 @@ class Executor:
                     self._dispatch(f, f.action)
                 except Exception as e:
                     self._crashed(f, e)
+        return self.report
+
+    @contextmanager
+    def _tracking(self):
+        """期间记下每个动作（每一步逆操作）发出的写调用（见 `_Tracked`）。包的是 Context 上的客户端，
+        结束后还原。"""
+        qbit, abdb = self.ctx.qbit, self.ctx.abdb
+        if qbit is not None:
+            self.ctx.qbit = _Tracked(qbit, self._effects, _QBIT_WRITES, "qbit")
+        if abdb is not None:
+            self.ctx.abdb = _Tracked(abdb, self._effects, _ABDB_WRITES, "abdb")
+        try:
+            yield
         finally:
             self.ctx.qbit, self.ctx.abdb = qbit, abdb
-        return self.report
 
     def _crashed(self, f: Finding, e: Exception) -> None:
         """动作抛了异常、它自己没接住。发出过改动就是 unknown，否则 failed。
@@ -2033,6 +2041,21 @@ class Executor:
         done, skipped, failed, lost = [], [], [], []
         self._undo_notes = []
 
+        def refuse(why: str) -> dict:
+            return {"run_id": run_id, "refused": why, "total": len(records),
+                    "reverted": 0, "skipped": 0, "failed": 0,
+                    "irreversible": len(no_undo), "torrent_records_lost": 0,
+                    "priority_not_restored": 0, "notes": [],
+                    "unconfirmed": len(unconfirmed), "unconfirmed_reverted": 0,
+                    "unconfirmed_no_undo": sum(1 for r in unconfirmed if not r.get("undo")),
+                    "skipped_detail": [], "failed_detail": [], "audit_problems": []}
+
+        # 回退留下的逐步记录（`rollback-of-…`）不带逆操作：回退不能再回退。以前没有逐步记录，
+        # 这个批次号根本不存在；现在它出现在 `runs` 里，拒绝要说清楚，而不是报"0 项可回退"
+        if run_id.startswith(auditlog.ROLLBACK_PREFIX):
+            return refuse(f"{run_id} 是一次回退留下的记录（回退 {run_id[len(auditlog.ROLLBACK_PREFIX):]}），"
+                          "回退记录本身不带逆操作、不能再回退；需要的话按它的逐步记录人工核对")
+
         # qBittorrent 不在就整批拒绝（critic N3）：逆改名会退化成 `mv`，
         # 目录改名的逆操作无从得知哪些文件归活种子，其余逆操作
         # 各自 AttributeError 记成 failed——半截回退比不回退更难收拾。
@@ -2041,29 +2064,41 @@ class Executor:
         # 也**不写** rollback 汇总记录：写了 `list_runs` 就会把这批标成已回退。
         refused = self.qbit_blocker()
         if refused:
-            return {"run_id": run_id, "refused": refused, "total": len(records),
-                    "reverted": 0, "skipped": 0, "failed": 0,
-                    "irreversible": len(no_undo), "torrent_records_lost": 0,
-                    "priority_not_restored": 0, "notes": [],
-                    "unconfirmed": len(unconfirmed), "unconfirmed_reverted": 0,
-                    "unconfirmed_no_undo": sum(1 for r in unconfirmed if not r.get("undo")),
-                    "skipped_detail": [], "failed_detail": []}
+            return refuse(refused)
 
-        for rec in reversed(undoable):        # LIFO
-            u = rec["undo"]
-            try:
-                ok, reason = self._apply_undo(u, rec)
-                if ok:
-                    done.append(rec)
-                else:
-                    skipped.append({**rec, "skip_reason": reason})
-            except Exception as e:
-                failed.append({**rec, "error": f"{type(e).__name__}: {e}"})
-            if self._claim_index is not None:
-                # 每一步逆操作之后占用索引作废（失败的也可能改到一半），下一步看到的是新状态
-                self._claim_index.invalidate()
-            if u.get("torrent_record_lost"):
-                lost.append(rec)
+        problems: list[str] = []
+        with self._tracking():
+            for rec in reversed(undoable):        # LIFO
+                u = rec["undo"]
+                self._effects.clear()
+                notes_before = len(self._undo_notes)
+                try:
+                    ok, reason = self._apply_undo(u, rec)
+                    if ok:
+                        done.append(rec)
+                        step = (auditlog.APPLIED, {})
+                    else:
+                        skipped.append({**rec, "skip_reason": reason})
+                        step = (auditlog.SKIPPED, {"reason": reason})
+                except Exception as e:
+                    failed.append({**rec, "error": _describe(e)})
+                    # 汇总照旧算进 failed（"这一步抛了异常"）；逐步记录说实话：发出过改动就是 unknown
+                    step = ((auditlog.UNKNOWN, {
+                        "error": _describe(e),
+                        "reason": ("逆操作在已经发出改动之后抛了异常（"
+                                   + "、".join(dict.fromkeys(self._effects))
+                                   + "），还原了没有、还原了多少无法确认"),
+                        "effects_attempted": list(self._effects)})
+                            if self._effects else (auditlog.FAILED, {"error": _describe(e)}))
+                if self._claim_index is not None:
+                    # 每一步逆操作之后占用索引作废（失败的也可能改到一半），下一步看到的是新状态
+                    self._claim_index.invalidate()
+                if u.get("torrent_record_lost"):
+                    lost.append(rec)
+                if not self.dry_run:
+                    notes = self._undo_notes[notes_before:]
+                    problems += self._write_step(run_id, rec, u, step[0],
+                                                 {**step[1], **({"notes": notes} if notes else {})})
 
         result = {
             "run_id": run_id,
@@ -2082,17 +2117,46 @@ class Executor:
             "skipped_detail": skipped[:10],
             "failed_detail": failed[:10],
             "refused": "",
-            "audit_problems": [],
+            "audit_problems": problems,
         }
         if not self.dry_run:
+            # 汇总：`run_id` 是**被回退的批次**——`list_runs` 靠它标"已回退"。以前写的是字面量
+            # `rollback-of-…`，却被后面的 `**result` 覆盖回原批次号（critic §2 的更正；生产上 4 条历史汇总
+            # 都是这个形状）。现在明写，逐步记录的批次号放在 `rollback_run_id`。
             # 写汇总同样永不抛（`audit.write`）：回退做完了，别因为记不下来而报成异常
-            result["audit_problems"] = auditlog.write(self.cfg.audit_log, {
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "run_id": f"rollback-of-{run_id}",
-                "status": "rollback",
+            result["audit_problems"] = problems + auditlog.write(self.cfg.audit_log, {
                 **result,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "run_id": run_id,
+                "status": auditlog.ROLLBACK,
+                "rollback_run_id": f"{auditlog.ROLLBACK_PREFIX}{run_id}",
+                "rollback_id": self.run_id,
             })
         return result
+
+    def _write_step(self, run_id: str, rec: dict, u: dict, status: str, extra: dict) -> list[str]:
+        """回退的一步留一条审计（critic N12：以前只有汇总，还原了哪几条、停在哪一步都查不到）。
+        记录形状见 `audit` 模块文档。永不抛；返回写盘遇到的问题。"""
+        self._seq += 1
+        step = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "run_id": f"{auditlog.ROLLBACK_PREFIX}{run_id}",
+            "seq": self._seq,
+            "status": status,
+            "dry_run": False,
+            "rule": rec.get("rule") or "",
+            "kind": rec.get("kind") or "",
+            "op": f"undo:{u.get('op')}",
+            "args": u,
+            "summary": f"回退：{rec.get('summary') or ''}",
+            "rollback_of": run_id,
+            "rollback_id": self.run_id,
+            "undoes": {"seq": rec.get("seq"), "ts": rec.get("ts"), "op": rec.get("op"),
+                       "status": rec.get("status")},
+            **extra,
+        }
+        return [f"[undo:{u.get('op')}] {str(rec.get('summary') or '')[:50]}（{status}）：{p}"
+                for p in auditlog.write(self.cfg.audit_log, step)]
 
     def _read_audit(self, run_id: str) -> list[dict]:
         """某一批次的全部非预演记录，按写入顺序。
@@ -2104,7 +2168,9 @@ class Executor:
         out = [rec for rec in auditlog.iter_records(self.cfg.audit_log)
                if rec.get("run_id") == run_id and not rec.get("dry_run")]
         big = float("inf")
-        out.sort(key=lambda r: r["seq"] if isinstance(r.get("seq"), int) else big)
+        # 回退的逐步记录：同一批可能被回退不止一次，每次的 `seq` 各自从头数——先按那一次回退分组
+        out.sort(key=lambda r: (str(r.get("rollback_id") or ""),
+                                r["seq"] if isinstance(r.get("seq"), int) else big))
         return out
 
     def _undo_problem(self, u: dict) -> str | None:
@@ -2271,6 +2337,7 @@ class Executor:
                            if "/" in rel else u["new_name"])
                 self.ctx.qbit.rename_file(h, rel, new_rel)
             else:
+                self._effect("fs.rename")
                 cur.rename(back)
             return True, ""
 
@@ -2337,6 +2404,7 @@ class Executor:
             # 没有种子声明的残留（NFO、孤儿字幕、`.extras` 里的东西……）逐个文件搬回，
             # 任何种子声明的路径都不碰：setLocation 是异步的，qBit 可能还没搬完。
             if cur.exists():
+                self._effect("fs.merge_tree")
                 self._merge_tree(cur, back, skip=claimed)
 
             bid, prev = u.get("bangumi_id"), u.get("prev_savepath")
@@ -2351,6 +2419,7 @@ class Executor:
                 return True, ""
             from . import sidecar as sc_mod
             p = sc_mod.path_for(Path(u["show_dir"]))
+            self._effect("fs.sidecar")
             if u.get("prev") is None:
                 p.unlink(missing_ok=True)
             else:
@@ -2379,6 +2448,7 @@ class Executor:
             if info:
                 info["have"] = [x for x in (info.get("have") or [])
                                 if x != int(u["episode"])]
+                self._effect("fs.sidecar")
                 sc_mod.save(d, sc)
             return True, ""
 
@@ -2528,6 +2598,7 @@ class Executor:
                         self._undo_notes.append(f"{dst.name}：文件会搬回，但合集条目的下载恢复不了（{why}）")
                 return True, ""
             dst.parent.mkdir(parents=True, exist_ok=True)
+            self._effect("fs.move_from_trash")
             shutil.move(str(src), str(dst))
             # 文件先回来、再恢复下载：反过来 qBittorrent 会先开始往这个名字写半成品
             if fp:
@@ -2671,10 +2742,13 @@ class Executor:
         """列出历史 run，供选择回退哪一次。主审计与 audit.fallback.jsonl 一起读。
 
         每个批次：`applied`（已生效的条数）、`unconfirmed`（记 unknown 的条数）、`undoable`（回退会
-        尝试的条数：带逆操作的 applied 与 unknown）、`rolled_back`（有回退汇总记录指向它）。
+        尝试的条数：带逆操作的 applied 与 unknown）、`rolled_back`（有回退指向它：汇总记录的 `run_id`，
+        或逐步记录的 `rollback_of`）。回退自己的逐步记录成一个批次（`rollback-of-…`），带 `rollback_of`，
+        没有可回退的条目。
         各代格式都认：没有 `run_id` 的（2026-08-17 上午那一代）、预演的不成批次；不认识的状态不计数。
         """
         runs: dict[str, dict] = {}
+        targets: set[str] = set()
         for rec in auditlog.iter_records(self.cfg.audit_log):
             rid = rec.get("run_id")
             if not rid or not isinstance(rid, str) or rec.get("dry_run"):
@@ -2689,9 +2763,14 @@ class Executor:
                     r["undoable"] += 1
                 r["kinds"].add(str(rec.get("kind") or ""))
             if status == auditlog.ROLLBACK:
-                r["rolled_back"] = True
+                targets.add(rid)
+            if isinstance(rec.get("rollback_of"), str):
+                r["rollback_of"] = rec["rollback_of"]
+                targets.add(rec["rollback_of"])
         out = []
         for r in runs.values():
             r["kinds"] = sorted(k for k in r["kinds"] if k)
+            if r["run_id"] in targets:
+                r["rolled_back"] = True
             out.append(r)
         return sorted(out, key=lambda r: r["ts"])

@@ -193,3 +193,29 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
     拿诊断期的旧快照把 have 盖回去（生产 2026-09-16 起 12 次抓取丢记账是同一类：改动之后的异常吞掉了记账）。
 
 **测试**：harness 新增 `lib.docker_fail("start" | "stop")`——docker 替身在那个子命令上记完日志以 1 退出。
+
+## 8. 回退逐步留审计
+
+**现场**（critic N12）：`rollback` 只写一条汇总（`status: rollback` + 计数）。还原了哪几条、跳过了哪几条、半路
+在哪一步出错，审计里都查不到；健康摘要看不见回退改了什么。汇总的字面量写着 `"run_id": "rollback-of-<id>"`，
+却被后面的 `**result` 覆盖回原批次号（critic §2 的更正：executor 调研以为 `list_runs` 会把标记打在
+`rollback-of-X` 上，其实标对了；生产上 4 条历史汇总也都是原批次号）。
+
+**修法**：
+
+- 每一步逆操作一条记录（`_write_step`，形状见 `audit` 模块文档）：`run_id` = `rollback-of-<X>`、
+  `rollback_of` = X、`rollback_id` = 这次回退自己的 ID、`op` = `undo:<逆操作>`、`args` = 逆操作、`undoes` 指回
+  原记录；`status` 还原了 applied / 核对后跳过 skipped（`reason`）/ 没动就出错 failed / 动了之后出错 unknown
+  （回退期间同样用 `_tracking()` 记下发出的写调用；逆操作里的文件系统搬运也 `_effect()`）。预演不写。
+- 汇总照旧、并且明写：`run_id` 是 X、`status` 是 `rollback`，另加 `rollback_run_id`、`rollback_id`。历史汇总
+  （只有 `ts` / `run_id` / `status` 与计数）照样标记它们回退的批次。结果里的 `failed` 仍是"这一步抛了异常"
+  （含 unknown 的步），cli 与既有测试的口径不变；精确的状态在逐步记录里。
+- `list_runs`：回退批次带 `rollback_of`，没有可回退的条目；被回退的批次由汇总**或**逐步记录标"已回退"
+  （汇总那一行写不进去时也标得上）。`runs` 输出「↩回退 X 的记录」；`rollback --last` 不选回退批次；
+  `rollback --run rollback-of-X` 明确拒绝（回退记录不带逆操作，回退不能再回退），退出码 3。
+- `_read_audit` 先按 `rollback_id` 分组再按 `seq` 排：同一批可以回退不止一次，每次的 `seq` 各自从头数。
+
+**不做的**：回退的逐步记录不带"再做一遍"的逆操作。逆操作的逆（`restore_from_trash` 的逆是再隔离一次、
+`readd_torrent` 的逆是再摘掉）各自要过删除关口与占用检查，不是把记录反过来就行——需要时另起一个阶段。
+
+**测试**：`tests/test_rollback_steps.py`。

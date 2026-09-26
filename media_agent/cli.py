@@ -240,6 +240,9 @@ def cmd_runs(args, cfg) -> int:
     print(f"{'批次 ID':<26} {'时间':<20} {'已执行':>6} {'可回退':>6}  类型")
     for r in runs:
         mark = " ↩已回退" if r.get("rolled_back") else ""
+        if r.get("rollback_of"):
+            # 回退的逐步记录（每一步还原 / 跳过 / 出错各一条）；它本身不能再回退
+            mark += f" ↩回退 {r['rollback_of']} 的记录"
         if r.get("unconfirmed"):
             # 当初记 unknown 的：改动也许生效了。带逆操作的已算进"可回退"，回退时按此刻状态核对
             mark += f" ❓未确认 {r['unconfirmed']}"
@@ -255,7 +258,8 @@ def cmd_rollback(args, cfg) -> int:
 
     run_id = args.run
     if args.last or not run_id:
-        runs = [r for r in ex.list_runs() if not r.get("rolled_back") and r["undoable"]]
+        runs = [r for r in ex.list_runs()
+                if not r.get("rolled_back") and not r.get("rollback_of") and r["undoable"]]
         if not runs:
             print("没有可回退的批次")
             return 1
@@ -265,6 +269,8 @@ def cmd_rollback(args, cfg) -> int:
     res = ex.rollback(run_id)
     if res.get("refused"):
         return _refuse(res["refused"])
+    if not args.dry_run:
+        print(f"  逐步记录：批次 rollback-of-{run_id}（每一步还原 / 跳过 / 出错各一条，media-agent runs 可见）")
     print(f"  已还原: {res['reverted']}")
     print(f"  跳过:   {res['skipped']}")
     print(f"  失败:   {res['failed']}")
