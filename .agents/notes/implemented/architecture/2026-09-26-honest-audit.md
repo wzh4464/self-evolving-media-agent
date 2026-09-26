@@ -174,3 +174,22 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
 **测试陷阱（本节测试踩过一次）**：测试里撤销自己的替身不要用 `monkeypatch.undo()`——它连 conftest 的隔离
 （`PROJECT_ROOT` 打到临时目录）一起撤掉，之后的回退把汇总记录写进了仓库自己的 `state/audit.jsonl`
 （本机开发目录，已删；`tests/test_purge_log.py` 里早有同样的提醒）。只 `setattr` 回原值。
+
+## 7. AutoBangumi 数据库与抓取的核实
+
+- `fix_title_aliases` / `repoint_rss` 的 `abdb.write` 是"docker stop → 改库提交 → docker start（`check=True`）"。
+  容器起不来时 CalledProcessError 在**提交之后**抛出——以前记 failed、没有逆操作，库其实改了、回退也找不到它，
+  AutoBangumi 还停着没人知道。现在出错后读库（只读连接，容器停着也能读）：值是新的 → applied、带逆操作，
+  并写 `after_error_note`（"容器可能还停着，需人工确认"），日志一行；值是原来的（`docker stop` 就失败了、
+  或事务没提交）→ failed；读不到 / 对不上 → unknown 带逆操作（`Executor._ab_write`）。
+- `grab_episode`：
+  - `add_torrent` 出错：按 .torrent 算出的 v1 infohash 查种子在不在。在 → 照常走完（即时改名、写 have），
+    `already_present: null`（分不清是这次加的还是本来就有）；不在 → failed（沿用「加种子失败: 」开头）；
+    读不到 / 纯 v2 种子算不出 infohash → unknown，写 `infohash`，**不**写 have、不带逆操作（没有"撤掉抓取"的逆操作——
+    回退的 `ungrab_episode` 从来只动 have）。
+  - 种子加进去之后写 sidecar 出错：种子已加入是抓取的改动本身，记 **applied**（带 `ungrab_episode`）并写
+    `sidecar_error` / `sidecar_note`；这一集照样记进 `_grabbed`——本轮排在最后的 `write_sidecar` 会把它并进
+    have，没有那一条就下一轮 409 那条路径补。以前整条记 failed、`_grabbed` 也没记，同一批的 `write_sidecar`
+    拿诊断期的旧快照把 have 盖回去（生产 2026-09-16 起 12 次抓取丢记账是同一类：改动之后的异常吞掉了记账）。
+
+**测试**：harness 新增 `lib.docker_fail("start" | "stop")`——docker 替身在那个子命令上记完日志以 1 退出。

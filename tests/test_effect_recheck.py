@@ -565,3 +565,160 @@ def test_sidecar_write_that_raised_before_replacing_is_failed(lib, monkeypatch):
     [rec] = rep.failed
     assert "没有生效" in rec["effect"]
     assert sc_mod.path_for(sh.path).read_text(encoding="utf-8") == before
+
+
+# ------------------------------------------------------------------ AutoBangumi 数据库
+def _ab_fix(lib) -> Finding:
+    lib.bangumi(id=7, official_title="上伊那牡丹", title_raw="Sake o Tsugu",
+                save_path=str(lib.media_root / "上伊那牡丹" / "Season 1"), group_name="ANi")
+    return Finding(rule="title-match-broken", kind="title_match_broken", severity="important",
+                   summary="订阅失效", show="上伊那牡丹",
+                   action=Action(op="fix_title_aliases",
+                                 args={"bangumi_id": 7, "aliases": ["Yoeru Sugata wa Yuri no Hana"]}))
+
+
+def _aliases(lib) -> str:
+    return lib.abdb.query("SELECT title_aliases FROM bangumi WHERE id=7")[0]["title_aliases"]
+
+
+def test_ab_write_committed_but_docker_start_failed_is_applied_and_says_so(lib):
+    """`abdb.write` 是 docker stop → 改库提交 → docker start（`check=True`）。容器起不来时 CalledProcessError
+    在**提交之后**抛出：以前记 failed、没有逆操作——库其实改了，回退也找不到它。"""
+    f = _ab_fix(lib)
+    lib.docker_fail("start")
+
+    rep = lib.apply([f], run_id="t-ab")
+
+    [rec] = rep.applied
+    assert "start" in rec["confirmed_after_error"]
+    assert "容器" in rec["after_error_note"]
+    assert rec["undo"] == {"op": "restore_title_aliases", "bangumi_id": 7, "prev": "[]"}
+    assert _aliases(lib) == '["Yoeru Sugata wa Yuri no Hana"]'
+
+
+@pytest.mark.allow("failed_record", match="CalledProcessError")
+def test_ab_write_that_failed_before_committing_is_failed(lib):
+    f = _ab_fix(lib)
+    lib.docker_fail("stop")
+
+    rep = lib.apply([f])
+
+    [rec] = rep.failed
+    assert "没有生效" in rec["effect"] and "undo" not in rec
+    assert _aliases(lib) == "[]"
+
+
+def test_rss_repoint_committed_but_docker_start_failed_is_applied(lib):
+    old = "https://mikanani.me/RSS/Search?searchstr=Sake+o+Tsugu"
+    new = "https://mikanani.me/RSS/Bangumi?bangumiId=3500&subgroupid=583"
+    lib.bangumi(id=7, official_title="上伊那牡丹", title_raw="Sake o Tsugu", rss_link=old,
+                save_path=str(lib.media_root / "上伊那牡丹" / "Season 1"), group_name="ANi")
+    f = Finding(rule="rss-drift", kind="rss_drift", severity="important", summary="换链接",
+                show="上伊那牡丹", action=Action(op="repoint_rss", args={
+                    "bangumi_id": 7, "rss_link": new, "aliases": ["Yoeru Sugata"]}))
+    lib.docker_fail("start")
+
+    rep = lib.apply([f])
+
+    [rec] = rep.applied
+    assert rec["undo"]["prev_rss_link"] == old and "start" in rec["confirmed_after_error"]
+    assert lib.abdb.query("SELECT rss_link FROM bangumi WHERE id=7")[0]["rss_link"] == new
+
+
+# ------------------------------------------------------------------ 抓取
+GRAB_SHOW = "躲在超市后门抽烟的两人"
+GRAB_TITLE = "[LoliHouse] Super no Ura de Yani Suu Futari - 12 [WebRip 1080p HEVC-10bit AAC]"
+
+
+def _grab(lib):
+    sh = lib.show(GRAB_SHOW)
+    sh.season(1)
+    url, h = lib.web.torrent(GRAB_TITLE)
+    f = Finding(rule="episode-available", kind="episode_grabbable", severity="important",
+                summary="S01E12 可抓取", show=GRAB_SHOW,
+                action=Action(op="grab_episode", args={
+                    "url": url, "title": GRAB_TITLE, "show_dir": str(sh.path), "season": 1,
+                    "episode": 12, "bangumi_id": None, "category": GRAB_SHOW,
+                    "official_title": GRAB_SHOW}))
+    return sh, f, h
+
+
+def _have(lib) -> list:
+    return (lib.sidecar(GRAB_SHOW).seasons.get("1") or {}).get("have") or []
+
+
+def test_grab_whose_add_timed_out_after_qbit_added_it_goes_on(lib):
+    """加种请求超时、qBittorrent 其实已经加上了：以前记「加种子失败」——下一轮再抓一遍（409），
+    这一轮的 have、即时改名全没做。现在按 infohash 核实种子在，照常走完。"""
+    _, f, h = _grab(lib)
+    lib.qbit.fail("add_torrent", after=True)
+
+    rep = lib.apply([f])
+
+    [rec] = rep.applied
+    assert "ReadTimeout" in rec["confirmed_after_error"]
+    assert rec["already_present"] is None                   # 分不清是这次加的还是本来就有
+    assert lib.qbit.has(h) and _have(lib) == [12]
+
+
+@pytest.mark.allow("failed_record", match="加种子失败")
+def test_grab_whose_add_never_reached_qbit_is_failed(lib):
+    _, f, h = _grab(lib)
+    lib.qbit.fail("add_torrent")
+
+    rep = lib.apply([f])
+
+    [rec] = rep.failed
+    assert rec["error"].startswith("加种子失败") and "没有生效" in rec["effect"]
+    assert not lib.qbit.has(h) and _have(lib) == []
+
+
+@pytest.mark.allow("unknown_record", match="加种子")
+def test_grab_whose_add_cannot_be_confirmed_is_unknown(lib):
+    _, f, h = _grab(lib)
+    real = lib.qbit.add_torrent
+
+    def blind(*a, **k):
+        real(*a, **k)
+        lib.qbit.fail("torrents", times=None)
+        raise httpx.ReadTimeout("timed out (injected)")
+
+    lib.qbit.add_torrent = blind
+
+    rep = lib.apply([f])
+
+    [rec] = rep.unknown
+    assert rec["infohash"] == h and "undo" not in rec
+    assert _have(lib) == []                                  # 没确认的抓取不记进 have
+
+
+def test_grab_whose_sidecar_write_failed_is_applied_and_write_sidecar_catches_up(lib, monkeypatch):
+    """种子加进去了、写 sidecar 出错（以前整条记 failed、没有逆操作；`_grabbed` 也没记，同一批的
+    write_sidecar 用诊断期的旧快照把 have 盖回去，下一轮再抓一遍）。现在记 applied 并写明 sidecar 出错，
+    本轮的 write_sidecar 把这一集并进 have。"""
+    from media_agent import sidecar as sc_mod
+
+    sh, f, _ = _grab(lib)
+    sh.sidecar(seasons={"1": {"have": [10, 11]}})
+    real = sc_mod.save
+    calls = {"n": 0}
+
+    def flaky(show_dir, sc):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(28, "No space left on device (injected)")
+        return real(show_dir, sc)
+
+    monkeypatch.setattr(sc_mod, "save", flaky)
+    stale = Finding(rule="sidecar-sync", kind="sidecar_stale", severity="minor", summary="档案",
+                    show=GRAB_SHOW, action=Action(op="write_sidecar", args={
+                        "show_dir": str(sh.path),
+                        "payload": {"canonical_title": GRAB_SHOW, "seasons": {"1": {"have": [10, 11]}}}}))
+
+    rep = lib.apply([stale, f])
+
+    [grab] = [r for r in rep.applied if r["op"] == "grab_episode"]
+    assert "No space" in grab["sidecar_error"]
+    assert grab["undo"]["op"] == "ungrab_episode"
+    assert [r["op"] for r in rep.applied] == ["grab_episode", "write_sidecar"]
+    assert _have(lib) == [10, 11, 12]

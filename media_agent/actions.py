@@ -864,6 +864,38 @@ class Executor:
                 time.sleep(2)
         return False
 
+    def _ab_write(self, f: Finding, a: Action, stmts: list, probe, undo: dict) -> dict | None:
+        """`abdb.write`（docker stop → 改库提交 → docker start）并在出错时核实。
+
+        返回写进 applied 记录的附加字段（正常为空）；已记 failed / unknown 时返回 None，调用方直接 return。
+        `docker start` 用 `check=True`：容器起不来时 CalledProcessError 在**提交之后**抛出——库已经改了。
+        以前记 failed、没有逆操作；现在按库里此刻的值认（`probe`），改好了照常走完、记 applied 并写明
+        容器可能还停着（AutoBangumi 停着，订阅就不走了，必须有人看见）。
+        """
+        self._intend(undo)
+        try:
+            self.ctx.abdb.write(stmts)
+        except Exception as e:
+            if not self._settle(f, a, e, probe, what="写 AutoBangumi 数据库（docker stop → 改库 → docker start）",
+                                undo=undo):
+                return None
+            note = ("写库那一步报了错、但库已改好（按库里此刻的值核实）；若是 docker start 出错，"
+                    "AutoBangumi 容器可能还停着，需人工确认")
+            self.ctx.log(f"[{a.op}] {note}：{self._confirmed_after}")
+            return {"after_error_note": note}
+        return {}
+
+    def _ab_landed(self, bid, column: str, want, before) -> bool | None:
+        """AutoBangumi 库里这一订阅的 `column` 此刻是 `want`（True）还是原来的 `before`（False）。"""
+        assert column in ("title_aliases", "rss_link")          # 列名来自代码，不来自数据
+        rows = self.ctx.abdb.query(f"SELECT {column} FROM bangumi WHERE id=?", (bid,))  # noqa: S608
+        if not rows:
+            return None
+        cur = rows[0][column]
+        if cur == want:
+            return True
+        return False if cur == before else None
+
     def _op_fix_title_aliases(self, f: Finding, a: Action) -> None:
         """修复订阅的标题匹配，并解除因此卡住的重抓阻塞。
 
@@ -904,7 +936,12 @@ class Executor:
                         stmts.append(("DELETE FROM torrent WHERE id=?", (r["id"],)))
                         cleared += 1
 
-        self.ctx.abdb.write(stmts)
+        undo = {"op": "restore_title_aliases", "bangumi_id": bid, "prev": prev}
+        want = json.dumps(aliases, ensure_ascii=False)
+        after = self._ab_write(f, a, stmts, lambda: self._ab_landed(bid, "title_aliases", want, prev),
+                               undo)
+        if after is None:
+            return
 
         # 步骤 3：让 AutoBangumi 重新拉一遍（必须等它起来，见 _wait_ab_ready）
         refreshed = False
@@ -917,9 +954,8 @@ class Executor:
 
         self._audit("applied", f, a,
                     {"aliases": aliases, "cleared_stuck_records": cleared,
-                     "refreshed": refreshed},
-                    undo={"op": "restore_title_aliases",
-                          "bangumi_id": bid, "prev": prev})
+                     "refreshed": refreshed, **after},
+                    undo=undo)
 
     def _op_repoint_rss(self, f: Finding, a: Action) -> None:
         """把订阅从"搜索式 RSS"改到"番组+字幕组式 RSS"，并补上新发布名的别名。
@@ -965,7 +1001,12 @@ class Executor:
                   (new_url, json.dumps(aliases, ensure_ascii=False), bid))]
         stmts += [("UPDATE rssitem SET url=? WHERE id=?", (new_url, i))
                   for i in item_ids]
-        self.ctx.abdb.write(stmts)
+        undo = {"op": "restore_rss_link", "bangumi_id": bid, "prev_rss_link": prev_url,
+                "prev_aliases": prev_aliases, "rssitem_ids": item_ids}
+        after = self._ab_write(f, a, stmts, lambda: self._ab_landed(bid, "rss_link", new_url, prev_url),
+                               undo)
+        if after is None:
+            return
 
         refreshed = False
         if self.ctx.ab and self._wait_ab_ready():
@@ -977,11 +1018,8 @@ class Executor:
 
         self._audit("applied", f, a,
                     {"rss_link": new_url, "aliases": aliases,
-                     "updated_rssitem": item_ids, "refreshed": refreshed},
-                    undo={"op": "restore_rss_link", "bangumi_id": bid,
-                          "prev_rss_link": prev_url,
-                          "prev_aliases": prev_aliases,
-                          "rssitem_ids": item_ids})
+                     "updated_rssitem": item_ids, "refreshed": refreshed, **after},
+                    undo=undo)
 
     def _op_grab_episode(self, f: Finding, a: Action) -> None:
         """抓取某一集：下 .torrent、加进 qBittorrent、把集号写进 sidecar。
@@ -1034,13 +1072,18 @@ class Executor:
         # 撞掉 2016 年真正第 8 集的事故，起点就是这里写死的 `"Bangumi"`——
         # 等于把自己下的种子拱手放进了 AB 的地盘。
         cat = a.args.get("category") or "Bangumi"
+        ih = self._infohash_v1(blob) or ""
         try:
             added = self.ctx.qbit.add_torrent(
                 blob, save_path=str(save_path), category=cat, tags=",".join(tags))
+            already: bool | None = not added
         except Exception as e:
-            self._audit("failed", f, a, {"error": f"加种子失败: {e}"})
-            return
-        already = not added
+            # 加种请求超时、qBittorrent 其实已经加上了：以前记「加种子失败」，这一轮的 have、即时改名全没做，
+            # 下一轮再抓一遍（409）。按 infohash 核实种子在不在（纯 v2 种子算不出 infohash：说不清）。
+            if not self._settle(f, a, e, lambda: (self._live_torrent(ih) is not None) if ih else None,
+                                what="加种子", prefix="加种子失败: ", extra={"infohash": ih}):
+                return
+            already = None                   # 种子在；分不清是这次加的还是本来就有
         self._claims().invalidate()          # 多了一个种子：占用索引要重新问
 
         # 发布方的分季编号与库内连续编号不一致时，改写 qBittorrent 里的**种子名**。
@@ -1074,23 +1117,35 @@ class Executor:
         renamed = self._rename_grabbed(blob, a.args.get("official_title") or cat, season, ep)
 
         # 写 sidecar：加进 have，并把这个发布名记成别名（下次匹配用得上）
-        sc = sc_mod.load(show_dir)
-        info = sc.seasons.setdefault(str(season), {})
-        have = sorted(set(info.get("have") or []) | {ep})
-        info["have"] = have
         title = a.args.get("title", "")
-        for part in re.split(r"\s*/\s*", title):
-            part = part.strip()
-            if 4 <= len(part) <= 60 and not part.startswith("["):
-                sc.add_alias(part)
-        sc_mod.save(show_dir, sc)
+        have: list = []
+        sidecar: dict = {}
+        self._effect("fs.sidecar")
+        try:
+            sc = sc_mod.load(show_dir)
+            info = sc.seasons.setdefault(str(season), {})
+            have = sorted(set(info.get("have") or []) | {ep})
+            info["have"] = have
+            for part in re.split(r"\s*/\s*", title):
+                part = part.strip()
+                if 4 <= len(part) <= 60 and not part.startswith("["):
+                    sc.add_alias(part)
+            sc_mod.save(show_dir, sc)
+        except Exception as e:
+            # 种子已经加进去了——这是抓取的改动本身；记账没写成不能让它变成"失败、没有逆操作"
+            # （2026-09-16 起 12 次抓取就是这样丢的记账）。下面照样记进 `_grabbed`：本轮排在最后的
+            # write_sidecar 会把这一集并进 have；没有那一条的话，下一轮会再抓一遍，409 那条路径补上 have。
+            sidecar = {"sidecar_error": _describe(e),
+                       "sidecar_note": "种子已加入；写 sidecar 出错，have 由本轮的 write_sidecar 补，"
+                                       "没有的话下一轮再抓时（409）补"}
+            self.ctx.log(f"[grab] {title[:60]}：种子已加入，但写 sidecar 出错（{_describe(e)}）")
         self._grabbed.setdefault(str(show_dir), set()).add((season, ep))
 
         self._audit("applied", f, a,
                     {"already_present": already,
                      "save_path": str(save_path),
                      "have_after": have,
-                     "rename": renamed},
+                     "rename": renamed, **sidecar},
                     undo={"op": "ungrab_episode", "show_dir": str(show_dir),
                           "season": season, "episode": ep,
                           "title": title})

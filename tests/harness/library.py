@@ -311,6 +311,12 @@ class LibraryBuilder:
         shutil.move(str(src), str(dst))
         return dst
 
+    def docker_fail(self, verb: str) -> None:
+        """之后 `docker <verb>`（stop / start）以 1 退出。AB 数据库的写是"停容器 → 改库 → 起容器"，
+        `docker_fail("start")` 就是库已提交、容器没起来。"""
+        assert self.docker_log is not None
+        (self.docker_log.parent / f"fail-{verb}").write_text("", encoding="utf-8")
+
     def qbit_down(self) -> None:
         """之后新建的 Context 里 `qbit=None`——即 build_context 登录失败的形态。"""
         self.qbit_up = False
