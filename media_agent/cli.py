@@ -19,7 +19,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, disposal, health, history, notify, runlock
+from . import __version__, disposal, health, history, notify, runlock, runlog
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -693,8 +693,9 @@ def cmd_run(args, cfg) -> int:
     NameError、检测器崩了、磁盘快满）launchd 上都是 0。现在每轮都有一份 `state/health/<批次 ID>.json` 与输出末尾
     一小节，critical 时退出码非零（1 / 3 / 4 / 5，见 `health.exit_code_for`）。
     """
-    # 批次 ID 先定下来：发现历史、审计、隔离区处置、健康报告都用这一个，彼此对得上
-    rh = health.RunHealth(cfg, run_id=new_run_id(), cmd="run",
+    # 批次 ID 先定下来：发现历史、审计、隔离区处置、健康报告、日志前缀都用这一个，彼此对得上
+    # （经 `main` 起的由它先定好，日志前缀从拿锁之前就带上）
+    rh = health.RunHealth(cfg, run_id=getattr(args, "run_id", None) or new_run_id(), cmd="run",
                           dry_run=args.dry_run or not cfg.auto_apply)
     try:
         rc = _run(args, cfg, rh)
@@ -886,12 +887,35 @@ def main() -> int:
     except ValueError as e:
         _log(f"配置错误：{e}")
         return 2
+    if args.cmd == "run":
+        # launchd 把这些输出追加进 state/run.log / run.err.log：每一行带时间与批次 ID（`runlog`）
+        args.run_id = new_run_id()
+        with runlog.stamped(args.run_id):
+            return _locked(args, cfg, before=_run_banner)
+    return _locked(args, cfg)
+
+
+def _run_banner(args, cfg) -> None:
+    """`run` 拿到锁之后、做任何事之前：轮转日志（锁保证没有别的 media-agent 同时在写），打一行轮次分隔。"""
+    rotated = runlog.rotate(cfg.state_dir)
+    print(f"═══ media-agent {__version__} run 开始：批次 {args.run_id}"
+          f"{'（预演）' if args.dry_run or not cfg.auto_apply else ''} ═══")
+    for m in rotated:
+        _log(m)
+
+
+def _locked(args, cfg, before=None) -> int:
+    """需要运行锁的子命令先拿锁（见 runlock.py），拿不到以 75 结束。`before` 在拿到锁之后、执行之前调用。"""
     if not _needs_lock(args):
+        if before:
+            before(args, cfg)
         return args.func(args, cfg)
     lock = RunLock(cfg.state_dir / LOCK_NAME, label=" ".join(["media-agent", *sys.argv[1:]]))
     if not lock.acquire(wait=runlock.DEFAULT_WAIT):
         return _locked_out(lock.holder())
     try:
+        if before:
+            before(args, cfg)
         return args.func(args, cfg)
     finally:
         lock.release()

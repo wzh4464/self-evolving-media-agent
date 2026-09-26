@@ -199,7 +199,7 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
 `com.zihan.media-agent.plist` 直接执行 `~/media-agent/.venv/bin/media-agent run`，
 **不经 `uv run`**：`uv run` 每轮都会按 `uv.lock` 同步环境，锁文件一变就在凌晨联网装依赖，
 PyPI 不通这一轮就起不来。依赖只在部署时装。周期 21600 秒、`RunAtLoad false`、`Nice 10`、
-`LowPriorityIO`，stdout / stderr 追加到 `state/run.log` / `state/run.err.log`。
+`LowPriorityIO`，stdout / stderr 追加到 `state/run.log` / `state/run.err.log`。每一行带时间与批次 ID，每轮以「run 开始：批次 …」一行开头；两个文件超过 5 MB 时由 `run` 自己先拷贝再截断地轮转成 `.1` … `.5`（`media_agent/runlog.py`：launchd 持有描述符，不能改名；不需要 newsyslog）。
 plist 由 `deploy.sh` 在变化时自动重装；手工重装：
 
 ```sh
