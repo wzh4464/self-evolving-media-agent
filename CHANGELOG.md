@@ -29,8 +29,18 @@
   PR 时跑离线测试，矩阵为 Ubuntu × Python 3.12（生产解释器，装 ffmpeg 跑探测一致性）
   / 3.14，以及 macOS × 3.12（生产媒体卷是大小写不敏感的 APFS）；另有一个任务用
   生产的 uv 0.7.2 核对锁文件可读、不带 dev 组可装、CLI 能起来。
+- **跨进程运行锁**（`state/run.lock`，`media_agent/runlock.py`）：`run`、`apply`、
+  `rollback`、`repair`、`evolve`、`purge --apply` 同一时刻只能有一个在跑（含 `--dry-run`；
+  `scan` / `diagnose` / `runs` / 只预演的 `purge` 不拿锁）。拿不到锁最多等 10 秒，
+  然后打印持有者（pid、命令、开始时间）并以退出码 75（EX_TEMPFAIL）结束，什么都不做。
+  锁是 `flock(2)`，进程被 kill 也会自动释放；与 `deploy.sh` 用的 `/usr/bin/lockf -k`
+  互斥。此前没有任何锁：launchd 的一轮与手动命令、部署切换代码都可能同时进行。
 
 ### 变更
+- **批次 ID 不再撞车**（critic N10）：由秒级 `20260926T131502` 改为
+  `20260926T131502.123-<pid>`。以前同一秒里起的两个执行器共用一个 ID，
+  回退其中一批会把另一批一起撤掉（launchd 上 media-agent 与 vpn-watchdog 的
+  周期同为 6 小时）。前缀仍是定宽时间戳、字典序即时间序；旧 ID 照常可列、可回退。
 - `media-agent run` 等命令在 qBittorrent 不可用或数据不完整时以退出码 3 结束
   （`cli.EXIT_DEGRADED`），launchd 的 last exit code 由此可见降级。
 - 生产机上运行时生成的 28 条演进规则原样纳入版本库（`.agents/rules/`），

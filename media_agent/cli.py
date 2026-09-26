@@ -15,6 +15,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from . import runlock
 from .actions import Executor
 from .cache import Cache
 from .clients import (
@@ -24,6 +25,7 @@ from .config import load_config
 from .evolution import Evolver, find_failure_patterns, find_residue, load_evolved
 from .kernel import Context, Registry
 from .plugins import register_builtins
+from .runlock import LOCK_NAME, RunLock
 from .scan import build_state
 
 
@@ -35,6 +37,27 @@ def _log(msg: str) -> None:
 # 以前 `run` 永远返回 0：2026-09-19 那轮登录超时照样执行、删错了东西，
 # launchd 上看 last exit code 仍是 0。非零才会被看见。
 EXIT_DEGRADED = 3
+
+# 另一个进程持有运行锁、本次什么都没做时的退出码。取 sysexits 的 EX_TEMPFAIL，
+# 与 /usr/bin/lockf 等锁超时的退出码一致：launchd 的 last exit code 75 = "被挡住了，下轮再来"。
+EXIT_LOCKED = 75
+
+
+def _needs_lock(args) -> bool:
+    """会改动媒体库 / qBittorrent / 状态的子命令才拿运行锁（见 runlock.py）。
+
+    声明在各子命令的 `set_defaults(lock=...)` 上；将来的抓取模式同样要声明。
+    """
+    lock = getattr(args, "lock", False)
+    return bool(lock(args) if callable(lock) else lock)
+
+
+def _locked_out(holder: str) -> int:
+    msg = (f"⏳ 另一个 media-agent 进程正持有运行锁（{holder or '持有者未知，可能是部署脚本'}），"
+           "本次不执行任何操作")
+    print(f"\n═══ {msg} ═══")
+    _log(msg)
+    return EXIT_LOCKED
 
 
 def _refuse(why: str) -> int:
@@ -179,10 +202,10 @@ def cmd_runs(args, cfg) -> int:
     if not runs:
         print("还没有任何已执行的批次")
         return 0
-    print(f"{'批次 ID':<20} {'时间':<20} {'已执行':>6} {'可回退':>6}  类型")
+    print(f"{'批次 ID':<26} {'时间':<20} {'已执行':>6} {'可回退':>6}  类型")
     for r in runs:
         mark = " ↩已回退" if r.get("rolled_back") else ""
-        print(f"{r['run_id']:<20} {r['ts']:<20} {r['applied']:>6} {r['undoable']:>6}  "
+        print(f"{r['run_id']:<26} {r['ts']:<20} {r['applied']:>6} {r['undoable']:>6}  "
               f"{','.join(r['kinds'][:3])}{mark}")
     print(f"\n回退最近一次： media-agent rollback --last")
     return 0
@@ -429,7 +452,7 @@ def main() -> int:
     s.add_argument("--kind", nargs="*", help="只处理指定类型的问题")
     s.add_argument("--show", nargs="*", help="只处理指定番剧（目录名）")
     s.add_argument("--limit", type=int, help="最多处理多少条（受控试跑用）")
-    s.set_defaults(func=cmd_apply)
+    s.set_defaults(func=cmd_apply, lock=True)
 
     s = sub.add_parser("runs", help="列出历史批次（回退用）")
     s.set_defaults(func=cmd_runs)
@@ -438,28 +461,30 @@ def main() -> int:
     s.add_argument("--run", help="批次 ID，省略则回退最近一次")
     s.add_argument("--last", action="store_true", help="回退最近一次未回退的批次")
     s.add_argument("--dry-run", action="store_true", help="只预演回退，不实际还原")
-    s.set_defaults(func=cmd_rollback)
+    s.set_defaults(func=cmd_rollback, lock=True)
 
     s = sub.add_parser("repair", help="修复目录改名后新旧并存的分裂状态")
     s.add_argument("--run", required=True, help="出问题的批次 ID")
     s.add_argument("--dry-run", action="store_true")
-    s.set_defaults(func=cmd_repair)
+    s.set_defaults(func=cmd_repair, lock=True)
 
     s = sub.add_parser("purge", help="清理隔离区里可验证为安全的文件")
     s.add_argument("--apply", action="store_true", help="真正删除（默认只预演）")
     s.add_argument("--verbose", action="store_true", help="列出保留原因")
-    s.set_defaults(func=cmd_purge)
+    # 预演只读隔离区；真删（--apply）才要锁
+    s.set_defaults(func=cmd_purge, lock=lambda a: a.apply)
 
     s = sub.add_parser("evolve", help="自演进：为规则盲区提议新规则")
     s.add_argument("--max-proposals", type=int, default=3)
-    s.set_defaults(func=cmd_evolve)
+    # 会写 .agents/，影子验证还会跑全部检测器（含写 sidecar 的抓取规则）
+    s.set_defaults(func=cmd_evolve, lock=True)
 
     s = sub.add_parser("run", help="完整自治轮次")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-evolve", action="store_true",
                    help="本轮不演进（EVOLVE_MODE=propose 时才有意义，默认 off 本来就不跑）")
     s.add_argument("--max-proposals", type=int, default=3)
-    s.set_defaults(func=cmd_run)
+    s.set_defaults(func=cmd_run, lock=True)
 
     args = p.parse_args()
     try:
@@ -467,7 +492,15 @@ def main() -> int:
     except ValueError as e:
         _log(f"配置错误：{e}")
         return 2
-    return args.func(args, cfg)
+    if not _needs_lock(args):
+        return args.func(args, cfg)
+    lock = RunLock(cfg.state_dir / LOCK_NAME, label=" ".join(["media-agent", *sys.argv[1:]]))
+    if not lock.acquire(wait=runlock.DEFAULT_WAIT):
+        return _locked_out(lock.holder())
+    try:
+        return args.func(args, cfg)
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

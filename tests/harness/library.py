@@ -16,8 +16,8 @@
   每次都新建 Context，并清掉 `probe._CACHE` / `builtin._OFFSET_CACHE` 这类进程级缓存。
   （`build_state` 自己也会在每次扫描开头清 `ctx._tfile_cache` 与 `_OFFSET_CACHE`——
   B3 已修，见 `tests/test_rescan_freshness.py`；同 ctx 重扫的行为由那里单独覆盖。）
-- **run_id 显式给**：执行器的默认 run_id 只精确到秒，同一秒里的两轮会被
-  `rollback` 当成一批。
+- **run_id 显式给**（`t001`、`t002`…）：断言里好认。执行器的默认 run_id
+  带毫秒与 pid（`actions.new_run_id`），不会撞，只是测试里没法预先写出来。
 - **文件是稀疏的**：`stat` 报的是声明的逻辑大小，创建瞬时完成；文件头带身份，
   FakeProbe 与 `content_digest` 都认它。
 - **日期一律相对今天**（`tmdb.weekly` / `web.days_ago`）：代码直接调 `date.today()`。

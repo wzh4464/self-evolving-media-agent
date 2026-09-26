@@ -71,6 +71,33 @@ def _bad_rel(rel, what: str) -> str | None:
     return None
 
 
+_last_run_at: datetime | None = None
+
+
+def new_run_id() -> str:
+    """批次 ID：`YYYYMMDDTHHMMSS.mmm-<pid>`，例如 `20260926T131502.123-48213`。
+
+    以前只精确到秒（`20260926T131502`）。批次 ID 是回退的单元——两个进程在同一秒
+    各起一个 Executor，两批改动就会被 `rollback` 当成一批一起撤掉（critic N10）：
+    launchd 上 media-agent 与 vpn-watchdog 的 `StartInterval` 同为 21600，将来 1800 秒
+    一次的抓取也会每 6 小时与 `run` 对齐一次。
+
+    - **跨进程不撞**：带 pid——同一时刻活着的两个进程 pid 不同，拿不拿运行锁都一样。
+    - **进程内不撞**：同一毫秒（或时钟回拨）时顺延到上一个 ID 的下一毫秒，
+      进程内严格递增；不忙等，冻结的时钟下也不会卡死。
+    - **仍可排序、兼容旧 ID**：前 15 位还是定宽的秒级时间戳，字典序即时间序；
+      旧 ID 是新 ID 的前缀形态，`list_runs` 按记录的 `ts` 排序、`rollback --run`
+      按整串精确匹配，两种 ID 混在同一份 audit.jsonl 里都照常工作。
+    """
+    global _last_run_at
+    now = datetime.now()
+    now = now.replace(microsecond=now.microsecond // 1000 * 1000)
+    if _last_run_at is not None and now <= _last_run_at:
+        now = _last_run_at + timedelta(milliseconds=1)
+    _last_run_at = now
+    return f"{now:%Y%m%dT%H%M%S}.{now.microsecond // 1000:03d}-{os.getpid()}"
+
+
 @dataclass
 class ExecReport:
     applied: list[dict] = field(default_factory=list)
@@ -91,7 +118,7 @@ class Executor:
         self.cfg = ctx.config
         self.dry_run = dry_run
         # 一次 apply = 一个 run_id，回退以 run 为单位，这就是"一键回退"的单元
-        self.run_id = run_id or datetime.now().strftime("%Y%m%dT%H%M%S")
+        self.run_id = run_id or new_run_id()
         self.report = ExecReport()
         self._deleted_count = 0
         self._deleted_bytes = 0
