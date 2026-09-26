@@ -46,6 +46,12 @@
   同步环境，锁文件一变（引入 pytest 那次就变了）凌晨那轮就得联网装依赖，PyPI 不通
   就起不来；现在依赖只在部署时装。周期 21600 秒、Nice 10、LowPriorityIO、日志路径不变。
   需要重新 `launchctl bootstrap` 才生效（`deploy.sh` 发现 plist 变了会自动重装）。
+- `.gitignore` 补齐生产机独有的东西：`.env.*`（生产上的 `.env.bak-20260917T205051`
+  装着真密钥；`.env.example` 除外）、`*.bak` / `*.bak-*` / `*.bak.*`（生产上有 5 个
+  `media_agent/*.py.bak-*` 与 `preferences.json.bak-20260905`）、`.DS_Store`（生产机
+  没有全局 excludesfile）、工具缓存。生产目录改成 git 工作区后，`git add -A`
+  不会再把它们带进公开仓库；`.agents/rules/` 与 `.agents/preferences.json`
+  明确保持版本化，由测试守住。
 - `media-agent run` 等命令在 qBittorrent 不可用或数据不完整时以退出码 3 结束
   （`cli.EXIT_DEGRADED`），launchd 的 last exit code 由此可见降级。
 - 生产机上运行时生成的 28 条演进规则原样纳入版本库（`.agents/rules/`），
