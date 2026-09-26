@@ -13,6 +13,17 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-27
+
+**身份靠事实，一轮收尾。** 整改第 4 阶段：诊断不再写任何东西；sidecar 里的用户意图永不被快照覆盖；
+TMDB 身份钉进 sidecar、标题连看两轮才采用；每个种子是什么按 infohash 记进出处账本，判重、复核、
+封存、处置都查账本而不是猜文件名；`run` 在一轮之内迭代到不动点，不再「等下一轮（6 小时后）」。
+
+- 部署前在生产数据的独立副本上连跑两轮 dry-run：只有 13 个 sidecar 写回（季 0 进度、过期标题追上
+  目录名），没有任何改名或删除；审查回放发现的三处首轮误操作（100 个女朋友 S3 被改成 S01、两个目录
+  来回翻名、手改的特别篇被改回剧集名）均已修复并验证不再出现。
+- 测试 890 → 1134。
+
 ### 新增
 - **`run` 一轮之内收敛**：扫描 → 诊断 → 执行重复到不动点（`MAX_ITERATIONS`，新配置，默认 3；上一次迭代做成了新动作才
   再来一次）。以前前后依赖的两步永远隔一轮（6 小时）：AutoBangumi 的重复版本落在 `Bangumi` 分类，这一轮只交接分类，
@@ -597,7 +608,8 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.1...v0.3.0
