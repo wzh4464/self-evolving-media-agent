@@ -45,6 +45,21 @@ _OFFSET_CACHE: dict[str, dict] = {}
 
 
 
+def release_text(f: MediaFile) -> str:
+    """这个文件的**名字证据**：出处账本里的番组页标题（有的话）+ 种子显示名（没有种子就是文件名）。
+
+    版本词常常只在番组页标题里：LoliHouse 的内部名只写 `ASSx2`，「简繁内封字幕」只在 Mikan 标题里；尼古喵喵的
+    「邪竜解放版」、合并发布的「无修版」同样。只看内部名，探测不可用时复核判它没有中文字幕、择优给它 0 分。
+    标题说的是整个发布（合集、合并发布的每个文件都一样）——文件之间的差别仍由文件名说（`_prefer_score` 先比文件名）。
+    撤销了的行也算：撤销的是对集位的担保，发布标题还是那个发布的。"""
+    base = f.torrent_name or f.filename
+    row = getattr(f, "ledger", None)
+    title = (getattr(row, "mikan_title", "") or "").strip()
+    if not title or title in base:
+        return base
+    return f"{title} {base}"
+
+
 def _rank_for_keep(f: MediaFile) -> tuple:
     """重复集取舍的排序键。分数越高越该留。
 
@@ -57,9 +72,10 @@ def _rank_for_keep(f: MediaFile) -> tuple:
     - **体积跨编码折算。** 同画质下 HEVC/AV1 只要 AVC 六成，裸比体积等于
       系统性偏向低效编码——上面那次正是 AVC 710MB 赢了 HEVC 566MB。
 
-    探不到（文件不在、没装 ffprobe）就原样退回纯名字判断，不制造新的失败模式。
+    探不到（文件不在、没装 ffprobe）就原样退回纯名字判断，不制造新的失败模式。名字证据含出处账本里的
+    番组页标题（`release_text`：「简繁内封字幕」常常只在那里）。
     """
-    q = parse_quality(f.torrent_name or f.filename, f.size)
+    q = parse_quality(release_text(f), f.size)
     info = probe(f.path)
     if info is None:
         return (q.height, 1 if q.simplified else 0, int(q.is_bdrip), float(f.size))
@@ -99,7 +115,7 @@ def meets_requirements(f: MediaFile) -> tuple[bool, str]:
     所以「零字幕轨」不等于「没字幕」：此时退回名字证据判断，
     不能因为探不到就判它不合格。
     """
-    title = f.torrent_name or f.filename
+    title = release_text(f)          # 番组页标题（出处账本）+ 显示名：LoliHouse 的「简繁内封字幕」只在前者里
     info = probe(f.path)
 
     # **先看文件，再看名字。** 反过来写会把 LoliHouse 整个组判死：它的种子内部
@@ -134,9 +150,11 @@ def _prefer_score(f: MediaFile) -> tuple:
     用 `score_only` 而不是 `evaluate`：硬门槛（必须有中文字幕）是整个发布
     的属性，写在种子标题里，单个文件名通常不含那些关键词，走 `evaluate`
     会双双卡在硬门槛上并列 0 分。硬门槛由 `meets_requirements` 单独把关。
+
+    发布那一档（`joint`）也算出处账本里的番组页标题（`release_text`）：「邪竜解放版」常常只在那里。
     """
     own = preferences.score_only(f.filename)
-    joint = preferences.score_only(f.torrent_name or f.filename)
+    joint = preferences.score_only(release_text(f))
     return (own, joint, f.size)
 
 
