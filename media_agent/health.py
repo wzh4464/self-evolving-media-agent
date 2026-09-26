@@ -288,7 +288,10 @@ class RunHealth:
                                   "load_errors": list(getattr(reg, "load_errors", []))}
         self.data["findings"] = {"total": len(findings),
                                  "actionable": sum(1 for f in findings if f.action),
-                                 "by_severity": by_sev}
+                                 "by_severity": by_sev,
+                                 # 解析不了的 sidecar：人写的换算关系 / 版本要求此刻读不到，写的一方一律拒绝
+                                 "sidecar_corrupt": sorted({f.show for f in findings
+                                                            if f.kind == "sidecar_corrupt"})}
 
     def refused(self, why: str) -> None:
         self.data["degraded"]["refused"] = why
@@ -391,6 +394,11 @@ class RunHealth:
             add("warn", "unknown_actions", f"{act['unknown']} 个动作未确认（也许生效了，要人核对）" + (
                 "；其中 " + "、".join(f"[{r['rule']}] {r['op']} 已在 {r['runs']} 个批次里出现"
                                      for r in rep_[:3]) if rep_ else ""))
+        bad = (d["findings"] or {}).get("sidecar_corrupt") or []
+        if bad:
+            add("warn", "sidecar_corrupt",
+                f"{len(bad)} 部番的 .media-agent.json 解析不了（{'、'.join(bad[:5])}"
+                f"{' 等' if len(bad) > 5 else ''}）：不覆盖、已备份，里面人写的换算关系 / 版本要求这期间不生效——要人修")
         if act.get("ab_maybe_stopped"):
             # AutoBangumi 停着，订阅就不走了。以前只有一行日志与审计里的一个字段：这一轮 ok、不发信，最早要 6 小时后
             # 下一轮 AB 登录失败（ab_down）才看得见——`clients` 是在这次写库之前取的（2026-09-26 复审）

@@ -42,14 +42,16 @@ class SidecarSyncDetector:
                     b_by_dir.setdefault(parts[i + 1], b)
 
         for show in state.shows:
-            sc = sc_mod.load(show.dir_path)
+            sc, corrupt = sc_mod.load_checked(show.dir_path)
             changed = []
 
             if sc.canonical_title != show.dir_name:
                 sc.canonical_title = show.dir_name
                 changed.append("规范名")
-            if show.tmdb_id and sc.tmdb_id != show.tmdb_id:
+            # TMDB 身份（`sidecar.IDENTITY`）：只在还没有时填；填上之后只有人改
+            if show.tmdb_id and not sc.tmdb_id:
                 sc.tmdb_id, sc.tmdb_title = show.tmdb_id, show.tmdb_title
+                sc.tmdb_source = "search"
                 changed.append("TMDB")
 
             b = b_by_dir.get(show.dir_name)
@@ -124,6 +126,22 @@ class SidecarSyncDetector:
                 del sc.seasons[k]
                 changed.append(f"清理 S{k} 旧记录")
 
+            if corrupt:
+                # 坏掉的档案不覆盖（里面也许有人写的 season_offsets / require_any / notes）。动作照样给：
+                # 执行器会先备份、再拒绝写并记下原因（`sidecar.SidecarCorrupt`）——每轮审计里都看得见
+                backups = sorted(p.name for p in show.dir_path.glob(sc_mod.SIDECAR_NAME + ".corrupt-*"))
+                yield Finding(
+                    rule=self.id, kind="sidecar_corrupt", severity="important",
+                    summary=(f"采集档案解析不了（{corrupt}）：不覆盖、等人修——里面人写的换算关系 / 版本要求"
+                             f"这期间不生效"),
+                    show=show.dir_name, path=str(sc_mod.path_for(show.dir_path)),
+                    evidence={"problem": corrupt, "backups": backups},
+                    action=Action(op="write_sidecar",
+                                  args={"show_dir": str(show.dir_path),
+                                        "payload": sc_mod.asdict_of(sc)},
+                                  note="执行时按此刻文件再核一次：仍坏就备份并拒绝写"),
+                )
+                continue
             if not changed:
                 continue
             yield Finding(

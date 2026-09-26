@@ -831,45 +831,52 @@ class Executor:
         self._audit("applied", f, a, undo=undo)
 
     def _op_write_sidecar(self, f: Finding, a: Action) -> None:
-        """写入每部番的采集档案。纯写自有文件，不碰媒体内容。"""
+        """写入每部番的采集档案。纯写自有文件，不碰媒体内容。
+
+        **按写的这一刻的文件合并，只写派生字段**（`sidecar.merge_for_write`，字段归属见 `sidecar.DERIVED` 等）。
+        payload 是诊断期的快照；以前拿它整份覆盖，诊断之后人改的 `season_offsets` / `require_any` / `notes`、
+        另一个进程写的、回退写回去的全被盖掉，本版本不认识的键也一并丢了（2026-09-26 状态测绘）。
+        """
         from . import sidecar as sc_mod
         show_dir = Path(a.args["show_dir"])
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
+        if not show_dir.is_dir():
+            # 目录改名（op 8）排在写档案（op 10）之前：诊断期的路径已经不在了。档案跟着目录走了，
+            # 下一轮按新目录重算；往旧路径写只会凭空建一个目录或失败。
+            self._audit("skipped", f, a, {"reason": f"目录已不在（本轮改名或搬走了）：{show_dir}，档案下一轮按新目录重算"})
+            return
         prev = sc_mod.path_for(show_dir)
-        prev_content = prev.read_text(encoding="utf-8") if prev.exists() else None
+        try:
+            prev_content = prev.read_text(encoding="utf-8") if prev.exists() else None
+        except (OSError, UnicodeDecodeError):
+            prev_content = None          # 读不了的由下面 write_merged 的坏文件检查拒绝
         payload = a.args["payload"]
-        known = {k for k in sc_mod.Sidecar.__dataclass_fields__}
-        sc = sc_mod.Sidecar(**{k: v for k, v in payload.items() if k in known})
+        # 本轮 grab_episode（op 0）已经往 sidecar 写过新集；payload 是诊断期的快照，没有它们。
+        # 实测 2026-09-26「躲在超市后门抽烟的两人」S01E12 文件都落盘了，`have` 还停在 11，下一轮又抓一遍。
+        # 只并回**本轮自己抓的**那几集，不并磁盘上的旧值——sidecar-sync 的职责之一正是把已经删掉的集
+        # 从 `have` 里摘掉，无脑求并集会让它再也摘不掉。
+        grabbed = self._grabbed.get(str(show_dir), ())
 
-        # payload 是**诊断阶段**的快照，而抓取（op 0）排在本动作（op 10）之前，
-        # 已经往磁盘上的 sidecar 写过新集。整份覆盖会把它抹掉：实测 2026-09-26
-        # 「躲在超市后门抽烟的两人」S01E12 文件都落盘了，`have` 还停在 11，
-        # 于是下一轮把同一集又抓一遍（靠 qBittorrent 的 infohash 去重才没真重下）。
-        #
-        # 只并回**本轮自己抓的**那几集，不并磁盘上的旧值——sidecar-sync 的职责
-        # 之一正是把已经删掉的集从 `have` 里摘掉，无脑求并集会让它再也摘不掉。
-        for season, ep in self._grabbed.get(str(show_dir), ()):
-            info = sc.seasons.setdefault(str(season), {})
-            info["have"] = sorted(set(info.get("have") or []) | {ep})
-
-        # 别名是只增不减的（`add_alias` 的语义），抓取时记下的发布名同样要保住。
-        if prev_content:
-            try:
-                import json as _json
-                for al in (_json.loads(prev_content).get("aliases") or []):
-                    sc.add_alias(al)
-            except (ValueError, AttributeError):
-                pass
+        def add_grabbed(merged: dict) -> None:
+            seasons = merged.setdefault("seasons", {})
+            for season, ep in grabbed:
+                info = seasons.setdefault(str(season), {})
+                info["have"] = sorted(set(info.get("have") or []) | {ep})
 
         undo = {"op": "restore_sidecar", "show_dir": str(show_dir), "prev": prev_content}
         self._intend(undo)
         self._effect("fs.sidecar")
         try:
-            sc_mod.save(show_dir, sc)
+            sc_mod.write_merged(show_dir, payload, add_grabbed)
+        except sc_mod.SidecarCorrupt as e:
+            # 坏掉的档案里也许有人写的换算关系 / 版本要求：不覆盖，已备份，等人修
+            self._audit("skipped", f, a, {"reason": str(e),
+                                          "backup": str(e.backup) if e.backup else ""})
+            return
         except Exception as e:
-            # `sidecar.save` 先写临时文件、再原子替换：内容没变就是没生效
+            # 先写临时文件、再原子替换：内容没变就是没生效
             if not self._settle(f, a, e, lambda: self._sidecar_changed(prev, prev_content),
                                 what="写 sidecar ", undo=undo):
                 return
@@ -1158,16 +1165,18 @@ class Executor:
         have: list = []
         sidecar: dict = {}
         self._effect("fs.sidecar")
-        try:
-            sc = sc_mod.load(show_dir)
+
+        def record(sc) -> None:
             info = sc.seasons.setdefault(str(season), {})
-            have = sorted(set(info.get("have") or []) | {ep})
-            info["have"] = have
+            info["have"] = sorted(set(info.get("have") or []) | {ep})
             for part in re.split(r"\s*/\s*", title):
                 part = part.strip()
                 if 4 <= len(part) <= 60 and not part.startswith("["):
                     sc.add_alias(part)
-            sc_mod.save(show_dir, sc)
+        try:
+            # 按此刻的文件读-改-写；坏掉的档案拒绝覆盖（`SidecarCorrupt`，已备份）——以前读成默认值再整份写回，
+            # 人写的 season_offsets / require_any 就这么没了
+            have = sc_mod.update(show_dir, record).seasons[str(season)]["have"]
         except Exception as e:
             # 种子已经加进去了——这是抓取的改动本身；记账没写成不能让它变成"失败、没有逆操作"
             # （2026-09-16 起 12 次抓取就是这样丢的记账）。下面照样记进 `_grabbed`：本轮排在最后的
@@ -2483,15 +2492,22 @@ class Executor:
             return True, ""
 
         if op == "restore_sidecar":
+            from . import sidecar as sc_mod
+            d = Path(u["show_dir"])
+            _, problem = sc_mod.read_raw(d)
+            if problem:
+                # 这一轮之后档案坏了（多半是人手改到一半）：还原会把那份内容盖掉。先备份、不动，等人修
+                bk = None if self.dry_run else sc_mod.backup_corrupt(d)
+                return False, (f"sidecar 此刻解析不了（{problem}），不还原"
+                               + (f"；已备份到 {bk.name}" if bk else "") + "，修好之后再回退")
             if self.dry_run:
                 return True, ""
-            from . import sidecar as sc_mod
-            p = sc_mod.path_for(Path(u["show_dir"]))
+            p = sc_mod.path_for(d)
             self._effect("fs.sidecar")
             if u.get("prev") is None:
                 p.unlink(missing_ok=True)
             else:
-                p.write_text(u["prev"], encoding="utf-8")
+                sc_mod.write_text_atomic(p, u["prev"])
             return True, ""
 
         if op == "restore_title_aliases":
@@ -2511,13 +2527,17 @@ class Executor:
                 return True, ""
             from . import sidecar as sc_mod
             d = Path(u["show_dir"])
-            sc = sc_mod.load(d)
-            info = sc.seasons.get(str(u["season"]))
-            if info:
-                info["have"] = [x for x in (info.get("have") or [])
-                                if x != int(u["episode"])]
+            sc, problem = sc_mod.load_checked(d)
+            if problem:
+                bk = sc_mod.backup_corrupt(d)
+                return False, (f"sidecar 此刻解析不了（{problem}），不改"
+                               + (f"；已备份到 {bk.name}" if bk else "") + "，修好之后再回退")
+            if str(u["season"]) in sc.seasons:
+                def forget(sc) -> None:
+                    info = sc.seasons.get(str(u["season"])) or {}
+                    info["have"] = [x for x in (info.get("have") or []) if x != int(u["episode"])]
                 self._effect("fs.sidecar")
-                sc_mod.save(d, sc)
+                sc_mod.update(d, forget)
             return True, ""
 
         if op == "readd_torrent":

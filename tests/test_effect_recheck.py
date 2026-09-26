@@ -875,7 +875,7 @@ def test_dir_rename_that_crashed_moving_leftovers_is_unknown_with_the_full_undo(
 # ------------------------------------------------------------------ sidecar
 @pytest.mark.allow("failed_record", match="sidecar")
 def test_sidecar_write_that_raised_before_replacing_is_failed(lib, monkeypatch):
-    """`sidecar.save` 先写临时文件、再原子替换：它抛了异常而文件内容没变，就是没生效。"""
+    """sidecar 先写临时文件、再原子替换（`sidecar.write_text_atomic`）：它抛了异常而文件内容没变，就是没生效。"""
     from media_agent import sidecar as sc_mod
 
     sh = lib.show("尼古喵喵")
@@ -883,10 +883,10 @@ def test_sidecar_write_that_raised_before_replacing_is_failed(lib, monkeypatch):
     sh.sidecar(canonical_title="尼古喵喵", seasons={"1": {"have": [1]}})
     before = sc_mod.path_for(sh.path).read_text(encoding="utf-8")
 
-    def boom(show_dir, sc):
+    def boom(p, text):
         raise OSError(28, "No space left on device (injected sidecar)")
 
-    monkeypatch.setattr(sc_mod, "save", boom)
+    monkeypatch.setattr(sc_mod, "write_text_atomic", boom)
     f = Finding(rule="sidecar-sync", kind="sidecar_stale", severity="minor", summary="档案",
                 show="尼古喵喵", action=Action(op="write_sidecar", args={
                     "show_dir": str(sh.path),
@@ -1032,16 +1032,16 @@ def test_grab_whose_sidecar_write_failed_is_applied_and_write_sidecar_catches_up
 
     sh, f, _ = _grab(lib)
     sh.sidecar(seasons={"1": {"have": [10, 11]}})
-    real = sc_mod.save
+    real = sc_mod.write_text_atomic
     calls = {"n": 0}
 
-    def flaky(show_dir, sc):
+    def flaky(p, text):
         calls["n"] += 1
         if calls["n"] == 1:
             raise OSError(28, "No space left on device (injected)")
-        return real(show_dir, sc)
+        return real(p, text)
 
-    monkeypatch.setattr(sc_mod, "save", flaky)
+    monkeypatch.setattr(sc_mod, "write_text_atomic", flaky)
     stale = Finding(rule="sidecar-sync", kind="sidecar_stale", severity="minor", summary="档案",
                     show=GRAB_SHOW, action=Action(op="write_sidecar", args={
                         "show_dir": str(sh.path),
