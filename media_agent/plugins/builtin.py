@@ -297,6 +297,14 @@ def is_phantom(f: MediaFile) -> bool:
             and not os.path.lexists(str(f.path) + ".!qB"))
 
 
+def _playable(f: MediaFile) -> bool:
+    """盘上真有这份、不是空的、有种子的不比声明的小（没被截断）。幻影一律不算。"""
+    if is_phantom(f) or os.path.islink(f.path) or not os.path.isfile(f.path):
+        return False
+    size = os.path.getsize(f.path)
+    return size > 0 and not (f.torrent_hash and size < f.size)
+
+
 # ---------------------------------------------------------------------------
 class OrphanTorrentDetector:
     """在 Media 目录里但没有 `ab:<id>` 标签的种子。
@@ -1059,12 +1067,31 @@ class ExtrasDetector:
 
     @staticmethod
     def _only_copy(f: MediaFile, show: Show) -> bool:
+        """`f` 是它那一集唯一的可播文件吗（名字认得出集号、同一集没有别的正片）？
+
+        "别的正片"得**真能播**（`_playable`）：幻影（种子说下完了、盘上没有——LAT-01、用户经
+        Jellyfin 删文件）、0 字节、比种子声明小的都不算。以前只看"没标未完成"，一个幻影就让
+        唯一真实的那一集被当特典隔离，30 天后硬删（2026-09-26 审查）。
+
+        `f` 自己还没下完时（合集还在下），同一集**也还在下**的正片同样算数：BD 合集的特典常带
+        集号（药屋 `[menu][S01E03]`、Moozzi2 `Menu - 04`），那一集的正片就是合集自己的成员。
+        只数下完了的，特典就成了"唯一的一份"、照下不误（2026-09-26 审查，第 2 阶段的回归）——
+        设为不下载可回退、一个字节都不动，而正片自己没下完时 `f` 是不是它都不急这一轮。
+        """
         slot = _resolve(f, show)
         if not slot:
             return False
-        return not any(o is not f and _is_video(o) and not o.is_incomplete
-                       and not _is_extra(o, show) and _resolve(o, show) == slot
-                       for o in show.files)
+        for o in show.files:
+            if (o is f or not _is_video(o) or _is_extra(o, show)
+                    or _resolve(o, show) != slot):
+                continue
+            if o.is_incomplete:
+                if f.is_incomplete:
+                    return False
+                continue
+            if _playable(o):
+                return False
+        return True
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         for show in state.shows:

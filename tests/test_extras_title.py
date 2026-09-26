@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from harness import video
 from media_agent.plugins.builtin import ExtrasDetector
 
@@ -58,6 +60,42 @@ def test_release_name_whose_title_carries_a_marker_is_left_alone_as_the_only_cop
     s1.single("[G] Trailer Park Boys - 05 [1080p].mkv", size=GB)
 
     assert lib.diagnose(detectors=[ExtrasDetector]) == []
+
+
+def _not_a_copy(s1, kind, filename):
+    """同一集的"另一份"，其实放不了：幻影（种子说下完了、盘上没有——LAT-01、用户经 Jellyfin
+    删文件）、0 字节的本地文件、比种子声明小的（截断）。"""
+    from harness import write_sparse
+    if kind == "phantom":
+        s1.single(filename, size=GB, name="[X] Trailer Park Boys - 05.mkv", on_disk=False)
+    elif kind == "zero-byte":
+        s1.local(filename, size=0)
+    else:
+        t = s1.single(filename, size=GB, name="[X] Trailer Park Boys - 05.mkv")
+        write_sparse(t.path, GB // 3, "truncated")
+
+
+@pytest.mark.parametrize("kind", ["phantom", "zero-byte", "truncated"])
+def test_a_copy_that_cannot_play_does_not_make_the_only_copy_an_extra(lib, kind):
+    """2026-09-26 审查：`_only_copy` 以前数"同一集另一份下完了的正片"时不看它在不在盘上——一个幻影
+    就让唯一真实的第 5 集被当特典隔离，关口对没钉子的特典又不问集位，run 30 天后把它硬删。"""
+    s1 = lib.show("拖车公园").season(1)
+    ep = s1.single("[G] Trailer Park Boys - 05 [1080p].mkv", size=GB)
+    _not_a_copy(s1, kind, "拖车公园 S01E05.mkv")
+
+    assert [f for f in lib.diagnose(detectors=[ExtrasDetector]) if f.path == str(ep.path)] == []
+
+
+def test_the_backstop_holds_through_a_whole_cycle_with_a_phantom(lib):
+    s1 = lib.show("拖车公园").season(1)
+    ep = s1.single("[G] Trailer Park Boys - 05 [1080p].mkv", size=GB)
+    _not_a_copy(s1, "phantom", "拖车公园 S01E05.mkv")
+    ident = lib.ident(ep.path)
+
+    lib.cycle()
+
+    assert not [p for p in lib.trash_files() if lib.ident(p) == ident]
+    assert any(lib.ident(p) == ident for p in s1.path.rglob("*.mkv"))
 
 
 def test_pinned_episode_is_never_an_extra(lib):
