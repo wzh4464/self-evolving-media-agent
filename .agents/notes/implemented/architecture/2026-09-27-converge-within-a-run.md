@@ -88,11 +88,15 @@
 调研量的不带 TMDB 的扫描 0.72 秒），检测器约 0.7 秒——估计每多一次迭代 2–3 秒；而没有要做的事时（今天的常态，0 个
 可执行动作）只有一次迭代，与以前一样。
 
-## 给以后的 `media-agent grab`
+## 给以后的 `media-agent grab`（第 5 阶段）
 
-`converge.run` 不认识 `cmd_run`：抓取模式传只有 `GRAB_DETECTORS` 的 `Registry`、`select=lambda f: f.action.op == "grab_episode"`，
-就得到同样的一轮一个执行器、不重试、反向拒绝、到顶报待做。要注意的：抓取模式同样要拿运行锁、`ctx.qbit is None` 时不跑
-（执行器会整批拒绝）。
+`converge.run` 不认识 `cmd_run`：抓取模式传只有 `GRAB_DETECTORS` 的 `Registry`、`select=converge.only("grab_episode")`，
+就得到同样的一轮一个执行器、不重试、反向拒绝、到顶报待做；库里别的问题照样诊断出来、一件都不执行
+（`test_a_grab_only_pass_reuses_the_loop_with_only_grab_detectors`：第二次迭代那一集已在下，不再抓，不动点）。
+`cmd_grab` 要自己做的、`cmd_run` 已经在做的：拿运行锁（声明 `lock=True`，否则落在 `run` 诊断与执行之间的抓取会被
+诊断期的 sidecar 快照盖掉，runloop §8c）、声明 `pause=True`、`ctx.qbit is None` 时执行器整批拒绝（读不全同理）、
+写健康报告（`cmd` 字段区分）。抓取之后的改名由第二次迭代里的 unrenamed-file 做——那要把 `unrenamed-file` 也放进它的
+Registry、`select` 放行 `rename`，或者照旧交给下一轮 `run`，由第 5 阶段定。
 
 ## 测试
 

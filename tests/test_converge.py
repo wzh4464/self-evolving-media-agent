@@ -410,3 +410,38 @@ def test_a_degraded_final_pass_lists_no_pending(lib):
 
     assert out.stop == converge.CAP and out.pending == []
     assert "files(" in out.final_degraded
+
+
+# ------------------------------------------------------------------ 以后的 `media-agent grab`（第 5 阶段）
+def test_a_grab_only_pass_reuses_the_loop_with_only_grab_detectors(lib):
+    """抓取模式还没有（第 5 阶段），但循环要能原样给它用：只有抓取检测器的 Registry + 只做抓取的 `select`，
+    得到同样的一个执行器、不重试、到不动点就停。库里别的问题（待改名的发布名文件）一件都不碰。"""
+    from media_agent.plugins.grab import GRAB_DETECTORS
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(SHOW)
+    s1 = sh.season(1)
+    for n in range(1, 9):
+        s1.local(f"{SHOW} S01E{n:02d}.mkv")
+    schedule = weekly(12, first_days_ago=60)
+    sh.tmdb(1234, seasons={1: schedule})
+    sh.sidecar(tmdb_id=1234, tmdb_title=SHOW, mikan_id="3500", seasons={"1": {"have": list(range(1, 9))}})
+    title = "[LoliHouse] 尼古喵喵 / Yani Neko - 09 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"
+    item = MikanItem(title=title, pub=dict(schedule)[9])
+    lib.mikan("3500", [item], search=[SHOW])
+    other = lib.show("别的番").season(1).single("[G] Other - 01 [1080p].mkv")   # 全量规则会改它的名
+
+    c = lib.loop(detectors=GRAB_DETECTORS, select=converge.only("grab_episode"))
+
+    assert [r["op"] for r in lib.audit(c.run_id)] == ["grab_episode"]
+    assert lib.qbit.file_names(other.hash) == ["[G] Other - 01 [1080p].mkv"]
+    assert c.outcome.stop == converge.FIXED_POINT and len(c.iterations) == 2   # 第二次：那一集已在下，不再抓
+    assert lib.qbit.torrent(item.infohash)["tags"] == "ma:S01E09"
+
+
+def test_only_selects_by_op():
+    pick = converge.only("grab_episode", "rename")
+    grab = Finding(rule="r", kind="k", severity="minor", summary="s",
+                   action=Action(op="grab_episode", args={}))
+    trash = Finding(rule="r", kind="k", severity="minor", summary="s", action=Action(op="trash", args={}))
+    assert pick(grab) and not pick(trash)
+    assert not pick(Finding(rule="r", kind="k", severity="minor", summary="s"))

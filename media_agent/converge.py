@@ -35,7 +35,7 @@ TMDB 身份照常解析（不能像演进重扫那样 `resolve_tmdb=False`：标
 迭代约 2–3 秒（`.agents/notes/implemented/architecture/2026-09-27-converge-within-a-run.md`）。
 
 **给以后的 `media-agent grab` 用。** `run(ctx, reg, ex, scan=…, select=…)` 不认识 `cmd_run`：抓取模式传只有抓取检测器的
-`Registry` 与 `select=lambda f: f.action.op == "grab_episode"`，同样得到一轮一个执行器、不重试、反向拒绝、到顶报待做。
+`Registry` 与 `select=only("grab_episode")`，同样得到一轮一个执行器、不重试、反向拒绝、到顶报待做。
 """
 from __future__ import annotations
 
@@ -78,6 +78,13 @@ _TARGET: dict[str, tuple[str, ...]] = {
     "fix_title_aliases": ("bangumi_id",),
     "repoint_rss": ("bangumi_id",),
 }
+
+
+def only(*ops: str) -> Callable[[Finding], bool]:
+    """`run(select=…)` 用：只做这几种动作，别的发现照样诊断出来、不执行。以后的 `media-agent grab`（第 5 阶段）就是
+    `run(ctx, <只有 GRAB_DETECTORS 的 Registry>, ex, select=only("grab_episode"), …)`。"""
+    wanted = frozenset(ops)
+    return lambda f: f.action is not None and f.action.op in wanted
 
 
 def key_of(op: str, args: dict | None) -> tuple:
