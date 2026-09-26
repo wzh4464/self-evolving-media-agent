@@ -136,15 +136,25 @@ def rotate(state_dir, *, names=LOG_NAMES, max_bytes: int = MAX_BYTES, keep: int 
             continue
         if st.st_size <= max_bytes:
             continue
+        # 先拷、拷成了才把旧的往后挪。以前先挪再拷：拷不出去（磁盘满——正是"一行都不丢"要应付的情形）时挪已经
+        # 发生了，每一轮丢一代，一天之后只剩最老的那份；拷到一半的临时文件也留在满了的盘上（2026-09-26 复审）。
+        tmp = p.with_name(f".{name}.1.tmp")
+        try:
+            shutil.copyfile(p, tmp)
+        except Exception as e:                      # noqa: BLE001 —— 拷不出去就什么都不动：一行都不丢，下一轮再试
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError as e2:
+                msgs.append(f"⚠️  删不掉拷到一半的 {tmp.name}（{type(e2).__name__}: {e2}）")
+            msgs.append(f"⚠️  {name} 没能轮转（{type(e).__name__}: {e}），原样留着，下一轮再试")
+            continue
         try:
             for i in range(keep - 1, 0, -1):
                 older = p.with_name(f"{name}.{i}")
                 if older.exists():
                     os.replace(older, p.with_name(f"{name}.{i + 1}"))
-            tmp = p.with_name(f".{name}.1.tmp")
-            shutil.copyfile(p, tmp)
             os.replace(tmp, p.with_name(f"{name}.1"))
-        except Exception as e:                      # noqa: BLE001 —— 拷不出去就不截断：一行都不丢，下一轮再试
+        except Exception as e:                      # noqa: BLE001 —— 改名出错（同目录改名，罕见）：不截断，下一轮再试
             msgs.append(f"⚠️  {name} 没能轮转（{type(e).__name__}: {e}），原样留着，下一轮再试")
             continue
         try:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -169,6 +170,30 @@ def test_rotation_problems_are_reported_not_raised(tmp_path, monkeypatch):
 
     assert any("没能轮转" in m and "No space left" in m for m in msgs)
     assert (tmp_path / "run.log").stat().st_size == 6 * MB      # 拷不出去就不截断：一行都不丢
+
+
+def test_a_failing_copy_leaves_every_generation_alone_run_after_run(tmp_path, monkeypatch):
+    """磁盘满（文档里说"一行都不丢"的那种情形）：以前先把 .4→.5 … .1→.2 挪完再拷，拷不出去时挪已经发生了——
+    每一轮丢掉一代，一天（4 轮）之后只剩最老的那份；拷到一半的 .run.log.1.tmp 也留在已经满了的盘上
+    （2026-09-26 复审）。现在先拷、拷成了才挪。"""
+    for i in range(1, 6):
+        (tmp_path / f"run.log.{i}").write_text(f"gen{i}")
+    _fill(tmp_path / "run.log", 6 * MB)
+
+    def half_then_full(src, dst, *a, **k):
+        Path(dst).write_bytes(b"partial")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runlog.shutil, "copyfile", half_then_full)
+
+    for _ in range(5):
+        msgs = runlog.rotate(tmp_path, fds=())
+        assert any("没能轮转" in m for m in msgs)
+
+    assert [(tmp_path / f"run.log.{i}").read_text() for i in range(1, 6)] == \
+        ["gen1", "gen2", "gen3", "gen4", "gen5"]
+    assert (tmp_path / "run.log").stat().st_size == 6 * MB
+    assert not (tmp_path / ".run.log.1.tmp").exists()
 
 
 def test_main_run_rotates_before_printing(monkeypatch, capsys, project_root):

@@ -42,7 +42,7 @@
 - **`run` 的每一行输出带时间与批次 ID**（`2026-09-26T12:00:00 [批次 ID] …`），每轮以一行
   `═══ media-agent <版本> run 开始：批次 … ═══` 开头——launchd 追加的 `state/run.log` / `run.err.log` 终于对得上是
   哪一轮打的。两个文件超过 5 MB 时在 `run` 开头**先拷贝再截断**地轮转（`run.log.1` … `.5`）：launchd 持有描述符，
-  改名会让这一轮的输出写进旧文件。
+  改名会让这一轮的输出写进旧文件。拷不出去（磁盘满）时哪一代都不动、不截断，下一轮再试。
 - **维护暂停**（critic N17）：VPN 救援进行中（`~/gluetun/.rescue-active`，`RESCUE_MARKER` 可改）或有 `state/PAUSE`
   时，`run` / `apply` 一开始就以 75 结束、什么都不做，说清为什么暂停、多久了、怎么恢复；`diagnose` 照常。暂停的 `run`
   照样写健康报告（warn），忘了删的 `state/PAUSE` 会被看见。被运行锁挡住的 `run` 同样写 warn 报告（谁占着、从什么时候起）：
