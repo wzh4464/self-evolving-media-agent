@@ -361,6 +361,13 @@ def cmd_repair(args, cfg) -> int:
                   + (f"，{d['stranded']} 个同名滞留" if d["stranded"] else "")
                   + (f"，{d['left_for_torrents']} 个文件仍归种子、没用文件系统搬"
                      if d.get("left_for_torrents") else ""))
+            ab = d.get("ab_savepath") or ""
+            if ab.startswith("❌"):
+                errors += 1
+                print(f"    {ab}")
+            elif ab:
+                # 半路中止的目录改名没走到的最后一步（`Executor._repair_ab_savepath`）
+                print(f"    AutoBangumi 的 save_path 已改到 {ab}")
     return 1 if errors else 0
 
 

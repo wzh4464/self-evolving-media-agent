@@ -95,7 +95,7 @@ rollback；574 行（2026-08-17 上午）没有 `run_id` 也没有 `undo`；4 �
 |---|---|
 | `rollback` | 带 `undo` 的与 applied 一起按 LIFO 尝试（每个逆操作动手前都核对此刻状态，没生效的自然跳过）；结果多 `unconfirmed` / `unconfirmed_reverted` / `unconfirmed_no_undo`，cli 单独一行标出，明细里标「当初未确认」 |
 | `list_runs` / `runs` | 多 `unconfirmed` 计数；带 `undo` 的算进 `undoable`（`rollback --last` 因此会选到它）；输出「❓未确认 N」 |
-| `repair` | unknown 的 `rename_show_dir`（种子搬了、残留搬到一半出错）同样是分裂现场 |
+| `repair` | unknown 的 `rename_show_dir`（种子搬了、残留搬到一半出错）同样是分裂现场；半路中止的（`rename_show_dir_partial`，unknown 或 failed）也是，repair 往前做完 |
 | 隔离区处置 | unknown 的 trash **不算已隔离**：那份文件交给人，理由写明「隔离未确认」，永不自动删（`purge._trash_records`） |
 | `find_failure_patterns` | failed 与 unknown 分开计数，结果多 `status`；`evolve` 输出标「失败 / 未确认」 |
 | cli `apply` / `run` | 逐条列出 ❓ 未确认的动作 |
@@ -172,12 +172,23 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
   `recheck_triggered: false` + `recheck_error`（以前抛出去记 failed、没有逆操作：映射改了，却回退不了）。
 - `rename_show_dir`：每个种子的 `setLocation` 出错按 `_location_landed` 认，受理了照算已搬。确认没搬的仍是
   failed；有说不清的就是 unknown（半迁移、还不知道迁了多少）。两者都记 `rename_show_dir_partial`——
-  回退现在对它明说"只做了一部分、无法自动回退，交给人 / `repair`"，不再报"未知逆操作"。种子都搬完之后
+  回退现在对它明说"只做了一部分、无法自动回退，交给人 / `repair --run <批次>`"，不再报"未知逆操作"。
+  **repair 真的接得住**（复审时补）：最初的部分逆操作只有 `moved_hashes` / `torrent_savepaths`，没有新旧目录，
+  `repair_split_dirs` 又只认 `rename_show_dir`——照着建议跑 `repair --run X` 得到「分裂目录 0 对」、退出码 0，
+  两个目录各一半，最需要人动手的时候给了一句假安慰。现在部分逆操作也带 `path` / `new_name` / `bangumi_id` /
+  `prev_savepath`，repair 认它（unknown 与 failed 都认——确认有种子没搬成的同样是分裂现场），把旧目录里剩下的
+  种子交给 qBittorrent 搬过去、合并残留，最后补上改名没走到的一步：AutoBangumi 的 save_path 改到新目录
+  （`_repair_ab_savepath`；改不成在 repair 的输出里说、退出码 1）。往前做完而不是往回撤：旧目录那一半的种子
+  没搬过、搬它们与第一次改名是同一个动作，回撤却要把已搬的再搬一遍。种子都搬完之后
   搬残留（`_merge_tree`）或改 AB 数据库时抛异常：`_intend` 事先登记了完整的 `rename_show_dir` 逆操作，
   通用兜底记 unknown 并带上它；逆操作按此刻状态核对（旧目录还在就拒绝），`repair` 认得这条 unknown、
   把残留合并过去。
 - `write_sidecar`：`sidecar.save` 先写临时文件再原子替换，抛了异常而内容没变 → failed（核实过的）；变了 → 说不清。
   `write_nfo` 登记文件系统改动（没有逆操作，出错时至少不说成"没生效"）。
+
+**测试**（repair 接部分改名，复审时补）：`tests/test_effect_recheck.py`——照着回退的建议跑 repair：unknown 的部分改名
+合并成一个目录、两个种子都在新目录（改之前 `pairs == 0`）；failed 的部分改名 repair 搬剩下的并把 AB 的 save_path
+改到新目录；AB 改不成时 `repair` 命令说出来、退出码 1。
 
 **测试陷阱（本节测试踩过一次）**：测试里撤销自己的替身不要用 `monkeypatch.undo()`——它连 conftest 的隔离
 （`PROJECT_ROOT` 打到临时目录）一起撤掉，之后的回退把汇总记录写进了仓库自己的 `state/audit.jsonl`
@@ -258,7 +269,7 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
 |---|---|---|---|---|
 | `applied` | 生效了，已确认 | 改了 | 可逆就带 | 尝试 |
 | `skipped` | 没动手 | 没改 | 不带 | 不管 |
-| `failed` | 没生效（异常在任何改动之前，或核实过没生效） | 意图中的改动没发生；已发生的附带改动以字段写明（`torrent_record_lost` / `priority_zeroed` / `stray_copy` / `relocated_from`…） | 一般不带（目录改名半路中止带 `rename_show_dir_partial`，回退明说交给人） | 不管 |
+| `failed` | 没生效（异常在任何改动之前，或核实过没生效） | 意图中的改动没发生；已发生的附带改动以字段写明（`torrent_record_lost` / `priority_zeroed` / `stray_copy` / `relocated_from`…） | 一般不带（目录改名半路中止带 `rename_show_dir_partial`，回退明说交给人 / `repair`，repair 往前做完） | 不管 |
 | `unknown` | 也许生效了、确认不了 | 可能改了、可能改了一部分 | 有"如果生效了该怎么撤"就带 | 尝试（每个逆操作动手前核对此刻状态），结果单独计数、标「当初未确认」 |
 
 **回退**：逐步记录（`run_id` = `rollback-of-<X>`，`rollback_of`、`rollback_id`、`op` = `undo:<逆操作>`、

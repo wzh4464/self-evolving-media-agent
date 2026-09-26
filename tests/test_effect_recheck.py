@@ -509,6 +509,92 @@ def test_dir_rename_with_an_unconfirmable_set_location_is_unknown_and_not_auto_r
     assert "只做了一部分" in res["skipped_detail"][0]["skip_reason"]
 
 
+@pytest.mark.allow("unknown_record", match="setLocation")
+def test_partial_dir_rename_is_finished_by_following_the_rollback_advice(lib):
+    """回退拒绝部分目录改名时建议 `repair --run`。以前照做的结果是「分裂目录 0 对」、退出码 0：`repair` 只认
+    `rename_show_dir`，部分改名的逆操作又没有新旧目录——两个目录各一半，最需要人动手的时候给了一句假安慰
+    （2026-09-26 复审）。现在 repair 认得它，把剩下的交给 qBittorrent 搬过去、合并残留。"""
+    s1 = lib.show("旧名").season(1)
+    a = s1.single("旧名 S01E01.mkv", size=1000)
+    b = s1.single("旧名 S01E02.mkv", size=2000)
+    lib.show("旧名").local("tvshow.nfo", size=10)
+    real = lib.qbit.set_location
+
+    def flaky(hashes, location):
+        if b.hash in hashes:
+            lib.qbit.fail("torrents", times=None)
+            raise httpx.ReadTimeout("timed out (injected)")         # 没搬，而且读不到 qBit
+        real(hashes, location)
+
+    lib.qbit.set_location = flaky
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")], run_id="t-half")
+    [rec] = rep.unknown
+    assert rec["undo"]["path"] == str(lib.path("新名")) and rec["undo"]["new_name"] == "旧名"
+    lib.qbit._faults.clear()
+    del lib.qbit.set_location
+
+    res = lib.rollback("t-half")
+    advice = res["skipped_detail"][0]["skip_reason"]
+    assert "只做了一部分" in advice and "media-agent repair --run t-half" in advice
+
+    fixed = Executor(lib.context(), dry_run=False, run_id="t-repair").repair_split_dirs("t-half")
+
+    assert fixed["pairs"] == 1 and fixed["detail"][0]["old_removed"], fixed
+    new = lib.path("新名") / "Season 1"
+    assert {lib.qbit.torrent(h)["save_path"] for h in (a.hash, b.hash)} == {str(new)}
+    assert (new / "旧名 S01E02.mkv").exists() and (lib.path("新名") / "tvshow.nfo").exists()
+    assert not lib.path("旧名").exists()
+
+
+@pytest.mark.allow("failed_record", match="setLocation")
+def test_repair_finishes_a_failed_partial_dir_rename_and_syncs_autobangumi(lib):
+    """确认没搬成（failed）的部分目录改名同样是分裂现场：repair 把剩下的搬过去，并把 AutoBangumi 的 save_path
+    改到新目录——改名本来就是为了这一步，不改的话下一集又会建出旧目录。"""
+    sh = lib.show("旧名")
+    s1 = sh.season(1)
+    a = s1.single("旧名 S01E01.mkv", size=1000)
+    b = s1.single("旧名 S01E02.mkv", size=2000)
+    sh.bangumi(7, title_raw="Old Name")
+    lib.qbit.fail("set_location", hash=b.hash)
+    f = _dir_rename(lib, "旧名", "新名")
+    f.action.args["bangumi_id"] = 7
+
+    rep = lib.apply([f], run_id="t-fail")
+    [rec] = rep.failed
+    assert rec["undo"]["op"] == "rename_show_dir_partial" and rec["undo"]["bangumi_id"] == 7
+
+    fixed = Executor(lib.context(), dry_run=False, run_id="t-repair").repair_split_dirs("t-fail")
+
+    new = lib.path("新名") / "Season 1"
+    assert fixed["pairs"] == 1 and fixed["detail"][0]["moved_via_qbit"] == 1, fixed
+    assert {lib.qbit.torrent(h)["save_path"] for h in (a.hash, b.hash)} == {str(new)}
+    assert lib.abdb.query("SELECT save_path FROM bangumi WHERE id=?", (7,))[0]["save_path"] == str(new)
+    assert fixed["detail"][0]["ab_savepath"] == str(new)
+
+
+@pytest.mark.allow("failed_record", match="setLocation")
+def test_repair_command_says_when_autobangumi_could_not_be_synced(lib, monkeypatch, capsys):
+    import argparse
+
+    from media_agent import cli
+    sh = lib.show("旧名")
+    s1 = sh.season(1)
+    s1.single("旧名 S01E01.mkv", size=1000)
+    b = s1.single("旧名 S01E02.mkv", size=2000)
+    sh.bangumi(7, title_raw="Old Name")
+    lib.qbit.fail("set_location", hash=b.hash)
+    f = _dir_rename(lib, "旧名", "新名")
+    f.action.args["bangumi_id"] = 7
+    lib.apply([f], run_id="t-fail")
+    lib.docker_fail("stop")                                       # AB 的库这次改不了
+    monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
+
+    rc = cli.cmd_repair(argparse.Namespace(run="t-fail", dry_run=False), lib.cfg)
+
+    out = capsys.readouterr().out
+    assert rc == 1 and "AutoBangumi 的 save_path 没改成" in out
+
+
 @pytest.mark.allow("unknown_record", match="merge")
 def test_dir_rename_that_crashed_moving_leftovers_is_unknown_with_the_full_undo(lib, monkeypatch):
     """种子都由 qBittorrent 搬过去了，搬残留文件时出错（以前记 failed、没有逆操作——种子明明搬了）。"""

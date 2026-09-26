@@ -1679,9 +1679,12 @@ class Executor:
         if move_failed or move_unsure:
             # 有种子没搬成功就中止：此时目录处于半迁移状态，
             # 继续 mv 剩余文件只会让情况更糟，交给人处理。
-            # 有说不清的就是 unknown（半迁移、还不知道迁了多少）；逆操作只是个记录，回退不会盲目还原它
-            partial = {"op": "rename_show_dir_partial", "moved_hashes": moved_ok,
-                       "torrent_savepaths": affected}
+            # 有说不清的就是 unknown（半迁移、还不知道迁了多少）；逆操作只是个记录，回退不会盲目还原它。
+            # 带上新旧目录与 AB 的订阅：`repair_split_dirs` 靠它们把剩下的搬过去、同步 save_path——回退拒绝时
+            # 给人的建议就是 repair（以前这里没有目录，repair 找到 0 对、退出码 0；2026-09-26 复审）
+            partial = {"op": "rename_show_dir_partial", "path": str(new), "new_name": old.name,
+                       "bangumi_id": bid, "prev_savepath": prev_savepath,
+                       "moved_hashes": moved_ok, "torrent_savepaths": affected}
             if move_unsure:
                 self._audit(auditlog.UNKNOWN, f, a, {
                     "error": (move_unsure + move_failed)[0]["error"],
@@ -2364,8 +2367,13 @@ class Executor:
             # 目录改名半路中止（有种子没搬成、或说不清搬没搬）：新旧两个目录各有一部分。整体还原的逆操作
             # 要求"新目录里全是记录里的种子、旧目录不存在"，这里两条都不成立——不盲目还原，交给人
             moved = u.get("moved_hashes") or []
-            return False, (f"目录改名只做了一部分（{len(moved)} 个种子已由 qBittorrent 搬到新目录），"
-                           f"无法自动回退：需人工核对新旧两个目录（可用 media-agent repair --run 合并）")
+            head = (f"目录改名只做了一部分（{len(moved)} 个种子已由 qBittorrent 搬到新目录），无法自动回退："
+                    "需人工核对新旧两个目录")
+            if u.get("path") and u.get("new_name") and rec and rec.get("run_id"):
+                # repair 往前做完：剩下的交给 qBittorrent 搬、合并残留、同步 AB 的 save_path
+                return False, (f"{head}，或用 media-agent repair --run {rec['run_id']} 把剩下的搬到新目录"
+                               "（先加 --dry-run 看它要搬什么）")
+            return False, head
 
         if op == "rename_show_dir":
             cur = Path(u["path"])
@@ -2693,10 +2701,15 @@ class Executor:
             return {"pairs": 0, "detail": [], "refused": refused}
         pairs = []
         for rec in self._read_audit(run_id):
-            # unknown 的目录改名（种子搬了、残留搬到一半出错）正是要修的分裂现场
-            if rec.get("status") not in auditlog.UNDOABLE or rec.get("op") != "rename_show_dir":
+            if rec.get("op") != "rename_show_dir":
                 continue
             u = rec.get("undo") or {}
+            # unknown 的目录改名（种子搬了、残留搬到一半出错）正是要修的分裂现场；半路中止的（逆操作是
+            # `rename_show_dir_partial`，unknown 或确认有种子没搬成的 failed）也是——回退拒绝它时建议的就是这里
+            partial = u.get("op") == "rename_show_dir_partial"
+            ok = auditlog.UNDOABLE + ((auditlog.FAILED,) if partial else ())
+            if rec.get("status") not in ok:
+                continue
             # 与回退同一道闸（critic N1）：空 path 会让 new = Path('.')、
             # old = cwd 下的相对目录，_merge_tree 就在运维者的当前目录里搬文件。
             new, why = _inside(u.get("path"), Path(self.cfg.media_root), "path")
@@ -2704,10 +2717,10 @@ class Executor:
                 continue
             old = new.parent / u["new_name"]
             if old.is_dir() and new.is_dir() and old != new:
-                pairs.append((old, new))
+                pairs.append((old, new, u if partial else None))
 
         results = []
-        for old, new in pairs:
+        for old, new, partial in pairs:
             # 先问 qBittorrent 此刻谁在旧目录里有文件——不只是 save_path 在旧目录下的：
             # Original 布局、save_path 在媒体根、根目录恰好叫剧名的种子，content 在
             # 旧目录下而 save_path 不在，以前它不进 setLocation 名单，文件直接被
@@ -2754,13 +2767,29 @@ class Executor:
                 continue
 
             moved, stranded = self._merge_tree(old, new, skip=claimed)
-            results.append({"old": old.name, "new": new.name,
-                            "moved_via_qbit": via_qbit, "moved_via_fs": moved,
-                            "stranded": stranded,
-                            "left_for_torrents": sum(1 for p in claimed.values() if p.exists()),
-                            "old_removed": not old.exists()})
+            done = {"old": old.name, "new": new.name,
+                    "moved_via_qbit": via_qbit, "moved_via_fs": moved,
+                    "stranded": stranded,
+                    "left_for_torrents": sum(1 for p in claimed.values() if p.exists()),
+                    "old_removed": not old.exists()}
+            if partial:
+                done["ab_savepath"] = self._repair_ab_savepath(partial, old, new)
+            results.append(done)
 
         return {"pairs": len(pairs), "detail": results, "refused": ""}
+
+    def _repair_ab_savepath(self, u: dict, old: Path, new: Path) -> str:
+        """半路中止的目录改名没走到最后一步：AutoBangumi 的 save_path 还指着旧目录，下一集会把旧目录建回来。
+        repair 把种子搬完之后补上。返回新的 save_path，没有要改的返回空串，改不成返回以「❌」开头的原因。"""
+        bid, prev = u.get("bangumi_id"), str(u.get("prev_savepath") or "")
+        if not (bid and prev and self.ctx.abdb and under(prev, old)):
+            return ""
+        dest = repath(prev, old, new)
+        try:
+            self.ctx.abdb.write([("UPDATE bangumi SET save_path=? WHERE id=?", (dest, bid))])
+        except Exception as e:                      # noqa: BLE001 —— 原因作为返回值写进 repair 的结果、由 cli 打印
+            return f"❌ AutoBangumi 的 save_path 没改成（{_describe(e)}），仍指着旧目录、下一集会重建它——需人工改"
+        return dest
 
     def list_runs(self) -> list[dict]:
         """列出历史 run，供选择回退哪一次。主审计与 audit.fallback.jsonl 一起读。
