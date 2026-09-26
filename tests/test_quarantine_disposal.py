@@ -1183,3 +1183,23 @@ def test_a_record_without_its_original_path_is_not_deleted(lib, no_rmtree):
     [c] = rep.pool
     assert "原路径不明" in c.why
     assert moved.exists() and not rep.deleted
+
+
+def test_a_local_keeper_vouches_end_to_end(lib, no_rmtree):
+    """整条链：两份都是纯本地文件的判重（BD 手工导入），关口在隔离时记下保留方的内容摘要；31 天后
+    run 的处置认出库里那份就是它、时长自证通过，照删——无种子的替代者只有这一条路能作保。"""
+    s1 = lib.show("朱音落语").season(1)
+    s1.local("朱音落语 S01E05.mkv", size=1_300_000_000, probe=EP_LEN)
+    lose = s1.local("朱音落语 S01E05 [raw].mkv", size=1_200_000_000,
+                    probe=video("h264", duration=1440.0))
+    _episodes(s1, "朱音落语", (1, 2, 3), EP_LEN)
+    ident = lib.ident(lose)
+    c = lib.cycle()
+    [rec] = c.applied("trash")
+    assert rec["deletion"]["keeper"]["hash"] == "" and rec["deletion"]["keeper"]["digest"]
+    [moved] = [p for p in lib.trash_files() if lib.ident(p) == ident]
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001", now=_later(31))
+
+    assert [x.trash_path for x in rep.deleted] == [moved]
+    assert "时长自证" in rep.deleted[0].why
