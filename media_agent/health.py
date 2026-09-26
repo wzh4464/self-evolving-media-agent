@@ -247,7 +247,7 @@ class RunHealth:
             "crash": None, "paused": "", "locked": "", "detectors": None, "findings": None, "actions": None,
             "grab": None, "stuck": None, "unrenamed": None, "trash": None, "torrents": None,
             "evolve": None, "logged_errors": {"count": 0, "by_tag": {}, "samples": []},
-            "ledger": None,
+            "ledger": None, "loop": None,
         }
 
     # ---- 各阶段 ----
@@ -312,11 +312,14 @@ class RunHealth:
             "problem": getattr(state, "ledger_problem", "") or "",
             "backfill": getattr(state, "ledger_backfill", None)}
 
-    def diagnosed(self, reg, findings) -> None:
+    def diagnosed(self, reg, findings, errors: list | None = None) -> None:
+        """`findings`：这一轮**最后一次**诊断的（`run` 迭代到不动点时，见 `converge`）；`errors`：各次迭代崩过的
+        规则合起来（不给就用 `reg.errors`，即最后一次诊断的）。"""
         by_sev: dict = {}
         for f in findings:
             by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
-        self.data["detectors"] = {"count": len(reg.detectors), "errors": list(reg.errors),
+        self.data["detectors"] = {"count": len(reg.detectors),
+                                  "errors": list(reg.errors if errors is None else errors),
                                   "load_errors": list(getattr(reg, "load_errors", []))}
         self.data["findings"] = {"total": len(findings),
                                  "actionable": sum(1 for f in findings if f.action),
@@ -328,7 +331,9 @@ class RunHealth:
     def refused(self, why: str) -> None:
         self.data["degraded"]["refused"] = why
 
-    def applied(self, report, findings, state) -> None:
+    def applied(self, report, findings, state, proposed: list | None = None) -> None:
+        """`report` 是整轮的（各次迭代累计）；`findings` / `state` 是最后一次诊断的（未改名的看它）；`proposed`：各次迭代
+        提过的动作合起来（抓取"提议了几集"看它，不给就用 `findings`）。"""
         def brief(recs):
             return [{"op": r.get("op"), "rule": r.get("rule"), "summary": str(r.get("summary"))[:100],
                      "error": str(r.get("error") or r.get("reason") or "")[:200]} for r in recs[:10]]
@@ -343,13 +348,21 @@ class RunHealth:
             "repeated": repeated_failures(self.cfg.audit_log, report),
             # 改 AB 数据库之后 docker start 报了错、库已改好（`Executor._ab_write`）：容器也许还停着
             "ab_maybe_stopped": brief([r for r in report.applied if r.get("after_error_note")])}
-        self.data["grab"] = grab_stats(findings, report)
+        self.data["grab"] = grab_stats(findings if proposed is None else proposed, report)
         old = unrenamed_old(findings, report, state.torrents, self.cfg.unrenamed_alert_hours)
         self.data["unrenamed"] = {"threshold_hours": self.cfg.unrenamed_alert_hours,
                                   "count": len(old), "old": old[:50]}
 
     def rescan_degraded(self, why: str) -> None:
         self.data["degraded"]["rescan"] = why
+
+    def loop(self, outcome) -> None:
+        """这一轮的迭代（`converge.Outcome`）：每次迭代的扫描 / 诊断 / 执行、停在哪、到顶时的待做、两条规则打架。
+        最后一次扫描读 qBittorrent 不完整（第二次迭代起的拒绝）：那一次的报错记进 `degraded.qbit_errors`。"""
+        self.data["loop"] = outcome.to_dict()
+        errs = list(getattr(outcome.state, "qbit_errors", None) or [])
+        if errs and len(outcome.iterations) > 1:
+            self.data["degraded"]["qbit_errors"] = errs
 
     def evolve(self, what: str) -> None:
         self.data["evolve"] = what
@@ -437,6 +450,20 @@ class RunHealth:
             add("warn", "ab_container_maybe_stopped",
                 f"{len(act['ab_maybe_stopped'])} 次改 AutoBangumi 数据库之后 docker start 报了错（库已改好）："
                 "容器也许还停着、订阅不走——要人确认（docker ps）")
+        lp = d.get("loop") or {}
+        if lp.get("stop") == "cap" and lp.get("pending_count"):
+            pend = lp.get("pending") or []
+            items = "；".join(f"[{x['rule']}] {x['op']} {str(x['summary'])[:50]}" for x in pend[:3])
+            add("warn", "loop_cap",
+                f"迭代到上限 {lp['max']} 次仍有 {lp['pending_count']} 个动作待做（{items}"
+                f"{' 等' if lp['pending_count'] > 3 else ''}）——下一轮 run 接着做；每轮都到顶，多半是有规则在拉锯")
+        osc = lp.get("oscillations") or []
+        if osc:
+            pairs = "；".join(f"[{(x.get('evidence') or {}).get('second', {}).get('rule')}] 要撤销 "
+                             f"[{(x.get('evidence') or {}).get('first', {}).get('rule')}] 刚做的 "
+                             f"{(x.get('evidence') or {}).get('first', {}).get('op')}" for x in osc[:3])
+            add("warn", "oscillation",
+                f"{len(osc)} 个动作会撤销同一轮里已执行的动作，已拒绝（{pairs}）——两条规则在打架，要人看哪条的判断不对")
         lg = d["ledger"] or {}
         if lg.get("problem"):
             add("warn", "ledger_unavailable",
@@ -591,6 +618,14 @@ def render(rep: dict, path=None) -> list[str]:
     un = rep.get("unrenamed")
     if un and un.get("count"):
         lines.append(f"  未改名  {un['count']} 个发布名文件超过 {un['threshold_hours']:g} 小时")
+    lp = rep.get("loop")
+    if lp:
+        its = [it for it in lp.get("iterations") or [] if not it.get("final")]
+        stop = {"fixed_point": "不动点", "cap": f"到上限，待做 {lp.get('pending_count', 0)}",
+                "refused": "读不全，拒绝", "dry_run": "预演"}.get(lp.get("stop"), str(lp.get("stop")))
+        lines.append(f"  迭代    {len(its)} 次 · {stop}"
+                     + (f" · 反向拒绝 {len(lp['oscillations'])}" if lp.get("oscillations") else "")
+                     + "（每次执行 " + " / ".join(str(it.get("applied", 0)) for it in its) + "）")
     lg = rep.get("ledger")
     if lg:
         ins = sum(((lg.get("backfill") or {}).get("inserted") or {}).values())

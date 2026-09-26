@@ -533,16 +533,22 @@ def test_a_degraded_rescan_before_evolving_is_critical(offline_cli, capsys, monk
     _clean(lib)
     lib.configure(evolve_mode="propose")
     lib.llm.enabled = True
-    real, n = cli.build_state, []
+    real, real_loop, looped = cli.build_state, cli.converge.run, []
 
-    def second_blind(ctx, **kw):
-        n.append(1)
+    def loop(*a, **k):
+        # 迭代到不动点的扫描（`converge`）都在这里面；它返回之后的那次扫描才是演进重扫
+        out = real_loop(*a, **k)
+        looped.append(1)
+        return out
+
+    def rescan_blind(ctx, **kw):
         st = real(ctx, **kw)
-        if len(n) == 2:
+        if looped:
             st.qbit_errors.append("重扫时读不到（注入）")
         return st
 
-    monkeypatch.setattr(cli, "build_state", second_blind)
+    monkeypatch.setattr(cli.converge, "run", loop)
+    monkeypatch.setattr(cli, "build_state", rescan_blind)
 
     assert cli.cmd_run(_args(), lib.cfg) == cli.EXIT_DEGRADED
     rep = _latest(lib)

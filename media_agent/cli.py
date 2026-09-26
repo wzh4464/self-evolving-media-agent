@@ -6,7 +6,7 @@
     media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升（需 EVOLVE_MODE=propose）
     media-agent purge     # 隔离区处置预演（--apply 真删，每个都先记 state/purge.jsonl）
     media-agent ledger backfill  # 补录出处账本（--dry-run 只报覆盖率）；run 开头自动补增量
-    media-agent run       # 一轮完整自治：diagnose → apply → [evolve] → 隔离区处置
+    media-agent run       # 一轮完整自治：(diagnose → apply) 迭代到不动点 → [evolve] → 隔离区处置
                           # evolve 只在 EVOLVE_MODE=propose 时跑，默认 off（见 config.py）
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, disposal, health, history, notify, pause, runlock, runlog, titles
+from . import __version__, converge, disposal, health, history, notify, pause, runlock, runlog, titles
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -811,46 +811,77 @@ def _run(args, cfg, rh) -> int:
     rh.clients(ctx)
     prev = health.load_baseline(cfg.state_dir)
     scanned_at = datetime.now().isoformat(timespec="seconds")
-    state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
-    rh.scanned(state, prev)
-    if not state.qbit_errors:
-        # 这一轮的种子数被采信了：下一轮拿它比（`health.torrent_count_problem`）。时间取扫描之前——
-        # 这一轮自己摘掉的种子也算进下一轮"解释得通"的那部分。被拒绝的一轮不挪基线。
-        problem = health.save_baseline(cfg.state_dir, count=len(state.torrents), run_id=run_id,
-                                       ts=scanned_at, source="run")
-        if problem:
-            _log(f"⚠️  {problem}")
-    # 出处账本的增量补录（`ledger_backfill`）：这一轮还没有出处的种子，从抓取审计、AB 库（只读）、番组页找回
-    # 它是什么，诊断之前挂到文件上
-    _auto_backfill(ctx, state)
-    rh.ledger(state)
     reg = build_registry()
-
-    findings = reg.run_all(ctx, state)
-    rh.diagnosed(reg, findings)
     dry = args.dry_run or not cfg.auto_apply
+    ex = Executor(ctx, dry_run=dry, run_id=run_id)
+
+    def on_scan(n, state) -> None:
+        if n != 1:
+            return
+        rh.scanned(state, prev)
+        if not state.qbit_errors:
+            # 这一轮的种子数被采信了：下一轮拿它比（`health.torrent_count_problem`）。时间取扫描之前——
+            # 这一轮自己摘掉的种子也算进下一轮"解释得通"的那部分。被拒绝的一轮不挪基线。
+            problem = health.save_baseline(cfg.state_dir, count=len(state.torrents), run_id=run_id,
+                                           ts=scanned_at, source="run")
+            if problem:
+                _log(f"⚠️  {problem}")
+        # 出处账本的增量补录（`ledger_backfill`）：这一轮还没有出处的种子，从抓取审计、AB 库（只读）、番组页找回
+        # 它是什么，诊断之前挂到文件上。后面的迭代不再补：本轮抓的执行器当场记账，扫描每次都重读账本
+        _auto_backfill(ctx, state)
+        rh.ledger(state)
+
+    def on_diagnose(n, state, findings) -> None:
+        if n == 1:
+            print(f"═══ 诊断：{len(findings)} 个问题 ═══")
+            _warn_degraded(state)
+            _print_findings(findings, False)
+            print(f"\n═══ 执行：扫描 → 诊断 → 执行，迭代到不动点（最多 {cfg.max_iterations} 次） ═══")
+        else:
+            _warn_degraded(state)
+
+    # 扫描 → 诊断 → 执行，重复到不动点（`converge` 模块文档）：一个执行器（一个批次 ID、配额跨迭代累计）、
+    # 每次迭代一份新扫描、TMDB 身份照常解析、试过的不再试、撤销本轮已执行动作的拒绝
+    out = converge.run(ctx, reg, ex, max_iterations=cfg.max_iterations,
+                       scan=lambda n: build_state(ctx, resolve_tmdb=not args.no_tmdb),
+                       on_scan=on_scan, on_diagnose=on_diagnose,
+                       on_iteration=lambda it: print(it.line(cfg.max_iterations)))
+    report, state, findings = ex.report, out.state, out.findings
+    rh.loop(out)
+    # 发现历史、卡住检测、健康报告的"发现"按**最后一次**诊断算：已经在这一轮修好的不算"还在"
+    rh.diagnosed(reg, findings, errors=out.detector_errors)
     _record_findings(cfg, run_id, findings, state, "run", dry_run=dry)
-    # TMDB 标题稳定闸（`titles`）：新标题要连续两轮 `run` 看到才采用——只有 `run` 数轮次，
-    # 人手跑的 `diagnose` 不算。记不下来只说一句：最坏是一个新标题多等一轮
-    problem = titles.record(cfg.state_dir, state.title_decisions, run_id=run_id)
+    # TMDB 标题稳定闸（`titles`）：新标题要连续两轮 `run` 看到才采用——只有 `run` 数轮次，人手跑的 `diagnose` 不算；
+    # 一轮只记一次（迭代之间记了，同一轮的第二次迭代就会把新标题"确认"下来）。记不下来只说一句：最坏是多等一轮
+    problem = titles.record(cfg.state_dir, out.title_decisions, run_id=run_id)
     if problem:
         _log(f"⚠️  标题稳定记录：{problem}")
-    print(f"═══ 诊断：{len(findings)} 个问题 ═══")
-    _warn_degraded(state)
-    _print_findings(findings, False)
 
-    ex = Executor(ctx, dry_run=dry, run_id=run_id)
-    report = ex.apply(findings)
-    if report.refused:
-        # fail closed：不修、不演进（演进器会拿这份残缺快照去立规则）、
-        # 也不处置隔离区——降级的一轮不改动任何东西。
-        rh.refused(report.refused)
-        return _refuse(report.refused)
-    rh.applied(report, findings, state)
-    print(f"\n═══ 修复：{report.summary()} ═══")
+    if out.stop == converge.REFUSED:
+        # fail closed：这一次迭代起不修、不演进（演进器会拿这份残缺快照去立规则）、也不处置隔离区。
+        # 前面的迭代已经做了的照样报（同一个批次 ID，可整批回退）
+        n = len(out.iterations)
+        why = report.refused
+        if n > 1:
+            why = (f"第 {n} 次迭代：{report.refused}；此前 {n - 1} 次迭代已执行 {len(report.applied)} 项"
+                   f"（批次 {run_id}，可 rollback）")
+            rh.applied(report, findings, state, proposed=out.proposed)
+            print(f"\n═══ 修复：{report.summary()} ═══")
+            _print_unknown(report.unknown)
+        rh.refused(why)
+        return _refuse(why)
+    rh.applied(report, findings, state, proposed=out.proposed)
+    print(f"\n═══ 修复：{report.summary()}（{_loop_brief(out)}） ═══")
     _print_unknown(report.unknown)
+    _print_loop(out)
 
     rc = 0
+    if out.final_degraded:
+        # 到顶之后的收尾诊断读 qBittorrent 不完整：待做的列不出来。与演进重扫读不全同一个口径——修复已经做了，
+        # 处置照跑，退出码 3 让它被看见
+        rh.rescan_degraded(out.final_degraded)
+        print(f"\n═══ 收尾诊断：qBittorrent 数据不完整，列不出还要做什么：{out.final_degraded} ═══")
+        rc = EXIT_DEGRADED
     if cfg.evolve_mode != "propose":
         # 冻结：不重扫、不调 LLM、不构造 Evolver（它的 __init__ 就会建 .agents/rules）
         rh.evolve("frozen")
@@ -891,6 +922,27 @@ def _run(args, cfg, rh) -> int:
     if _report_audit_problems(report.audit_problems, cfg.state_dir):
         return EXIT_AUDIT_INCOMPLETE
     return rc
+
+
+_STOP = {converge.FIXED_POINT: "不动点", converge.CAP: "到上限", converge.DRY_RUN: "预演只跑一次",
+         converge.REFUSED: "拒绝"}
+
+
+def _loop_brief(out) -> str:
+    n = sum(1 for it in out.iterations if not it.final)
+    return f"{n} 次迭代，{_STOP.get(out.stop, out.stop)}"
+
+
+def _print_loop(out, limit: int = 10) -> None:
+    """到顶时还要做的、两条规则打架的：逐条说。"""
+    if out.stop == converge.CAP and out.pending:
+        print(f"  ⚠️  迭代到上限 {out.max_iterations} 次仍有 {len(out.pending)} 个动作待做（下一轮 run 接着做）：")
+        for f in out.pending[:limit]:
+            print(f"    ⏳ [{f.rule}] {f.action.op}【{f.show or '-'}】{str(f.summary)[:120]}")
+        if len(out.pending) > limit:
+            print(f"    …另 {len(out.pending) - limit} 个（media-agent health --json 的 loop.pending）")
+    for o in out.oscillations[:limit]:
+        print(f"  ⚠️  两条规则在打架：{o.summary}")
 
 
 def main() -> int:
