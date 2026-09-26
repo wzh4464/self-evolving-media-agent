@@ -137,3 +137,25 @@ tests / tools / deploy、生产机上全部 `*.py` / `*.sh` 都查过（grab 调
 `converge()` 第一轮判重封存新种子、AB 那份进隔离区、同轮改名，最后只有新种子声明集位名。
 `tests/test_grab_stale_bypass.py` 的换源用例改为断言"不改到旧种子仍声明的名字上"，另加上面
 那条 xfail。
+
+## 5. relink 与它的逆操作走闸门（N6 的原始场景）
+
+**以前**：`StaleTorrentPathDetector` 按"字节数唯一"在剧目录（目录没了就全库）里给失联种子
+找文件，从不看那个文件是不是已经归另一个活种子；`relink_torrent` 随后 setLocation →
+renameFile → recheck。两个种子从此声明同一个文件；大小相同而内容不同时 recheck 判分片缺失，
+qBittorrent 重下、覆盖到别人的文件上。逆操作把种子映射回原来失联的路径，那个路径此后若被
+别的种子声明，回退同样造出双重声明。
+
+**现在**：`Executor._relink_conflicts(h, cur_sp, mapping, new_sp, disk_for_mapped=…)` 算出
+这个种子每个条目的最终落点，逐个问占用：
+- 映射里的条目落到 `(new_sp or cur_sp)/映射后的名字`。正向只问 qBittorrent（那个文件本来
+  就该在盘上，它就是要关联的对象）；逆向盘上 + qBittorrent 都问（目标是原来失联的路径，
+  盘上此后有了别的文件同样算）。
+- 换目录时不在映射里的条目会被 setLocation 连带搬走，目的地一并查。
+- 正向：任何冲突 → skipped，理由含占用者 hash，`claims` 列出每个查询；看不全 → failed
+  「未做任何改动」。**都在 setLocation 之前**——以前 setLocation 先发、改名全失败时
+  save_path 已经挪了。逆向：冲突 / 看不全 → 这一条回退跳过并写明原因。
+
+**测试**：`tests/test_relink_claims.py`——关联到无主文件照常（recheck 回到 100%）、可回退；
+同目录的目标文件归另一个种子、换目录后的目标文件归另一个种子都拒绝且快照不变、一个
+qBittorrent 调用都没有；邻居 `files()` 读不到 failed；回退时原路径被新种子占了就跳过。

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .claims import ClaimCheck, ClaimIndex
+from .claims import ClaimCheck, ClaimIndex, ClaimsUnknown
 from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
 
@@ -999,18 +999,45 @@ class Executor:
         h = a.args["torrent_hash"]
         mapping = a.args["mapping"]
         new_save_path = a.args.get("new_save_path") or ""
+
+        # 先问占用，再做任何改动（critic N6）。检测器按"字节数唯一"定位，从不看那个
+        # 文件是不是已经归另一个活种子；关联过去就是两个种子声明同一个文件，大小相同
+        # 而内容不同时 recheck 把分片判缺，qBittorrent 会重下、覆盖到别人的文件上。
+        try:
+            cur = self._claims().torrent(h)
+        except ClaimsUnknown as e:
+            self._audit("failed", f, a, {
+                "error": f"无法确认目标路径的占用情况，未做任何改动：{e}"})
+            return
+        if cur is None:
+            self._audit("skipped", f, a, {"reason": "种子已不在 qBittorrent 里"})
+            return
+        cur_sp = (cur.get("save_path") or "").rstrip("/")
+        conflicts = self._relink_conflicts(h, cur_sp, mapping, new_save_path,
+                                           disk_for_mapped=False)
+        unknown = next((c for c in conflicts if c.unknown), None)
+        if unknown:
+            self._audit("failed", f, a, {
+                "error": f"无法确认目标路径的占用情况，未做任何改动：{unknown.unknown}",
+                "claims": [c.audit() for c in conflicts]})
+            return
+        if conflicts:
+            self._audit("skipped", f, a, {
+                "reason": ("目标文件已归另一个活种子（" + "；".join(c.describe(1) for c in conflicts[:2])
+                           + "），关联过去就是两个种子争同一个文件，recheck 还会按自己的"
+                             "分片去校验、重下它"),
+                "claims": [c.audit() for c in conflicts]})
+            return
         if self.dry_run:
             self._audit("skipped", f, a,
                         {"reason": "dry-run", "would_relink": len(mapping),
                          "would_relocate_to": new_save_path})
             return
 
-        prev_save_path = ""
+        prev_save_path = cur_sp if new_save_path else ""
         if new_save_path:
             # 文件已搬到别的目录：先把 save_path 挪过去，renameFile 用的是
             # 相对 save_path 的路径，跨不出去。
-            cur = next((t for t in self.ctx.qbit.torrents() if t["hash"] == h), None)
-            prev_save_path = (cur or {}).get("save_path") or ""
             self.ctx.qbit.set_location([h], new_save_path)
 
         before = {e["name"] for e in self.ctx.qbit.files(h)}
@@ -1040,6 +1067,41 @@ class Executor:
                           "torrent_hash": h,
                           "new_save_path": prev_save_path,
                           "mapping": [{"old": m["new"], "new": m["old"]} for m in renamed]})
+
+    def _relink_conflicts(self, h: str, cur_sp: str, mapping: list[dict], new_sp: str,
+                          *, disk_for_mapped: bool) -> list[ClaimCheck]:
+        """relink（或它的逆操作）之后这个种子的每个条目会落在哪、那里此刻有没有别人。
+
+        - 映射里的条目落到 `(new_sp or cur_sp)/映射后的名字`。正向时那个文件本来就该在盘上
+          （就是要关联过去的那个），只问 qBittorrent（`disk_for_mapped=False`）；逆向时
+          目标是原来失联的路径，盘上此后若有了别的文件同样算占用。
+        - 换目录时（`new_sp` 非空）不在映射里的条目也会被 setLocation 连带搬过去，
+          它们的目的地一并查（盘上 + qBittorrent）。
+        返回不空闲的查询结果（被占或看不全）。
+        """
+        claims = self._claims()
+        moved = {m.get("old"): m.get("new") for m in mapping}
+        dest_root = Path(new_sp or cur_sp or "/")
+        out: list[ClaimCheck] = []
+        try:
+            entries = claims.entries(h)
+        except ClaimsUnknown as e:
+            return [ClaimCheck(str(dest_root), unknown=str(e))]
+        for e in entries:
+            if e.get("priority", 1) == 0:
+                continue
+            name = e["name"]
+            own = Path(cur_sp or "/") / name
+            if name in moved:
+                chk = claims.check(dest_root / moved[name], own_hash=h, own_path=own,
+                                   disk=disk_for_mapped)
+            elif new_sp:
+                chk = claims.check(dest_root / name, own_hash=h, own_path=own)
+            else:
+                continue
+            if not chk.free:
+                out.append(chk)
+        return out
 
     def _op_delete_category(self, f: Finding, a: Action) -> None:
         """删除空分类。只动分类定义，不碰任何文件。
@@ -1729,9 +1791,22 @@ class Executor:
             return True, ""
 
         if op == "relink_torrent":
+            h = u["torrent_hash"]
+            # 映射回原来（失联时）的路径之前先问占用（critic N6）：那个名字此后若被别的
+            # 种子声明、或盘上有了别的文件，回退就造出两个种子争一个路径。
+            cur = self._claims().torrent(h)
+            if cur is None:
+                return False, "种子已不在 qBittorrent 里"
+            conflicts = self._relink_conflicts(
+                h, (cur.get("save_path") or "").rstrip("/"), u.get("mapping") or [],
+                u.get("new_save_path") or "", disk_for_mapped=True)
+            unknown = next((c for c in conflicts if c.unknown), None)
+            if unknown:
+                return False, f"无法确认还原目标的占用情况，未做任何改动：{unknown.unknown}"
+            if conflicts:
+                return False, "还原目标已被占用：" + "；".join(c.describe(1) for c in conflicts[:2])
             if self.dry_run:
                 return True, ""
-            h = u["torrent_hash"]
             for m in u.get("mapping", []):
                 try:
                     self.ctx.qbit.rename_file(h, m["old"], m["new"])
