@@ -475,6 +475,56 @@ def test_undoes_matches_each_recorded_inverse():
     assert not converge.undoes("grab_episode", {"url": url}, trashed)   # 只作废了一个文件，种子还在
 
 
+def test_undoes_knows_a_relink_reversed_and_a_regrab_after_the_record_was_lost(lib):
+    """两个以前没测到的逆操作（2026-09-27 审查：把它们关掉的变异全套存活）：
+    - relink 的反向——按执行器真记下的逆操作（映射反过来）认；原样再 relink 一次不是反向；
+    - 隔离时连种子记录一起丢了（`torrent_record_lost`）：再把那个种子抓回来就是撤销那次隔离。"""
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+    size = 734_003_200
+    s1 = lib.show("古诺希亚").season(1)
+    t = s1.single("GNOSIA - S01E08 [WebRip 1080p HEVC-10bit AAC].mkv", size=size, on_disk=False)
+    s1.local("古诺希亚 S01E08.mkv", size=size)
+    [rec] = lib.cycle(detectors=[StaleTorrentPathDetector]).applied("relink_torrent")
+    back = {"torrent_hash": t.hash, "mapping": rec["undo"]["mapping"]}
+    assert converge.undoes("relink_torrent", back, rec)
+    assert not converge.undoes("relink_torrent", rec["args"], rec)
+
+    h = "a" * 40
+    lost = {"status": "applied", "op": "trash", "args": {"torrent_hash": h},
+            "undo": {"op": "restore_from_trash", "torrent_record_lost": True}}
+    assert converge.undoes("grab_episode", {"url": f"https://mikanani.me/Download/20260901/{h}.torrent"}, lost)
+
+
+@pytest.mark.parametrize("op", ["relocate", "rename_show_dir"])
+def test_a_torrent_moved_this_run_is_not_dropped_as_dead_either(lib, op):
+    """`TOUCHING` 里另外两个动作：setLocation 之后种子同样有一阵子"下载中、0 做种"。只有 relink 那一条有测试，
+    把 relocate 从 `TOUCHING` 里拿掉、或不再解析目录改名的 `torrent_savepaths` 的变异全套存活（2026-09-27 审查）。
+    这里用执行器真写下的审计记录（目录改名的逆操作形状就是它）喂给那道闸。"""
+    from media_agent.actions import Executor
+    from media_agent.plugins.builtin import TitleDriftDetector
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(77, "新名字", seasons={1: weekly(2, first_days_ago=900)})
+    sh = lib.show("旧名字")
+    t = sh.season(1).single("新名字 S01E01.mkv")
+    sh.sidecar(tmdb_id=77, tmdb_title="新名字")
+    if op == "rename_show_dir":
+        applied = lib.cycle(detectors=[TitleDriftDetector]).applied(op)
+    else:
+        mv = Finding(rule="move", kind="move", severity="minor", summary="挪存储", torrent_hash=t.hash,
+                     action=Action(op="relocate", args={"torrent_hash": t.hash,
+                                                        "location": str(lib.media_root / "别处")}))
+        applied = lib.apply([mv]).applied
+    [moved] = applied
+    guard = converge._Guard(Executor(lib.context(), dry_run=True, run_id="t-guard"))
+    guard.note([moved], 1)
+    dead = Finding(rule="dead-torrent", kind="dead", severity="minor", summary="死种", torrent_hash=t.hash,
+                   action=Action(op="drop_torrent", args={"torrent_hash": t.hash, "dead": True}))
+
+    todo, memo, osc, deferred = guard.screen([dead], 2, write=False)
+
+    assert (todo, deferred) == ([], 1)
+
+
 def test_trashing_an_extra_of_a_just_grabbed_release_does_not_undo_the_grab():
     """只作废多文件发布里的一个条目（NCOP、PV）不撤销抓取；作废抓的那一集本身才撤销（2026-09-27 审查）。"""
     grab = {"status": "applied", "op": "grab_episode", "args": {},
