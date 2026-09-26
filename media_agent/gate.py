@@ -35,8 +35,9 @@
   只剩这一个时反过来整种子作废（留一个什么都不下的空种子会被 stale-torrent-path 报成死链）。
 - **I4 不删封存了集位的文件**：钉了 `ma:SxxEyy`、复核（`meets_requirements`）通过。**探测不可用
   （`probe` 返回 None：超时、出错）一律当作封存**——封存不能因为某一轮 ffprobe 超时就丢；
-  唯一的例外是合并发布里同一个种子的兄弟文件：封存由判重选中的那一份（同一个种子、同一个
-  钉子）持有，兄弟按用户偏好只留一份。
+  例外是合并发布里同一个种子的兄弟文件：封存由判重选中的那一份（同一个种子、同一个钉子）持有，
+  兄弟按用户偏好只留一份。钉子是整个种子的，特典处置的对象若不是那一集（钉着的合集里的 NCOP），
+  它不持有封存。
 - **死种半成品**（处置类别 `dead_partial`）：只许动 `.!qB`，而且那个死种此刻已不在 qBittorrent 里
   （同一批里被摘掉了，或已被删）——摘除没发生，它就仍在声明这份半成品（归入 I2）。
 - 另外：**演进规则产出的删除一律不执行**（critic N5）。第 1 阶段在 `Executor._dispatch` 拦下
@@ -51,13 +52,17 @@
     "deletion": {
       "gate": "passed" | "I1" | "I2" | "I4" | "evolved" | "unknown" | "mismatch",
       "disposition": "duplicate" | "extras" | "bundled_version" | "dead_partial" | "manual" | "other",
+      "rule": "<规则 id，同记录顶层的 rule>",
       "slot": [季, 集] | null,
       "keeper": {"path", "hash", "digest"} | null,
-      "subject": {"torrent_hash", "name", "pin", "tags", "category", "torrent_files"},
+      "subject": {"torrent_hash", "name", "pin", "tags", "category", "torrent_files",
+                  "removed_this_batch"?: true},     # 种子本批次早先已被摘：摘的那一刻记下的
       "notes": [...]?          # 例如 I3 的自动降级
     }
 
-规则 id 就是记录本身的 `rule`。
+`gate` 不是 `passed` 的记录一定是 skipped（I1 / I2 / I4 / evolved）或 failed（unknown /
+mismatch）；演进规则被拒的只有 `gate` / `disposition` / `rule`。drop_torrent 的记录同形
+（`subject` 是被摘的种子，`keeper` 是撞车的保留方）。
 """
 from __future__ import annotations
 
