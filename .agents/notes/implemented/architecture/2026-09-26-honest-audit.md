@@ -61,3 +61,41 @@ qBittorrent 其实已经改了，记录却是 failed、没有 undo，此后那�
 与备用文件里各一份、照样能回退；动作抛异常 + 审计一直写不进去不冲出 `apply()`；`Path` 混进 `args` 降级写入
 并能回退；末尾半行不吞下一条；`cmd_run` 跑到隔离区处置并以 4 退出。tripwire 新种类 `audit_fallback`：
 测试里任何一条审计没原样写进 audit.jsonl 都会变红，除非声明。
+
+## 3. 新状态 `unknown`：改动也许生效了、确认不了
+
+**现场**：`failed` 在执行器里一直兼着两种意思——"没生效"与"异常发生在改动之后，不知道生效没有"。
+生产 2026-09-16 … 09-26 的 12 次抓取（20260916T041844 … 20260926T055214）在 `add_torrent` 成功之后撞上
+`resp` NameError，全记 failed、没有 undo，qBittorrent 里其实多了种子；2026-09-14 run 20260914T100214 的
+`renameFile` 读超时，qBittorrent 已经改了名，同样记 failed、没有 undo，此后那个集位一直"被占"。
+
+**修法（这一节是通用兜底，按动作核实见下一节）**：
+
+- `apply()` 期间把 `ctx.qbit` / `ctx.abdb` 包一层 `_Tracked`：每个写方法（`_QBIT_WRITES`、`abdb.write`）
+  **发出即记**进 `self._effects`（抛了异常也可能已经生效）；文件系统上的改动由动作自己 `_effect()`。
+  每个动作开始时清空；结束后还原 Context 上的客户端。
+- 动作抛了异常、自己没接住（`_crashed`）：没发出过改动 → `failed`；发出过 → `unknown`，带
+  `effects_attempted`、`reason`，以及动作事先用 `_intend(undo)` 登记的"如果生效了该怎么撤"。
+- 报告分桶多一个 `unknown`（critic §3.5：原来是 `{...}[status]`，新状态直接 KeyError，而这一行就在改动之后）；
+  不认识的状态进 unknown 而不是 failed。`summary()` 带"未确认 N 项"。
+
+**向后兼容地引进**：生产 audit.jsonl 2026-09-26 只读核对——9627 行、状态只有 applied / skipped / failed /
+rollback；574 行（2026-08-17 上午）没有 `run_id` 也没有 `undo`；4 条回退汇总只有 `ts` / `run_id` / `status`
+与计数，`run_id` 是被回退的那一批。每个读状态的地方：
+
+| 读的一方 | 对 `unknown` |
+|---|---|
+| `rollback` | 带 `undo` 的与 applied 一起按 LIFO 尝试（每个逆操作动手前都核对此刻状态，没生效的自然跳过）；结果多 `unconfirmed` / `unconfirmed_reverted` / `unconfirmed_no_undo`，cli 单独一行标出，明细里标「当初未确认」 |
+| `list_runs` / `runs` | 多 `unconfirmed` 计数；带 `undo` 的算进 `undoable`（`rollback --last` 因此会选到它）；输出「❓未确认 N」 |
+| `repair` | unknown 的 `rename_show_dir`（种子搬了、残留搬到一半出错）同样是分裂现场 |
+| 隔离区处置 | unknown 的 trash **不算已隔离**：那份文件交给人，理由写明「隔离未确认」，永不自动删（`purge._trash_records`） |
+| `find_failure_patterns` | failed 与 unknown 分开计数，结果多 `status`；`evolve` 输出标「失败 / 未确认」 |
+| cli `apply` / `run` | 逐条列出 ❓ 未确认的动作 |
+
+不认识的状态（将来的）一律当作"不是已生效"：不计入回退、不计入已隔离、不计入失败模式。
+
+**测试**：`tests/test_audit_contract.py`——按生产几代格式合成的 audit.jsonl（没有 run_id 的、秒级 run_id、
+回退汇总、预演、坏行、非对象行、带 seq 的 unknown、将来的状态）喂给 `list_runs` / `runs` /
+`rollback --last` / `find_failure_patterns` / `_read_audit`；抓取 `add_torrent` 之后 NameError 记 unknown、
+之前抛异常仍是 failed；回退带逆操作的 unknown（生效了的还原、没生效的不动）；unknown 的隔离交给人；
+unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。

@@ -227,6 +227,9 @@ class Cycle:
     def failed(self, op: str | None = None) -> list[dict]:
         return [r for r in self.report.failed if op is None or r["op"] == op]
 
+    def unknown(self, op: str | None = None) -> list[dict]:
+        return [r for r in self.report.unknown if op is None or r["op"] == op]
+
 
 class LibraryBuilder:
     """见模块文档。一般通过 conftest 的 `lib` fixture 拿到。"""

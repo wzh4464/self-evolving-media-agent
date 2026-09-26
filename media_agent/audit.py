@@ -14,6 +14,20 @@
 3. 读的一方（`iter_records`）两个文件一起读——转写的记录照样能回退、照样出现在 `runs` 里。
 
 每一处降级 / 转写都由调用方计数，在本轮输出与退出码里大声说（`ExecReport.audit_problems`）。
+
+**状态**（`status`）——执行器每条动作记录恰好一个：
+
+- `applied`：改动生效了，**已确认**（正常返回，或调用抛了异常、但按此刻状态核实确实生效）。
+  可逆的带 `undo`。
+- `skipped`：没动手（dry-run、闸门拒绝、状态已变……），`reason` 说明。什么都没改。
+- `failed`：没生效——要么异常发生在发出任何改动之前，要么改动调用出错后按此刻状态核实**没有**生效。
+  `error` 说明；若有已发生的附带改动（如隔离时种子已摘、文件没搬走）以字段写明。
+- `unknown`：改动**也许**生效了、执行器确认不了（改动调用出错后读不到此刻状态，或异常发生在已经发出
+  改动之后）。`error` 是异常，`reason` 说明为什么确认不了；`effects_attempted` 列出已发出的改动；
+  有"如果生效了该怎么撤"时照样带 `undo`——回退会按此刻状态核对后尝试它（每个逆操作动手前都核对）。
+
+回退另写 `rollback`（汇总，`run_id` 是被回退的批次——历史记录也是这个形状）。不认识的状态
+一律当作"不是已生效"读：不计入回退、不计入已隔离。
 """
 from __future__ import annotations
 
@@ -24,6 +38,14 @@ from collections.abc import Iterator
 from pathlib import Path
 
 FALLBACK_NAME = "audit.fallback.jsonl"
+
+APPLIED, SKIPPED, FAILED, UNKNOWN = "applied", "skipped", "failed", "unknown"
+# 执行器动作记录的全部状态（见模块文档）
+STATUSES = (APPLIED, SKIPPED, FAILED, UNKNOWN)
+# 回退会尝试其 `undo` 的状态：已生效的，与也许生效了的（逆操作动手前各自核对此刻状态）
+UNDOABLE = (APPLIED, UNKNOWN)
+# 回退汇总记录的状态
+ROLLBACK = "rollback"
 
 
 def fallback_path(audit_log: Path) -> Path:

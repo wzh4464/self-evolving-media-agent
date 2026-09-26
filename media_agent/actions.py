@@ -92,6 +92,40 @@ def _bad_rel(rel, what: str) -> str | None:
     return None
 
 
+# ---------------- 已发出的改动（effect vs bookkeeping）----------------
+#
+# 一个动作抛了异常，它是"没生效"还是"生效了、只是后面的记账没做完"，取决于异常之前有没有发出过改动。
+# 生产 2026-09-16 … 09-26 的 12 次抓取：`add_torrent` 成功之后撞上 `resp` NameError，全记 failed、
+# 没有逆操作；2026-09-14 run 20260914T100214 的 `renameFile` 读超时，qBittorrent 其实改了，同样记 failed。
+# 所以执行器在 `apply()` 期间把 qBittorrent / AutoBangumi 数据库包一层，记下每个动作**发出过**的写调用
+# （发出即记，不管它返回还是抛异常——抛了也可能已经生效）；文件系统上的改动由各动作自己 `_effect()`。
+_QBIT_WRITES = frozenset({
+    "add_torrent", "rename_torrent", "rename_file", "set_location", "create_category",
+    "set_category", "remove_categories", "add_tags", "remove_tags", "set_file_priority",
+    "recheck", "delete"})
+_ABDB_WRITES = frozenset({"write"})
+
+
+class _Tracked:
+    """包一层客户端：`writes` 里的方法被调用时先往 `sink` 记一笔（`<label>.<方法名>`），再照常调用。
+    其余属性原样透传。"""
+
+    def __init__(self, inner, sink: list, writes: frozenset, label: str):
+        self._inner, self._sink, self._writes, self._label = inner, sink, writes, label
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if name not in self._writes or not callable(attr):
+            return attr
+        sink, what = self._sink, f"{self._label}.{name}"
+
+        def call(*a, **k):
+            sink.append(what)
+            return attr(*a, **k)
+
+        return call
+
+
 def _describe(e: BaseException) -> str:
     """异常的一句话描述，给审计的 `error`。`str(e)` 本身出错也不抛——这是写失败记录的那一步。"""
     try:
@@ -132,6 +166,8 @@ class ExecReport:
     applied: list[dict] = field(default_factory=list)
     skipped: list[dict] = field(default_factory=list)
     failed: list[dict] = field(default_factory=list)
+    # 也许生效了、确认不了的（`audit.UNKNOWN`）。以前这些混在 failed 里：改动其实做了，报告说"失败"
+    unknown: list[dict] = field(default_factory=list)
     # 非空 = 整批被拒绝执行（qBittorrent 不可用或本轮扫描读不全），值是原因
     refused: str = ""
     # 没能原样写进 audit.jsonl 的记录（每条一句：哪条、怎么了）。写审计永不抛异常（`audit.write`），
@@ -142,6 +178,8 @@ class ExecReport:
         if self.refused:
             return f"⛔ 拒绝执行本批次：{self.refused}"
         s = f"执行 {len(self.applied)} 项，跳过 {len(self.skipped)} 项，失败 {len(self.failed)} 项"
+        if self.unknown:
+            s += f"，未确认 {len(self.unknown)} 项（改动也许生效了，需核对）"
         if self.audit_problems:
             s += (f"；⚠️ {len(self.audit_problems)} 条审计没能原样写进 audit.jsonl"
                   f"（见 stderr / {auditlog.FALLBACK_NAME}）")
@@ -179,6 +217,18 @@ class Executor:
         # 本批次写出的审计序号（记录的 `seq`，从 1 起）。回退按它排 LIFO：主审计写不进去时，
         # 同一批的记录会分在 audit.jsonl 与 audit.fallback.jsonl 两个文件里，文件顺序不再是写入顺序。
         self._seq = 0
+        # 当前这个动作已经发出的改动（`_Tracked` 与 `_effect` 往里记），以及"如果生效了该怎么撤"
+        # （`_intend`）。动作抛异常时据此决定记 failed 还是 unknown（`_crashed`）。每个动作开始时清空。
+        self._effects: list[str] = []
+        self._would_undo: dict | None = None
+
+    def _effect(self, what: str) -> None:
+        """记一笔即将发出的、不经 qBittorrent / AB 数据库的改动（文件系统搬运、写 sidecar……）。"""
+        self._effects.append(what)
+
+    def _intend(self, undo: dict | None) -> None:
+        """动手之前登记"如果生效了该怎么撤"。之后抛异常而确认不了时，unknown 记录带上它。"""
+        self._would_undo = undo
 
     def _claims(self) -> ClaimIndex:
         """本批次共用的占用索引。**任何往媒体库里落一个名字的动作，落笔前都问它**
@@ -222,9 +272,12 @@ class Executor:
             # applied / failed 都可能已经改了东西（failed 也可能是改到一半）：
             # 占用索引作废，后面的动作看到的是这一步之后的状态。
             self._claim_index.invalidate()
-        bucket = {"applied": self.report.applied,
-                  "skipped": self.report.skipped,
-                  "failed": self.report.failed}.get(status, self.report.failed)
+        # critic §3.5：以前是 `{...}[status]`，多一个状态就 KeyError——而这一行就在改动之后。
+        # 不认识的状态（不该出现）进 unknown：宁可说"不知道"，也不把它塞进 failed 说"没生效"。
+        bucket = {auditlog.APPLIED: self.report.applied,
+                  auditlog.SKIPPED: self.report.skipped,
+                  auditlog.FAILED: self.report.failed,
+                  auditlog.UNKNOWN: self.report.unknown}.get(status, self.report.unknown)
         bucket.append(rec)
         for p in auditlog.write(self.cfg.audit_log, rec):
             self.report.audit_problems.append(
@@ -299,12 +352,40 @@ class Executor:
             (f for f in findings if f.action),
             key=lambda f: (self._OP_ORDER.get(f.action.op, 99), f.show, f.path),
         )
-        for f in ordered:
-            try:
-                self._dispatch(f, f.action)
-            except Exception as e:
-                self._audit("failed", f, f.action, {"error": _describe(e)})
+        # 本批次期间记下每个动作发出的写调用（见 `_Tracked`）。包的是 Context 上的客户端，结束后还原。
+        qbit, abdb = self.ctx.qbit, self.ctx.abdb
+        self.ctx.qbit = _Tracked(qbit, self._effects, _QBIT_WRITES, "qbit")
+        if abdb is not None:
+            self.ctx.abdb = _Tracked(abdb, self._effects, _ABDB_WRITES, "abdb")
+        try:
+            for f in ordered:
+                self._effects.clear()
+                self._would_undo = None
+                try:
+                    self._dispatch(f, f.action)
+                except Exception as e:
+                    self._crashed(f, e)
+        finally:
+            self.ctx.qbit, self.ctx.abdb = qbit, abdb
         return self.report
+
+    def _crashed(self, f: Finding, e: Exception) -> None:
+        """动作抛了异常、它自己没接住。发出过改动就是 unknown，否则 failed。
+
+        以前一律 failed：生产上"种子已经加进去、之后 NameError"的 12 次抓取，"qBittorrent 已经改了名、
+        HTTP 读超时"的那次改名，全都说成"没生效"，还不带逆操作。能按此刻状态核实的改动由各动作自己
+        核实（`_settle`）；走到这里的，就是没人核实过的。
+        """
+        if not self._effects:
+            self._audit(auditlog.FAILED, f, f.action, {"error": _describe(e)})
+            return
+        self._audit(auditlog.UNKNOWN, f, f.action, {
+            "error": _describe(e),
+            "reason": ("异常发生在已经发出的改动之后（"
+                       + "、".join(dict.fromkeys(self._effects))
+                       + "），改动生效了没有、生效了多少无法确认；按此刻状态核对后再处理"),
+            "effects_attempted": list(self._effects)},
+            undo=self._would_undo)
 
     def _dispatch(self, f: Finding, a: Action) -> None:
         if (f.evidence or {}).get("origin") == DSL_ORIGIN:
@@ -1589,9 +1670,12 @@ class Executor:
         宁可跳过并报告，也不要盲目覆盖。
         """
         records = self._read_audit(run_id)
-        undoable = [r for r in records if r.get("status") == "applied" and r.get("undo")]
+        # 带逆操作的 unknown（当初也许生效了、确认不了）同样尝试：每个逆操作动手前都按此刻状态核对，
+        # 没生效的会以"当前文件不存在"之类跳过。结果里单独标出（`unconfirmed*`），不混进"已还原"。
+        undoable = [r for r in records if r.get("status") in auditlog.UNDOABLE and r.get("undo")]
         no_undo = [r for r in records
-                   if r.get("status") == "applied" and not r.get("undo")]
+                   if r.get("status") == auditlog.APPLIED and not r.get("undo")]
+        unconfirmed = [r for r in records if r.get("status") == auditlog.UNKNOWN]
 
         done, skipped, failed, lost = [], [], [], []
         self._undo_notes = []
@@ -1608,6 +1692,8 @@ class Executor:
                     "reverted": 0, "skipped": 0, "failed": 0,
                     "irreversible": len(no_undo), "torrent_records_lost": 0,
                     "priority_not_restored": 0, "notes": [],
+                    "unconfirmed": len(unconfirmed), "unconfirmed_reverted": 0,
+                    "unconfirmed_no_undo": sum(1 for r in unconfirmed if not r.get("undo")),
                     "skipped_detail": [], "failed_detail": []}
 
         for rec in reversed(undoable):        # LIFO
@@ -1636,6 +1722,10 @@ class Executor:
             "torrent_records_lost": len(lost),
             "priority_not_restored": len(self._undo_notes),
             "notes": self._undo_notes[:10],
+            # 当初记 unknown 的：共几条、其中按此刻状态还原了几条、几条没有逆操作（只能人工核对）
+            "unconfirmed": len(unconfirmed),
+            "unconfirmed_reverted": sum(1 for r in done if r.get("status") == auditlog.UNKNOWN),
+            "unconfirmed_no_undo": sum(1 for r in unconfirmed if not r.get("undo")),
             "skipped_detail": skipped[:10],
             "failed_detail": failed[:10],
             "refused": "",
@@ -2148,7 +2238,8 @@ class Executor:
             return {"pairs": 0, "detail": [], "refused": refused}
         pairs = []
         for rec in self._read_audit(run_id):
-            if rec.get("status") != "applied" or rec.get("op") != "rename_show_dir":
+            # unknown 的目录改名（种子搬了、残留搬到一半出错）正是要修的分裂现场
+            if rec.get("status") not in auditlog.UNDOABLE or rec.get("op") != "rename_show_dir":
                 continue
             u = rec.get("undo") or {}
             # 与回退同一道闸（critic N1）：空 path 会让 new = Path('.')、
@@ -2217,20 +2308,27 @@ class Executor:
         return {"pairs": len(pairs), "detail": results, "refused": ""}
 
     def list_runs(self) -> list[dict]:
-        """列出历史 run，供选择回退哪一次。主审计与 audit.fallback.jsonl 一起读。"""
+        """列出历史 run，供选择回退哪一次。主审计与 audit.fallback.jsonl 一起读。
+
+        每个批次：`applied`（已生效的条数）、`unconfirmed`（记 unknown 的条数）、`undoable`（回退会
+        尝试的条数：带逆操作的 applied 与 unknown）、`rolled_back`（有回退汇总记录指向它）。
+        各代格式都认：没有 `run_id` 的（2026-08-17 上午那一代）、预演的不成批次；不认识的状态不计数。
+        """
         runs: dict[str, dict] = {}
         for rec in auditlog.iter_records(self.cfg.audit_log):
             rid = rec.get("run_id")
-            if not rid or rec.get("dry_run"):
+            if not rid or not isinstance(rid, str) or rec.get("dry_run"):
                 continue
-            r = runs.setdefault(rid, {"run_id": rid, "ts": rec.get("ts", ""),
-                                      "applied": 0, "undoable": 0, "kinds": set()})
-            if rec.get("status") == "applied":
-                r["applied"] += 1
+            r = runs.setdefault(rid, {"run_id": rid, "ts": str(rec.get("ts") or ""),
+                                      "applied": 0, "unconfirmed": 0, "undoable": 0,
+                                      "kinds": set()})
+            status = rec.get("status")
+            if status in auditlog.UNDOABLE:
+                r["applied" if status == auditlog.APPLIED else "unconfirmed"] += 1
                 if rec.get("undo"):
                     r["undoable"] += 1
-                r["kinds"].add(rec.get("kind", ""))
-            if rec.get("status") == "rollback":
+                r["kinds"].add(str(rec.get("kind") or ""))
+            if status == auditlog.ROLLBACK:
                 r["rolled_back"] = True
         out = []
         for r in runs.values():

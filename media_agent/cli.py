@@ -215,9 +215,19 @@ def cmd_apply(args, cfg) -> int:
         print(f"  ⏭️  [{rec['op']}] {rec['summary']} —— {rec.get('reason','')}")
     for rec in report.failed:
         print(f"  ❌ [{rec['op']}] {rec['summary']} —— {rec.get('error','')}")
+    _print_unknown(report.unknown)
     if _report_audit_problems(report.audit_problems, cfg.state_dir):
         return EXIT_AUDIT_INCOMPLETE
     return 0
+
+
+def _print_unknown(recs: list[dict], limit: int = 20) -> None:
+    """记 unknown 的动作（改动也许生效了、确认不了）逐条列出：它们要人按此刻状态核对。"""
+    for rec in recs[:limit]:
+        print(f"  ❓ [{rec['op']}] {rec['summary']} —— 未确认：{rec.get('reason') or rec.get('error', '')}"
+              + ("（带逆操作，rollback 会按此刻状态尝试还原）" if rec.get("undo") else ""))
+    if len(recs) > limit:
+        print(f"  ❓ …另 {len(recs) - limit} 条未确认（media-agent runs / audit.jsonl）")
 
 
 def cmd_runs(args, cfg) -> int:
@@ -230,6 +240,9 @@ def cmd_runs(args, cfg) -> int:
     print(f"{'批次 ID':<26} {'时间':<20} {'已执行':>6} {'可回退':>6}  类型")
     for r in runs:
         mark = " ↩已回退" if r.get("rolled_back") else ""
+        if r.get("unconfirmed"):
+            # 当初记 unknown 的：改动也许生效了。带逆操作的已算进"可回退"，回退时按此刻状态核对
+            mark += f" ❓未确认 {r['unconfirmed']}"
         print(f"{r['run_id']:<26} {r['ts']:<20} {r['applied']:>6} {r['undoable']:>6}  "
               f"{','.join(r['kinds'][:3])}{mark}")
     print(f"\n回退最近一次： media-agent rollback --last")
@@ -260,15 +273,22 @@ def cmd_rollback(args, cfg) -> int:
     if res["torrent_records_lost"]:
         print(f"  ⚠️  种子记录已丢失: {res['torrent_records_lost']} 项"
               f"（文件可还原，但需重新添加种子才能继续做种）")
+    if res.get("unconfirmed"):
+        print(f"  ❓ 当初未确认是否生效（unknown）: {res['unconfirmed']} 项——其中 "
+              f"{res.get('unconfirmed_reverted', 0)} 项按此刻状态核对后已还原（计入上面的已还原）"
+              + (f"，{res['unconfirmed_no_undo']} 项没有逆操作、需人工核对"
+                 if res.get("unconfirmed_no_undo") else ""))
     if res.get("priority_not_restored"):
         print(f"  ⚠️  文件已搬回、合集条目的下载没恢复: {res['priority_not_restored']} 项"
               f"（它此刻没有种子做种）")
         for n in res.get("notes") or []:
             print(f"    ⚠️  {n}")
     for d in res["skipped_detail"]:
-        print(f"    ⏭️  {d.get('skip_reason','')}")
+        tag = "（当初未确认）" if d.get("status") == "unknown" else ""
+        print(f"    ⏭️  {tag}{d.get('skip_reason','')}")
     for d in res["failed_detail"]:
-        print(f"    ❌ {d.get('error','')}")
+        tag = "（当初未确认）" if d.get("status") == "unknown" else ""
+        print(f"    ❌ {tag}{d.get('error','')}")
     if _report_audit_problems(res.get("audit_problems") or [], cfg.state_dir):
         return EXIT_AUDIT_INCOMPLETE
     return 0
@@ -470,9 +490,10 @@ def cmd_evolve(args, cfg) -> int:
 
     failures = find_failure_patterns(cfg.audit_log)
     if failures:
-        print("\n⚠️  反复失败的动作（可能是规则本身有问题）：")
+        print("\n⚠️  反复失败 / 反复未确认的动作（可能是规则本身有问题）：")
         for f in failures:
-            print(f"  {f['runs']} 个批次 / 共 {f['count']} 次 "
+            tag = "未确认" if f.get("status") == "unknown" else "失败"
+            print(f"  {f['runs']} 个批次 / 共 {f['count']} 次 {tag} "
                   f"[{f['rule']}] {f['op']}: {f['error']}")
     return 0
 
@@ -496,6 +517,7 @@ def cmd_run(args, cfg) -> int:
         # 也不处置隔离区——降级的一轮不改动任何东西。
         return _refuse(report.refused)
     print(f"\n═══ 修复：{report.summary()} ═══")
+    _print_unknown(report.unknown)
 
     rc = 0
     if cfg.evolve_mode != "propose":

@@ -19,7 +19,6 @@ import errno
 import json
 from pathlib import Path
 
-import httpx
 import pytest
 from harness import video
 
@@ -55,6 +54,18 @@ def _disk_full(monkeypatch, lib, *, times: int | None = 1, fallback_too: bool = 
         return real(path, line)
 
     monkeypatch.setattr(audit_mod, "append_line", append)
+
+
+def _crash_on(monkeypatch, torrent_hash: str) -> None:
+    """这个种子的改名动作一进来就抛异常（任何改动发出之前）：走 `apply()` 的兜底，记 failed。"""
+    real = Executor._op_rename
+
+    def flaky(self, f, a):
+        if a.args.get("torrent_hash") == torrent_hash:
+            raise RuntimeError("bug before any write (injected)")
+        return real(self, f, a)
+
+    monkeypatch.setattr(Executor, "_op_rename", flaky)
 
 
 def _fallback_records(lib) -> list[dict]:
@@ -108,12 +119,12 @@ def test_fallback_record_is_still_rolled_back(lib, monkeypatch):
 
 
 @pytest.mark.allow("audit_fallback")
-@pytest.mark.allow("failed_record", match="ReadTimeout")
+@pytest.mark.allow("failed_record", match="bug before any write")
 def test_audit_failure_inside_the_failure_handler_does_not_escape_apply(lib, monkeypatch, capsys):
     """critic N8 的余项：动作抛异常 → `apply` 写 failed → 写审计又抛 → 以前冲出 `apply()`。"""
     _, a, b = _two_renames(lib)
     findings = lib.diagnose()
-    lib.qbit.fail("rename_file", hash=a.hash, exc=httpx.ReadTimeout("timed out (injected)"))
+    _crash_on(monkeypatch, a.hash)
     _disk_full(monkeypatch, lib, times=None)                         # 主审计一直写不进
 
     rep = Executor(lib.context(), dry_run=False, run_id="t-full").apply(findings)
@@ -185,11 +196,11 @@ def _args(**kw):
 
 
 @pytest.mark.allow("audit_fallback")
-@pytest.mark.allow("failed_record", match="ReadTimeout")
+@pytest.mark.allow("failed_record", match="bug before any write")
 def test_cmd_run_reaches_disposal_and_exits_nonzero_when_audit_is_lost(lib, monkeypatch, capsys):
     monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
     _, a, _ = _two_renames(lib)
-    lib.qbit.fail("rename_file", hash=a.hash, exc=httpx.ReadTimeout("timed out (injected)"))
+    _crash_on(monkeypatch, a.hash)
     _disk_full(monkeypatch, lib, times=None)
     disposed = []
     real = cli.disposal.dispose

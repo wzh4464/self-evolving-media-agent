@@ -7,7 +7,7 @@
 3. **不起子进程**：`subprocess.run` 只放行测试自己 tmp 目录里的替身脚本
    （docker stub）；`@pytest.mark.ffmpeg` 的测试另外放行 ffprobe / ffmpeg。
 4. **假 ffprobe**：`media_agent.probe._run` → FakeProbe（开发机上真 ffprobe 是存在的）。
-5. **Tripwire**：Executor 的 failed 审计、Registry 吞掉的检测器异常、没路由的 URL、
+5. **Tripwire**：Executor 的 failed / unknown 审计、Registry 吞掉的检测器异常、没路由的 URL、
    假对象没建模的方法……测试结束时未声明的一律判失败。
 
 `@pytest.mark.live` 的测试跳过以上全部——它们本来就是要碰真库的（只读），
@@ -175,6 +175,10 @@ def _offline(request, monkeypatch, tmp_path, project_root, tripwire, web, fake_p
         if status == "failed":
             tripwire.record("failed_record",
                             f"{action.op} [{finding.rule}] {(extra or {}).get('error', '')}")
+        elif status == "unknown":
+            tripwire.record("unknown_record",
+                            f"{action.op} [{finding.rule}] {(extra or {}).get('error', '')} "
+                            f"{(extra or {}).get('reason', '')}")
         for p in self.report.audit_problems[n:]:
             tripwire.record("audit_fallback", p)
 
