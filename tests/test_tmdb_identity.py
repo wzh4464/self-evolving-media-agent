@@ -391,6 +391,48 @@ def test_a_tmdb_http_error_never_puts_the_api_key_into_findings_or_logs(lib, whe
     assert any("HTTP 5" in m or "HTTP 4" in m for m in lib.logs)   # 状态码照样说出来
 
 
+def _held_scene(lib):
+    """一部各个按标题的规则都有事做的番：目录名不是 TMDB 标题（title-drift）、没有 NFO（missing-nfo）、一个还叫发布名的
+    种子（unrenamed-file），它的分类也不是标题（category-consolidation），第 9 集已播、番组页上有（episode-available）。"""
+    from harness import MikanItem
+    lib.configure(qbit_allow_empty=True)
+    schedule = weekly(12, first_days_ago=60)
+    lib.tmdb.add_show(1234, "尼古喵喵", seasons={1: schedule})
+    sh = lib.show("Yani-Neko")
+    s1 = sh.season(1)
+    for n in range(1, 8):
+        s1.local(f"尼古喵喵 S01E{n:02d}.mkv")
+    s1.single("[LoliHouse] Yani Neko - 08 [WebRip 1080p HEVC-10bit AAC].mkv", category="Yani Neko")
+    sh.sidecar(tmdb_id=1234, tmdb_title="尼古喵喵", tmdb_source="human", mikan_id="3500",
+               seasons={"1": {"have": list(range(1, 9))}})
+    title = "[LoliHouse] 尼古喵喵 / Yani Neko - 09 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"
+    lib.mikan("3500", [MikanItem(title=title, pub=dict(schedule)[9])], search=["尼古喵喵", "Yani-Neko"])
+
+
+def _detectors_by_op():
+    from media_agent.plugins.builtin import (CategoryConsolidationDetector, MissingNfoDetector,
+                                             TitleDriftDetector, UnrenamedDetector)
+    from media_agent.plugins.grab import EpisodeAvailableDetector
+    return [(EpisodeAvailableDetector, "grab_episode"), (CategoryConsolidationDetector, "recategorize"),
+            (UnrenamedDetector, "rename"), (TitleDriftDetector, "rename_show_dir"),
+            (MissingNfoDetector, "write_nfo")]
+
+
+@pytest.mark.parametrize("detector, op", _detectors_by_op(), ids=[op for _d, op in _detectors_by_op()])
+def test_every_title_based_rule_honours_naming_hold(lib, detector, op):
+    """`naming_held` 的摘要承诺这一轮不改名、目录名、分类、NFO、抓取。以前只有改名在这里测过（再加上 converge 那条
+    刚钉住的测试顺带测了目录名与 NFO）：抓取与分类合并去掉 hold 检查的变异全套存活（2026-09-27 审查）。
+    同一份扫描：没有 hold 时这条规则提议这个动作，挂上 hold 就不提。"""
+    _held_scene(lib)
+    state = lib.scan()
+    assert op in {f.action.op for f in lib.diagnose(state, detectors=[detector]) if f.action}
+
+    for show in state.shows:
+        show.naming_hold = "测试：标题认不准"
+
+    assert op not in {f.action.op for f in lib.diagnose(state, detectors=[detector]) if f.action}
+
+
 def test_corrupt_sidecar_holds_naming(lib):
     lib.configure(qbit_allow_empty=True)
     lib.tmdb.enabled = True
