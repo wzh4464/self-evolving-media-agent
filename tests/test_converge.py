@@ -216,7 +216,70 @@ def test_delete_quota_is_cumulative_across_iterations(lib):
     assert len(trashes) == 2
 
 
+class _TrashLocal:
+    """合成的：每次诊断都提议把 `junk-*.mkv`（纯本地、名字认不出集号）移进隔离区。"""
+    id = "junk"
+
+    def detect(self, ctx, state):
+        for show in state.shows:
+            for f in show.files:
+                if f.filename.startswith("junk-"):
+                    yield Finding(rule=self.id, kind="junk", severity="minor", summary=f.filename,
+                                  show=show.dir_name, path=str(f.path),
+                                  action=Action(op="trash", args={"path": str(f.path), "torrent_hash": ""}))
+
+
+def test_a_refused_action_is_not_retried_while_other_work_keeps_the_loop_going(lib):
+    """"被闸拦下的，后面的迭代不再试"：上面那条配额测试里第二次迭代什么都没做成、循环就停了，重试不重试根本测不出来
+    （2026-09-27 审查：变异"所有跳过都当成可重试"全套存活）。这里另一条规则每次迭代都有新动作，循环跑满三次。"""
+    lib.configure(qbit_allow_empty=True, max_delete_per_run=1)
+    s1 = lib.show(SHOW).season(1)
+    s1.local("x1.mkv")
+    s1.local("junk-a.mkv")
+    s1.local("junk-b.mkv")
+
+    class Upto4(_Chain):
+        def detect(self, ctx, state):
+            return [f for f in super().detect(ctx, state) if f.summary != "x4.mkv"]
+
+    c = lib.loop(detectors=[Upto4(), _TrashLocal()], max_iterations=3)
+
+    assert [it.applied for it in c.iterations] == [2, 1, 1]
+    trashes = [(r["status"], r["args"]["path"].rsplit("/", 1)[-1]) for r in lib.audit(c.run_id)
+               if r["op"] == "trash"]
+    assert trashes == [("applied", "junk-a.mkv"), ("skipped", "junk-b.mkv")]    # 只拦一次，不每次迭代再撞一次
+    assert [it.memo for it in c.iterations if not it.final] == [0, 1, 1]
+
+
 # ------------------------------------------------------------------ 不重试
+def test_a_relink_blocked_by_a_live_torrent_is_retried_once_that_torrent_is_gone(lib):
+    """`RETRYABLE` 的第二条：relink 的目标文件此刻归另一个活种子，"此刻被挡着"——那个种子在这一轮里没了（判重、死种
+    处置摘掉），下一次迭代再试就成（2026-09-27 审查：把这句前缀改掉的变异全套存活）。"""
+    from media_agent.actions import Executor
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+    from media_agent.scan import build_state
+    size = 734_003_200
+    lib.configure(qbit_allow_empty=True)
+    s1 = lib.show("古诺希亚").season(1)
+    t = s1.single("GNOSIA - S01E08 [WebRip 1080p HEVC-10bit AAC].mkv", size=size, on_disk=False)
+    b = s1.single("古诺希亚 S01E08.mkv", size=size, name="[B] Gnosia - 08 [1080p].mkv")
+    s1.local("x1.mkv")                                           # 让第一次迭代做成点什么，循环才会再来一次
+    ctx = lib.context()
+    ex = Executor(ctx, dry_run=False, run_id="t001")
+
+    def scan(n):
+        if n == 2:
+            lib.qbit.delete([b.hash], False)                     # 占着的那个种子这一轮被摘了（文件还在）
+        return build_state(ctx)
+
+    out = converge.run(ctx, lib.registry([StaleTorrentPathDetector(), _Upto3()]), ex, scan=scan,
+                       max_iterations=3)
+
+    relinks = [(r["status"], converge.retryable(r)) for r in lib.audit("t001") if r["op"] == "relink_torrent"]
+    assert relinks == [("skipped", True), ("applied", False)]
+    assert lib.qbit.file_names(t.hash) == ["古诺希亚 S01E08.mkv"]
+    assert out.stop == converge.FIXED_POINT
+
 class _Once:
     """每次迭代都提同一个动作。"""
 
