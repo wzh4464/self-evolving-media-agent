@@ -13,6 +13,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-27
+
 ### 安全
 - 命令行输出（launchd 追加进 `state/run.log` 的那些）一律按行打码：v0.4.0 上线第一轮，第 3 阶段新说出来的
   TMDB 报错把请求 URL 里的 `api_key` 明文带进了标准输出——健康报告与通知邮件本就过了 `notify.redact`，
@@ -495,7 +497,8 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.0...v0.2.1
