@@ -13,6 +13,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-26
+
 ### 修复
 - 部署在切换阶段被 SIGTERM 打断时，调用方会在「自动退回」还没做完就拿到返回码：`deploy.sh`
   复制自己之前的那一层没设 trap，非交互 bash 收到无 trap 的 SIGTERM 立即退出（SIGINT 才会等
@@ -199,6 +201,7 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wzh4464/self-evolving-media-agent/releases/tag/v0.1.0
