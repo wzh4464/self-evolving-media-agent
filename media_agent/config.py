@@ -66,6 +66,17 @@ def _int_at_least(v: str, name: str, minimum: int) -> int:
     return x
 
 
+def _percent(v: str, name: str) -> float:
+    """0–100 的百分数。"""
+    try:
+        x = float(v.strip())
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} 要写成百分数（如 10），收到 {v!r}") from None
+    if not (0 <= x <= 100):
+        raise ValueError(f"{name} 要在 0 到 100 之间，收到 {v!r}")
+    return x
+
+
 @dataclass
 class Config:
     media_root: Path
@@ -107,6 +118,10 @@ class Config:
     # 同一个问题（发现历史里的同一个指纹，带动作或严重度 ≥ important）连续这么多轮 `run` 都在，就报成
     # "卡住"（`history.find_stuck`）。默认 4 = 6 小时一轮的 24 小时。至少 2——1 轮就叫卡住没有意义。
     stuck_runs: int = 4
+    # 种子数合理性（`health.torrent_count_problem`）：比上一轮被采信的计数少了、且审计里的本项目摘除解释不了的
+    # 部分超过 max(TORRENT_DROP_MIN, 上一轮 × TORRENT_DROP_PCT%)，这一轮按"读不全"整轮拒绝（退出码 3）。
+    torrent_drop_min: int = 20
+    torrent_drop_pct: float = 10.0
 
     @property
     def state_dir(self) -> Path:
@@ -159,4 +174,6 @@ def load_config(env_file: Path | None = None) -> Config:
         min_free_gb=float(g("MIN_FREE_GB", "50")),
         grab_metadata_timeout=_seconds(g("GRAB_METADATA_TIMEOUT", "30"), "GRAB_METADATA_TIMEOUT"),
         stuck_runs=_int_at_least(g("STUCK_RUNS", "4"), "STUCK_RUNS", 2),
+        torrent_drop_min=_int_at_least(g("TORRENT_DROP_MIN", "20"), "TORRENT_DROP_MIN", 0),
+        torrent_drop_pct=_percent(g("TORRENT_DROP_PCT", "10"), "TORRENT_DROP_PCT"),
     )

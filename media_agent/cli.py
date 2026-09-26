@@ -18,7 +18,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, disposal, history, runlock
+from . import __version__, disposal, health, history, runlock
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -571,6 +571,40 @@ def _remind_commit(path) -> None:
           "（deploy/README.md「用户意图放在哪」）")
 
 
+def cmd_health(args, cfg) -> int:
+    """运行健康。`--accept-torrent-count`：把此刻 qBittorrent 的种子数认作新基线（人为批量删除之后）。"""
+    if args.accept_torrent_count:
+        return _accept_torrent_count(cfg)
+    base = health.load_baseline(cfg.state_dir)
+    if not base:
+        print("还没有种子数基线（下一轮 run 之后才有）")
+        return 0
+    print(f"种子数基线：{base['count']} 个（{base.get('source')}，批次 {base.get('run_id')}，"
+          f"{base.get('ts')}）")
+    return 0
+
+
+def _accept_torrent_count(cfg) -> int:
+    ctx = build_context(cfg)
+    if ctx.qbit is None:
+        return _refuse("qBittorrent 不可用：读不到此刻的种子数，基线不动")
+    try:
+        n = len(ctx.qbit.torrents())
+    except Exception as e:                           # noqa: BLE001 —— 读不到就不动基线，照实说
+        return _refuse(f"读不到种子列表（{type(e).__name__}: {e}），基线不动")
+    prev = health.load_baseline(cfg.state_dir)
+    problem = health.save_baseline(cfg.state_dir, count=n, run_id=new_run_id(),
+                                   ts=datetime.now().isoformat(timespec="seconds"),
+                                   source="accepted")
+    if problem:
+        print(f"❌ {problem}")
+        return 1
+    print(f"已把此刻的 {n} 个种子认作新的基线"
+          + (f"（原来是 {prev['count']} 个，批次 {prev.get('run_id')}）" if prev else "")
+          + "；下一轮 run 按它比")
+    return 0
+
+
 def cmd_evolve(args, cfg) -> int:
     if cfg.evolve_mode != "propose":
         # 手动 evolve 同样往 .agents/ 写规则和笔记——冻结期间工作区要与部署的 tag 一致
@@ -623,7 +657,15 @@ def cmd_run(args, cfg) -> int:
     # 批次 ID 先定下来：发现历史、审计、隔离区处置、健康报告都用这一个，彼此对得上
     run_id = new_run_id()
     ctx = build_context(cfg, need_llm=True)
+    scanned_at = datetime.now().isoformat(timespec="seconds")
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
+    if not state.qbit_errors:
+        # 这一轮的种子数被采信了：下一轮拿它比（`health.torrent_count_problem`）。时间取扫描之前——
+        # 这一轮自己摘掉的种子也算进下一轮"解释得通"的那部分。被拒绝的一轮不挪基线。
+        problem = health.save_baseline(cfg.state_dir, count=len(state.torrents), run_id=run_id,
+                                       ts=scanned_at, source="run")
+        if problem:
+            _log(f"⚠️  {problem}")
     reg = build_registry()
 
     findings = reg.run_all(ctx, state)
@@ -730,6 +772,11 @@ def main() -> int:
     s.add_argument("--force", action="store_true", help="发现历史里还没有这个指纹也确认（要写全 16 位）")
     s.add_argument("--list", action="store_true", help="列出全部确认")
     s.set_defaults(func=cmd_ack)
+
+    s = sub.add_parser("health", help="运行健康（种子数基线等）")
+    s.add_argument("--accept-torrent-count", action="store_true",
+                   help="把此刻 qBittorrent 的种子数认作新基线（在 qBit 里手动批量删除之后）")
+    s.set_defaults(func=cmd_health)
 
     s = sub.add_parser("run", help="完整自治轮次")
     s.add_argument("--dry-run", action="store_true")

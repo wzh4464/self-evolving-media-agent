@@ -213,7 +213,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zihan.media-agent.pl
 | 退出码 | 含义 |
 |---|---|
 | 0 | 正常 |
-| 3 | 降级、整批拒绝改动（qBittorrent 不可用或读不全），什么都没改 |
+| 3 | 降级、整批拒绝改动（qBittorrent 不可用、读不全，或种子数比上一轮骤降而审计解释不了——确认是人为删除的用 `media-agent health --accept-torrent-count`），什么都没改 |
 | 4 | 改动照常做了，但有审计记录没能原样写进 `state/audit.jsonl`（磁盘满、权限……）——已转写到 run.err.log 与 `state/audit.fallback.jsonl`，`rollback` / `runs` 会一起读；先腾空间 |
 | 75 | 另一个进程持有运行锁，这一轮什么都没做 |
 
