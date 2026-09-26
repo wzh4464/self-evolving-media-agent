@@ -127,3 +127,29 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
 **测试**：`tests/test_effect_recheck.py`。FakeQbit 新增 `fail(..., after=True)`：改动照常生效之后再抛
 （"响应丢了"）；默认仍是"请求没到"。生产那次改名原样：记 applied、带逆操作、能回退；请求没到：failed；
 改完之后 qBittorrent 读不到：unknown、带逆操作，回退照样还原；状态对不上：unknown。
+
+## 5. 删除一侧的核实：摘种子、设为不下载、搬进隔离区
+
+**现场**：`_op_trash` 整种子作废时 `delete` 超时，以前一律记「删除种子记录失败，文件未动」并停手——而超时时
+种子常常已经摘掉了（qBittorrent 5.2.3 的 `SessionImpl::removeTorrent` 在处理请求时就把它从列表里 `take`
+掉）：记录说种子还在，文件也没进隔离区，下一轮扫描把它当成没有种子的纯本地文件。`drop_torrent`、幻影 / 下载中
+特典的 `_drop_record` / `_zero_priority` 同理。搬进隔离区（`shutil.move`）出错则一律 failed。
+
+**修法**：
+
+- `delete` 出错：按种子列表认（`_torrent_gone`）。不在了 → 照常往下走（隔离接着搬文件、摘除记 applied 带
+  magnet 重加的逆操作）；还在 → failed；读不到 → unknown（摘除带"重加"的逆操作；隔离写明 `path_still_at`，
+  文件不动）。说不清时**不**记进 `_removed_torrents`——那样占用索引会无视它的条目，后面的改名可能改到它仍声明的路径上。
+- `filePrio` 出错：按那个条目此刻的优先级认（`_priority_landed`），unknown 带恢复优先级的逆操作。
+- 搬进隔离区出错（`_settle_move`）：跨卷搬运是先拷后删、**删源是最后一步**——
+  原位置没了且隔离区那份大小对得上 → 搬完了，applied；原位置还在 → 没搬走，failed，隔离区里若多了半份，
+  写进 `stray_copy`；其余（原位置没了、那份大小不对或也不在）→ unknown，带 `restore_from_trash` 逆操作
+  （能捞回来的只剩那一份）。failed / unknown 都写明种子那一步已经发生的事（`torrent_record_lost` /
+  `priority_zeroed`）。
+- 隔离区处置（`purge._trash_records`）：unknown 的隔离与 failed 留下的 `stray_copy` 都**不算已隔离**，那份文件
+  交给人、理由写明（「隔离未确认」/「搬运失败留下的拷贝」），不再是"来历不明"。
+
+保留下来的旧口径：各动作原来的报错开头（「删除种子记录失败，文件未动：」「设为不下载失败，…」「搬入隔离区失败：」）
+照旧放在 `error` 前面（`_settle(prefix=)`），按它们检索日志的习惯不断。
+
+**测试**：`tests/test_effect_recheck.py` 的"隔离 / 摘种子 / 设为不下载"一节，每种核实结局各一个现场。

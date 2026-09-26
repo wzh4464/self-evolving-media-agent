@@ -206,3 +206,180 @@ def test_recategorize_timeout_with_qbit_unreadable_is_unknown_with_undo(lib):
     _unblind(lib, "set_category")
     assert lib.rollback("t-cat")["reverted"] == 1
     assert t.view()["category"] == "Bangumi"
+
+
+# ------------------------------------------------------------------ 隔离 / 摘种子 / 设为不下载
+def _trash(path, torrent_hash: str = "", *, file_only: bool = False, show: str = "朱音落语"):
+    args = {"path": str(path), "torrent_hash": torrent_hash}
+    if file_only:
+        args["file_only"] = True
+    return Finding(rule="duplicate-episode", kind="duplicate", severity="important",
+                   summary=f"清理 {path}", show=show, path=str(path),
+                   torrent_hash=torrent_hash, action=Action(op="trash", args=args))
+
+
+def _akane(lib):
+    """朱音落语 S01E12：要隔离的那份有种子，集位里另有一份（删除关口 I1 放行）。"""
+    s1 = lib.show("朱音落语").season(1)
+    t = s1.single("朱音落语 S01E12.mp4", size=508_000_000)
+    s1.local("朱音落语 S01E12 [BD].mp4", size=508_000_000)
+    return s1, t
+
+
+def test_trash_whose_torrent_delete_timed_out_after_removing_it_goes_on(lib):
+    """以前：`delete` 超时就记「删除种子记录失败，文件未动」——而种子其实已经摘掉了，
+    记录说它还在，文件也没进隔离区。现在核实种子确实不在了，照常把文件搬进隔离区。"""
+    _, t = _akane(lib)
+    ident = lib.ident(t.path)
+    lib.qbit.fail("delete", hash=t.hash, after=True)
+
+    rep = lib.apply([_trash(t.path, t.hash)])
+
+    [rec] = rep.applied
+    assert "ReadTimeout" in rec["confirmed_after_error"]
+    assert rec["undo"]["torrent_record_lost"] is True
+    [moved] = lib.trash_files()
+    assert lib.ident(moved) == ident and not lib.qbit.has(t.hash)
+
+
+@pytest.mark.allow("unknown_record", match="删除种子记录")
+def test_trash_whose_torrent_delete_cannot_be_confirmed_stops_unknown(lib):
+    _, t = _akane(lib)
+    _blind_after(lib, "delete", t.hash)
+
+    rep = lib.apply([_trash(t.path, t.hash)])
+
+    [rec] = rep.unknown
+    assert rec["path_still_at"] == str(t.path) and t.path.exists()   # 文件一个字节没动
+    assert lib.trash_files() == []
+
+
+def test_file_only_trash_whose_priority_change_timed_out_after_taking_effect(lib):
+    s1 = lib.show("尼古喵喵").season(1)
+    t = s1.torrent({"尼古喵喵 S01E10.mkv": 600_000_000, "NCOP.mkv": 90_000_000},
+                   name="[TV版&无修版] 尼古喵喵 - EP10", layout="nosub")
+    lib.qbit.fail("set_file_priority", hash=t.hash, after=True)
+
+    rep = lib.apply([_trash(s1.path / "NCOP.mkv", t.hash, file_only=True, show="尼古喵喵")])
+
+    [rec] = rep.applied
+    assert rec["undo"]["file_priority"]["index"] == 1
+    assert "ReadTimeout" in rec["confirmed_after_error"]
+    assert [f["priority"] for f in lib.qbit.raw(t.hash)["_files"]] == [1, 0]
+
+
+def _move_then(monkeypatch, effect):
+    """`shutil.move` 先按 `effect` 动一下盘，再抛 OSError（磁盘满之类）。"""
+    import shutil
+
+    real = shutil.move
+
+    def move(src, dst, *a, **k):
+        effect(real, Path(src), Path(dst))
+        raise OSError(28, "No space left on device (injected)")
+
+    monkeypatch.setattr(shutil, "move", move)
+
+
+def test_move_that_raised_after_it_finished_is_applied(lib, monkeypatch):
+    _, t = _akane(lib)
+    ident = lib.ident(t.path)
+    _move_then(monkeypatch, lambda real, src, dst: real(str(src), str(dst)))
+
+    rep = lib.apply([_trash(t.path, t.hash)])
+
+    [rec] = rep.applied
+    assert "No space" in rec["confirmed_after_error"]
+    [moved] = lib.trash_files()
+    assert lib.ident(moved) == ident and rec["undo"]["trash_path"] == str(moved)
+
+
+@pytest.mark.allow("failed_record", match="搬入隔离区失败")
+def test_move_that_left_a_partial_copy_is_failed_and_the_copy_is_named(lib, monkeypatch):
+    """跨卷搬运是先拷后删：拷到一半磁盘满，原文件还在库里、隔离区里多了半份。原文件没搬走，
+    记 failed；那半份写进 `stray_copy`，隔离区处置认得出它、交给人（不再是"来历不明"）。"""
+    from media_agent import purge as purge_mod
+
+    _, t = _akane(lib)
+
+    def half(real, src, dst):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"half")
+
+    _move_then(monkeypatch, half)
+
+    rep = lib.apply([_trash(t.path, t.hash)])
+
+    [rec] = rep.failed
+    assert rec["torrent_record_lost"] is True and t.path.exists()
+    [stray] = lib.trash_files()
+    assert rec["stray_copy"] == str(stray)
+    [c] = purge_mod.build_pool(lib.context())
+    assert not c.eligible and "搬运失败" in c.why and c.origin == str(t.path)
+
+
+@pytest.mark.allow("unknown_record", match="搬入隔离区")
+def test_move_that_lost_the_source_and_left_a_short_copy_is_unknown(lib, monkeypatch):
+    _, t = _akane(lib)
+
+    def short(real, src, dst):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"short")
+        src.unlink()
+
+    _move_then(monkeypatch, short)
+
+    rep = lib.apply([_trash(t.path, t.hash)])
+
+    [rec] = rep.unknown
+    assert rec["undo"]["op"] == "restore_from_trash" and rec["trashed_to"] == rec["undo"]["trash_path"]
+    assert rec["torrent_record_lost"] is True
+
+
+def test_dead_drop_whose_delete_timed_out_after_removing_it_is_applied_with_readd(lib):
+    from media_agent.plugins.builtin import DeadTorrentDetector
+
+    s1 = lib.show("尼古喵喵").season(1)
+    dead = s1.torrent({"尼古喵喵 S01E11.mkv": 600_000_000}, name="[A] Yani Neko - 11.mkv",
+                      layout="single", progress=0.4, state="stalledDL",
+                      added_hours_ago=24 * 30, availability=0, num_complete=0)
+    lib.qbit.fail("delete", hash=dead.hash, after=True)
+
+    c = lib.cycle(detectors=[DeadTorrentDetector])
+
+    [drop] = c.applied("drop_torrent")
+    assert drop["undo"]["op"] == "readd_torrent" and "ReadTimeout" in drop["confirmed_after_error"]
+    assert not lib.qbit.has(dead.hash)
+
+
+@pytest.mark.allow("unknown_record", match="删除种子记录")
+def test_dead_drop_whose_delete_cannot_be_confirmed_is_unknown_with_readd(lib):
+    from media_agent.plugins.builtin import DeadTorrentDetector
+
+    s1 = lib.show("尼古喵喵").season(1)
+    dead = s1.torrent({"尼古喵喵 S01E11.mkv": 600_000_000}, name="[A] Yani Neko - 11.mkv",
+                      layout="single", progress=0.4, state="stalledDL",
+                      added_hours_ago=24 * 30, availability=0, num_complete=0)
+    findings = lib.diagnose(detectors=[DeadTorrentDetector])
+    _blind_after(lib, "delete", dead.hash)
+
+    rep = Executor(lib.context(), dry_run=False, run_id="t-drop").apply(
+        [f for f in findings if f.action and f.action.op == "drop_torrent"])
+
+    [rec] = rep.unknown
+    assert rec["undo"]["op"] == "readd_torrent"
+
+
+def test_skipping_a_downloading_extra_whose_priority_change_timed_out_after(lib):
+    from media_agent.plugins.builtin import ExtrasDetector
+
+    s1 = lib.show("银八").season(1)
+    t = s1.torrent({"银八 S01E01.mkv": 600_000_000, "NCOP1.mkv": 90_000_000},
+                   name="[G] Gintama BD", layout="original", state="downloading", progress=0.5)
+    lib.qbit.fail("set_file_priority", hash=t.hash, after=True)
+
+    c = lib.cycle(detectors=[ExtrasDetector])
+
+    [rec] = c.applied("trash")
+    assert rec["priority_zeroed"] and rec["undo"]["op"] == "restore_file_priority"
+    assert "ReadTimeout" in rec["confirmed_after_error"]

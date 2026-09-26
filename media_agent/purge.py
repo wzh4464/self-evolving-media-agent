@@ -85,7 +85,8 @@ class Candidate:
     stat_key: tuple = ()      # 隔离文件的 (inode, 大小, mtime)
     survivor_hash: str = ""
     survivor_size: int | None = None
-    # 这份文件的隔离记录是 unknown（没能确认搬完）：值是原因。它不算已隔离，只交给人（`_human_why`）
+    # 这份文件的隔离没成（unknown 的隔离，或 failed 的隔离留下的半份拷贝）：值是原因。
+    # 它不算已隔离，只交给人（`_human_why`）
     unconfirmed: str = ""
 
 
@@ -98,23 +99,39 @@ def _audit_by_trash_path(audit_log: Path) -> dict:
 
 
 def _trash_records(audit_log: Path) -> tuple[dict, dict]:
-    """`(已隔离, 隔离未确认)`：两张 `trashed_to` -> 审计记录 的表，各自以最后一条为准。
+    """`(已隔离, 隔离没成)`：两张 隔离区路径 -> 审计记录 的表，各自以最后一条为准。
 
-    `unknown` 的 trash（搬运半路出错、隔离区与原位置都有，或读不到 qBittorrent 确认种子那一步）
-    **不算已隔离**：隔离区里那份可能是不完整的拷贝，也可能库里那份才是残的。它不进第一张表——
-    否则过了保留期就会按判据被硬删——而是进第二张，`build_pool` 据此写明为什么交给人。"""
+    **不算已隔离**、进第二张表的（`build_pool` 据此写明为什么交给人，永不自动删）：
+
+    - `unknown` 的 trash（`trashed_to`）：搬运出错后原位置没了、隔离区那份大小对不上——它可能不完整；
+    - `failed` 的 trash 留下的 `stray_copy`：拷到一半出错，原文件还在库里，隔离区里多出来的那半份。
+
+    进第一张表就会过了保留期按判据被硬删——这两种都不该。"""
     done: dict[str, dict] = {}
     unsure: dict[str, dict] = {}
     for r in auditlog.iter_records(audit_log):
-        if r.get("op") != "trash" or not isinstance(r.get("trashed_to"), str) or not r["trashed_to"]:
+        if r.get("op") != "trash":
             continue
-        if r.get("status") == auditlog.APPLIED:
-            done[r["trashed_to"]] = r
-            unsure.pop(r["trashed_to"], None)
-        elif r.get("status") == auditlog.UNKNOWN:
-            unsure[r["trashed_to"]] = r
-            done.pop(r["trashed_to"], None)
+        status = r.get("status")
+        key = r.get("stray_copy") if status == auditlog.FAILED else r.get("trashed_to")
+        if not isinstance(key, str) or not key:
+            continue
+        if status == auditlog.APPLIED:
+            done[key] = r
+            unsure.pop(key, None)
+        elif status in (auditlog.UNKNOWN, auditlog.FAILED):
+            unsure[key] = r
+            done.pop(key, None)
     return done, unsure
+
+
+def _unsure_why(r: dict) -> str:
+    """隔离没成的那份文件为什么交给人（`_trash_records` 的第二张表）。"""
+    if r.get("status") == auditlog.FAILED:
+        return (f"搬运失败留下的拷贝（审计 failed：原文件仍在 {r.get('path_still_at') or '原位'}），"
+                f"可能不完整")
+    return (f"隔离未确认（审计 unknown：{str(r.get('reason') or r.get('error') or '')[:80]}），"
+            f"这份可能是不完整的拷贝")
 
 
 def _manual_by_trash_path(purge_log: Path, trash_root: Path) -> dict:
@@ -360,7 +377,7 @@ def build_pool(ctx, *, now: datetime | None = None, early: bool = True) -> list[
             c.disposition = disposition_of_record(rec)
         elif str(p) in unsure:
             u = unsure[str(p)]
-            c.unconfirmed = str(u.get("reason") or u.get("error") or "隔离结果未确认")
+            c.unconfirmed = _unsure_why(u)
             c.rule = u.get("rule") or ""
             c.origin = (u.get("args") or {}).get("path") or ""
         else:
@@ -535,8 +552,7 @@ def _new_owner(claims, c: Candidate, cl) -> bool:
 
 def _human_why(c: Candidate) -> str:
     if c.unconfirmed:
-        return (f"隔离未确认（审计 unknown：{c.unconfirmed[:80]}）：这份可能是不完整的拷贝，"
-                f"也可能原位置那份才是残的，不自动删（需人工处置）")
+        return f"{c.unconfirmed}，不自动删（需人工处置）"
     if c.disposition == "bundled_version":
         return "合并发布的另一版本：用户口径只留一份，但留哪份由人定，不自动删（需人工处置）"
     if c.disposition == "manual":

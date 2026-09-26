@@ -234,7 +234,7 @@ class Executor:
 
     # ---------------- 改动调用出错之后：按此刻状态核实 ----------------
     def _settle(self, f: Finding, a: Action, err: Exception, probe, *, what: str,
-                undo: dict | None = None, extra: dict | None = None) -> bool:
+                undo: dict | None = None, extra: dict | None = None, prefix: str = "") -> bool:
         """一个改动调用抛了异常：问一次此刻的状态，它到底生效没有（B2）。
 
         `probe()` 返回 True（生效了）、False（没生效：状态与动手前一致）或 None（对不上：部分生效、
@@ -246,7 +246,8 @@ class Executor:
         - 没生效：记 failed（`effect` 写明是核实过的），返回 False。
         - 说不清：记 unknown，带 `undo`（"如果生效了该怎么撤"；回退时逆操作自己再核对），返回 False。
 
-        `extra` 进 failed / unknown 记录（如隔离时"种子已摘"这类已经发生的附带改动）。
+        `extra` 进 failed / unknown 记录（如隔离时"种子已摘"这类已经发生的附带改动）；`prefix` 加在它们的
+        `error` 前面（沿用各动作原来的报错开头，如「删除种子记录失败，文件未动：」）。
         """
         why = _describe(err)
         recheck = ""
@@ -260,13 +261,13 @@ class Executor:
         extra = dict(extra or {})
         if seen is False:
             self._audit(auditlog.FAILED, f, a, {
-                "error": why, "effect": f"{what}出错；按此刻状态核实：没有生效", **extra})
+                "error": prefix + why, "effect": f"{what}出错；按此刻状态核实：没有生效", **extra})
             return False
         reason = (f"{what}出错，复核此刻状态也失败（{recheck}），改动生效没有无法确认" if recheck
                   else f"{what}出错，此刻状态与动手前、预期的都对不上（部分生效，或被别人同时改了）")
         self._audit(auditlog.UNKNOWN, f, a, {
-            "error": why, "reason": reason, "effects_attempted": list(self._effects), **extra},
-            undo=undo)
+            "error": prefix + why, "reason": reason, "effects_attempted": list(self._effects),
+            **extra}, undo=undo)
         return False
 
     def _live_torrent(self, h: str) -> dict | None:
@@ -274,6 +275,22 @@ class Executor:
         h = (h or "").lower()
         return next((t for t in self.ctx.qbit.torrents() if (t.get("hash") or "").lower() == h),
                     None)
+
+    def _torrent_gone(self, h: str) -> bool:
+        """`delete` 之后：种子已不在列表里（True）还是还在（False）。qBittorrent 5.2.3 的
+        `SessionImpl::removeTorrent` 在处理请求时就把它从列表里 `take` 掉（libtorrent 那边的移除是
+        异步的，列表不是），所以"还在"就是没摘。"""
+        return self._live_torrent(h) is None
+
+    def _priority_landed(self, h: str, index: int, want: int, before: int) -> bool | None:
+        """`filePrio` 之后：第 `index` 个条目的优先级是 `want`（True）、还是原来的 `before`（False）。"""
+        entry = next((e for e in self.ctx.qbit.files(h) if e.get("index") == index), None)
+        if entry is None:
+            return None
+        cur = entry.get("priority", 1)
+        if cur == want:
+            return True
+        return False if cur == before else None
 
     def _rename_landed(self, h: str, old_rel: str, new_rel: str) -> bool | None:
         """`renameFile(old → new)` 之后，种子的条目里是新名字（True）、还是原名（False）。"""
@@ -1210,7 +1227,16 @@ class Executor:
 
         magnet = victim.get("magnet_uri") or a.args.get("magnet") or ""
         paths = self._claimed_paths(victim)          # 摘之前记下：摘了就问不到了
-        self.ctx.qbit.delete([h], delete_files=False)
+        undo = self._readd_undo(victim, magnet, paths)
+        self._intend(undo)
+        try:
+            self.ctx.qbit.delete([h], delete_files=False)
+        except Exception as e:
+            # 摘没摘掉按列表认。说不清时**不**记进 `_removed_torrents`：那样占用索引会无视它的条目，
+            # 后面的改名可能改到它仍声明的路径上
+            if not self._settle(f, a, e, lambda: self._torrent_gone(h), what="删除种子记录",
+                                prefix="删除种子记录失败，文件未动：", undo=undo, extra=extra):
+                return
         self._removed_torrents.add(h)
         self._removed_subjects[h.lower()] = {**v.subject, "torrent_files": len(paths)}
 
@@ -1221,7 +1247,7 @@ class Executor:
                      "files_untouched": True,
                      **({} if magnet else {"note": "无 magnet_uri，此条不可回退"}),
                      **extra},
-                    undo=self._readd_undo(victim, magnet, paths))
+                    undo=undo)
 
     def _claimed_paths(self, victim: dict) -> list[str]:
         """这个种子此刻声明着的绝对路径（优先级非 0 的条目），写进 `readd_torrent` 逆操作，
@@ -1623,20 +1649,28 @@ class Executor:
             try:
                 self.ctx.qbit.delete([h], delete_files=False)
             except Exception as e:
-                self._audit("failed", f, a, {
-                    "error": f"删除种子记录失败，文件未动：{type(e).__name__}: {e}", **extra})
-                return
+                # 以前一律「删除种子记录失败，文件未动」——而超时时种子常常已经摘掉了：记录说它还在，
+                # 文件也没进隔离区。核实确实不在了，就照常往下走、把文件搬进去
+                if not self._settle(f, a, e, lambda: self._torrent_gone(h), what="删除种子记录",
+                                    prefix="删除种子记录失败，文件未动：",
+                                    extra={"path_still_at": str(path), **extra}):
+                    return
             record_lost = True
             self._removed_torrents.add(h)
             self._removed_subjects[h] = v.subject
         elif h and v.entry.get("priority", 1) != 0:
             # 只作废种子里的某个文件：设为不下载，保留其余部分（已是不下载的条目不用再动种子）
+            idx, before = v.entry["index"], v.entry.get("priority", 1)
             try:
-                self.ctx.qbit.set_file_priority(h, [v.entry["index"]], 0)
+                self.ctx.qbit.set_file_priority(h, [idx], 0)
             except Exception as e:
-                self._audit("failed", f, a, {
-                    "error": f"设为不下载失败，文件未动：{type(e).__name__}: {e}", **extra})
-                return
+                if not self._settle(
+                        f, a, e, lambda: self._priority_landed(h, idx, 0, before),
+                        what="设为不下载", prefix="设为不下载失败，文件未动：",
+                        undo={"op": "restore_file_priority", "torrent_hash": h, "index": idx,
+                              "name": v.entry["name"], "priority": before},
+                        extra={"path_still_at": str(path), **extra}):
+                    return
             zeroed = True
 
         day = datetime.now().strftime("%Y-%m-%d")
@@ -1644,21 +1678,6 @@ class Executor:
         dest = dest_dir / path.name
         if os.path.lexists(dest):
             dest = dest_dir / f"{path.stem}.{int(time.time())}{path.suffix}"
-        try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(path), str(dest))
-        except Exception as e:
-            # 种子那一步已经做了、文件没搬走：如实记下，别只剩一句异常
-            # （跨卷搬运是先拷后删，磁盘满时就会在这里失败，critic N8）。
-            self._audit("failed", f, a, {
-                "error": f"搬入隔离区失败：{type(e).__name__}: {e}",
-                "torrent_record_lost": record_lost, "priority_zeroed": zeroed,
-                "path_still_at": str(path), **extra})
-            return
-        self._deleted_count += 1
-        self._deleted_bytes += size
-        self._trashed_paths.add(str(path))
-
         # 文件可从隔离区还原；但被删掉的种子记录还原不了（种子文件本身已不在）。
         # 只作废了合集里的这一个条目时，回退要连它的下载一起恢复（2026-09-26 审查：以前只搬回文件、
         # 报「已还原」，条目却一直是优先级 0——搬回来的成了没有种子做种的"本地文件"）。
@@ -1668,8 +1687,58 @@ class Executor:
             undo["file_priority"] = {"torrent_hash": h, "index": v.entry["index"],
                                      "name": v.entry["name"],
                                      "priority": v.entry.get("priority", 1)}
+        self._intend(undo)
+        self._effect("fs.move_to_trash")
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(dest))
+        except Exception as e:
+            if not self._settle_move(f, a, e, path, dest, size, undo, {
+                    "torrent_record_lost": record_lost, "priority_zeroed": zeroed, **extra}):
+                return
+        self._deleted_count += 1
+        self._deleted_bytes += size
+        self._trashed_paths.add(str(path))
         self._audit("applied", f, a, {"trashed_to": str(dest), "freed_bytes": size, **extra},
                     undo=undo)
+
+    def _settle_move(self, f: Finding, a: Action, err: Exception, path: Path, dest: Path,
+                     size: int, undo: dict, side: dict) -> bool:
+        """搬进隔离区（`shutil.move`）出错之后按盘上状态认结局。返回 True = 搬完了，照常记 applied。
+
+        跨卷搬运（隔离区与媒体是同一个 APFS 容器里的两个卷，critic N8）是先拷后删，**删源是最后一步**：
+
+        - 原位置没了、隔离区里那份大小对得上：搬完了，只是之后报了错 → 照常 applied。
+        - 原位置还在：没搬走（源文件在删之前从不被改动）→ failed。隔离区里若多了一份（拷到一半），
+          写进 `stray_copy`——隔离区处置据此认出它、交给人，不再是"来历不明"的文件。
+        - 其余（原位置没了、隔离区那份大小不对或也不在）：unknown，带逆操作——能捞回来的只剩那一份。
+
+        `side` 是种子那一步已经发生的事（`torrent_record_lost` / `priority_zeroed`）与关口的 `deletion`，
+        如实写进 failed / unknown 记录（以前只剩一句异常）。
+        """
+        why = f"{_describe(err)}"
+        try:
+            moved = self._fs_moved(path, dest, size)
+        except Exception:                           # noqa: BLE001 —— 读不了盘：说不清
+            moved = None
+        if moved is True:
+            self._confirmed_after = why
+            return True
+        if os.path.lexists(path):
+            stray = {"stray_copy": str(dest)} if os.path.lexists(dest) else {}
+            self._audit(auditlog.FAILED, f, a, {
+                "error": f"搬入隔离区失败：{why}",
+                "effect": "按盘上状态核实：文件还在原位，没有搬走",
+                "path_still_at": str(path), **stray, **side})
+            return False
+        self._audit(auditlog.UNKNOWN, f, a, {
+            "error": f"搬入隔离区失败：{why}",
+            "reason": ("搬入隔离区出错：原位置已经没有这个文件，隔离区里的那份"
+                       + ("大小对不上（可能不完整）" if os.path.lexists(dest) else "也不在")
+                       + "——能捞回来的只剩隔离区里那份"),
+            "trashed_to": str(dest), "effects_attempted": list(self._effects), **side},
+            undo=undo)
+        return False
 
     _GONE = ("文件已不在原位（种子声明了但盘上没有，或诊断后被挪走），种子与文件都不动")
 
@@ -1760,18 +1829,21 @@ class Executor:
             self._audit("skipped", f, a, {"reason": "dry-run", "would_zero": entry["name"],
                                           **extra})
             return
+        idx, before = entry["index"], entry.get("priority", 1)
+        undo = {"op": "restore_file_priority", "torrent_hash": h, "index": idx,
+                "name": entry["name"], "priority": before}
+        self._intend(undo)
         try:
-            self.ctx.qbit.set_file_priority(h, [entry["index"]], 0)
+            self.ctx.qbit.set_file_priority(h, [idx], 0)
         except Exception as e:
-            self._audit("failed", f, a, {
-                "error": f"设为不下载失败，未做任何改动：{type(e).__name__}: {e}", **extra})
-            return
+            if not self._settle(f, a, e, lambda: self._priority_landed(h, idx, 0, before),
+                                what="设为不下载", prefix="设为不下载失败，未做任何改动：",
+                                undo=undo, extra=extra):
+                return
         self._audit("applied", f, a,
                     {"priority_zeroed": True, "at": entry["name"], "files_untouched": True,
                      "note": note, **extra},
-                    undo={"op": "restore_file_priority", "torrent_hash": h,
-                          "index": entry["index"], "name": entry["name"],
-                          "priority": entry.get("priority", 1)})
+                    undo=undo)
 
     def _drop_record(self, f: Finding, a: Action, victim: dict, note: str,
                      extra: dict | None = None) -> None:
@@ -1784,12 +1856,14 @@ class Executor:
             return
         magnet = victim.get("magnet_uri") or ""
         paths = self._claimed_paths(victim)          # 摘之前记下：摘了就问不到了
+        undo = self._readd_undo(victim, magnet, paths)
+        self._intend(undo)
         try:
             self.ctx.qbit.delete([h], delete_files=False)
         except Exception as e:
-            self._audit("failed", f, a, {
-                "error": f"删除种子记录失败，未做任何改动：{type(e).__name__}: {e}", **extra})
-            return
+            if not self._settle(f, a, e, lambda: self._torrent_gone(h), what="删除种子记录",
+                                prefix="删除种子记录失败，未做任何改动：", undo=undo, extra=extra):
+                return
         self._removed_torrents.add(h)
         if (extra.get("deletion") or {}).get("subject"):
             self._removed_subjects[h.lower()] = extra["deletion"]["subject"]
@@ -1797,7 +1871,7 @@ class Executor:
                     {"dropped": victim.get("name", ""), "files_untouched": True, "note": note,
                      **({} if magnet else {"irreversible": "无 magnet_uri，此条不可回退"}),
                      **extra},
-                    undo=self._readd_undo(victim, magnet, paths))
+                    undo=undo)
 
     # ---------------- 回退 ----------------
     def rollback(self, run_id: str) -> dict:
