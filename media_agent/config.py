@@ -55,6 +55,17 @@ def _seconds(v: str, name: str) -> float:
     return x
 
 
+def _hours(v: str, name: str) -> float:
+    """非负、有限的小时数。"""
+    try:
+        x = float(v.strip())
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} 要写成小时数（如 12），收到 {v!r}") from None
+    if not (x >= 0 and x != float("inf")):
+        raise ValueError(f"{name} 要写成非负的有限小时数，收到 {v!r}")
+    return x
+
+
 def _int_at_least(v: str, name: str, minimum: int) -> int:
     """不小于 `minimum` 的整数。写错了大声失败，理由同 `_seconds`。"""
     try:
@@ -122,6 +133,9 @@ class Config:
     # 部分超过 max(TORRENT_DROP_MIN, 上一轮 × TORRENT_DROP_PCT%)，这一轮按"读不全"整轮拒绝（退出码 3）。
     torrent_drop_min: int = 20
     torrent_drop_pct: float = 10.0
+    # 健康报告：这一轮之后仍是发布名、而且已经待了超过这么多小时的文件报 warn（`health.unrenamed_old`）。
+    # 拿到种子就该改名（下载中也改），6 小时一轮的节奏下 12 小时 = 已经错过两轮。
+    unrenamed_alert_hours: float = 12.0
 
     @property
     def state_dir(self) -> Path:
@@ -176,4 +190,5 @@ def load_config(env_file: Path | None = None) -> Config:
         stuck_runs=_int_at_least(g("STUCK_RUNS", "4"), "STUCK_RUNS", 2),
         torrent_drop_min=_int_at_least(g("TORRENT_DROP_MIN", "20"), "TORRENT_DROP_MIN", 0),
         torrent_drop_pct=_percent(g("TORRENT_DROP_PCT", "10"), "TORRENT_DROP_PCT"),
+        unrenamed_alert_hours=_hours(g("UNRENAMED_ALERT_HOURS", "12"), "UNRENAMED_ALERT_HOURS"),
     )

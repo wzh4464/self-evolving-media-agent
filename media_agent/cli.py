@@ -14,6 +14,7 @@ import argparse
 import json
 import re
 import sys
+import traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,13 @@ EXIT_DEGRADED = 3
 # 另一个进程持有运行锁、本次什么都没做时的退出码。取 sysexits 的 EX_TEMPFAIL，
 # 与 /usr/bin/lockf 等锁超时的退出码一致：launchd 的 last exit code 75 = "被挡住了，下轮再来"。
 EXIT_LOCKED = 75
+
+# 异常冲出了这一轮：与 Python 未捕获异常的退出码相同，只是健康报告照写（`cmd_run`）。
+EXIT_CRASH = health.EXIT_CRASH
+
+# 这一轮跑完了，但健康报告是 critical 且不属于上面几种：处置之后媒体卷剩余仍低于 MIN_FREE_GB
+# （`health.exit_code_for`）。launchd 只记下退出码、照常 6 小时后再起下一轮——非零不会让它停掉任务。
+EXIT_CRITICAL = health.EXIT_CRITICAL
 
 # 改动照常做了、整轮也跑完了，但有审计记录没能原样写进 audit.jsonl（磁盘满、权限、序列化不了）时的
 # 退出码。记录已转写到 stderr（run.err.log）与 state/audit.fallback.jsonl，回退照样读得到；但这种
@@ -101,30 +109,43 @@ def _warn_degraded(state) -> None:
 
 
 def build_context(cfg, need_llm: bool = False) -> Context:
+    # 各客户端此刻的状况，健康报告用（`ok` / `down: 原因` / `off（为什么）`）
+    status: dict[str, str] = {}
     qbit = None
     try:
         qbit = QBitClient(cfg.qbit_url, cfg.qbit_user, cfg.qbit_pass)
+        status["qbit"] = "ok"
     except Exception as e:
         _log(f"⚠️  qBittorrent 连接失败：{e}")
+        status["qbit"] = f"down: {type(e).__name__}: {e}"[:200]
 
     ab = None
     try:
         if cfg.ab_user:
             ab = AutoBangumiClient(cfg.ab_url, cfg.ab_user, cfg.ab_pass)
+            status["ab"] = "ok"
+        else:
+            status["ab"] = "off（未配置 AB_USER）"
     except Exception as e:
         _log(f"⚠️  AutoBangumi API 连接失败（不影响只读诊断）：{e}")
+        status["ab"] = f"down: {type(e).__name__}: {e}"[:200]
 
     abdb = AutoBangumiDB(cfg.ab_db, cfg.ab_container, cfg.docker_bin) if cfg.ab_db else None
+    status["abdb"] = "ok" if abdb else "off（未配置 AB_DB）"
     tmdb = TMDBClient(cfg.tmdb_api_key, cfg.tmdb_lang)
+    status["tmdb"] = "ok" if tmdb.enabled else "off（未配置 TMDB_API_KEY）"
     if not tmdb.enabled:
         _log("⚠️  未配置 TMDB_API_KEY，标题对齐相关规则将跳过")
 
     llm = LLMClient(cfg.llm_base, cfg.llm_key, cfg.llm_model)
+    status["llm"] = "ok" if llm.enabled else "off（未配置 LLM_KEY）"
     if need_llm and not llm.enabled:
         _log("⚠️  未配置 LLM_KEY，自演进与模糊匹配将跳过")
 
-    return Context(cfg, qbit=qbit, ab=ab, abdb=abdb, tmdb=tmdb,
-                   anilist=AniListClient(), llm=llm, logger=_log)
+    ctx = Context(cfg, qbit=qbit, ab=ab, abdb=abdb, tmdb=tmdb,
+                  anilist=AniListClient(), llm=llm, logger=_log)
+    ctx.client_status = status
+    return ctx
 
 
 def build_registry() -> Registry:
@@ -486,8 +507,9 @@ def _print_stuck(cfg, stuck: list, limit: int = 20) -> None:
         return
     tail = f"（另有 {acked} 个已确认、不再提醒）" if acked else ""
     print(f"\n═══ 卡住：{len(open_)} 个问题连续 ≥{cfg.stuck_runs} 轮都在{tail} ═══")
+    root = str(cfg.media_root).rstrip("/") + "/"
     for s in open_[:limit]:
-        where = "" if s.target == s.show else f" {s.target}"
+        where = "" if s.target == s.show else f" {s.target.removeprefix(root)}"
         print(f"  ⏳ 连续 {s.runs} 轮（自 {s.first_seen}）[{s.rule}] {s.kind}【{s.show or '-'}】{where}")
         print(f"      {s.summary[:160]}")
         print(f"      指纹 {s.fp}——要人处理、先不提醒：media-agent ack {s.fp} --reason \"…\"")
@@ -572,15 +594,25 @@ def _remind_commit(path) -> None:
 
 
 def cmd_health(args, cfg) -> int:
-    """运行健康。`--accept-torrent-count`：把此刻 qBittorrent 的种子数认作新基线（人为批量删除之后）。"""
-    if args.accept_torrent_count:
+    """最近一轮（或 `--run` 指定那一轮）的健康报告；`--json` 原样输出。
+
+    `--accept-torrent-count`：把此刻 qBittorrent 的种子数认作新基线（人为批量删除之后）。"""
+    if getattr(args, "accept_torrent_count", False):
         return _accept_torrent_count(cfg)
-    base = health.load_baseline(cfg.state_dir)
-    if not base:
-        print("还没有种子数基线（下一轮 run 之后才有）")
+    rep = health.load_report(cfg.state_dir, getattr(args, "run", None))
+    if rep is None:
+        which = f"批次 {args.run} 的" if getattr(args, "run", None) else "任何"
+        print(f"还没有{which}健康报告（state/health/，每轮 run 结束时写）")
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
         return 0
-    print(f"种子数基线：{base['count']} 个（{base.get('source')}，批次 {base.get('run_id')}，"
-          f"{base.get('ts')}）")
+    for line in health.render(rep, health.health_dir(cfg.state_dir) / f"{rep.get('run_id')}.json"):
+        print(line)
+    base = health.load_baseline(cfg.state_dir)
+    if base:
+        print(f"  种子数基线 {base['count']}（{base.get('source')}，批次 {base.get('run_id')}，"
+              f"{base.get('ts')}）")
     return 0
 
 
@@ -653,12 +685,55 @@ def cmd_evolve(args, cfg) -> int:
 
 
 def cmd_run(args, cfg) -> int:
-    """一轮完整自治。"""
+    """一轮完整自治。收尾——正常结束、整批拒绝、异常冲出都一样——写健康报告（`health` 模块文档）。
+
+    以前 `run` 只在"整批拒绝"与"审计没写全"时退出码非零；异常冲出就是一段 traceback，其余一切（抓取连着十天
+    NameError、检测器崩了、磁盘快满）launchd 上都是 0。现在每轮都有一份 `state/health/<批次 ID>.json` 与输出末尾
+    一小节，critical 时退出码非零（1 / 3 / 4 / 5，见 `health.exit_code_for`）。
+    """
     # 批次 ID 先定下来：发现历史、审计、隔离区处置、健康报告都用这一个，彼此对得上
-    run_id = new_run_id()
+    rh = health.RunHealth(cfg, run_id=new_run_id(), cmd="run",
+                          dry_run=args.dry_run or not cfg.auto_apply)
+    try:
+        rc = _run(args, cfg, rh)
+    except Exception as e:
+        # 冲出来的异常：完整 traceback 进 stderr（run.err.log），摘要进健康报告，退出码与未捕获异常同为 1
+        rh.crashed(e)
+        traceback.print_exc()
+        rc = EXIT_CRASH
+    except BaseException as e:
+        # Ctrl-C / 被 kill 的 SystemExit：报告照写，异常照常往外抛
+        rh.crashed(e)
+        _finish_run(cfg, rh, EXIT_CRASH)
+        raise
+    return _finish_run(cfg, rh, rc)
+
+
+def _finish_run(cfg, rh, rc: int) -> int:
+    """定状态、写报告、打印一小节；返回最终退出码。这一步自己出错不改变这一轮的退出码。"""
+    try:
+        rep = rh.finish(rc)
+        path, problems = health.write_report(cfg.state_dir, rep)
+        for line in health.render(rep, path):
+            print(line)
+        for p in problems:
+            _log(f"⚠️  健康报告：{p}")
+        return rep["exit_code"]
+    except Exception as e:                           # noqa: BLE001 —— 观测出错不能吞掉这一轮的结论
+        _log(f"⚠️  健康报告出错（{type(e).__name__}: {e}），本轮退出码按原样 {rc}")
+        traceback.print_exc()
+        return rc
+
+
+def _run(args, cfg, rh) -> int:
+    run_id = rh.data["run_id"]
     ctx = build_context(cfg, need_llm=True)
+    ctx.log = rh.tap(ctx.log)
+    rh.clients(ctx)
+    prev = health.load_baseline(cfg.state_dir)
     scanned_at = datetime.now().isoformat(timespec="seconds")
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
+    rh.scanned(state, prev)
     if not state.qbit_errors:
         # 这一轮的种子数被采信了：下一轮拿它比（`health.torrent_count_problem`）。时间取扫描之前——
         # 这一轮自己摘掉的种子也算进下一轮"解释得通"的那部分。被拒绝的一轮不挪基线。
@@ -669,6 +744,7 @@ def cmd_run(args, cfg) -> int:
     reg = build_registry()
 
     findings = reg.run_all(ctx, state)
+    rh.diagnosed(reg, findings)
     _record_findings(cfg, run_id, findings, state, "run")
     print(f"═══ 诊断：{len(findings)} 个问题 ═══")
     _warn_degraded(state)
@@ -680,13 +756,16 @@ def cmd_run(args, cfg) -> int:
     if report.refused:
         # fail closed：不修、不演进（演进器会拿这份残缺快照去立规则）、
         # 也不处置隔离区——降级的一轮不改动任何东西。
+        rh.refused(report.refused)
         return _refuse(report.refused)
+    rh.applied(report, findings, state)
     print(f"\n═══ 修复：{report.summary()} ═══")
     _print_unknown(report.unknown)
 
     rc = 0
     if cfg.evolve_mode != "propose":
         # 冻结：不重扫、不调 LLM、不构造 Evolver（它的 __init__ 就会建 .agents/rules）
+        rh.evolve("frozen")
         print(f"\n═══ 演进：已冻结（EVOLVE_MODE={cfg.evolve_mode}） ═══")
     elif ctx.llm.enabled and not args.no_evolve:
         # 修复后重新扫描，残留才是真盲区
@@ -694,6 +773,8 @@ def cmd_run(args, cfg) -> int:
         if state2.qbit_errors:
             # 种子视图残缺时，有种子的文件全变成"无主文件"，演进器会拿它们当
             # 盲区去立规则——规则一旦上线就是永久的。宁可这轮不演进。
+            rh.rescan_degraded(state2.qbit_errors[0])
+            rh.evolve("skipped")
             print(f"\n═══ 演进：跳过——重扫时 qBittorrent 数据不完整："
                   f"{state2.qbit_errors[0]} ═══")
             rc = EXIT_DEGRADED
@@ -702,15 +783,22 @@ def cmd_run(args, cfg) -> int:
             results = Evolver(ctx, reg).evolve(state2, findings2,
                                                max_proposals=args.max_proposals)
             promoted = [r for r in results if r["outcome"] == "promoted"]
+            rh.evolve(f"proposed {len(results)}, promoted {len(promoted)}")
             print(f"\n═══ 演进：提议 {len(results)} 条，上线 {len(promoted)} 条 ═══")
             for r in promoted:
                 print(f"  🎉 {r['rule_id']}")
+    else:
+        rh.evolve("off")
 
     # 隔离区处置（disposal 模块文档）：以前这里按日期 rmtree 整个日目录、一行记录都不写
     # （Executor.purge_trash，生产上删掉过 6 个文件 4.7GB，说不出是哪几个）。现在按处置类别
     # 逐个判、逐个预写日志后删；要人定的过了保留期只报不删。
-    _print_disposal(cfg, disposal.dispose(ctx, mode="run", run_id=ex.run_id, dry_run=dry))
-    _print_stuck(cfg, _stuck(cfg, run_id))
+    rep = disposal.dispose(ctx, mode="run", run_id=ex.run_id, dry_run=dry)
+    rh.disposed(rep)
+    _print_disposal(cfg, rep)
+    stuck = _stuck(cfg, run_id)
+    rh.stuck(stuck)
+    _print_stuck(cfg, stuck)
     # 审计写不进去不中止这一轮（上面的处置照跑——磁盘满时它是唯一腾空间的一步），但在最后大声说
     if _report_audit_problems(report.audit_problems, cfg.state_dir):
         return EXIT_AUDIT_INCOMPLETE
@@ -773,7 +861,9 @@ def main() -> int:
     s.add_argument("--list", action="store_true", help="列出全部确认")
     s.set_defaults(func=cmd_ack)
 
-    s = sub.add_parser("health", help="运行健康（种子数基线等）")
+    s = sub.add_parser("health", help="最近一轮（或指定一轮）的健康报告")
+    s.add_argument("--run", help="批次 ID，省略则看最近一轮")
+    s.add_argument("--json", action="store_true", help="原样输出 JSON")
     s.add_argument("--accept-torrent-count", action="store_true",
                    help="把此刻 qBittorrent 的种子数认作新基线（在 qBit 里手动批量删除之后）")
     s.set_defaults(func=cmd_health)

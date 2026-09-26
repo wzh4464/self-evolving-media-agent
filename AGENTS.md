@@ -48,6 +48,7 @@ uv run media-agent evolve             # 为规则盲区提议新规则（需 EVO
 uv run media-agent run                # 完整自治轮次（演进默认冻结），末尾处置隔离区
 uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题、先不提醒（写 .agents/acks.json，要提交）
+uv run media-agent health               # 最近一轮的健康报告（--run ID 指定一轮，--json 原样）
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 

@@ -126,6 +126,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
             state.qbit_errors.append(msg)
             ctx.log(f"[scan] qBittorrent 数据不完整——{msg}")
     state.torrents = torrents
+    state.qbit_listed = listed
     torrent_by_hash = {t["hash"]: t for t in torrents}
     by_path: dict[str, dict] = {}
     for t in torrents:

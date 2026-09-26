@@ -330,6 +330,8 @@ class LibraryState:
     # 本次扫描读 qBittorrent 时出的错（不可用 / torrents() / 某个种子的 files()）。
     # 非空 = 种子视图不完整，这份快照只能看、不能拿去改东西（见 Executor.apply）。
     qbit_errors: list[str] = field(default_factory=list)
+    # `torrents()` 这一轮真的成功返回过（`torrents` 为空时分得清"0 个"与"没读到"，健康报告用）
+    qbit_listed: bool = False
 
     def all_files(self) -> Iterable[MediaFile]:
         for s in self.shows:
@@ -367,6 +369,9 @@ class Context:
         # 是同一个列表。放在 Context 上是为了让执行器不依赖调用方记得把 state 传进来：
         # 忘了传，闸门就形同虚设。
         self.qbit_errors: list[str] = []
+        # 构造时各客户端的状况（`cli.build_context` 填）：`ok` / `down: <原因>` / `off（…）`。健康报告用；
+        # 测试里直接构造的 Context 没有它，健康报告按客户端在不在推断。
+        self.client_status: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------

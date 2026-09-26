@@ -143,3 +143,40 @@ run.err.log 的人认它），末尾加上位置。健康报告（第 6 节）�
 第二轮同样拒绝；本项目自己摘 25 个死种后 30 → 5 放行；阈值内放行；539 的 10% 口径；审计里摘除的五种形状与
 四种不算的；确认命令重置基线、没 qBit 时拒绝；坏基线文件；阈值配置校验。关掉扫描里的检查，前两个红；
 不减审计里的摘除，死种那个红。
+
+## 6. 每轮健康报告（`health.RunHealth`，`media-agent health`）
+
+**现场**：`run` 的输出只有发现清单与一行"执行 N 项"；退出码只在"整批拒绝"（3）与"审计没写全"（4）时非零，
+异常冲出就是一段 traceback。抓取连着十天 NameError、检测器崩了、磁盘快满——launchd 上都是 last exit code 0。
+
+**做法**：`cmd_run` 拆成 `_run`（原来的主体）与收尾 `_finish_run`：
+
+- `RunHealth` 边跑边记：客户端状况（`build_context` 填进 `ctx.client_status`：`ok` / `down: 原因` / `off（为什么）`；
+  测试里直接构造的 Context 按客户端在不在推断）、扫描（`qbit_errors`、此刻的种子数——`LibraryState.qbit_listed`
+  分得清"0 个"与"没读到"——与上一轮的基线）、检测器（条数、`Registry.errors`）、发现（按严重度）、执行报告
+  （四种状态的条数、failed / unknown 前 10 条、审计转写）、抓取统计（提议 / 加上 / 409 已存在 / 元数据超时 /
+  失败 / 未确认 / 跳过）、发布名文件超过 `UNRENAMED_ALERT_HOURS`（默认 12）还没改的（`unrenamed-file` 提了、这一轮
+  没改成；有种子按加入时间、本地文件按 ctime）、隔离区（总大小 / 文件数、剩余空间、容量闸、处置结果）、卡住、
+  演进、`ctx.log` 里"失败 / 出错"的行数（按 `[标签]` 归类，`tap` 包在 `ctx.log` 外面）、耗时。
+- **try / finally 语义**：`_run` 正常返回、整批拒绝、异常冲出（`except Exception`：完整 traceback 进 stderr，摘要
+  `{error, where}` 进报告，退出码 1——与 Python 未捕获异常相同）、甚至 Ctrl-C（`BaseException`：报告照写，异常照抛）
+  都会写 `state/health/<批次 ID>.json`（只留 60 份）并在输出末尾打印一小节。没跑到的阶段在报告里是 null——"没跑到"，
+  不是"没问题"。收尾自己出错只在 stderr 说一句，不改变这一轮的退出码。
+- **状态**（`RunHealth.reasons`，每条原因带 `level` / `code` / `text`）：
+  - critical：`crash`（1）、`refused` 整批拒绝（3）、`rescan_degraded` 演进重扫时读不全（3）、`audit_incomplete`（4）、
+    `disk_full` 处置之后媒体卷估计剩余仍低于 `MIN_FREE_GB`（**5，新**）；
+  - warn：`paused`（第 9 节）、`detector_crash`、`failed_actions`、`unknown_actions`、`stuck`（未确认的）、
+    `unrenamed_old`、`ab_down`、`tmdb_off`、`low_space`（低过阈值但提前删回来了）、`free_space_unknown`、
+    `disposal_failed`；
+  - 其余 ok。"日志里有报错行"只列出、不改状态：生产上 TMDB 查询这类一次性失败每轮都可能有，拿它定 warn 会让
+    warn 变成常态、没人再看。
+- **退出码** = `exit_code_for(critical 原因, _run 的返回值)`：几种同时出现时取 1 > 3 > 4 > 5。warn 一律 0。launchd 的
+  `StartInterval` 任务只记下退出码、6 小时后照常起下一轮（plist 里没有 `KeepAlive`，非零不会触发重启节流），
+  所以 5 只是让 `launchctl list` 看得见。
+- `media-agent health [--run ID] [--json]`：最近一轮（或指定那一轮）的报告；没有就退出码 1。
+
+**测试**：`tests/test_health_report.py`——干净的一轮 ok、与发现历史 / 审计同一个批次 ID；第二轮带上一轮的种子数；
+整批拒绝 critical / 3；`disposal.dispose` 抛异常时报告照写、critical / 1、traceback 进 stderr；审计写不进去 critical / 4；
+处置之后仍低于阈值 critical / 5（`test_quarantine_disposal` 里原来断言 0 的那条随之改成 5）；退出码优先级；检测器崩溃、
+动作失败、TMDB 没配、未改名超时、卡住各自 warn，确认之后回到 ok；这一轮改掉的不算未改名；抓取统计；隔离区大小
+与处置；`health` 命令的最近 / 指定 / JSON / 不存在；报告目录写不进去不改退出码；只留 60 份；配置校验。
