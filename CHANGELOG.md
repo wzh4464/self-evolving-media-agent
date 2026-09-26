@@ -13,6 +13,19 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-27
+
+**悄悄停摆必须被看见。** 整改第 3 阶段：执行器不再对发生过的事撒谎，每一轮都留下可比对的
+发现历史与健康报告，状态变化时发邮件。
+
+- 审计新增 `unknown` 状态：改动之后才出错的动作先按此刻状态核实，能确认就记 applied（带 undo），
+  确认不了就记 unknown（附预备的 undo），不再一律记 failed 且无法回退；写审计出错不中止整轮。
+- 每轮全部发现按稳定指纹写进 `state/findings/`；同一问题连续 4 轮原地不动即报「卡住」，可 `ack`。
+- 每轮收尾写 `state/health/<run_id>.json`（`media-agent health`），critical 时退出码非零；
+  种子数骤降又解释不了时整轮拒绝；健康状态变化时发邮件，一轮最多一封。
+- `run` 输出逐行带时间与批次 ID，日志先拷贝再截断地轮转；VPN 救援中或有 `state/PAUSE` 时暂停。
+- 测试 607 → 886。
+
 ### 新增
 - **发现历史**：每轮 `run` 与 `diagnose` 把全部发现（含没有动作、已归类的）写进
   `state/findings/<批次 ID>.jsonl`，只留最近 60 份。每条带稳定指纹：规则 + 类型 + 目标（集位 / 季、路径、
@@ -474,7 +487,8 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.1.0...v0.2.0
