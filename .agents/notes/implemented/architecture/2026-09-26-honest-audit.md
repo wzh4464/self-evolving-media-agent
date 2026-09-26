@@ -153,3 +153,24 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
 照旧放在 `error` 前面（`_settle(prefix=)`），按它们检索日志的习惯不断。
 
 **测试**：`tests/test_effect_recheck.py` 的"隔离 / 摘种子 / 设为不下载"一节，每种核实结局各一个现场。
+
+## 6. setLocation 的核实：重新关联、目录改名；sidecar
+
+- `relink_torrent`：`setLocation` 出错按 `_location_landed` 认；每个映射的 `renameFile` 出错按
+  `_rename_landed` 认，改成了照算 `relinked`，说不清的有一个就整条记 unknown（`unconfirmed` 计数），逆操作
+  是"已改的 + 说不清的"整体反过来（逆操作逐条改名、改不动的跳过）。一个映射都没改成而目录已经挪了：
+  仍是 failed，但写明 `relocated_from` / `relocated_to`（以前这件事不留痕迹）。触发校验（`recheck`）的请求
+  出错**不再**让整条变成失败：映射已经改好了，那是这个动作的改动本身——记 applied、带逆操作，
+  `recheck_triggered: false` + `recheck_error`（以前抛出去记 failed、没有逆操作：映射改了，却回退不了）。
+- `rename_show_dir`：每个种子的 `setLocation` 出错按 `_location_landed` 认，受理了照算已搬。确认没搬的仍是
+  failed；有说不清的就是 unknown（半迁移、还不知道迁了多少）。两者都记 `rename_show_dir_partial`——
+  回退现在对它明说"只做了一部分、无法自动回退，交给人 / `repair`"，不再报"未知逆操作"。种子都搬完之后
+  搬残留（`_merge_tree`）或改 AB 数据库时抛异常：`_intend` 事先登记了完整的 `rename_show_dir` 逆操作，
+  通用兜底记 unknown 并带上它；逆操作按此刻状态核对（旧目录还在就拒绝），`repair` 认得这条 unknown、
+  把残留合并过去。
+- `write_sidecar`：`sidecar.save` 先写临时文件再原子替换，抛了异常而内容没变 → failed（核实过的）；变了 → 说不清。
+  `write_nfo` 登记文件系统改动（没有逆操作，出错时至少不说成"没生效"）。
+
+**测试陷阱（本节测试踩过一次）**：测试里撤销自己的替身不要用 `monkeypatch.undo()`——它连 conftest 的隔离
+（`PROJECT_ROOT` 打到临时目录）一起撤掉，之后的回退把汇总记录写进了仓库自己的 `state/audit.jsonl`
+（本机开发目录，已删；`tests/test_purge_log.py` 里早有同样的提醒）。只 `setattr` 回原值。

@@ -270,6 +270,14 @@ class Executor:
             **extra}, undo=undo)
         return False
 
+    @staticmethod
+    def _confirm(probe) -> bool | None:
+        """`probe()` 的结论；它自己抛异常（读不到此刻状态）当作说不清（None）。"""
+        try:
+            return probe()
+        except Exception:                           # noqa: BLE001
+            return None
+
     def _live_torrent(self, h: str) -> dict | None:
         """此刻 qBittorrent 里的这个种子（不走占用索引的缓存）；不在返回 None，读不到抛异常。"""
         h = (h or "").lower()
@@ -818,10 +826,24 @@ class Executor:
             except (ValueError, AttributeError):
                 pass
 
-        sc_mod.save(show_dir, sc)
-        self._audit("applied", f, a,
-                    undo={"op": "restore_sidecar", "show_dir": str(show_dir),
-                          "prev": prev_content})
+        undo = {"op": "restore_sidecar", "show_dir": str(show_dir), "prev": prev_content}
+        self._intend(undo)
+        self._effect("fs.sidecar")
+        try:
+            sc_mod.save(show_dir, sc)
+        except Exception as e:
+            # `sidecar.save` 先写临时文件、再原子替换：内容没变就是没生效
+            if not self._settle(f, a, e, lambda: self._sidecar_changed(prev, prev_content),
+                                what="写 sidecar ", undo=undo):
+                return
+        self._audit("applied", f, a, undo=undo)
+
+    @staticmethod
+    def _sidecar_changed(p: Path, before: str | None) -> bool | None:
+        """写 sidecar 出错之后：内容与动手前一样 → 没生效（False）；变了 → 说不清（None）——
+        `save` 的原子替换一旦发生就不会再抛，变了多半是别人同时写的。"""
+        now = p.read_text(encoding="utf-8") if p.exists() else None
+        return False if now == before else None
 
     def _wait_ab_ready(self, timeout: float = 45.0) -> bool:
         """等 AutoBangumi 重新起来再调它的接口。
@@ -1334,13 +1356,26 @@ class Executor:
             return
 
         prev_save_path = cur_sp if new_save_path else ""
+
+        def undo_for(done: list[dict]) -> dict:
+            return {"op": "relink_torrent", "torrent_hash": h, "new_save_path": prev_save_path,
+                    "mapping": [{"old": m["new"], "new": m["old"]} for m in done]}
+
+        # 抛异常而说不清时的逆操作：整个映射反过来（逆操作逐条改名、改不动的跳过），再挪回原目录
+        self._intend(undo_for(mapping))
         if new_save_path:
             # 文件已搬到别的目录：先把 save_path 挪过去，renameFile 用的是
             # 相对 save_path 的路径，跨不出去。
-            self.ctx.qbit.set_location([h], new_save_path)
+            try:
+                self.ctx.qbit.set_location([h], new_save_path)
+            except Exception as e:
+                if not self._settle(
+                        f, a, e, lambda: self._location_landed(h, new_save_path, cur_sp),
+                        what="setLocation ", undo=undo_for([])):
+                    return
 
         before = {e["name"] for e in self.ctx.qbit.files(h)}
-        renamed, failed = [], []
+        renamed, failed, unsure = [], [], []
         for m in mapping:
             if m["old"] not in before:
                 failed.append({**m, "error": "种子文件列表里已无此条目"})
@@ -1349,23 +1384,47 @@ class Executor:
                 self.ctx.qbit.rename_file(h, m["old"], m["new"])
                 renamed.append(m)
             except Exception as e:
-                failed.append({**m, "error": str(e)})
+                # 与 `_op_rename` 同理：超时时 qBittorrent 常常已经改了映射
+                landed = self._confirm(lambda m=m: self._rename_landed(h, m["old"], m["new"]))
+                if landed is True:
+                    renamed.append(m)
+                    self._confirmed_after = _describe(e)
+                elif landed is False:
+                    failed.append({**m, "error": _describe(e)})
+                else:
+                    unsure.append({**m, "error": _describe(e)})
 
+        if unsure:
+            self._audit(auditlog.UNKNOWN, f, a, {
+                "error": unsure[0]["error"],
+                "reason": (f"{len(unsure)} 个条目的 renameFile 出错、按此刻状态核实不了"
+                           f"（映射改没改成不知道），没有触发校验"),
+                "relinked": len(renamed), "failed": len(failed), "unconfirmed": len(unsure),
+                "relocated_to": new_save_path, "effects_attempted": list(self._effects)},
+                undo=undo_for(renamed + unsure))
+            return
         if not renamed:
+            # 目录（若换了）已经挪过去、一个映射也没改成：失败，但挪了目录这件事要写下来
             self._audit("failed", f, a, {"error": "没有任何文件重建关联成功",
-                                         "failures": failed[:3]})
+                                         "failures": failed[:3],
+                                         **({"relocated_from": prev_save_path,
+                                             "relocated_to": new_save_path}
+                                            if new_save_path else {})})
             return
 
-        # 交给 libtorrent 校验哈希；结果异步产生，这里只负责触发
-        self.ctx.qbit.recheck([h])
+        # 交给 libtorrent 校验哈希；结果异步产生，这里只负责触发。映射已经改好了——那是这个动作的改动本身；
+        # 触发校验的请求出错不能让它变成"失败、没有逆操作"（以前就是这样：映射改了，却回退不了）
+        recheck: dict = {"recheck_triggered": True}
+        try:
+            self.ctx.qbit.recheck([h])
+        except Exception as e:
+            recheck = {"recheck_triggered": False, "recheck_error": _describe(e),
+                       "recheck_note": "触发校验的请求出错；下一轮 stale-torrent-path 会再看它"}
         self._audit("applied", f, a,
                     {"relinked": len(renamed), "failed": len(failed),
-                     "relocated_to": new_save_path, "recheck_triggered": True,
+                     "relocated_to": new_save_path, **recheck,
                      "note": "recheck 为异步，稍后确认 progress 回到 100%"},
-                    undo={"op": "relink_torrent",
-                          "torrent_hash": h,
-                          "new_save_path": prev_save_path,
-                          "mapping": [{"old": m["new"], "new": m["old"]} for m in renamed]})
+                    undo=undo_for(renamed))
 
     def _relink_conflicts(self, h: str, cur_sp: str, mapping: list[dict], new_sp: str,
                           *, disk_for_mapped: bool) -> list[ClaimCheck]:
@@ -1443,6 +1502,7 @@ class Executor:
             return
         nfo = Path(a.args["path"])
         nfo.parent.mkdir(parents=True, exist_ok=True)
+        self._effect("fs.write_nfo")          # 没有逆操作（旧内容不留）；出错时至少别说成"没生效"
         nfo.write_text(
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
             "<tvshow>\n"
@@ -1509,29 +1569,56 @@ class Executor:
             if rows:
                 prev_savepath = rows[0]["save_path"] or ""
 
+        undo = {"op": "rename_show_dir", "path": str(new), "new_name": old.name,
+                "bangumi_id": bid, "prev_savepath": prev_savepath, "torrent_savepaths": affected}
+        # 种子都搬过去之后，搬残留 / 改 AB 数据库时抛异常：那时目录改名基本已经发生了，
+        # unknown 记录带上完整的逆操作（逆操作动手前自己核对：有陌生种子、目标已存在都会停）
+        self._intend(undo)
+
         # === 由 qBittorrent 搬运，而不是自己 mv 目录 ===
         # 裸 mv 会让所有种子的记录路径瞬间失效（实测已因此产生 28 个死链种子）。
         # setLocation 让 qBittorrent 自己移动文件并同步记录，做种不中断。
-        moved_ok, move_failed = [], []
+        moved_ok, move_failed, move_unsure = [], [], []
         for h, sp in affected:
+            dest = repath(sp, old, new)
             try:
-                self.ctx.qbit.set_location([h], repath(sp, old, new))
+                self.ctx.qbit.set_location([h], dest)
                 moved_ok.append(h)
             except Exception as e:
-                move_failed.append({"hash": h, "error": str(e)})
+                # 超时时 qBittorrent 常常已经受理了（`_location_landed`：save_path 已变或正在 moving）
+                landed = self._confirm(lambda h=h, dest=dest, sp=sp: self._location_landed(h, dest, sp))
+                if landed is True:
+                    moved_ok.append(h)
+                    self._confirmed_after = _describe(e)
+                elif landed is False:
+                    move_failed.append({"hash": h, "error": _describe(e)})
+                else:
+                    move_unsure.append({"hash": h, "error": _describe(e)})
 
-        if move_failed:
+        if move_failed or move_unsure:
             # 有种子没搬成功就中止：此时目录处于半迁移状态，
             # 继续 mv 剩余文件只会让情况更糟，交给人处理。
+            # 有说不清的就是 unknown（半迁移、还不知道迁了多少）；逆操作只是个记录，回退不会盲目还原它
+            partial = {"op": "rename_show_dir_partial", "moved_hashes": moved_ok,
+                       "torrent_savepaths": affected}
+            if move_unsure:
+                self._audit(auditlog.UNKNOWN, f, a, {
+                    "error": (move_unsure + move_failed)[0]["error"],
+                    "reason": (f"{len(move_unsure)} 个种子的 setLocation 出错、按此刻状态核实不了"
+                               f"（{len(moved_ok)} 个已搬、{len(move_failed)} 个确认没搬），已中止目录改名"),
+                    "moved_ok": len(moved_ok),
+                    "unconfirmed_hashes": [x["hash"] for x in move_unsure],
+                    "failures": move_failed[:3], "effects_attempted": list(self._effects)},
+                    undo=partial)
+                return
             self._audit("failed", f, a,
                         {"error": f"{len(move_failed)} 个种子 setLocation 失败，已中止目录改名",
                          "moved_ok": len(moved_ok), "failures": move_failed[:3]},
-                        undo={"op": "rename_show_dir_partial",
-                              "moved_hashes": moved_ok,
-                              "torrent_savepaths": affected})
+                        undo=partial)
             return
 
         # 种子搬完后，把没有种子关联的残留文件（NFO、孤儿字幕、失联种子的文件等）挪过去
+        self._effect("fs.merge_tree")
         leftovers, stranded = self._merge_tree(old, new)
 
         if bid and self.ctx.abdb and prev_savepath:
@@ -1546,10 +1633,7 @@ class Executor:
                      "leftover_files_moved": leftovers,
                      "stranded_files": stranded,
                      "old_dir_removed": not old.exists()},
-                    undo={"op": "rename_show_dir", "path": str(new),
-                          "new_name": old.name, "bangumi_id": bid,
-                          "prev_savepath": prev_savepath,
-                          "torrent_savepaths": affected})
+                    undo=undo)
 
     def _op_trash(self, f: Finding, a: Action) -> None:
         """删除 = 移入隔离区。受配额上限保护，**动手前过删除关口**（`media_agent/gate.py`）。
@@ -2134,6 +2218,13 @@ class Executor:
             else:
                 cur.rename(back)
             return True, ""
+
+        if op == "rename_show_dir_partial":
+            # 目录改名半路中止（有种子没搬成、或说不清搬没搬）：新旧两个目录各有一部分。整体还原的逆操作
+            # 要求"新目录里全是记录里的种子、旧目录不存在"，这里两条都不成立——不盲目还原，交给人
+            moved = u.get("moved_hashes") or []
+            return False, (f"目录改名只做了一部分（{len(moved)} 个种子已由 qBittorrent 搬到新目录），"
+                           f"无法自动回退：需人工核对新旧两个目录（可用 media-agent repair --run 合并）")
 
         if op == "rename_show_dir":
             cur = Path(u["path"])

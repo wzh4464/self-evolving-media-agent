@@ -383,3 +383,185 @@ def test_skipping_a_downloading_extra_whose_priority_change_timed_out_after(lib)
     [rec] = c.applied("trash")
     assert rec["priority_zeroed"] and rec["undo"]["op"] == "restore_file_priority"
     assert "ReadTimeout" in rec["confirmed_after_error"]
+
+
+# ------------------------------------------------------------------ setLocation：重新关联、目录改名
+GN_SIZE = 734_003_200
+GN_OLD = "GNOSIA - S01E08 [WebRip 1080p HEVC-10bit AAC].mkv"
+GN_SLOT = "古诺希亚 S01E08.mkv"
+
+
+def _stale_moved(lib):
+    """失联种子：它记着 Season 1 下的发布名，文件已被挪到 Season 2 并改了名（要换目录的那种 relink）。"""
+    sh = lib.show("古诺希亚")
+    t = sh.season(1).single(GN_OLD, size=GN_SIZE, on_disk=False)
+    sh.season(2).local(GN_SLOT, size=GN_SIZE)
+    return sh, t
+
+
+def test_relink_whose_set_location_timed_out_after_moving_goes_on(lib):
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+
+    sh, t = _stale_moved(lib)
+    lib.qbit.fail("set_location", hash=t.hash, after=True)
+
+    c = lib.cycle(detectors=[StaleTorrentPathDetector])
+
+    [rec] = c.applied("relink_torrent")
+    assert rec["relocated_to"] == str(sh.path / "Season 2") and rec["relinked"] == 1
+    assert "ReadTimeout" in rec["confirmed_after_error"]
+    assert lib.qbit.file_names(t.hash) == [GN_SLOT]
+
+
+def test_relink_whose_rename_timed_out_after_mapping_counts_it(lib):
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+
+    _, t = _stale_moved(lib)
+    lib.qbit.fail("rename_file", hash=t.hash, after=True)
+
+    c = lib.cycle(detectors=[StaleTorrentPathDetector])
+
+    [rec] = c.applied("relink_torrent")
+    assert (rec["relinked"], rec["failed"]) == (1, 0)
+    assert rec["undo"]["mapping"] == [{"old": GN_SLOT, "new": GN_OLD}]
+    assert lib.qbit.torrent(t.hash)["progress"] == 1
+
+
+@pytest.mark.allow("unknown_record", match="renameFile")
+def test_relink_whose_rename_cannot_be_confirmed_is_unknown_with_the_reverse_mapping(lib):
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+
+    sh, t = _stale_moved(lib)
+    findings = lib.diagnose(detectors=[StaleTorrentPathDetector])
+    _blind_after(lib, "rename_file", t.hash)
+
+    rep = Executor(lib.context(), dry_run=False, run_id="t-relink").apply(findings)
+
+    [rec] = rep.unknown
+    assert rec["undo"] == {"op": "relink_torrent", "torrent_hash": t.hash,
+                           "new_save_path": str(sh.path / "Season 1"),
+                           "mapping": [{"old": GN_SLOT, "new": GN_OLD}]}
+    assert rec["unconfirmed"] == 1
+
+
+def test_relink_whose_recheck_request_failed_is_applied_and_says_so(lib):
+    """映射已经改好（这是 relink 的改动本身），只是触发校验的请求出错：记 applied，写明没确认触发校验。
+    以前这里抛出去，记 failed、没有逆操作——映射改了，却回退不了。"""
+    from media_agent.plugins.builtin import StaleTorrentPathDetector
+
+    _, t = _stale_moved(lib)
+    lib.qbit.fail("recheck", hash=t.hash)
+
+    c = lib.cycle(detectors=[StaleTorrentPathDetector])
+
+    [rec] = c.applied("relink_torrent")
+    assert rec["recheck_triggered"] is False and "ReadTimeout" in rec["recheck_error"]
+    assert rec["undo"]["mapping"] == [{"old": GN_SLOT, "new": GN_OLD}]
+
+
+def _dir_rename(lib, old: str, new: str) -> Finding:
+    p = lib.path(old)
+    return Finding(rule="title-drift", kind="title_drift", severity="important",
+                   summary=f"目录名 `{old}` 与 TMDB 官方标题 `{new}` 不一致", show=old,
+                   path=str(p), action=Action(op="rename_show_dir",
+                                              args={"path": str(p), "new_name": new}))
+
+
+def test_dir_rename_whose_set_location_timed_out_after_moving_is_applied(lib):
+    s1 = lib.show("旧名").season(1)
+    t = s1.single("旧名 S01E01.mkv", size=1000)
+    lib.qbit.fail("set_location", hash=t.hash, after=True)
+
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")], run_id="t-dir")
+
+    [rec] = rep.applied
+    assert rec["torrents_moved"] == 1 and "ReadTimeout" in rec["confirmed_after_error"]
+    assert lib.qbit.torrent(t.hash)["save_path"] == str(lib.path("新名") / "Season 1")
+    assert lib.rollback("t-dir")["reverted"] == 1
+
+
+@pytest.mark.allow("unknown_record", match="setLocation")
+def test_dir_rename_with_an_unconfirmable_set_location_is_unknown_and_not_auto_reverted(lib):
+    """两个种子，第二个的 setLocation 超时之后连 qBittorrent 都读不到了：半迁移、而且说不清迁了多少。
+    记 unknown；回退不会拿"部分目录改名"去盲目还原，明说交给人。"""
+    s1 = lib.show("旧名").season(1)
+    a = s1.single("旧名 S01E01.mkv", size=1000)
+    b = s1.single("旧名 S01E02.mkv", size=2000)
+    real = lib.qbit.set_location
+
+    def flaky(hashes, location):
+        real(hashes, location)
+        if b.hash in hashes:
+            lib.qbit.fail("torrents", times=None)
+            raise httpx.ReadTimeout("timed out (injected)")
+
+    lib.qbit.set_location = flaky
+
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")], run_id="t-half")
+
+    [rec] = rep.unknown
+    assert rec["undo"]["op"] == "rename_show_dir_partial"
+    assert rec["unconfirmed_hashes"] == [b.hash] and rec["undo"]["moved_hashes"] == [a.hash]
+    lib.qbit._faults.clear()
+    del lib.qbit.set_location
+    res = lib.rollback("t-half")
+    assert res["reverted"] == 0 and res["skipped"] == 1
+    assert "只做了一部分" in res["skipped_detail"][0]["skip_reason"]
+
+
+@pytest.mark.allow("unknown_record", match="merge")
+def test_dir_rename_that_crashed_moving_leftovers_is_unknown_with_the_full_undo(lib, monkeypatch):
+    """种子都由 qBittorrent 搬过去了，搬残留文件时出错（以前记 failed、没有逆操作——种子明明搬了）。"""
+    show = lib.show("旧名")
+    t = show.season(1).single("旧名 S01E01.mkv", size=1000)
+    show.local("tvshow.nfo", size=10)
+
+    real = Executor._merge_tree
+
+    def boom(self, old, new, skip=frozenset()):
+        raise OSError(5, "merge failed (injected)")
+
+    monkeypatch.setattr(Executor, "_merge_tree", boom)
+
+    rep = lib.apply([_dir_rename(lib, "旧名", "新名")], run_id="t-merge")
+
+    [rec] = rep.unknown
+    assert rec["undo"]["op"] == "rename_show_dir"
+    assert rec["effects_attempted"][:1] == ["qbit.set_location"]
+    # 只撤这一处替身：monkeypatch.undo() 会连 conftest 的隔离（PROJECT_ROOT）一起撤掉
+    monkeypatch.setattr(Executor, "_merge_tree", real)
+    # 旧目录里还剩着 tvshow.nfo：整体还原的逆操作按此刻状态核对后拒绝（不把两个目录搅在一起）……
+    res = lib.rollback("t-merge")
+    assert res["reverted"] == 0 and "已存在" in res["skipped_detail"][0]["skip_reason"]
+    # ……而 repair 认得这条 unknown 的目录改名，把残留合并过去
+    rep = Executor(lib.context(), dry_run=False, run_id="t-repair").repair_split_dirs("t-merge")
+    assert rep["pairs"] == 1 and rep["detail"][0]["old_removed"]
+    assert (lib.path("新名") / "tvshow.nfo").exists()
+    assert lib.qbit.torrent(t.hash)["save_path"] == str(lib.path("新名") / "Season 1")
+
+
+# ------------------------------------------------------------------ sidecar
+@pytest.mark.allow("failed_record", match="sidecar")
+def test_sidecar_write_that_raised_before_replacing_is_failed(lib, monkeypatch):
+    """`sidecar.save` 先写临时文件、再原子替换：它抛了异常而文件内容没变，就是没生效。"""
+    from media_agent import sidecar as sc_mod
+
+    sh = lib.show("尼古喵喵")
+    sh.season(1)
+    sh.sidecar(canonical_title="尼古喵喵", seasons={"1": {"have": [1]}})
+    before = sc_mod.path_for(sh.path).read_text(encoding="utf-8")
+
+    def boom(show_dir, sc):
+        raise OSError(28, "No space left on device (injected sidecar)")
+
+    monkeypatch.setattr(sc_mod, "save", boom)
+    f = Finding(rule="sidecar-sync", kind="sidecar_stale", severity="minor", summary="档案",
+                show="尼古喵喵", action=Action(op="write_sidecar", args={
+                    "show_dir": str(sh.path),
+                    "payload": {"canonical_title": "尼古喵喵", "seasons": {"1": {"have": [1, 2]}}}}))
+
+    rep = lib.apply([f])
+
+    [rec] = rep.failed
+    assert "没有生效" in rec["effect"]
+    assert sc_mod.path_for(sh.path).read_text(encoding="utf-8") == before
