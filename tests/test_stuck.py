@@ -145,11 +145,15 @@ def test_broken_acks_file_is_reported_not_fatal(tmp_path):
     assert acks == {} and problems and "acks.json" in problems[0]
 
 
-def test_shipped_acks_cover_the_two_known_layout_mismatches():
+def test_shipped_acks_cover_the_two_known_layout_mismatches(lib):
     """仓库里带的 `.agents/acks.json`：生产上今天仅有的两条会升级成"卡住"的发现
     （2026-09-26 run.log：胆大党、超超超超超喜欢你的100个女朋友的 season_layout_mismatch，
-    要人重排目录）。指纹要与检测器此刻算出来的对得上——改了指纹算法这里会红。"""
+    要人重排目录）。指纹要与**检测器此刻算出来的**对得上——改了指纹算法，或检测器给这条发现加了
+    path / subject，这里都会红（以前拿手搭的 Finding 算，检测器变了测不出来，复审变异 X1）。"""
+    from harness import weekly
+
     from media_agent import config
+    from media_agent.plugins.grab import EpisodeAvailableDetector
     acks, problems = history.load_acks(config.PROJECT_ROOT.parent / "_unused")
     assert problems == [] and acks == {}                          # 不存在的文件 = 没有确认
 
@@ -157,9 +161,25 @@ def test_shipped_acks_cover_the_two_known_layout_mismatches():
     shipped = pathlib.Path(__file__).resolve().parent.parent / ".agents" / "acks.json"
     acks, problems = history.load_acks(shipped)
     assert problems == []
-    for show in ("胆大党", "超超超超超喜欢你的100个女朋友"):
-        fp = history.fingerprint(_layout(show=show))
-        assert fp in acks and acks[fp]["reason"]
+
+    # 生产的形状：库内按分季目录放（sidecar 的 have 在 Season 2 / 3 下），TMDB 只有一季
+    lib.tmdb.enabled = True
+    for i, (show, extra) in enumerate((("胆大党", [2]), ("超超超超超喜欢你的100个女朋友", [2, 3]))):
+        sh = lib.show(show)
+        seasons = {}
+        for sn in [1, *extra]:
+            sh.season(sn).local(f"{show} S{sn:02d}E01.mkv")
+            seasons[str(sn)] = {"have": [1]}
+        sh.tmdb(4000 + i, seasons={1: weekly(24, first_days_ago=200)})
+        sh.sidecar(seasons=seasons)
+
+    found = [f for f in lib.diagnose(detectors=[EpisodeAvailableDetector])
+             if f.kind == "season_layout_mismatch"]
+
+    assert sorted(f.show for f in found) == ["胆大党", "超超超超超喜欢你的100个女朋友"]
+    for f in found:
+        fp = history.fingerprint(f)
+        assert fp in acks and acks[fp]["reason"], (f.show, fp)
 
 
 # ------------------------------------------------------------------ 配置
