@@ -262,8 +262,10 @@ d08f05a7 成了幻影——`torrents/files` 报着 `朱音落语 S01E12.mp4`、�
 - `_op_rename`：盘上不在之外，再问活的 `torrents/files`：目标路径还被另一个种子
   （优先级非 0 的条目）声明着就跳过，理由写明是哪个种子（`_claimants`）。本地文件改名同样适用。
 
-**遗留**：critic N6 说的"集位占用"要成为所有写路径的共用闸门——`rename_single_video`
-（抓取后的即时改名）、`relink_torrent`、逆改名、`readd_torrent` 还没接上 `_claimants`。
+**遗留**（第 2 阶段已接上）：critic N6 说的"集位占用"要成为所有写路径的共用闸门——
+`rename_single_video`（抓取后的即时改名）、`relink_torrent`、逆改名、`readd_torrent` 当时还没接上
+`_claimants`。第 2 阶段把它换成共用原语 `media_agent/claims.py`、接到了全部写路径上（`_claimants`
+已删），见 `architecture/2026-09-26-path-claims.md`。
 
 **测试**：`tests/test_phantom_slot.py`——审查原样现场收敛后只剩 K 一个声明、隔离区为空；
 幻影名字更好 / 钉了 `ma:` 时真文件都不进隔离区；只跑改名规则时，有种子与本地文件都不会

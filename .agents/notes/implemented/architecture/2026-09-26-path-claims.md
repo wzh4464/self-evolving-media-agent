@@ -249,3 +249,20 @@ qBittorrent 就又要往那个路径写。此后若另一个种子映射到了�
 
 **测试**：`tests/test_rollback_claims.py` 末条——合集里的幻影条目被设为不下载，之后另一个种子映射到
 同名，回退跳过、优先级仍是 0（改前红）。
+
+## 10. 契约（给后续改动者）
+
+- **新加任何往媒体库里落名字的动作**（改名、setLocation、renameFile、从别处搬回、加种、恢复
+  优先级……），落笔前 `self._claims().check(目标, own_hash=…, own_path=…)`（目录用 `check_dir`），
+  不空闲就不写：`unknown` 非空 → 拒绝（正向动作记 failed「未做任何改动」，逆操作跳过）；
+  `claimants` 非空 → skipped，审计里放 `claims` / `claimants`。AGENTS.md 第 8 条。
+- **改完要让索引作废**：执行器写任何非 skipped 审计时自动作废；审计之前就改了东西、之后同一个
+  动作里还要再问的（加种之后的即时改名、repair 的多对合并）要手动 `invalidate()`；`rollback`
+  每步之后作废。
+- `own_path` 给的是**此刻**（改名前）的绝对路径；`own_hash` 与它一起豁免"自己那个条目"。
+  只给 `own_hash` 会豁免这个种子的所有条目——只在确实如此时用。
+- `disk=False` 只用于目标文件按设计就该在盘上的场合（relink 正向、重加种子、恢复优先级）。
+- 仍然没接的写路径与留作后续的事项见各节"不做的"与 CHANGELOG；目前有：加种本身
+  （`add_torrent` 时 .torrent 里的文件名可能与别人的声明重名）、`relocate`（只有演进规则会发，
+  已被 N5 的闸门整条拦下）、正向 `_merge_tree` 与异步 setLocation 的竞速、死种留下的孤儿
+  `.!qB` 挡住换源新种子改名（`test_grab_stale_bypass.py` 的 xfail）。

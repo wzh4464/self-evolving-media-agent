@@ -88,6 +88,13 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
 7. **修订阅时三步顺序不能反**：先改 `title_aliases`/`rss_link` → 再清"已登记但
    不在 qBittorrent"的 torrent 记录 → 最后刷新。`pull_rss` 只处理 `check_new()`
    筛出的新条目，顺序反了会让 AutoBangumi 用**仍然失效**的规则把条目重新登记一遍。
+8. **往媒体库里落一个名字之前，先问 `claims` 它此刻归谁。** 盘上看不到不等于没人占：
+   0% 的种子、只有 `X.!qB` 的下载、只差大小写的名字（生产卷是大小写不敏感的 APFS）
+   都算占用。改名、抓取后改名、relink、目录改名、回退里的每个写路径都走
+   `Executor._claims()`（`ClaimIndex.check` / `check_dir` / `claims_under`）；被占就跳过
+   并写明占用者，**看不全（qBittorrent 读失败）就拒绝**。新加的写路径同样要接，改完东西
+   要让索引作废（执行器在写非 skipped 审计时自动作废）。见
+   [路径占用](.agents/notes/implemented/architecture/2026-09-26-path-claims.md)。
 
 ## 自演进的闭环
 
