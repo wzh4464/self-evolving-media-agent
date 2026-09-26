@@ -100,7 +100,7 @@ Even in full-auto mode:
   is proven. Anything that needs a human is kept and listed. Every hard delete is
   written to `state/purge.jsonl` *before* it happens. When the disk gets low,
   already-proven duplicates are released oldest first.
-- **Per-run caps.** More than 50 files or 200 GB in one pass? The whole batch is
+- **Per-run caps.** More than 50 files or 200 GB in one run (all iterations together)? The rest is
   skipped and flagged — a wrong rule can't run away.
 - **Full audit trail.** Every action, skip, and failure lands in `state/audit.jsonl`.
 - **Defense in depth.** Action args are validated at proposal time *and* again at
@@ -120,6 +120,31 @@ name across all their files. The dry run caught it; the fix and the reasoning ar
 [recorded as a bug-fix note](.agents/notes/implemented/bug-fix/2026-08-17-collection-torrent-episode-collapse.md).
 Two more self-defects surfaced the same way. **Rules will be wrong — full autonomy
 is only safe because being wrong is recoverable.**
+
+## One run, finished
+
+A run used to diagnose everything once and then execute: whatever an action made
+possible had to wait for the *next* run, six hours later. An AutoBangumi duplicate
+landing in the `Bangumi` category took three runs to settle (hand the category over,
+then dedupe, then rename the winner into the freed slot); a grab whose metadata
+arrived late stayed release-named for a run.
+
+Now `run` repeats scan → diagnose → execute until an iteration changes nothing new
+(at most `MAX_ITERATIONS`, default 3):
+
+- **One executor per run**: one run id (still one rollback unit), delete caps that
+  count the whole run, not each iteration.
+- **No retries within a run.** An action that was applied, failed, came back unknown
+  or was refused by a gate is not tried again; only "blocked right now" skips (the
+  target slot is occupied) are retried after another rule freed it.
+- **Two rules fighting are stopped.** An action that would undo one applied earlier
+  in the same run (rename back, category back, drop what was just grabbed) is refused
+  and reported as an `oscillation` finding.
+- **Reaching the cap is a warning** listing what is still pending. Every iteration
+  after the first hits only caches (TMDB episode tables are cached per season: 6 h
+  while airing, 7 days once ended), so an extra iteration costs a couple of seconds.
+- Findings history, stuck detection and the health report look at the *final*
+  diagnosis; a partial qBittorrent read in any iteration refuses as before.
 
 ## Knowing when it has quietly stopped
 
@@ -167,7 +192,7 @@ uv run media-agent diagnose            # run every rule, read-only
 uv run media-agent apply --dry-run     # preview fixes
 uv run media-agent apply               # execute
 uv run media-agent evolve              # draft rules for the blind spots
-uv run media-agent run                 # one full autonomous cycle
+uv run media-agent run                 # one full autonomous cycle, iterated to a fixed point
 uv run media-agent health              # the last run's health report
 uv run media-agent ack <fp> --reason … # acknowledge a stuck finding (commit .agents/acks.json)
 uv run media-agent ledger backfill --dry-run   # provenance coverage (every run backfills new torrents)
@@ -204,6 +229,7 @@ media_agent/
   scan.py         Disk + qBittorrent + AutoBangumi → one LibraryState
   plugins/        The nine built-in detectors
   actions.py      Executor + quarantine + caps + audit log
+  converge.py     One run to a fixed point: scan → diagnose → execute, no retries, no flip-flops
   history.py      Findings history, fingerprints, stuck detection, acknowledgements
   titles.py       TMDB title stability: a new title needs two consecutive runs, no flip-back within 30 days
   health.py       Per-run health report, torrent-count plausibility

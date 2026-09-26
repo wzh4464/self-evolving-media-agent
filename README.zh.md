@@ -93,7 +93,7 @@ agent 产出的是**声明式 JSON**，由固定的解释器求值。它只能�
 - **隔离区，而非删除。** 移除 = 移入 `state/trash/<日期>/`，可还原。真删按类别：特典与死种半成品
   30 天后删，判重要证明库里有完整的替代者才删，要人定的永不自动删、在日志里列出来。每一次硬删除都先记进
   `state/purge.jsonl` 再动手；磁盘紧张时从最老的"已证明安全"的判重开始提前删。
-- **单轮配额。** 一轮超过 50 个文件或 200 GB？整批跳过并告警——写错的规则跑不脱缰。
+- **单轮配额。** 一轮（各次迭代合起来）超过 50 个文件或 200 GB？其余的跳过并告警——写错的规则跑不脱缰。
 - **完整审计。** 每个动作、跳过、失败都落在 `state/audit.jsonl`。
 - **纵深防御。** 动作参数在提议时验一次、执行时再验一次。
 - **解析失败闸。** 超过 3 个文件声称是同一集，判定为解析出错而非重复，**不删任何东西**。
@@ -106,6 +106,23 @@ agent 产出的是**声明式 JSON**，由固定的解释器求值。它只能�
 修复与推理[记录在这篇 bug-fix note](.agents/notes/implemented/bug-fix/2026-08-17-collection-torrent-episode-collapse.md) 里。
 同样的方式还揪出了另外两个自身缺陷。**规则一定会写错——全自动之所以敢开，
 是因为写错了能救回来。**
+
+## 一轮做完
+
+以前一轮 `run` 是"先全量诊断、再统一执行"：执行里做成的事，要等**下一轮**（6 小时后）才看得见。AutoBangumi 的
+重复版本落在 `Bangumi` 分类要三轮才了结（交接分类 → 判重 → 赢家改进腾出来的集位）；抓取之后元数据来晚了，文件在
+发布名上躺一轮。
+
+现在 `run` 重复"扫描 → 诊断 → 执行"，直到某次迭代没有做成任何新动作（最多 `MAX_ITERATIONS` 次，默认 3）：
+
+- **一轮一个执行器**：一个批次 ID（仍是一个回退单元），删除配额管整轮、不是每次迭代。
+- **一轮之内不重试。** 执行过、失败、未确认、被闸拦下的动作不再试；只有"此刻被挡着"的跳过（集位被占）在别的规则
+  腾出来之后再试。
+- **两条规则打架会被拦下。** 一个动作要是会撤销同一轮里已执行的动作（改名改回去、分类改回去、刚抓的又要摘），
+  拒绝它、报一条 `oscillation`。
+- **到了上限是 warn**，列出还要做的。第二次迭代起全走缓存（TMDB 分集表按季缓存：在播 6 小时、播完 7 天），多一次
+  迭代只多几秒。
+- 发现历史、卡住检测、健康报告看的是**最后一次**诊断；任何一次迭代读 qBittorrent 不完整都照旧整批拒绝。
 
 ## 悄悄停摆必须被看见
 
@@ -141,7 +158,7 @@ uv run media-agent diagnose            # 跑全部规则，只读
 uv run media-agent apply --dry-run     # 预演修复
 uv run media-agent apply               # 执行
 uv run media-agent evolve              # 为盲区起草规则
-uv run media-agent run                 # 一轮完整自治
+uv run media-agent run                 # 一轮完整自治（迭代到不动点）
 uv run media-agent health              # 最近一轮的健康报告
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题（要提交 .agents/acks.json）
 uv run media-agent ledger backfill --dry-run   # 出处覆盖率（每轮 run 会自动补新种子）
@@ -177,6 +194,7 @@ media_agent/
   scan.py         磁盘 + qBittorrent + AutoBangumi → 统一的 LibraryState
   plugins/        九条内置检测器
   actions.py      执行器 + 隔离区 + 配额 + 审计日志
+  converge.py     一轮之内收敛：扫描 → 诊断 → 执行到不动点，不重试、不来回改
   titles.py       TMDB 标题稳定闸：新标题连看两轮才采用，30 天内不改回去
   evolution.py    残留 → 提议 → 影子验证 → 提升
 .agents/

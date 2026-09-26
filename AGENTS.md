@@ -19,6 +19,7 @@ media_agent/
   clients.py      capability 的 provider 实现（qBit/AutoBangumi/TMDB/AniList/LLM）
   plugins/        内置检测器
   actions.py      执行器 + 隔离区 + 配额上限 + 审计日志
+  converge.py     一轮之内收敛：扫描 → 诊断 → 执行重复到不动点（一个执行器、试过的不再试、撤销本轮动作的拒绝）
   audit.py        audit.jsonl 的读写：写永不抛（降级 / 转写 audit.fallback.jsonl），读两个文件一起读
   purge.py        隔离区里每一份能不能真删（按处置类别的判据）
   disposal.py     硬删除的唯一出口：预写 purge.jsonl、容量闸、run / purge 的处置
@@ -52,7 +53,7 @@ uv run media-agent diagnose           # 跑全部规则，出问题清单（只�
 uv run media-agent apply --dry-run    # 预演修复
 uv run media-agent apply              # 执行修复
 uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
-uv run media-agent run                # 完整自治轮次（演进默认冻结），末尾处置隔离区
+uv run media-agent run                # 完整自治轮次：迭代到不动点（MAX_ITERATIONS，默认 3；演进默认冻结），末尾处置隔离区
 uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题、先不提醒（写 .agents/acks.json，要提交）
 uv run media-agent health               # 最近一轮的健康报告（--run ID 指定一轮，--json 原样）
@@ -63,8 +64,8 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
 
 **改动删改类逻辑前先写离线测试。** 用 `tests/harness` 的 `LibraryBuilder`
 把事故现场搭出来（范例见 `tests/test_e2e_smoke.py`，fixture 一览见
-`tests/harness/__init__.py`），`lib.cycle()` 跑一轮
-扫描 → 全量规则 → 执行。测试里触发的 failed 审计、被吞的检测器异常、
+`tests/harness/__init__.py`），`lib.cycle()` 跑一次
+扫描 → 全量规则 → 执行，`lib.loop()` 像 `run` 那样迭代到不动点（`tests/test_converge.py`）。测试里触发的 failed 审计、被吞的检测器异常、
 没配路由的 URL 都会让测试变红，需要时用 `@pytest.mark.allow(...)` 显式声明。
 见 [离线测试基座](.agents/notes/implemented/testing/2026-09-26-offline-test-harness.md)。
 
@@ -155,6 +156,13 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     `builtin.recorded_slot` / `ledger_view`（钉子 > 账本 > 名字，`_resolve` 已经这样），版本词用 `release_text`
     （番组页标题 + 显示名），新写的加种路径要调 `ledger.record_grab`。账本读不了时一切按名字走、健康报告说出来，
     **永不因账本拦下一轮**。见 [出处账本](.agents/notes/implemented/architecture/2026-09-27-provenance-ledger.md)。
+
+15. **一轮 `run` 迭代到不动点，一轮一个执行器**（`media_agent/converge.py`）。扫描 → 诊断 → 执行重复到某次迭代没有新动作
+    （`MAX_ITERATIONS`）：配额、批次 ID、`_grabbed` 跨迭代；按路径记的本批次状态每次迭代清掉（`Executor.new_iteration`）。
+    **新加的动作**：在 `converge._TARGET` 里写明它"对谁"做（没写的按全部参数认，一轮只试一次）；有逆操作的，让
+    `converge.undoes` 认得出它的反向——撤销本轮已执行动作的一律拒绝、报 `oscillation`；只有"此刻被挡着、别的动作能挪开"的
+    跳过才进 `converge.RETRYABLE`。一轮只做一次的事（发现历史、标题稳定闸、卡住检测、健康报告）按**最后一次**诊断做，
+    不在迭代里做。见 [一轮之内收敛](.agents/notes/implemented/architecture/2026-09-27-converge-within-a-run.md)。
 
 ## 自演进的闭环
 
