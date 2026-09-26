@@ -27,14 +27,18 @@ from .. import preferences
 from ..cache import Cache, FEED_TTL, LOOKUP_TTL, season_episodes
 from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
                       tmdb_groups)
-from ..naming import (SPECIAL_RE, declared_seasons, parse_episode, parse_pin, season_of_dir,
-                      slot_in_season)
+from ..naming import (SPECIAL_RE, declared_seasons, offset_episode, parse_episode, parse_pin,
+                      season_of_dir, slot_in_season)
 from ..sidecar import load as load_sidecar
 from .subscription import (MIKAN, _disk_episodes, _http_get,
                            _mikan_search_ids, is_seasonal)
 
 # 单轮为一部番最多提议抓几集，防止新订阅时一次刷屏
 MAX_PER_SHOW = 6
+
+# 一集播出多少天之后，番组页上还一个发布都没有才报（`episode_not_released`）。字幕组一般一两天内出；
+# 在这之前是正常的等待，每轮都报只会把真问题淹掉。
+NO_RELEASE_GRACE_DAYS = 3
 
 # 上一次为（这部番, 这一季）选中的番组页记多久。它只是下一轮候选里排第一的那个、每轮照样按播出日期
 # 重新打分，所以放得久一点无妨；过期了也只是回到"按 rss_link / 标题重新搜"。
@@ -306,6 +310,8 @@ class EpisodeAvailableDetector:
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         if not (ctx.tmdb and ctx.tmdb.enabled):
             return
+        from .builtin import episode_offset_for
+
         cache = Cache(ctx.config.cache_db)
         rules = preferences.load_rules()
         today = date.today().isoformat()
@@ -475,6 +481,11 @@ class EpisodeAvailableDetector:
                 off_by_season = {int(k): int(v)
                                  for k, v in (sc.season_offsets or {}).items()
                                  if str(k).isdigit()}
+                # 集号偏移（critic N13）：AB 37《100个女朋友》第三季的发布按连续集号编，`- 25` 是 S03E01。以前这里
+                # 只认原始集号：`by_ep[25]` 有、要找的 `by_ep[1]` 空着，下面一句 `continue`——既不抓也不报，AB 一退役
+                # 这部番就无声地停了。偏移与判重 / 改名 / 出处账本同一个口径（`episode_offset_for`、`offset_episode`：
+                # 换算出非正数的不收，理由记进 `off_season`，照样报出来）
+                ep_off = episode_offset_for(show, int(season_key)) if int(season_key) else 0
                 by_ep: dict[int, list[dict]] = {}
                 off_season: dict[int, list[tuple[dict, str]]] = {}
                 for it in items:
@@ -482,15 +493,23 @@ class EpisodeAvailableDetector:
                     if n is None:
                         continue
                     ep_here, why = _slot_in_season(it["title"], n, int(season_key), off_by_season)
+                    if ep_here is not None and ep_off:
+                        shifted = offset_episode(ep_here, ep_off)
+                        if shifted is None:
+                            why = (f"按集号偏移 {ep_off:+d} 换算出非正数（{ep_here} → {ep_here + ep_off}），"
+                                   f"说不清是哪一集")
+                        ep_here = shifted
                     if ep_here is None:
                         off_season.setdefault(n, []).append((it, why))
                     else:
                         by_ep.setdefault(ep_here, []).append(it)
 
+                silent: list[int] = []           # 归拢表里什么都没有的集：循环之后统一说
                 for ep in missing[:MAX_PER_SHOW]:
                     raw = by_ep.get(ep) or []
                     elsewhere = off_season.get(ep) or []
                     if not raw and not elsewhere:
+                        silent.append(ep)
                         continue
 
                     # 先按播出日期把明显错季的剔掉，再交给偏好打分。
@@ -511,8 +530,8 @@ class EpisodeAvailableDetector:
                                 subject=f"S{int(season_key):02d}E{ep:02d}",
                                 summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                          f"只搜到 {len(wrong_season) + len(elsewhere)} 个明显属于别季的同集号"
-                                         f"发布（{len(elsewhere)} 个标的是别季 / 不是特典，{len(wrong_season)} 个"
-                                         f"早于播出），全部跳过"),
+                                         f"发布（{len(elsewhere)} 个标的是别季 / 不是特典 / 按集号偏移换算不进来，"
+                                         f"{len(wrong_season)} 个早于播出），全部跳过"),
                                 show=show.dir_name,
                                 evidence={"season": season_key, "episode": ep,
                                           "air_date": air_of.get(ep, ""), "mikan_id": mid,
@@ -577,6 +596,49 @@ class EpisodeAvailableDetector:
                             note="加入 qBittorrent 并把该集写进 sidecar 的 have 清单",
                         ),
                     )
+                if silent:
+                    yield from self._silent(show, int(season_key), silent, by_ep, eps, air_of, mid,
+                                            ep_off, today)
+
+    def _silent(self, show, season: int, silent: list[int], by_ep: dict, eps: list[dict],
+                air_of: dict, mid: str, ep_off: int, today: str) -> Iterable[Finding]:
+        """要找的集在归拢表里什么都没有（N13 以前的 bare `continue`）：说出来。
+
+        - 番组页上有编号落在这一季**之外**（比 TMDB 这一季最后一集还大）：多半是按连续集号发布、又没登记集号偏移——
+          这一季一集都抓不到，报 `episode_numbering_mismatch`（important），带上按最小编号推测的偏移供人核对；
+        - 否则是真的还没人发：播出超过 `NO_RELEASE_GRACE_DAYS` 天的才报 `episode_not_released`（minor），刚播的是
+          正常的等待。"""
+        last = max((int(e["episode_number"]) for e in eps if e.get("episode_number")), default=0)
+        unplaced = sorted(n for n in by_ep if n > last)
+        if unplaced:
+            guess = 1 - unplaced[0] + (ep_off or 0)
+            yield Finding(
+                rule=self.id, kind="episode_numbering_mismatch", severity="important",
+                subject=f"S{season:02d}",
+                summary=(f"「{show.official_title}」S{season} 缺 {silent}，番组页上的发布编号 "
+                         f"{unplaced[0]}–{unplaced[-1]} 却落在 TMDB 第 {season} 季（{last} 集）之外——多半是按连续集号"
+                         f"发布：在 sidecar 的 episode_offsets 里登记这一季的偏移（若 {unplaced[0]} 就是第 1 集："
+                         f"{{\"{season}\": {guess}}}），之前这一季一集都抓不到"),
+                show=show.dir_name,
+                evidence={"season": season, "missing": silent, "unplaced": unplaced[:24],
+                          "season_episodes": last, "episode_offset": ep_off,
+                          "suggested_offset": guess, "mikan_id": mid},
+            )
+            return
+        cutoff = (date.fromisoformat(today) - timedelta(days=NO_RELEASE_GRACE_DAYS)).isoformat()
+        overdue = [ep for ep in silent if (air_of.get(ep) or today) <= cutoff]
+        if not overdue:
+            return
+        yield Finding(
+            rule=self.id, kind="episode_not_released", severity="minor", subject=f"S{season:02d}",
+            summary=(f"「{show.official_title}」S{season} 的 {overdue} 播出已超过 {NO_RELEASE_GRACE_DAYS} 天，"
+                     f"番组页 {mid} 上还没有这几集的任何发布（字幕组断更、番组页选错了，或发布标题认不出集号）"),
+            show=show.dir_name,
+            evidence={"season": season, "episodes": overdue,
+                      "waiting": [ep for ep in silent if ep not in overdue],
+                      "air_dates": {str(ep): air_of.get(ep, "") for ep in overdue},
+                      "grace_days": NO_RELEASE_GRACE_DAYS, "mikan_id": mid},
+        )
 
 
 GRAB_DETECTORS = [EpisodeAvailableDetector]

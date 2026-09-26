@@ -188,7 +188,7 @@ sidecar 的 `require_any` 以前只在抓取挑候选时用。封存时也核对
 - 补录不看回退：审计里被回退过的抓取（`ungrab_episode`）补录时仍记为有效行（回退只撤销 `have`，种子与钉子都还在）。
 - `manual` 只来自 `manual:` 标签；`group:` 标签的人手加种（离线核对里的大部分剩余）仍是"没有出处"。
 - 演进规则的 DSL 还没有账本字段（`_FIELD_GETTERS`）。
-- AB `episode_offset` 番的抓取（critic N13）不在这一步。
+- AB `episode_offset` 番的抓取（critic N13）不在这一步——第 5 阶段处理了，见 `architecture/2026-09-27-episode-offsets.md`。
 
 ## 测试
 

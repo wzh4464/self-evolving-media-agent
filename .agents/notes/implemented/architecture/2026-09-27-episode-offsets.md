@@ -43,12 +43,27 @@ critic N13：抓取对 AB 带 `episode_offset` 的番无能为力、而且不出
 
 `media_agent/abrow.py`：AB 订阅行上要读的几样（库内季、番目录名、番组页 id、偏移），只读。
 
+## 抓取（N13 的后一半）
+
+- 候选按集号归拢时（`EpisodeAvailableDetector`，`by_ep`）先按声明的季号换算（`slot_in_season`，LAT-03），再加这一季的
+  集号偏移（`episode_offset_for`）——与判重、改名、出处账本同一个口径。换算出非正数的发布（`第三季 - 01` 配上 -24）不收，
+  理由（"按集号偏移 -24 换算出非正数"）进 `rejected_by_season`，照样报「明显属于别季」。
+- **归拢表里什么都没有的集不再 bare `continue`**，每季循环之后统一说：
+  - 番组页上有编号比 TMDB 这一季最后一集还大（`- 25`…`- 30` 对一个 12 集的季）：`episode_numbering_mismatch`
+    （important，subject `Sxx`）——多半是连续编号、没登记偏移，这一季一集都抓不到；带上按最小编号推测的偏移
+    （`suggested_offset`，"若 25 就是第 1 集"）给人核对；
+  - 否则是真的还没人发：播出超过 `NO_RELEASE_GRACE_DAYS`（3）天的才报 `episode_not_released`（minor，subject `Sxx`，
+    `episodes` 与还在正常等待的 `waiting`）。刚播出的不报——每轮都报只会把真问题淹掉。
+- 抓取的钉子与出处账本记的是换算后的集位（`ma:S03E01`），不是发布名里的 25（钉子早就是抓取器定的集位，这里只是让它
+  算对）。
+
 ## 对生产的影响
 
 - 只有 AB 37 一条有偏移。它的 Season 1 / 2 里要是还有没改名的 `- NN` 发布名文件，以前认不出（-24 之后非正），现在
   按 S01ENN / S02ENN 认——正确的方向。
 - 迁移（把 AB 行上的偏移写进 sidecar）是另一个动作，另作一步；在那之前规则照旧从 AB 行上读，那一季的行为不变。
-- 抓取还不看偏移（N13 的后一半），另作一步。
+- 抓取：AB 37 第三季缺的集从此能按连续编号的发布抓（AB 还开着时两边照旧赛跑，由封存 + 判重收尾，与别的番一样）。
+  新的两种发现在生产上会出现在"番组页选错了 / 字幕组断更"的季上——以前它们只是没动静。
 
 ## 测试
 
@@ -56,3 +71,8 @@ critic N13：抓取对 AB 带 `episode_offset` 的番无能为力、而且不出
 `{"3": 0}` 盖过 AB 的 -24；AB 的偏移只对它那一季（Season 1 的 `- 05` 以前认不出）；AB 的 `season_offset` 把偏移挪到
 `Season <season + season_offset>`；AB 行停用之后 sidecar 照样换算；出处账本按同一个口径从番组页标题重算（以前没有 AB 行
 就算成 (3, 25)、要改名成 S03E25）；写坏的项不崩。`tests/test_episode_offset.py` 原有的 5 条照旧通过。
+
+`tests/test_grab_episode_offset.py`：AB 行上的 -24 让 `- 25` 抓成 S03E01；AB 行没了、只有 sidecar 的也行；没有偏移时报
+`episode_numbering_mismatch`（带 `unplaced` 与推测的 -24）；换算出非正数的 `第三季 - 01` 不收、写明为什么；一两周都没有
+发布的报 `episode_not_released`、两天前刚播的算等待；只差刚播那一集时什么都不报；执行后钉子与账本是 S03E01。改之前
+7 条里 6 条红（剩下那条是"刚播的不报"的对照）。
