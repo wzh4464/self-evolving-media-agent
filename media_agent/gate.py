@@ -32,7 +32,8 @@
   豁免这次动作自己要处置的那个种子的那个条目；本批次已摘的种子不算）。
 - **I3 不为了去掉一个文件整种子作废多文件种子**：所属种子此刻要下载的文件多于一个时，
   **自动降级**成只作废这一个条目（按 `save_path + 条目名` 的完整路径认），并在审计里记一笔；
-  只剩这一个时反过来整种子作废（留一个什么都不下的空种子会被 stale-torrent-path 报成死链）。
+  要下载的只剩**它自己**时反过来整种子作废（留一个什么都不下的空种子会被 stale-torrent-path
+  报成死链）；它本来就是优先级 0 时种子一点不动，只搬文件。
 - **I4 不删封存了集位的文件**：钉了 `ma:SxxEyy`、复核（`meets_requirements`）通过。**探测不可用
   （`probe` 返回 None：超时、出错）一律当作封存**——封存不能因为某一轮 ffprobe 超时就丢；
   例外是合并发布里同一个种子的兄弟文件：封存由判重选中的那一份（同一个种子、同一个钉子）持有，
@@ -247,12 +248,19 @@ def check_trash(ex, f: Finding, path: Path) -> Verdict:
             return v.fail("种子文件列表里找不到该文件（或不止一条匹配），拒绝只搬文件、不改种子",
                           gate="mismatch")
         v.entry = entry
+        # 按**成员**定，不按个数定（2026-09-26 审查）：要删的这个已是优先级 0 时，"只剩一个要下载的"
+        # 是**别的**文件——以前照样整种子摘掉，正在做种的那一集跟着没了，回退也加不回来。
         file_only = bool(a.args.get("file_only"))
-        if len(wanted) > 1 and not file_only:
-            file_only = True
-            v.notes.append(i3_note(wanted, entry))
-        elif len(wanted) <= 1:
-            file_only = False                # 只剩它一个：设为不下载会留下一个空种子
+        if entry.get("priority", 1) == 0:
+            file_only = True                 # 它已经不下载了：种子一点不用动，只搬文件
+            v.notes.append(f"I3：{entry['name']} 在所属种子里已是不下载（优先级 0），"
+                           f"种子不动、只把文件移进隔离区")
+        elif len(wanted) > 1:
+            if not file_only:
+                file_only = True
+                v.notes.append(i3_note(wanted, entry))
+        else:
+            file_only = False                # 要下载的只剩它一个：设为不下载会留下一个空种子
         v.file_only = file_only
 
     # ---- I2：别的种子仍声明着这个路径

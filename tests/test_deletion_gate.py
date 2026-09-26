@@ -167,6 +167,46 @@ def test_i3_phantom_member_of_a_pack_is_not_dropped_whole(lib):
     assert any("I3" in n for n in rec["deletion"]["notes"])
 
 
+def test_i3_target_already_unwanted_leaves_its_torrent_alone(lib):
+    """2026-09-26 审查（复现）：I3 按"要下载的条目数"定整种子作废还是只作废这一个，却从没问要删的这个
+    是不是其中之一。它已是优先级 0、种子只剩**另一个**要下载的文件时，以前整种子摘掉——正在做种
+    E06 的种子没了，回退也加不回来（`restore_from_trash` 没有 magnet）。它已经不下载了，种子不用动。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    pack = s1.torrent({"尼古喵喵 S01E05.mkv": GB, "尼古喵喵 S01E06.mkv": GB},
+                      name="[G] Yani Neko 05-06", layout="nosub",
+                      priorities={"尼古喵喵 S01E05.mkv": 0})
+    s1.local("尼古喵喵 S01E05 [BD].mkv", size=GB)
+    e05 = s1.path / "尼古喵喵 S01E05.mkv"
+
+    rep = lib.apply([_trash(e05, pack.hash, rule="manual", kind="manual")])
+
+    [rec] = rep.applied
+    assert lib.qbit.has(pack.hash)
+    assert _priorities(lib, pack.hash) == {"尼古喵喵 S01E05.mkv": 0, "尼古喵喵 S01E06.mkv": 1}
+    assert rec["undo"]["torrent_record_lost"] is False and not e05.exists()
+    assert any("优先级 0" in n for n in rec["deletion"]["notes"])
+    assert not [c for c in lib.qbit.calls if c[0] in ("delete", "set_file_priority")]
+
+
+def test_i3_unwanted_member_of_an_original_layout_torrent_at_the_media_root(lib):
+    """审查的整条链：Original 布局、save_path 就是媒体根的种子，scan 的来源 2 凭 content_path 把它的
+    hash 挂到盘上的每个文件——包括优先级 0 的那个。判重输家正是它。"""
+    from harness.library import DirBuilder
+
+    sh = lib.show("尼古喵喵")
+    t = DirBuilder(sh, lib.media_root).torrent(
+        {"Season 1/尼古喵喵 S01E05.mkv": GB, "Season 1/尼古喵喵 S01E06.mkv": GB},
+        name="尼古喵喵", layout="original", priorities={"Season 1/尼古喵喵 S01E05.mkv": 0},
+        probe=RAW)
+    sh.season(1).single("尼古喵喵 S01E05 [BD 1080p].mkv", size=4 * GB, probe=CHI,
+                        name="[BD] Yani Neko - 05 [1080p].mkv")
+
+    lib.cycle()
+
+    assert lib.qbit.has(t.hash)
+    assert (sh.path / "Season 1" / "尼古喵喵 S01E06.mkv").exists()
+
+
 # ------------------------------------------------------------------ 演进规则
 def test_evolved_rule_trash_is_refused_by_the_gate_itself(lib):
     """第 1 阶段在 `_dispatch` 拦演进规则；关口自己也认——绕过分派直接调 `_op_trash`

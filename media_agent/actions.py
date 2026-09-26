@@ -1377,8 +1377,8 @@ class Executor:
             record_lost = True
             self._removed_torrents.add(h)
             self._removed_subjects[h] = v.subject
-        elif h:
-            # 只作废种子里的某个文件：设为不下载，保留其余部分
+        elif h and v.entry.get("priority", 1) != 0:
+            # 只作废种子里的某个文件：设为不下载，保留其余部分（已是不下载的条目不用再动种子）
             try:
                 self.ctx.qbit.set_file_priority(h, [v.entry["index"]], 0)
             except Exception as e:
