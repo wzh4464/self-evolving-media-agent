@@ -219,3 +219,9 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
 `readd_torrent` 的逆是再摘掉）各自要过删除关口与占用检查，不是把记录反过来就行——需要时另起一个阶段。
 
 **测试**：`tests/test_rollback_steps.py`。
+
+## 9. 部署前的状态备份带上 audit.fallback.jsonl
+
+`deploy.sh` 切换前把小体量状态复制到 `state/backups/<时间>-<版本>/` 供手工比对（代码回滚从不回卷审计）。
+`audit.fallback.jsonl` 是审计的一部分（回退、`runs`、隔离区处置一起读它），同样复制；文件不存在就跳过，
+与 `deploy.history` 同一写法。

@@ -325,7 +325,7 @@ switch_phase() {
     # audit.jsonl——数据回退仍是 media-agent rollback；这份只供手工比对。
     mkdir -p "$BK" || die "建不了备份目录 $BK"
     local f
-    for f in audit.jsonl purge.jsonl cache.sqlite3 deploy.history; do
+    for f in audit.jsonl audit.fallback.jsonl purge.jsonl cache.sqlite3 deploy.history; do
         [ -f "$APP/state/$f" ] && cp -p "$APP/state/$f" "$BK/"
     done
     [ -f "$AGENTS_DIR/$PLIST_NAME" ] && cp -p "$AGENTS_DIR/$PLIST_NAME" "$BK/"

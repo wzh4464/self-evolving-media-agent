@@ -293,6 +293,16 @@ def test_deploys_a_tag_in_place(sandbox):
     assert not list((sandbox.root / "tmp").glob("media-agent-stage.*"))
 
 
+def test_backup_includes_the_audit_fallback_file(sandbox):
+    """审计写不进主文件时的转写（`state/audit.fallback.jsonl`）也是审计：回退、runs 一起读它。"""
+    _write(sandbox.app / "state" / "audit.fallback.jsonl", '{"run_id": "20260926T031500.000-1"}\n')
+
+    assert sandbox.deploy("v1.1.0").returncode == 0
+
+    [bk] = (sandbox.app / "state" / "backups").iterdir()
+    assert (bk / "audit.fallback.jsonl").read_text() == '{"run_id": "20260926T031500.000-1"}\n'
+
+
 def test_unchanged_plist_is_left_alone(sandbox):
     assert sandbox.deploy("v1.1.0").returncode == 0
     (sandbox.root / "launchctl.log").unlink()

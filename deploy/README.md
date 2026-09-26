@@ -27,7 +27,7 @@
 | `.agents/rules/`、`.agents/notes/` | git（tag） | 演进规则与 Agent Notes |
 | `.env` | 只在生产（600） | 凭据与开关；`.env.*`（含 `.env.bak-*`）被忽略 |
 | `.venv/` | 只在生产 | 由部署用 `uv sync --frozen` 维护，运行时不再同步 |
-| `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`deploy.log`、`backups/`、`harvest/` |
+| `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`audit.fallback.jsonl`（审计写不进主文件时的转写，回退一起读）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`deploy.log`、`backups/`、`harvest/` |
 | 各番目录里的 `.media-agent.json` | 媒体根下 | 每部番的用户意图，不归部署管，见下节 |
 
 ## 用户意图放在哪
@@ -118,7 +118,7 @@ deploy/deploy.sh v0.2.0
    失败就到此为止。
 4. **切换（持运行锁）。** 等 `state/run.lock`（最多 `DEPLOY_LOCK_WAIT`=900 秒）；
    老代码（v0.1.0）不认锁，所以还要等 launchd 那一轮跑完。然后把小体量状态
-   （`audit.jsonl`、`purge.jsonl`、`cache.sqlite3`、已装的 plist）复制到
+   （`audit.jsonl`、`audit.fallback.jsonl`（有的话）、`purge.jsonl`、`cache.sqlite3`、已装的 plist）复制到
    `state/backups/<时间>-<部署前版本>/`，原地 `git checkout --detach <tag>`、
    `uv sync --frozen`、再跑一遍离线测试。任何一步失败都**自动退回**部署前的版本
    （含 venv 与被接管的文件），`deploy.history` 记 `reverted`。
