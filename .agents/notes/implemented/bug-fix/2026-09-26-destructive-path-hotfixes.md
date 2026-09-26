@@ -285,3 +285,22 @@ d08f05a7 成了幻影——`torrents/files` 报着 `朱音落语 S01E12.mp4`、�
 **测试**：`tests/test_extras_in_progress.py`——下载中的合集（有半成品 / 0% 没落盘）立刻
 设为不下载、正片半成品不动；`converge` 一轮收敛、不再每轮跳过；单文件 PV 摘记录；
 优先级可回退；下完的特典行为不变。
+
+## 11. 抓取的换源放行与死种判据同一口径（第 3 条带来的回归）
+
+**症状（审查复现）**：`grab._inflight` 把"已有种子在下"的集排除在抓取之外，例外是停滞
+太久的——放行换源。main 上放行与判死都是 `now - added_on > DEAD_TORRENT_HOURS`，
+新源抓取（op 0）与旧种子被摘（op 1）同一轮发生。第 3 条把死种改按"最后一次活着"计时，
+`_inflight` 仍用 `added_on`：一个 72 小时前加入、10 小时前还收过数据的种子被放行换源，
+新种子被 `_rename_grabbed` 改到同一个集位名上，旧种子却不算死、不被摘——两个种子
+抢一个文件，colliding-torrent 只报「谁也完不成」不动手；旧种子只要还在给别人传分片，
+`last_activity` 就一直刷新，永远等不到被摘。
+
+**修法**：`builtin.droppable_dead(ctx, t, now)`——"这一轮 dead-torrent 会不会摘掉它"，
+与检测器共用 `is_dead_now` / `_library_show_of` / `last_sign_of_life` /
+`completed_members`（读不到文件列表 = 不知道 = 不放行；有已下完成员的死种检测器只报告，
+这里也不放行）。`_inflight(ctx, show, by_hash)` 只对它放行。
+
+**测试**：`tests/test_grab_stale_bypass.py`——审查原样（72h 加入、10h 前活动）不换源；
+真死的换源且同轮摘掉旧种子、集位只剩新种子声明；刚见过完整副本的不换源；有已下完成员的
+死合集不换源。

@@ -720,6 +720,37 @@ def _library_show_of(save_path: str, media_root: Path) -> str | None:
     return None if not top or top.startswith(".") else top
 
 
+def completed_members(ctx: Context, torrent_hash: str) -> list[str] | None:
+    """种子里已经下完、仍要下载的成员文件；读不到文件列表返回 None（= 不知道）。"""
+    try:
+        entries = ctx.qbit.files(torrent_hash) if ctx.qbit else None
+    except Exception:
+        return None
+    if entries is None:
+        return None
+    return [e["name"] for e in entries
+            if e.get("priority", 1) != 0 and e.get("progress", 0) >= 1]
+
+
+def droppable_dead(ctx: Context, t: dict, now: float) -> bool:
+    """这一轮 dead-torrent 会不会**摘掉**它——与检测器完全同一个判据。
+
+    抓取的换源放行（`grab._inflight`）必须用它：放行抓新源（op 0）的那一轮，
+    旧种子就得同批被摘掉（op 1），否则新种子被改到同一个集位名上，两个种子抢
+    一个文件。以前放行看的是 `now - added_on`，而死种从 2026-09-26 起改按
+    "最后一次活着"计时——72 小时前加入、10 小时前还在收数据的种子被放行换源、
+    却不算死，新旧并存（审查复现）。有已下完成员的死种检测器只报告不摘，这里
+    同样不放行；读不到文件列表（`completed_members` 为 None）也不放行。
+    """
+    if not is_dead_now(t):
+        return False
+    if _library_show_of(t.get("save_path", ""), ctx.config.media_root) is None:
+        return False
+    if now - last_sign_of_life(t, now) < ctx.config.dead_torrent_hours * 3600:
+        return False
+    return completed_members(ctx, t.get("hash", "")) == []
+
+
 class DeadTorrentDetector:
     """0 做种 + availability 0 + 长期停滞 = 死种，等下去也不会有进度。
 
@@ -757,14 +788,9 @@ class DeadTorrentDetector:
             if stalled < threshold:
                 continue
             h = t.get("hash", "")
-            try:
-                entries = ctx.qbit.files(h) if ctx.qbit else None
-            except Exception:
-                entries = None
-            if entries is None:
+            done = completed_members(ctx, h)
+            if done is None:
                 continue                  # 看不到文件列表就不下结论
-            done = [e["name"] for e in entries
-                    if e.get("priority", 1) != 0 and e.get("progress", 0) >= 1]
             evidence = {"num_seeds": t.get("num_seeds"),
                         "num_complete": t.get("num_complete"),
                         "availability": t.get("availability"),
