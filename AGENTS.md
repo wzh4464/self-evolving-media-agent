@@ -133,6 +133,12 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     转写 stderr 与 `audit.fallback.jsonl`）；读审计一律用 `audit.iter_records`，不认识的状态当作"不是已生效"。见
     [审计状态契约](.agents/notes/implemented/architecture/2026-09-26-honest-audit.md)。
 
+12. **"悄悄停摆"必须被看见。** 宽 `except` 要么说出来（`ctx.log` 带上下文、审计、往上抛、交给调用方），要么在那一行
+    注释为什么不说（`tests/test_silent_excepts.py` 按语法检查）。新的健康信号接进 `health.RunHealth`（`run` 收尾不管
+    成败都写报告），critical 的要让退出码非零；有状态的新检测器给集位 / 季级发现填 `Finding.subject`，指纹里**永远
+    不放摘要**。要人处理、短期不会动的卡住问题用 `media-agent ack` 确认（`.agents/acks.json` 是版本化的用户意图）。见
+    [运行健康](.agents/notes/implemented/architecture/2026-09-26-run-health.md)。
+
 ## 自演进的闭环
 
 ```

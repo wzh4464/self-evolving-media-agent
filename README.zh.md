@@ -104,6 +104,25 @@ agent 产出的是**声明式 JSON**，由固定的解释器求值。它只能�
 同样的方式还揪出了另外两个自身缺陷。**规则一定会写错——全自动之所以敢开，
 是因为写错了能救回来。**
 
+## 悄悄停摆必须被看见
+
+这里最贵的故障从来不是崩溃，而是每一步都"成功"、却什么都没往前走：抓取每轮只补一集、连着三天；
+抓取连着十天失败、全记在审计里，launchd 上的退出码一直是 0。所以：
+
+- **发现历史。** 每轮 `run`（与 `diagnose`）把全部发现写进 `state/findings/<批次 ID>.jsonl`，带稳定指纹
+  （规则 + 类型 + 目标，**不含摘要**——摘要里嵌着计数）。
+- **卡住检测。** 同一个指纹连续 4 轮（`STUCK_RUNS`）都在，就报"卡住"、写明从哪一轮起。已知要人处理的用
+  `media-agent ack <指纹> --reason …` 确认，写进版本化的 `.agents/acks.json`。
+- **健康报告。** 每轮收尾（正常、整批拒绝、崩溃都一样）写 `state/health/<批次 ID>.json`，日志末尾一小节：客户端、
+  种子数与上一轮、执行结果、抓取统计、检测器崩溃、隔离区与剩余空间、卡住、超过 12 小时还是发布名的文件，以及总体
+  `ok | warn | critical`。critical 时退出码非零（1 崩溃、3 整批拒绝、4 审计没写全、5 磁盘仍不够）。
+  `media-agent health` 看最近一轮。
+- **qBittorrent 只恢复一部分会话时不动手。** 种子数比上一轮少了 max(20, 10%) 以上、审计又解释不了，整轮拒绝。
+- **有变化才发通知。** 可选的 SMTP 邮件：状态变坏或从 critical 恢复、出现新的卡住问题时发，一轮最多一封，密钥一律遮掉。
+- **看得懂的日志。** run 的每一行带时间与批次 ID；launchd 的日志超过 5 MB 就轮转。
+- **维护暂停。** 有 `state/PAUSE`、或 VPN 救援进行中，`run` / `apply` 以 75 结束、什么都不动；救援脚本与看门狗重建
+  qBittorrent 容器前先拿运行锁。
+
 ## 快速开始
 
 ```sh
@@ -120,6 +139,8 @@ uv run media-agent apply --dry-run     # 预演修复
 uv run media-agent apply               # 执行
 uv run media-agent evolve              # 为盲区起草规则
 uv run media-agent run                 # 一轮完整自治
+uv run media-agent health              # 最近一轮的健康报告
+uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题（要提交 .agents/acks.json）
 ```
 
 建议先 `diagnose`，再 `apply --dry-run`。**读清楚它想干什么之后**，
