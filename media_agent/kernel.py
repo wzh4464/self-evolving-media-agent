@@ -119,6 +119,12 @@ class MediaFile:
     torrent_progress: float = 0.0
     torrent_tags: str = ""
     torrent_category: str = ""
+    # 出处账本里这个种子的那一行（`ledger.Row`）：番组页标题、抓取器定的集位、发布方声明的季号。扫描时挂上，
+    # 没有 / 账本读不了为 None。规则问"这个文件是哪一集、是什么版本"时先问它，再看名字（`builtin.ledger_view`）
+    ledger: Any = None
+    # 所属种子此刻要下载的视频条目有几个（扫描的来源 1 数的；0 = 不知道 / 纯本地）。番组页标题说的是整个发布，
+    # 只有单视频的种子才能拿它当"这个文件是哪一集"的证据——合集、合并发布说不了
+    torrent_videos: int = 0
 
     @property
     def ext(self) -> str:
@@ -165,8 +171,14 @@ class Show:
     dir_path: Path
     bangumi: dict | None = None           # AutoBangumi bangumi 行
     tmdb_id: int | None = None
+    # 改名 / 目录名 / 分类用的 TMDB 标题：过了标题稳定闸的那个（`titles`），不一定是 TMDB 这一轮给的
     tmdb_title: str = ""
     tmdb_seasons: list[dict] = field(default_factory=list)
+    tmdb_source: str = ""         # tmdb_id 从哪来：sidecar（钉住的）/ search（这一轮搜到的）/ cache（旧的按目录名缓存）
+    # 非空 = 这部番这一轮不按标题改任何名字（改名、目录名、分类、NFO、抓取后改名），值是原因：
+    # TMDB 身份认不准（sidecar 坏了），或钉着 tmdb_id 却一个标题都不知道。退回目录名 / AB 标题去改名
+    # 正是 LAT-04 来回改名的那一步。
+    naming_hold: str = ""
     files: list[MediaFile] = field(default_factory=list)
     is_movie: bool = False        # 见 scan.py 的判定：电影没有"集号"可言
 
@@ -233,18 +245,24 @@ def have_episodes(show: "Show", *, allow_release_names: bool = True) -> dict:
     里明明已经用了四处。
 
     没下完的不算（`.!qB` 或种子进度 <1），否则会把"正在下"误当成"已有"。
+
+    **记下来的集位先于名字**（`builtin.recorded_slot`：`ma:` 钉子、出处账本），`allow_release_names=False`
+    也认它们：钉着 `ma:S01E08`、还叫着发布名 `- 03` 的已下完文件是第 8 集，不是第 3 集——以前按名字算，第 8 集
+    被判成缺、再抓一遍（critic N14）。
     """
     out: dict = {}
     if show.is_movie:
         return out
     from .naming import VIDEO_EXTS
+    # 插件层的判据（钉子、账本的换算要 sidecar 的 season_offsets），按需导入：builtin 在模块层导入 kernel
+    from .plugins.builtin import recorded_slot
 
     offset = int((show.bangumi or {}).get("episode_offset") or 0)
     for f in show.files:
         if f.is_incomplete or f.path.suffix.lower() not in VIDEO_EXTS:
             continue
-        key = episode_of_file(f, allow_release_name=allow_release_names,
-                              episode_offset=offset)
+        key = recorded_slot(f, show) or episode_of_file(
+            f, allow_release_name=allow_release_names, episode_offset=offset)
         if key:
             out.setdefault(key[0], set()).add(key[1])
     return out
@@ -332,6 +350,15 @@ class LibraryState:
     qbit_errors: list[str] = field(default_factory=list)
     # `torrents()` 这一轮真的成功返回过（`torrents` 为空时分得清"0 个"与"没读到"，健康报告用）
     qbit_listed: bool = False
+    # 每个 tmdb_id 这一轮用哪个标题、为什么（`titles.Decision`）；`run` 扫描后记进 state/titles.json
+    title_decisions: dict = field(default_factory=dict)
+    # 模型在多个 TMDB 候选里选的：这一轮不用，交给 `pin_tmdb` 动作钉进 sidecar（`identity` 检测器）
+    tmdb_proposals: list = field(default_factory=list)
+    # `run` 开头出处账本增量补录的结果（`ledger_backfill.BackfillReport.to_dict()`）；没补过为 None
+    ledger_backfill: dict | None = None
+    # 这一轮读到的出处账本（infohash → `ledger.Row`），已挂到各文件的 `ledger` 上；读不了时为空、原因在 `ledger_problem`
+    ledger_rows: dict = field(default_factory=dict)
+    ledger_problem: str = ""
 
     def all_files(self) -> Iterable[MediaFile]:
         for s in self.shows:

@@ -31,6 +31,11 @@ HEALTH_DIR = "health"
 BASELINE_NAME = "torrent-count.json"
 
 
+# 加进来多久还查不到出处才算数（`RunHealth.ledger`）：AB 登记、抓取记账都在加种的同一刻，补录每轮开头跑，
+# 刚加的种子一轮之内就该有出处；24 小时还没有，多半是有人绕开 AB 与本项目手动加的
+PROVENANCE_GRACE_H = 24.0
+
+
 def health_dir(state_dir) -> Path:
     return Path(state_dir) / HEALTH_DIR
 
@@ -242,6 +247,7 @@ class RunHealth:
             "crash": None, "paused": "", "locked": "", "detectors": None, "findings": None, "actions": None,
             "grab": None, "stuck": None, "unrenamed": None, "trash": None, "torrents": None,
             "evolve": None, "logged_errors": {"count": 0, "by_tag": {}, "samples": []},
+            "ledger": None, "loop": None,
         }
 
     # ---- 各阶段 ----
@@ -280,20 +286,63 @@ class RunHealth:
                                  "previous": (prev_baseline or {}).get("count"),
                                  "previous_run": (prev_baseline or {}).get("run_id")}
 
-    def diagnosed(self, reg, findings) -> None:
+    def ledger(self, state, now: float | None = None) -> None:
+        """出处账本的覆盖率（`ledger`）：这一轮的种子里有出处的、没有的（其中加进来超过 `PROVENANCE_GRACE_H`
+        小时的），本轮补录的结果，账本读不了的原因。上一轮报告里的"超时没出处"数一并记下，`reasons` 只在它增长时报。
+
+        没读到种子列表（qBittorrent 不可用）就不记——"0 个没出处"会被当成下一轮的比较基准。"""
+        import time
+        if not getattr(state, "qbit_listed", False):
+            return
+        now = time.time() if now is None else now
+        rows = getattr(state, "ledger_rows", None) or {}
+        unknown = [t for t in state.torrents if (t.get("hash") or "").lower() not in rows]
+        old = [t for t in unknown
+               if (t.get("added_on") or 0) and now - float(t["added_on"]) > PROVENANCE_GRACE_H * 3600]
+        prev = (load_report(self.cfg.state_dir) or {}).get("ledger") or {}
+        self.data["ledger"] = {
+            "torrents": len(state.torrents), "covered": len(state.torrents) - len(unknown),
+            "unknown": len(unknown), "unknown_old": len(old),
+            # 全部超时没出处的（短 hash），下一轮据此说出"新冒出来的是哪几个"
+            "unknown_old_hashes": [(t.get("hash") or "")[:8] for t in old],
+            "unknown_old_sample": [{"hash": (t.get("hash") or "")[:8], "name": str(t.get("name") or "")[:80]}
+                                   for t in sorted(old, key=lambda t: -float(t.get("added_on") or 0))[:10]],
+            "previous_unknown_old": prev.get("unknown_old"),
+            "previous_unknown_old_hashes": list(prev.get("unknown_old_hashes") or []),
+            "problem": getattr(state, "ledger_problem", "") or "",
+            "backfill": getattr(state, "ledger_backfill", None)}
+
+    def diagnosed(self, reg, findings, errors: list | None = None) -> None:
+        """`findings`：这一轮**最后一次**诊断的（`run` 迭代到不动点时，见 `converge`）；`errors`：各次迭代崩过的
+        规则合起来（不给就用 `reg.errors`，即最后一次诊断的）。"""
         by_sev: dict = {}
         for f in findings:
             by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
-        self.data["detectors"] = {"count": len(reg.detectors), "errors": list(reg.errors),
+        self.data["detectors"] = {"count": len(reg.detectors),
+                                  "errors": list(reg.errors if errors is None else errors),
                                   "load_errors": list(getattr(reg, "load_errors", []))}
         self.data["findings"] = {"total": len(findings),
                                  "actionable": sum(1 for f in findings if f.action),
-                                 "by_severity": by_sev}
+                                 "by_severity": by_sev,
+                                 # 解析不了的 sidecar：人写的换算关系 / 版本要求此刻读不到，写的一方一律拒绝
+                                 "sidecar_corrupt": sorted({f.show for f in findings
+                                                            if f.kind == "sidecar_corrupt"})}
 
     def refused(self, why: str) -> None:
         self.data["degraded"]["refused"] = why
 
-    def applied(self, report, findings, state) -> None:
+    def applied(self, report, findings, state, proposed: list | None = None) -> None:
+        """`report` 是整轮的（各次迭代累计）；`findings` / `state` 是最后一次诊断的（未改名的看它）；`proposed`：各次迭代
+        提过的动作合起来（抓取"提议了几集"看它，不给就用 `findings`）。"""
+        self.actions(report)
+        self.data["grab"] = grab_stats(findings if proposed is None else proposed, report)
+        old = unrenamed_old(findings, report, state.torrents, self.cfg.unrenamed_alert_hours)
+        self.data["unrenamed"] = {"threshold_hours": self.cfg.unrenamed_alert_hours,
+                                  "count": len(old), "old": old[:50]}
+
+    def actions(self, report) -> None:
+        """执行报告的计数与明细。`run` 半路冲出时只记这一节（前面迭代已经做了的，审计里都有），抓取统计与未改名要
+        最后一次诊断，没有就留 null。"""
         def brief(recs):
             return [{"op": r.get("op"), "rule": r.get("rule"), "summary": str(r.get("summary"))[:100],
                      "error": str(r.get("error") or r.get("reason") or "")[:200]} for r in recs[:10]]
@@ -308,13 +357,17 @@ class RunHealth:
             "repeated": repeated_failures(self.cfg.audit_log, report),
             # 改 AB 数据库之后 docker start 报了错、库已改好（`Executor._ab_write`）：容器也许还停着
             "ab_maybe_stopped": brief([r for r in report.applied if r.get("after_error_note")])}
-        self.data["grab"] = grab_stats(findings, report)
-        old = unrenamed_old(findings, report, state.torrents, self.cfg.unrenamed_alert_hours)
-        self.data["unrenamed"] = {"threshold_hours": self.cfg.unrenamed_alert_hours,
-                                  "count": len(old), "old": old[:50]}
 
     def rescan_degraded(self, why: str) -> None:
         self.data["degraded"]["rescan"] = why
+
+    def loop(self, outcome) -> None:
+        """这一轮的迭代（`converge.Outcome`）：每次迭代的扫描 / 诊断 / 执行、停在哪、到顶时的待做、两条规则打架。
+        最后一次扫描读 qBittorrent 不完整（第二次迭代起的拒绝）：那一次的报错记进 `degraded.qbit_errors`。"""
+        self.data["loop"] = outcome.to_dict()
+        errs = list(getattr(outcome.state, "qbit_errors", None) or [])
+        if errs and len(outcome.iterations) > 1:
+            self.data["degraded"]["qbit_errors"] = errs
 
     def evolve(self, what: str) -> None:
         self.data["evolve"] = what
@@ -391,12 +444,45 @@ class RunHealth:
             add("warn", "unknown_actions", f"{act['unknown']} 个动作未确认（也许生效了，要人核对）" + (
                 "；其中 " + "、".join(f"[{r['rule']}] {r['op']} 已在 {r['runs']} 个批次里出现"
                                      for r in rep_[:3]) if rep_ else ""))
+        bad = (d["findings"] or {}).get("sidecar_corrupt") or []
+        if bad:
+            add("warn", "sidecar_corrupt",
+                f"{len(bad)} 部番的 .media-agent.json 解析不了（{'、'.join(bad[:5])}"
+                f"{' 等' if len(bad) > 5 else ''}）：不覆盖、已备份，里面人写的换算关系 / 版本要求这期间不生效——要人修")
         if act.get("ab_maybe_stopped"):
             # AutoBangumi 停着，订阅就不走了。以前只有一行日志与审计里的一个字段：这一轮 ok、不发信，最早要 6 小时后
             # 下一轮 AB 登录失败（ab_down）才看得见——`clients` 是在这次写库之前取的（2026-09-26 复审）
             add("warn", "ab_container_maybe_stopped",
                 f"{len(act['ab_maybe_stopped'])} 次改 AutoBangumi 数据库之后 docker start 报了错（库已改好）："
                 "容器也许还停着、订阅不走——要人确认（docker ps）")
+        lp = d.get("loop") or {}
+        if lp.get("stop") == "cap" and lp.get("pending_count"):
+            pend = lp.get("pending") or []
+            items = "；".join(f"[{x['rule']}] {x['op']} {str(x['summary'])[:50]}" for x in pend[:3])
+            add("warn", "loop_cap",
+                f"迭代到上限 {lp['max']} 次仍有 {lp['pending_count']} 个动作待做（{items}"
+                f"{' 等' if lp['pending_count'] > 3 else ''}）——下一轮 run 接着做；每轮都到顶，多半是有规则在拉锯")
+        osc = lp.get("oscillations") or []
+        if osc:
+            pairs = "；".join(f"[{(x.get('evidence') or {}).get('second', {}).get('rule')}] 要撤销 "
+                             f"[{(x.get('evidence') or {}).get('first', {}).get('rule')}] 刚做的 "
+                             f"{(x.get('evidence') or {}).get('first', {}).get('op')}" for x in osc[:3])
+            add("warn", "oscillation",
+                f"{len(osc)} 个动作会撤销同一轮里已执行的动作，已拒绝（{pairs}）——两条规则在打架，要人看哪条的判断不对")
+        lg = d["ledger"] or {}
+        if lg.get("problem"):
+            add("warn", "ledger_unavailable",
+                f"出处账本{lg['problem']}：这一轮按没有账本认集位与版本（判重、改名、复核照旧能跑）——要人看")
+        prev_old = lg.get("previous_unknown_old")
+        if isinstance(prev_old, int) and lg.get("unknown_old", 0) > prev_old:
+            seen = set(lg.get("previous_unknown_old_hashes") or [])
+            sample = lg.get("unknown_old_sample", [])
+            fresh = [x for x in sample if x["hash"] not in seen] or sample   # 新冒出来的排前面（样本按加入时间倒序）
+            new_ones = "、".join(f"{x['hash']} {x['name'][:40]}" for x in fresh[:3])
+            add("warn", "provenance_unknown_grew",
+                f"查不到出处（抓取审计、AB 库、番组页、标签里都没有）且加进来超过 {PROVENANCE_GRACE_H:g} 小时的种子"
+                f"从 {prev_old} → {lg['unknown_old']} 个：有人绕开了 AB 与本项目加种？（如 {new_ones}）"
+                f"——`media-agent ledger backfill --dry-run` 看全部")
         st = d["stuck"] or {}
         if st.get("open"):
             add("warn", "stuck", f"{len(st['open'])} 个问题连续 ≥{self.cfg.stuck_runs} 轮都在")
@@ -537,6 +623,23 @@ def render(rep: dict, path=None) -> list[str]:
     un = rep.get("unrenamed")
     if un and un.get("count"):
         lines.append(f"  未改名  {un['count']} 个发布名文件超过 {un['threshold_hours']:g} 小时")
+    lp = rep.get("loop")
+    if lp:
+        its = [it for it in lp.get("iterations") or [] if not it.get("final")]
+        stop = {"fixed_point": "不动点", "cap": f"到上限，待做 {lp.get('pending_count', 0)}",
+                "refused": "读不全，拒绝", "dry_run": "预演", "crashed": "半路冲出",
+                "moving": "qBittorrent 还在搬存储，剩下的下一轮做"}.get(lp.get("stop"),
+                                                                                     str(lp.get("stop")))
+        lines.append(f"  迭代    {len(its)} 次 · {stop}"
+                     + (f" · 反向拒绝 {len(lp['oscillations'])}" if lp.get("oscillations") else "")
+                     + "（每次执行 " + " / ".join(str(it.get("applied", 0)) for it in its) + "）")
+    lg = rep.get("ledger")
+    if lg:
+        ins = sum(((lg.get("backfill") or {}).get("inserted") or {}).values())
+        lines.append(f"  出处    有出处 {lg['covered']}/{lg['torrents']} · 没有 {lg['unknown']}"
+                     f"（超过 {PROVENANCE_GRACE_H:g} 小时 {lg['unknown_old']}）"
+                     + (f" · 本轮补录 {ins}" if ins else "")
+                     + (" · 账本读不了" if lg.get("problem") else ""))
     le = rep.get("logged_errors") or {}
     if le.get("count"):
         top = "、".join(f"[{k}] {v}" for k, v in sorted(le["by_tag"].items(), key=lambda kv: -kv[1])[:4])

@@ -142,6 +142,10 @@ class Config:
     notify_smtp_port: int = 465
     notify_smtp_user: str = ""
     notify_smtp_pass: str = ""
+    # 一轮 `run` 最多迭代几次"扫描 → 诊断 → 执行"（`converge`）：上一次迭代做成了新动作才再来一次。以前一次，
+    # 前后依赖的两步（分类交接 → 判重 → 改名、抓取 → 改名）要隔一轮（6 小时）；到了上限还有要做的，健康报告 warn
+    # 并列出待做。1 = 以前的单次（外加一次不执行的收尾诊断，列出待做）。
+    max_iterations: int = 3
     # 维护暂停（`pause`）：这个文件在就说明 VPN 救援进行中（`deploy/rescue.py` 的 MARKER），`run` / `apply` 暂停。
     # `load_config` 默认 `~/gluetun/.rescue-active`；直接构造的 Config（测试基座）为 None = 不看。
     rescue_marker: Path | None = None
@@ -200,6 +204,7 @@ def load_config(env_file: Path | None = None) -> Config:
         torrent_drop_min=_int_at_least(g("TORRENT_DROP_MIN", "20"), "TORRENT_DROP_MIN", 0),
         torrent_drop_pct=_percent(g("TORRENT_DROP_PCT", "10"), "TORRENT_DROP_PCT"),
         unrenamed_alert_hours=_hours(g("UNRENAMED_ALERT_HOURS", "12"), "UNRENAMED_ALERT_HOURS"),
+        max_iterations=_int_at_least(g("MAX_ITERATIONS", "3"), "MAX_ITERATIONS", 1),
         notify_email_to=g("NOTIFY_EMAIL_TO", ""),
         notify_smtp_host=g("NOTIFY_SMTP_HOST", ""),
         notify_smtp_port=_int_at_least(g("NOTIFY_SMTP_PORT", "465"), "NOTIFY_SMTP_PORT", 1),

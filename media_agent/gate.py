@@ -34,7 +34,8 @@
   **自动降级**成只作废这一个条目（按 `save_path + 条目名` 的完整路径认），并在审计里记一笔；
   要下载的只剩**它自己**时反过来整种子作废（留一个什么都不下的空种子会被 stale-torrent-path
   报成死链）；它本来就是优先级 0 时种子一点不动，只搬文件。
-- **I4 不删封存了集位的文件**：钉了 `ma:SxxEyy`、复核（`meets_requirements`）通过。**探测不可用
+- **I4 不删封存了集位的文件**：钉了 `ma:SxxEyy`、复核（`meets_requirements`）通过、出处账本里的番组页标题满足
+  这部番的 `require_any`（与判重的封存同一个判据，`builtin.requirement_problem`；账本 / sidecar 读不了当满足）。**探测不可用
   （`probe` 返回 None：超时、出错）一律当作封存**——封存不能因为某一轮 ffprobe 超时就丢；
   例外是合并发布里同一个种子的兄弟文件：封存由判重选中的那一份（同一个种子、同一个钉子）持有，
   兄弟按用户偏好只留一份。钉子是整个种子的，特典处置的对象若不是那一集（钉着的合集里的 NCOP），
@@ -288,17 +289,37 @@ def check_trash(ex, f: Finding, path: Path) -> Verdict:
 
     # ---- I4：封存了集位的文件不删；探测不可用 = 不知道 = 当作封存
     if pin and _is_video(path) and not _is_partial(path):
-        why = _seal_problem(v, f, path, h, t, pin, wanted)
+        why = _seal_problem(v, f, path, h, t, pin, wanted, ex=ex, media_root=media_root)
         if why:
             return v.refuse("I4", why)
     return v
 
 
+def _show_requirement(ex, h: str, path: Path, media_root: Path) -> tuple[object, list[str]]:
+    """封存判据的第三条要的两样：出处账本里这个种子的那一行、这部番 sidecar 的 `require_any`。
+    任何一样读不了就当没有（不算"不满足"，封存照旧——看不全时站在不删的一侧）。"""
+    from . import ledger as ledger_mod
+    from . import sidecar as sc_mod
+
+    show_dir, _ = _show_dir(media_root, path)
+    if show_dir is None or not h:
+        return None, []
+    sc, problem = sc_mod.load_checked(show_dir)
+    req = [str(w) for w in (sc.require_any or []) if w] if not problem else []
+    if not req:
+        return None, []
+    rows, _problem = ledger_mod.load_rows(ex.cfg.state_dir)
+    return rows.get(h.lower()), req
+
+
 def _seal_problem(v: Verdict, f: Finding, path: Path, h: str, t: dict, pin,
-                  wanted: list[dict]) -> str:
+                  wanted: list[dict], *, ex=None, media_root: Path | None = None) -> str:
     """要删的这个封存着集位吗？封存着就返回拒绝理由。
 
-    封存 = 钉着 `ma:SxxEyy`（抓取器按偏好挑中的那一份）且复核（`meets_requirements`）通过。
+    封存 = 钉着 `ma:SxxEyy`（抓取器按偏好挑中的那一份）且复核（`meets_requirements`）通过，而且出处账本里它的
+    番组页标题满足这部番的 `require_any`（`builtin.requirement_problem`，与判重的封存同一个判据）——在
+    `require_any` 登记之前抓的 TV 版（尼古喵喵）钉着、复核也过，但它不是用户要的版本：判重不封存它、交回排序，
+    这里若仍当封存护着，判重换了方向也删不掉，这一集每轮卡着。账本或 sidecar 读不了当没有（封存照旧）。
     **探测不可用（`probe` 为 None：超时、出错）一律当作封存**：LoliHouse 的内部名只写
     `ASSx2`，只看名字过不了硬门槛（`tests/test_seal_slot.py` 第 3 组），某一轮 ffprobe 超时
     它就会失封、被当成输家——封存必须稳定。
@@ -323,6 +344,13 @@ def _seal_problem(v: Verdict, f: Finding, path: Path, h: str, t: dict, pin,
                    torrent_state=t.get("state", ""),
                    torrent_progress=float(t.get("progress") or 0),
                    torrent_tags=t.get("tags", ""), torrent_category=t.get("category", ""))
+    if ex is not None and media_root is not None:
+        from .plugins.builtin import requirement_problem
+        mf.ledger, req = _show_requirement(ex, h, path, media_root)
+        not_wanted = requirement_problem(mf, req)
+        if not_wanted:
+            v.notes.append(f"I4：{path.name} 钉着 ma:{_fmt(pin)}，但{not_wanted}")
+            return ""
     info = probe(path)
     ok, why = meets_requirements(mf)
     if info is None:

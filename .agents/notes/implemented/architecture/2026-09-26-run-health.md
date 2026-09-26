@@ -193,6 +193,12 @@ run.err.log 的人认它），末尾加上位置。健康报告（第 6 节）�
     `disposal_failed`，以及 `ab_container_maybe_stopped`（复审时补：改 AB 数据库之后 `docker start` 报了错、库已改好
     ——`_ab_write` 记 applied 带 `after_error_note`。以前只有一行日志与审计里的一个字段，这一轮 ok、不发信；客户端状况是
     在写库之前取的，最早要 6 小时后下一轮 AB 登录失败才看得见。报告的 `actions.ab_maybe_stopped` 列出是哪几条）；
+    2026-09-27 起还有出处账本的两条：`ledger_unavailable`（账本读不了，这一轮按没有账本走）、`provenance_unknown_grew`
+    （加进来超过 24 小时还查不到出处的种子比上一轮多了——只看增长，见 `architecture/2026-09-27-provenance-ledger.md`）；
+    一轮之内收敛（2026-09-27，`architecture/2026-09-27-converge-within-a-run.md`）又加两条：`loop_cap`（迭代到
+    `MAX_ITERATIONS` 仍有要做的，列出待做）、`oscillation`（一个动作会撤销同一轮里已执行的动作，两条规则在打架）；
+    到顶之后的收尾诊断读 qBittorrent 不完整按 `rescan_degraded`（critical，3）报。报告多了 `loop` 一节（每次迭代的
+    扫描 / 诊断 / 执行、停在哪、待做、打架的），"发现"一节按**最后一次**诊断算、"执行"一节是各次迭代的合计；
   - 其余 ok。"日志里有报错行"只列出、不改状态：生产上 TMDB 查询这类一次性失败每轮都可能有，拿它定 warn 会让
     warn 变成常态、没人再看。
 - **退出码** = `exit_code_for(critical 原因, _run 的返回值)`：几种同时出现时取 1 > 3 > 4 > 5。warn 一律 0。launchd 的

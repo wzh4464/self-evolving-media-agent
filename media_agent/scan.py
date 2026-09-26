@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 from .kernel import Context, LibraryState, MediaFile, Show, under
-from .naming import SUB_EXTS, VIDEO_EXTS, season_of_dir
+from .naming import SUB_EXTS, VIDEO_EXTS, is_normalized, normalize, season_of_dir
 
 SKIP_DIRS = {".autobangumi", "@eaDir", ".Trash", "lost+found"}
 SKIP_FILES = {".DS_Store", "Thumbs.db"}
@@ -136,6 +136,14 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
             # 合集种子：content_path 是目录，成员文件挂在它下面
             by_path.setdefault(cp.rstrip("/"), t)
 
+    # --- 出处账本（`ledger`）：每个种子是什么，挂到它的文件上 ---
+    # 读不了（坏了、结构版本更新）不拦扫描：按没有账本走，原因记进 `ledger_problem`（健康报告说出来）
+    from . import ledger as ledger_mod
+    ledger_rows, state.ledger_problem = ledger_mod.load_rows(cfg.state_dir)
+    state.ledger_rows = ledger_rows
+    if state.ledger_problem:
+        ctx.log(f"[scan] 出处账本{state.ledger_problem}；这一轮按没有账本认集位与版本")
+
     # --- AutoBangumi ---
     if ctx.abdb:
         try:
@@ -191,6 +199,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
         # 进度高的、再退回已存在于磁盘的。判不出来也没关系——重点是只留一条。
         covered: set[Path] = set()
         claimed: dict[Path, tuple] = {}
+        videos_of: dict[str, int] = {}   # 种子 → 要下载的视频条目数（`MediaFile.torrent_videos`）
         for h, t in torrent_by_hash.items():
             sp = (t.get("save_path") or "").rstrip("/")
             if not sp or not under(sp, show_dir):
@@ -202,6 +211,8 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                 suffix = abs_p.suffix.lower()
                 if suffix not in VIDEO_EXTS and suffix not in SUB_EXTS:
                     continue
+                if suffix in VIDEO_EXTS:
+                    videos_of[h] = videos_of.get(h, 0) + 1
                 covered.add(abs_p)
                 covered.add(Path(str(abs_p) + ".!qB"))
                 try:
@@ -231,6 +242,8 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                 torrent_progress=t.get("progress", 0.0),
                 torrent_tags=t.get("tags", ""),
                 torrent_category=t.get("category", ""),
+                ledger=ledger_rows.get(h.lower()),
+                torrent_videos=videos_of.get(h, 0),
             ))
 
         # --- 来源 2：磁盘上没有种子覆盖的文件（纯本地内容）---
@@ -277,6 +290,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
                 torrent_progress=(t or {}).get("progress", 0.0),
                 torrent_tags=(t or {}).get("tags", ""),
                 torrent_category=(t or {}).get("category", ""),
+                ledger=ledger_rows.get((t.get("hash") or "").lower()) if t else None,
             ))
 
         if show.files or show.extras_files:
@@ -323,65 +337,253 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
     return state
 
 
+def attach_ledger(state: LibraryState, rows: dict, problem: str = "") -> None:
+    """把（补录之后）重新读到的账本挂回这一轮的文件上：`run` 开头的增量补录在扫描之后才做。"""
+    state.ledger_rows, state.ledger_problem = rows, problem
+    for s in state.shows:
+        for f in (*s.files, *s.extras_files):
+            f.ledger = rows.get(f.torrent_hash.lower()) if f.torrent_hash else None
+
+
+def _id_key(tmdb_id: int) -> str:
+    """TMDB 条目元数据（标题、季）在缓存里的键：**按 tmdb_id**。以前按目录名——目录一改名就换了键、
+    重新搜一遍，搜出来的可能是另一个条目（critic N4）。"""
+    return f"tmdbshow:{tmdb_id}"
+
+
 def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
-    """给每部番挂上 TMDB 元数据。带磁盘缓存，避免每轮都打 API。"""
+    """给每部番挂上 TMDB 身份、季信息与**稳定后的**标题。
+
+    身份（tmdb_id）：
+    - sidecar 里有 `tmdb_id` 就照它认，不搜——那是钉住的身份（代码只在没有时填一次，之后只有人改）。
+      LAT-04：缓存过期后按目录名重新搜，搜不到时标题退回目录名、文件被改回去；搜到另一个条目时
+      `终物语 下` 的 19 个文件被改成了 `物语系列 …`。
+    - 没钉住的才搜：旧的按目录名缓存 → 搜目录名 / AB 标题（搜不到负缓存 `TMDB_MISS_TTL`）→ 确定性规则
+      选一个。规则选不出、要问模型的，**这一轮不用**：记进 `state.tmdb_proposals`，由 `tmdb-identity`
+      检测器提议 `pin_tmdb` 动作钉进 sidecar（审计里看得见、能回退），下一轮起照钉住的认。以前模型每轮
+      重新选、谁也看不见，直接决定改名目标、目录名、分类（critic N4）。
+    元数据按 tmdb_id 缓存（`TMDB_TTL`）；取不到新的就用旧的（不看时效）兜底。
+    标题过 `titles` 的稳定闸：取不到不退回目录名，变了要连看两轮，30 天内不改回去。
+    """
+    from . import sidecar as sc_mod
+    from . import titles
     from .cache import Cache
 
     cache = Cache(ctx.config.cache_db)
+    book, problem = titles.load(ctx.config.state_dir)
+    if problem:
+        ctx.log(f"[scan] 标题稳定记录{problem}：这一轮按没有记录处理（以库里此刻在用的名字为已采用）")
+    metas: dict[int, dict | None] = {}
+    # 这一轮 TMDB 出过错：其余的不再打网络，用缓存兜底。"这一轮"是这个 Context——`run` 迭代到不动点时每次迭代重扫一次，
+    # 断路器按扫描算的话 TMDB 挂着时每次迭代都再等一次 20 秒超时（`converge`）
+    net = {"broken": str(getattr(ctx, "tmdb_scan_down", "") or "")}
+    if net["broken"]:
+        ctx.log(f"[scan] TMDB 这一轮前面出过错（{net['broken']}），这次扫描不再打网络、用缓存兜底")
+
     for show in state.shows:
-        # 查询词优先用 AutoBangumi 的 official_title / title_raw，比目录名更干净
-        queries = [show.dir_name]
-        if show.bangumi:
-            for k in ("official_title", "title_raw"):
-                v = (show.bangumi.get(k) or "").strip()
-                if v and v not in queries:
-                    queries.append(v)
-
-        cached = cache.get_tmdb(show.dir_name)
-        if cached:
-            show.tmdb_id = cached.get("id")
-            show.tmdb_title = cached.get("title", "")
-            show.tmdb_seasons = cached.get("seasons", [])
+        sc, corrupt = sc_mod.load_checked(show.dir_path)
+        if corrupt:
+            # 身份认不准：不搜（搜出来的可能是另一个条目），也不按任何标题改名。坏档案由 sidecar-sync 报
+            show.naming_hold = f"sidecar 解析不了（{corrupt}），TMDB 身份认不准"
             continue
-
-        hit = None
-        for q in queries:
+        if sc.tmdb_id:
             try:
-                results = ctx.tmdb.search_tv(q)
-            except Exception as e:
-                ctx.log(f"[scan] TMDB 查询失败 {q}: {e}")
+                tid = int(sc.tmdb_id)
+            except (TypeError, ValueError):
+                show.naming_hold = f"sidecar 的 tmdb_id 不是整数：{sc.tmdb_id!r}"
                 continue
-            if results:
-                hit = _pick_tmdb(ctx, show, q, results)
-                if hit:
-                    break
+            source = "sidecar"
+        else:
+            tid = _search_tmdb(ctx, cache, state, show, net)
+            source = "search"
+            if not tid:
+                continue
 
-        if not hit:
+        if tid not in metas:
+            metas[tid] = _tmdb_meta(ctx, cache, tid, show.dir_name, net)
+        meta = metas[tid]
+        stale = meta or cache.get_tmdb_stale(_id_key(tid)) or {}
+        if source == "sidecar":
+            why = _unvouched_legacy_id(cache, show, sc, tid, stale, book.entry(tid).get("adopted", ""))
+            if why:
+                show.naming_hold = why
+                continue
+        show.tmdb_id = tid
+        show.tmdb_source = source
+        show.tmdb_seasons = stale.get("seasons", [])
+        if "tmdb_title" in (sc.pinned or []) and sc.tmdb_title:
+            show.tmdb_title = sc.tmdb_title          # 人钉住的标题：不过稳定闸、不记
             continue
+        if tid not in state.title_decisions:         # 一个条目一个决定（物语系列 14 个目录共用一个）
+            observed = (meta or {}).get("title") or None
+            fallback = "" if book.entry(tid) else _title_in_use(cache, show, sc, tid, observed, stale)
+            state.title_decisions[tid] = book.decide(tid, observed, fallback=fallback)
+        show.tmdb_title = state.title_decisions[tid].title
+        if not show.tmdb_title:
+            show.naming_hold = (f"TMDB 条目 {tid} 这一轮取不到标题（{net['broken'] or '没有缓存'}），"
+                                f"也没有记录过的标题")
+    if net["broken"]:
+        ctx.tmdb_scan_down = net["broken"]
+
+
+def _unvouched_legacy_id(cache, show: Show, sc, tid: int, stale: dict, adopted: str = "") -> str:
+    """旧版（本阶段之前）记下的 sidecar `tmdb_id` 有没有佐证：没有返回原因（这一轮不认它、不按它改名），有返回空串。
+
+    本阶段起扫描照 sidecar 的 tmdb_id 认、不再按目录名搜。代码写下的身份都带 `tmdb_source`；**没有 `tmdb_source`
+    的是旧版 sidecar-sync 写的**——它记的是写那一刻按目录名搜到的条目。目录后来在 media-agent 之外改了名，它就不再
+    说明这个目录是什么。2026-09-27 生产快照：`世界奇妙物语/` 08-17 写的 sidecar（71488 世界奇妙物语，TV 剧集）跟着
+    目录被人改成了 `世界奇妙物语 2018春之特别篇 (2018)`（审计里没有 rename_show_dir），v0.4.1 按新目录名搜不到、
+    从不动它；照 sidecar 认，title-drift 要把目录改回去、missing-nfo 要给它写剧集的 tvshow.nfo。
+
+    佐证（任一即可）：v0.4.1 按这个目录名缓存的就是这个条目（不看时效——生产上 129 份里 128 份如此）；目录名或文件名
+    就是这个条目的标题（TMDB 的、sidecar 里的、稳定闸采用的——media-agent 自己按标题改过的目录就是这样）；人钉过标题
+    （`pinned` 里有 `tmdb_title`）。一个标题都不知道的不在这里判（调用方另有说法）。"""
+    if (sc.tmdb_source or "").strip() or "tmdb_title" in (sc.pinned or []):
+        return ""
+    legacy = cache.get_tmdb_stale(show.dir_name) or {}
+    if legacy.get("id") == tid:
+        return ""
+    known = [t for t in dict.fromkeys((stale.get("title", ""), sc.tmdb_title or "", adopted or "")) if t]
+    if not known:
+        return ""
+    names = [f.filename for f in show.files]
+    if any(normalize(t) == normalize(show.dir_name) or any(is_normalized(n, t) for n in names)
+           for t in known):
+        return ""
+    return (f"sidecar 的 tmdb_id {tid}（「{known[0]}」）是旧版记下的，目录名、文件名都不是这个条目的标题，"
+            f"v0.4.1 按这个目录名也没有认过它——目录多半在 media-agent 之外改过名。这一轮不认这个身份；"
+            f"确认是它就在 sidecar 里写 \"tmdb_source\": \"human\"，不是就删掉 tmdb_id")
+
+
+def _title_in_use(cache, show: Show, sc, tid: int, observed: str | None, stale: dict) -> str:
+    """稳定闸还没有这个条目的记录时（部署后第一轮、记录读不了），库里**此刻**按哪个标题命名——当作"已采用的"。
+
+    按证据的强弱：
+    1. 目录名、或这部番的文件名已经就是某个候选标题（TMDB 这一轮给的、旧的按目录名缓存里的、sidecar 里的、
+       按 id 缓存的旧值）：库里用的就是它；
+    2. 都对不上：v0.4.1 按目录名缓存的条目命名（id 对得上、不看时效）→ sidecar 的 `tmdb_title` → 按 id 缓存的旧值。
+
+    **sidecar 的 `tmdb_title` 排在最后**：e47a054 之前的 sidecar-sync 只在 tmdb_id 变了时才重写它，TMDB 改了
+    标题、v0.4.1 按新标题把目录与文件改过去之后，它还是第一次写时的那个。2026-09-27 生产快照：《深夜重拳》09-16 已
+    `rename_show_dir 深夜Punch -> 深夜重拳`、12 个文件跟上，sidecar（09-17 写过）仍是「深夜Punch」；《虽然我是不完美恶女
+    ～雏宫蝶鼠替换传～》差一个空格。以它为已采用，部署后第一轮把两部番改回旧标题（恶女还连带 AB save_path、11 个分类、
+    删一个分类），第二轮确认新标题再改回来——正是稳定闸要挡的 LAT-04 来回改名。"""
+    legacy = cache.get_tmdb_stale(show.dir_name) or {}
+    legacy_title = legacy.get("title", "") if legacy.get("id") == tid else ""
+    own = sc.tmdb_title if str(sc.tmdb_id) == str(tid) else ""
+    candidates = [t for t in dict.fromkeys((observed or "", legacy_title, own, stale.get("title", ""))) if t]
+    names = [f.filename for f in show.files]
+    for t in candidates:
+        if normalize(t) == normalize(show.dir_name) or any(is_normalized(n, t) for n in names):
+            return t
+    return legacy_title or own or stale.get("title", "")
+
+
+def _tmdb_meta(ctx: Context, cache, tid: int, dir_name: str, net: dict) -> dict | None:
+    """这个 tmdb_id 的 {title, seasons}：按 id 的缓存 → 旧的按目录名缓存（id 对得上就迁过来，
+    部署后第一轮不必把 100 多部番重查一遍）→ 问 TMDB。取不到返回 None（调用方用旧值兜底）。"""
+    fresh = cache.get_tmdb(_id_key(tid))
+    if fresh:
+        return fresh
+    legacy = cache.get_tmdb(dir_name)
+    if legacy and legacy.get("id") == tid and legacy.get("title"):
+        meta = {"title": legacy["title"], "seasons": legacy.get("seasons", [])}
+        cache.put_tmdb(_id_key(tid), meta)
+        return meta
+    if net["broken"]:
+        return None
+    from .cache import _brief
+    from .clients import seasons_of, title_of
+    try:
+        d = ctx.tmdb.tv_detail(tid)
+        title, seasons = title_of(d)[0], seasons_of(d)
+    except Exception as e:
+        net["broken"] = _brief(e)
+        ctx.log(f"[scan] TMDB 取条目 {tid} 的标题 / 季信息失败（{net['broken']}），用上次的；"
+                f"这一轮其余的也不再问 TMDB")
+        return None
+    meta = {"title": title, "seasons": seasons}
+    cache.put_tmdb(_id_key(tid), meta)
+    return meta
+
+
+def _search_tmdb(ctx: Context, cache, state: LibraryState, show: Show, net: dict) -> int | None:
+    """没钉住身份的番：找它的 tmdb_id。找到返回 id；搜不到、或要问模型的（进 `state.tmdb_proposals`，
+    这一轮不用）返回 None。"""
+    from .cache import LOOKUP_TTL, TMDB_MISS_TTL, _brief
+
+    legacy = cache.get_tmdb(show.dir_name)
+    if legacy and legacy.get("id"):
+        return int(legacy["id"])
+
+    # 查询词优先用 AutoBangumi 的 official_title / title_raw，比目录名更干净
+    queries = [show.dir_name]
+    if show.bangumi:
+        for k in ("official_title", "title_raw"):
+            v = (show.bangumi.get(k) or "").strip()
+            if v and v not in queries:
+                queries.append(v)
+
+    picked = cache.get_llm(f"tmdbpick:{show.dir_name}", ttl=LOOKUP_TTL)
+    if picked and picked.get("id"):
+        state.tmdb_proposals.append({**picked, "show": show.dir_name, "show_dir": str(show.dir_path)})
+        return None
+    miss_key = "tmdbmiss:" + "|".join(queries)
+    if cache.get_tmdb(miss_key, ttl=TMDB_MISS_TTL) or net["broken"]:
+        return None
+
+    for q in queries:
         try:
-            title, _ = ctx.tmdb.official_title(hit["id"])
-            seasons = ctx.tmdb.seasons(hit["id"])
+            results = ctx.tmdb.search_tv(q)
         except Exception as e:
-            ctx.log(f"[scan] TMDB 取标题 / 季信息失败 {show.dir_name}（id {hit['id']}），这一轮按没匹配处理："
-                    f"{type(e).__name__}: {e}")
+            net["broken"] = _brief(e)
+            ctx.log(f"[scan] TMDB 查询失败 {q}（{net['broken']}），这一轮其余的也不再问 TMDB")
+            return None
+        if not results:
             continue
-        show.tmdb_id = hit["id"]
-        show.tmdb_title = title
-        show.tmdb_seasons = seasons
-        cache.put_tmdb(show.dir_name, {"id": hit["id"], "title": title, "seasons": seasons})
+        hit, how, why = _pick_tmdb(ctx, show, q, results)
+        if hit and how == "llm":
+            prop = {"id": int(hit["id"]), "title": hit.get("name") or hit.get("original_name") or "",
+                    "query": q, **why,
+                    "candidates": [{"id": r["id"], "name": r.get("name"),
+                                    "first_air_date": r.get("first_air_date")} for r in results[:8]]}
+            cache.put_llm(f"tmdbpick:{show.dir_name}", prop)
+            state.tmdb_proposals.append({**prop, "show": show.dir_name, "show_dir": str(show.dir_path)})
+            return None
+        if how == "llm":
+            break                           # 问过模型、它也选不出：负缓存，别每轮再问
+        if hit:
+            from .clients import seasons_of, title_of
+            try:
+                d = ctx.tmdb.tv_detail(hit["id"])
+                title, seasons = title_of(d)[0], seasons_of(d)
+            except Exception as e:
+                net["broken"] = _brief(e)
+                ctx.log(f"[scan] TMDB 取标题 / 季信息失败 {show.dir_name}（id {hit['id']}），这一轮按没匹配处理："
+                        f"{net['broken']}")
+                return None
+            # 旧格式的按目录名缓存照写一份：回退到上一个版本时它还认这个键
+            cache.put_tmdb(show.dir_name, {"id": hit["id"], "title": title, "seasons": seasons})
+            cache.put_tmdb(_id_key(int(hit["id"])), {"title": title, "seasons": seasons})
+            return int(hit["id"])
+    cache.put_tmdb(miss_key, {"queries": queries})
+    return None
 
 
-def _pick_tmdb(ctx: Context, show: Show, query: str, results: list[dict]) -> dict | None:
-    """多个候选时选哪个 —— 确定性规则先行，仍模糊才问模型。"""
+def _pick_tmdb(ctx: Context, show: Show, query: str,
+               results: list[dict]) -> tuple[dict | None, str, dict]:
+    """多个候选时选哪个 —— 确定性规则先行，仍模糊才问模型。返回 (选中的, 怎么选的, 模型的理由)：
+    怎么选的 = single / exact / first（没开模型时的旧兜底）/ llm（问了模型，选中的可能为 None）。
+    模型选的调用方不直接用（见 `_resolve_tmdb`）。"""
     if len(results) == 1:
-        return results[0]
+        return results[0], "single", {}
 
     from .naming import normalize
     q = normalize(query)
     exact = [r for r in results
              if normalize(r.get("name", "")) == q or normalize(r.get("original_name", "")) == q]
     if len(exact) == 1:
-        return exact[0]
+        return exact[0], "exact", {}
 
     if ctx.llm and ctx.llm.enabled:
         sample = [f.filename for f in show.files[:5]]
@@ -398,10 +600,16 @@ def _pick_tmdb(ctx: Context, show: Show, query: str, results: list[dict]) -> dic
                              "实际文件名样本": sample, "候选": cands},
                             ensure_ascii=False),
         )
-        if ans and ans.get("id") and float(ans.get("confidence", 0)) >= 0.7:
+        why = {"confidence": (ans or {}).get("confidence"),
+               "reason": str((ans or {}).get("reason") or "")[:200]}
+        try:
+            conf = float((ans or {}).get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0                   # 模型没按格式给置信度：当作不确定
+        if ans and ans.get("id") and conf >= 0.7:
             for r in results:
                 if r["id"] == ans["id"]:
-                    return r
-        return None
+                    return r, "llm", why
+        return None, "llm", why
 
-    return results[0] if exact else None
+    return (results[0], "first", {}) if exact else (None, "", {})

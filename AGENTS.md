@@ -19,10 +19,15 @@ media_agent/
   clients.py      capability 的 provider 实现（qBit/AutoBangumi/TMDB/AniList/LLM）
   plugins/        内置检测器
   actions.py      执行器 + 隔离区 + 配额上限 + 审计日志
+  converge.py     一轮之内收敛：扫描 → 诊断 → 执行重复到不动点（一个执行器、试过的不再试、撤销本轮动作的拒绝）
   audit.py        audit.jsonl 的读写：写永不抛（降级 / 转写 audit.fallback.jsonl），读两个文件一起读
   purge.py        隔离区里每一份能不能真删（按处置类别的判据）
   disposal.py     硬删除的唯一出口：预写 purge.jsonl、容量闸、run / purge 的处置
   history.py      发现历史：每轮全部发现落 state/findings/，指纹 = 规则 + 类型 + 目标（不含摘要）
+  titles.py       TMDB 标题稳定闸：取不到不退回目录名、新标题连续两轮 run 才采用、30 天内不改回去（state/titles.json）
+  sidecar.py      每部番的 .media-agent.json：字段归属（派生 / 身份 / 人的意图），按写的那一刻合并，坏文件不覆盖
+  ledger.py       出处账本 state/ledger.sqlite：按 infohash 记每个种子是什么（番组页标题、集位、发布方编号、版本词、评分）
+  ledger_backfill.py  补录账本：抓取审计 → AB 库（只读）→ 番组页 feed → ma: / manual: 标签；run 开头自动补增量
   health.py       运行健康：种子数基线（骤降且审计解释不了 → 整轮拒绝）、每轮健康报告
   notify.py       通知邮件：健康报告有变化才发（一轮最多一封），去重在 state/notify.json，永不带密钥
   runlog.py       run 的输出每行带时间与批次 ID；run.log / run.err.log 先拷贝再截断地轮转（launchd 持有描述符）
@@ -48,17 +53,19 @@ uv run media-agent diagnose           # 跑全部规则，出问题清单（只�
 uv run media-agent apply --dry-run    # 预演修复
 uv run media-agent apply              # 执行修复
 uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
-uv run media-agent run                # 完整自治轮次（演进默认冻结），末尾处置隔离区
+uv run media-agent run                # 完整自治轮次：迭代到不动点（MAX_ITERATIONS，默认 3；演进默认冻结），末尾处置隔离区
 uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题、先不提醒（写 .agents/acks.json，要提交）
 uv run media-agent health               # 最近一轮的健康报告（--run ID 指定一轮，--json 原样）
+uv run media-agent ledger backfill      # 补录出处账本（--dry-run 只报覆盖率；run 开头自动补增量）
+uv run media-agent ledger show <hash>   # 账本里某个种子是什么
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 
 **改动删改类逻辑前先写离线测试。** 用 `tests/harness` 的 `LibraryBuilder`
 把事故现场搭出来（范例见 `tests/test_e2e_smoke.py`，fixture 一览见
-`tests/harness/__init__.py`），`lib.cycle()` 跑一轮
-扫描 → 全量规则 → 执行。测试里触发的 failed 审计、被吞的检测器异常、
+`tests/harness/__init__.py`），`lib.cycle()` 跑一次
+扫描 → 全量规则 → 执行，`lib.loop()` 像 `run` 那样迭代到不动点（`tests/test_converge.py`）。测试里触发的 failed 审计、被吞的检测器异常、
 没配路由的 URL 都会让测试变红，需要时用 `@pytest.mark.allow(...)` 显式声明。
 见 [离线测试基座](.agents/notes/implemented/testing/2026-09-26-offline-test-harness.md)。
 
@@ -111,8 +118,8 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
    按**此刻**的 qBittorrent 与磁盘、按目标本身（路径 + hash）复核，与产出它的规则无关：
    I1 不让任何集位变成零个可播文件（点名的保留方此刻真在、下完了、没被截断、同批没被删；没点名的
    ——特典也算——名字认得出集号时那一集得另有真能播的文件）；I2 不删别的种子仍声明的路径；I3 多文件种子只作废这一个
-   条目（按成员定：已不下载的条目不动种子）；I4 不删封存的文件，
-   **探测不可用当作封存**；演进规则的删除一律不执行。拒绝记 skipped「删除关口：Ix …」，看不全记
+   条目（按成员定：已不下载的条目不动种子）；I4 不删封存的文件（钉子 + 复核通过 + 番组页标题满足这部番的
+   `require_any`），**探测不可用当作封存**；演进规则的删除一律不执行。拒绝记 skipped「删除关口：Ix …」，看不全记
    failed。新加删除类动作必须接关口；判重类检测器要在动作里给保留方与集位（`keep_path` /
    `keep_hash` / `keep_size` / `keep_digest` / `slot`）。每条隔离记录带 `deletion`（给 purge）。见
    [删除关口](.agents/notes/implemented/architecture/2026-09-26-deletion-gate.md)。
@@ -138,6 +145,25 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     成败都写报告），critical 的要让退出码非零；有状态的新检测器给集位 / 季级发现填 `Finding.subject`，指纹里**永远
     不放摘要**。要人处理、短期不会动的卡住问题用 `media-agent ack` 确认（`.agents/acks.json` 是版本化的用户意图）。见
     [运行健康](.agents/notes/implemented/architecture/2026-09-26-run-health.md)。
+
+13. **检测只读媒体根。** `scan` 与检测器只许读媒体库；要记下来的决策放 `state/` 的缓存，要改媒体库里的东西
+    （含 `.media-agent.json`）就产出动作、经执行器写（有审计、有逆操作）。`diagnose` / `apply --dry-run` /
+    影子验证之后媒体根下一个字节都不变（`tests/test_diagnose_purity.py` 守着）。见
+    [diagnose 改写 sidecar](.agents/notes/implemented/bug-fix/2026-09-26-diagnose-writes-sidecars.md)。
+
+14. **"这个种子是哪一集、是什么版本"先问出处账本，不再从文件名重新猜。** 名字会被 AutoBangumi、人、别的规则改
+    （2026-08-31 AB 把 `3rd Season - 08` 改成 `S01E08`，判重据此把 2016 年的第 8 集清进隔离区）。集位用
+    `builtin.recorded_slot` / `ledger_view`（钉子 > 账本 > 名字，`_resolve` 已经这样），版本词用 `release_text`
+    （番组页标题 + 显示名），新写的加种路径要调 `ledger.record_grab`。账本读不了时一切按名字走、健康报告说出来，
+    **永不因账本拦下一轮**。见 [出处账本](.agents/notes/implemented/architecture/2026-09-27-provenance-ledger.md)。
+
+15. **一轮 `run` 迭代到不动点，一轮一个执行器**（`media_agent/converge.py`）。扫描 → 诊断 → 执行重复到某次迭代没有新动作
+    （`MAX_ITERATIONS`）：配额、批次 ID、`_grabbed` 跨迭代；按路径记的本批次状态每次迭代清掉（`Executor.new_iteration`）。
+    **新加的动作**：在 `converge._TARGET` 里写明它"对谁"做（没写的按全部参数认，一轮只试一次）；有逆操作的，让
+    `converge.undoes` 认得出它的反向——撤销本轮已执行动作的一律拒绝、报 `oscillation`；只有"此刻被挡着、别的动作能挪开"的
+    跳过才进 `converge.RETRYABLE`；会让种子重新校验 / 搬存储的进 `converge.TOUCHING`（这一轮不按死种摘它），搬存储（setLocation）
+的还要进 `converge.MOVES`（下一次扫描之前先等 qBittorrent 搬完，等不到就停在这一次迭代）。一轮只做一次的事（发现历史、标题稳定闸、卡住检测、健康报告）按**最后一次**诊断做，
+    不在迭代里做。见 [一轮之内收敛](.agents/notes/implemented/architecture/2026-09-27-converge-within-a-run.md)。
 
 ## 自演进的闭环
 

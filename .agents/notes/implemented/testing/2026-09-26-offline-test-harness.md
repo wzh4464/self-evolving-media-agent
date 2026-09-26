@@ -40,7 +40,9 @@
 - **FakeTMDB / FakeAB / FakeLLM**；AutoBangumi 的库用**真的** `AutoBangumiDB`
   跑在临时 sqlite 上，docker 换成只记参数的脚本。
 - **LibraryBuilder**：几行声明剧、季、种子、磁盘文件（稀疏文件，大小精确）、
-  sidecar、订阅；`lib.cycle()` 一轮 = 新 Context → 扫描 → 全量内置规则 → 执行。
+  sidecar、订阅；`lib.cycle()` 一轮 = 新 Context → 扫描 → 全量内置规则 → 执行（只跑一次）；
+  `lib.loop()`（2026-09-27）= 一轮 `run` 的迭代到不动点：一个 Context、一个执行器，
+  `converge.run`，返回的 `Loop` 多一个 `outcome`（每次迭代、停在哪、待做、`oscillation`）。
 - **Tripwire**（conftest 自动启用）：没路由的 URL、直连网络、起子进程、
   调用未建模方法、Executor 的 failed 审计、Registry 吞掉的检测器异常、
   含「失败」的日志——测试结束时有未声明的就判失败。

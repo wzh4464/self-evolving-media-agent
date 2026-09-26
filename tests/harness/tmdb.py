@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 
 def weekly(n: int, first_days_ago: int, every: int = 7) -> list[tuple[int, str]]:
@@ -21,7 +22,12 @@ def weekly(n: int, first_days_ago: int, every: int = 7) -> list[tuple[int, str]]
 
 
 class TMDBNotFound(LookupError):
-    pass
+    """TMDB 的 404。带 `response.status_code`，与真客户端抛的 `httpx.HTTPStatusError` 同形：调用方按状态码
+    分"TMDB 答了：没有这一季"与"TMDB 连不上"（`cache._outage`）。"""
+
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        self.response = SimpleNamespace(status_code=404)
 
 
 class FakeTMDB:

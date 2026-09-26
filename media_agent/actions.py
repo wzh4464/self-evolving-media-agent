@@ -218,6 +218,10 @@ class Executor:
         # `write_sidecar` 排在最后、且是整份覆盖，而它的 payload 是**诊断阶段**
         # 算出来的快照——不带上这些，本轮刚抓的集会被旧快照盖掉。
         self._grabbed: dict[str, set] = {}
+        # 本批次改了名的番目录：{旧目录: 新目录}（跨迭代留着）。qBittorrent 的搬运是异步的，改名之后旧目录常常还在
+        # （种子还在里面搬）——往它里面写档案 / 钉身份，就在搬空之后留下一个只剩 `.media-agent.json` 的幽灵目录
+        # （2026-09-27 审查）。档案跟着新目录走，下一次扫描按新目录重算。
+        self._renamed_dirs: dict[str, str] = {}
         # 本批次已经处置掉的种子记录与已搬进隔离区的路径。诊断是一次性全量产出的，
         # 同一个输家常常同时挂着 trash（op 5）和 rename（op 6）：种子删了之后
         # 再去 `files()` 就是 404，记成 failed 还会污染 `find_failure_patterns`
@@ -449,6 +453,7 @@ class Executor:
         "repoint_rss": 0,        # 同上：链接指错地方，下游同样无从谈起
         "grab_episode": 0,       # 抓取只加种子、不碰已有文件，与下游动作互不干扰
         "write_sidecar": 10,     # 最后写档案，记录本轮结束后的最终状态
+        "pin_tmdb": 10,          # 钉 TMDB 身份：只写 sidecar，与写档案同一档（写档案不改已有的 tmdb_id）
         "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
         "drop_torrent": 1,       # 撞车的种子越早摘掉越好：它占着一条路径的
                                  # 所有权，后面的改名/归位都要以此为前提
@@ -520,6 +525,21 @@ class Executor:
                 except Exception as e:
                     self._crashed(f, e)
         return self.report
+
+    def new_iteration(self) -> None:
+        """`run` 迭代到不动点（`converge`）时，下一次迭代开始之前调用。一轮一个执行器：批次 ID、删除配额、
+        `_grabbed`、本轮摘掉的种子（按 hash，qBittorrent 的删除是异步的）都跨迭代留着。
+
+        清掉的两样：占用索引（下一次查询重新问 qBittorrent）与**按路径**记的"本批次已隔离"。后者只在同一份诊断里
+        有意义——同一批里一个输家常同时挂着 trash 与 rename。下一次迭代是新的扫描，隔离掉的文件已经不在里面了；
+        同一个路径上此刻可能是改名过来的赢家，还按路径记着，改名会说"文件本批次已移入隔离区"、删除关口会说
+        "保留方本批次已被移进隔离区"，都是假的拒绝。"""
+        self._claim_index = None
+        self._trashed_paths.clear()
+
+    def refuse(self, f: Finding, reason: str, extra: dict | None = None) -> None:
+        """执行器之外的一道闸拒绝了这个动作（`converge` 的反向动作）：记一条 skipped 审计，与执行器自己的拒绝同一个形状。"""
+        self._audit(auditlog.SKIPPED, f, f.action, {"reason": reason, **(extra or {})})
 
     @contextmanager
     def _tracking(self):
@@ -831,49 +851,126 @@ class Executor:
         self._audit("applied", f, a, undo=undo)
 
     def _op_write_sidecar(self, f: Finding, a: Action) -> None:
-        """写入每部番的采集档案。纯写自有文件，不碰媒体内容。"""
+        """写入每部番的采集档案。纯写自有文件，不碰媒体内容。
+
+        **按写的这一刻的文件合并，只写派生字段**（`sidecar.merge_for_write`，字段归属见 `sidecar.DERIVED` 等）。
+        payload 是诊断期的快照；以前拿它整份覆盖，诊断之后人改的 `season_offsets` / `require_any` / `notes`、
+        另一个进程写的、回退写回去的全被盖掉，本版本不认识的键也一并丢了（2026-09-26 状态测绘）。
+        """
         from . import sidecar as sc_mod
         show_dir = Path(a.args["show_dir"])
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
+        if self._dir_renamed(f, a, show_dir):
+            return
+        if not show_dir.is_dir():
+            # 目录改名（op 8）排在写档案（op 10）之前：诊断期的路径已经不在了。档案跟着目录走了，
+            # 下一轮按新目录重算；往旧路径写只会凭空建一个目录或失败。
+            self._audit("skipped", f, a, {"reason": f"目录已不在（本轮改名或搬走了）：{show_dir}，档案下一轮按新目录重算"})
+            return
         prev = sc_mod.path_for(show_dir)
-        prev_content = prev.read_text(encoding="utf-8") if prev.exists() else None
+        try:
+            prev_content = prev.read_text(encoding="utf-8") if prev.exists() else None
+        except (OSError, UnicodeDecodeError):
+            prev_content = None          # 读不了的由下面 write_merged 的坏文件检查拒绝
         payload = a.args["payload"]
-        known = {k for k in sc_mod.Sidecar.__dataclass_fields__}
-        sc = sc_mod.Sidecar(**{k: v for k, v in payload.items() if k in known})
+        # 本轮 grab_episode（op 0）已经往 sidecar 写过新集；payload 是诊断期的快照，没有它们。
+        # 实测 2026-09-26「躲在超市后门抽烟的两人」S01E12 文件都落盘了，`have` 还停在 11，下一轮又抓一遍。
+        # 只并回**本轮自己抓的**那几集，不并磁盘上的旧值——sidecar-sync 的职责之一正是把已经删掉的集
+        # 从 `have` 里摘掉，无脑求并集会让它再也摘不掉。
+        grabbed = self._grabbed.get(str(show_dir), ())
 
-        # payload 是**诊断阶段**的快照，而抓取（op 0）排在本动作（op 10）之前，
-        # 已经往磁盘上的 sidecar 写过新集。整份覆盖会把它抹掉：实测 2026-09-26
-        # 「躲在超市后门抽烟的两人」S01E12 文件都落盘了，`have` 还停在 11，
-        # 于是下一轮把同一集又抓一遍（靠 qBittorrent 的 infohash 去重才没真重下）。
-        #
-        # 只并回**本轮自己抓的**那几集，不并磁盘上的旧值——sidecar-sync 的职责
-        # 之一正是把已经删掉的集从 `have` 里摘掉，无脑求并集会让它再也摘不掉。
-        for season, ep in self._grabbed.get(str(show_dir), ()):
-            info = sc.seasons.setdefault(str(season), {})
-            info["have"] = sorted(set(info.get("have") or []) | {ep})
-
-        # 别名是只增不减的（`add_alias` 的语义），抓取时记下的发布名同样要保住。
-        if prev_content:
-            try:
-                import json as _json
-                for al in (_json.loads(prev_content).get("aliases") or []):
-                    sc.add_alias(al)
-            except (ValueError, AttributeError):
-                pass
+        def add_grabbed(merged: dict) -> None:
+            seasons = merged.setdefault("seasons", {})
+            for season, ep in grabbed:
+                info = seasons.setdefault(str(season), {})
+                info["have"] = sorted(set(info.get("have") or []) | {ep})
 
         undo = {"op": "restore_sidecar", "show_dir": str(show_dir), "prev": prev_content}
         self._intend(undo)
         self._effect("fs.sidecar")
         try:
-            sc_mod.save(show_dir, sc)
+            sc_mod.write_merged(show_dir, payload, add_grabbed)
+        except sc_mod.SidecarCorrupt as e:
+            # 坏掉的档案里也许有人写的换算关系 / 版本要求：不覆盖，已备份，等人修
+            self._audit("skipped", f, a, {"reason": str(e),
+                                          "backup": str(e.backup) if e.backup else ""})
+            return
         except Exception as e:
-            # `sidecar.save` 先写临时文件、再原子替换：内容没变就是没生效
+            # 先写临时文件、再原子替换：内容没变就是没生效
             if not self._settle(f, a, e, lambda: self._sidecar_changed(prev, prev_content),
                                 what="写 sidecar ", undo=undo):
                 return
         self._audit("applied", f, a, undo=undo)
+
+    def _op_pin_tmdb(self, f: Finding, a: Action) -> None:
+        """把模型选的 TMDB 条目钉进 sidecar（`tmdb_id` + `tmdb_source`）。**只在还没有 tmdb_id 时写**：
+        已有的（人钉的、上一轮钉的、sidecar-sync 填的）一律不改——身份只由人改（`sidecar.IDENTITY`）。
+
+        critic N4：模型在多个候选里的选择以前每轮重新做、谁也看不见，直接决定改名目标、目录名、分类。
+        钉进 sidecar 之后扫描照它认，不再问模型；这一步有审计、能回退（`restore_sidecar`）。
+        """
+        from . import sidecar as sc_mod
+        show_dir = Path(a.args["show_dir"])
+        want = int(a.args["tmdb_id"])
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run"})
+            return
+        if self._dir_renamed(f, a, show_dir):
+            return
+        if not show_dir.is_dir():
+            self._audit("skipped", f, a, {"reason": f"目录已不在：{show_dir}"})
+            return
+        cur, problem = sc_mod.load_checked(show_dir)
+        if problem:
+            bk = sc_mod.backup_corrupt(show_dir)
+            self._audit("skipped", f, a, {"reason": f"sidecar 解析不了（{problem}），不写"
+                                          + (f"；已备份到 {bk.name}" if bk else ""),
+                                          "backup": str(bk) if bk else ""})
+            return
+        if cur.tmdb_id:
+            same = int(cur.tmdb_id) == want if str(cur.tmdb_id).isdigit() else False
+            self._audit("skipped", f, a, {"reason": (
+                "sidecar 里已经钉着这个条目" if same else
+                f"sidecar 里已有 tmdb_id {cur.tmdb_id}（{cur.tmdb_source or '来源未记'}），不改——身份只由人改")})
+            return
+        p = sc_mod.path_for(show_dir)
+        try:
+            prev_content = p.read_text(encoding="utf-8") if p.exists() else None
+        except (OSError, UnicodeDecodeError):
+            prev_content = None
+        undo = {"op": "restore_sidecar", "show_dir": str(show_dir), "prev": prev_content}
+
+        def pin(sc) -> None:
+            sc.tmdb_id, sc.tmdb_source = want, str(a.args.get("source") or "llm")
+            if a.args.get("title"):
+                sc.tmdb_title = str(a.args["title"])
+
+        self._intend(undo)
+        self._effect("fs.sidecar")
+        try:
+            sc_mod.update(show_dir, pin)
+        except sc_mod.SidecarCorrupt as e:
+            self._audit("skipped", f, a, {"reason": str(e), "backup": str(e.backup) if e.backup else ""})
+            return
+        except Exception as e:
+            if not self._settle(f, a, e, lambda: self._sidecar_changed(p, prev_content),
+                                what="写 sidecar ", undo=undo):
+                return
+        self._audit("applied", f, a, undo=undo)
+
+    def _dir_renamed(self, f: Finding, a: Action, show_dir: Path) -> bool:
+        """这个番目录本批次已经改了名（`_renamed_dirs`）：不往旧目录里写，记 skipped。返回是不是。
+
+        只看 `is_dir()` 不够：qBittorrent 的 setLocation 是异步的，种子还在旧目录里搬的时候旧目录还在，写进去的档案
+        等搬空之后就是一个只剩 `.media-agent.json` 的幽灵目录（2026-09-27 审查：`FakeQbit.async_moves` 复现）。"""
+        new = self._renamed_dirs.get(str(show_dir))
+        if new is None:
+            return False
+        self._audit("skipped", f, a, {"reason": (f"目录本批次已改名为 {Path(new).name}（qBittorrent 可能还在搬旧目录里的"
+                                                 f"文件）：不往旧目录写，档案按新目录重算")})
+        return True
 
     @staticmethod
     def _sidecar_changed(p: Path, before: str | None) -> bool | None:
@@ -1122,6 +1219,10 @@ class Executor:
                 return
             already = None                   # 种子在；分不清是这次加的还是本来就有
         self._claims().invalidate()          # 多了一个种子：占用索引要重新问
+        # 这个种子是什么——在我们知道得最清楚的这一刻记进出处账本（`ledger`）：番组页标题、抓取器定的集位、
+        # 发布日期、评分、落选了几个。以前这些只进了 Finding 的 evidence，审计只存 args（state 调研 H1），
+        # 之后每条规则都从文件名重新猜（AB 把 `3rd Season - 08` 改成 S01E08，判重就认成第 8 集）。
+        ledger_note = self._ledger_grab(f, a, ih, None if already is None else not already)
 
         # 发布方的分季编号与库内连续编号不一致时，改写 qBittorrent 里的**种子名**。
         #
@@ -1158,16 +1259,18 @@ class Executor:
         have: list = []
         sidecar: dict = {}
         self._effect("fs.sidecar")
-        try:
-            sc = sc_mod.load(show_dir)
+
+        def record(sc) -> None:
             info = sc.seasons.setdefault(str(season), {})
-            have = sorted(set(info.get("have") or []) | {ep})
-            info["have"] = have
+            info["have"] = sorted(set(info.get("have") or []) | {ep})
             for part in re.split(r"\s*/\s*", title):
                 part = part.strip()
                 if 4 <= len(part) <= 60 and not part.startswith("["):
                     sc.add_alias(part)
-            sc_mod.save(show_dir, sc)
+        try:
+            # 按此刻的文件读-改-写；坏掉的档案拒绝覆盖（`SidecarCorrupt`，已备份）——以前读成默认值再整份写回，
+            # 人写的 season_offsets / require_any 就这么没了
+            have = sc_mod.update(show_dir, record).seasons[str(season)]["have"]
         except Exception as e:
             # 种子已经加进去了——这是抓取的改动本身；记账没写成不能让它变成"失败、没有逆操作"
             # （2026-09-16 起 12 次抓取就是这样丢的记账）。下面照样记进 `_grabbed`：本轮排在最后的
@@ -1182,10 +1285,40 @@ class Executor:
                     {"already_present": already,
                      "save_path": str(save_path),
                      "have_after": have,
-                     "rename": renamed, "metadata": metadata, **sidecar},
+                     "rename": renamed, "metadata": metadata, **sidecar,
+                     **({"infohash": ih} if ih else {}), **ledger_note},
                     undo={"op": "ungrab_episode", "show_dir": str(show_dir),
                           "season": season, "episode": ep,
-                          "title": title})
+                          "title": title, **({"infohash": ih} if ih else {})})
+
+    def _ledger_grab(self, f: Finding, a: Action, ih: str, added: bool | None) -> dict:
+        """抓取的这一行记进出处账本；返回并进审计的一段（`ledger` / `ledger_error`）。
+
+        写不进去（账本坏了、版本更新、磁盘满）**不让抓取变成失败**：种子已经加进去了，这是抓取的改动本身；
+        审计里写明账本没记上，下一轮开头的自动补录会从审计里的这一条补回来。"""
+        from . import ledger
+
+        if not ih:
+            return {"ledger": "算不出 v1 infohash（纯 v2 种子？），没有记"}
+        ev = f.evidence or {}
+        detail = {k: ev[k] for k in ("air_date", "mikan_id", "rejected_by_date", "rejected_by_season",
+                                     "candidates") if k in ev}
+        rej = ev.get("rejected_count")
+        detail["rejected"] = rej if isinstance(rej, int) else len(ev.get("rejected") or [])
+        try:
+            with ledger.Ledger.open(self.cfg.state_dir) as led:
+                led.record_grab(
+                    infohash=ih, mikan_title=a.args.get("title") or "", mikan_url=a.args.get("url") or "",
+                    pub_date=str(ev.get("chosen_pub") or ""), show_dir=str(a.args.get("show_dir") or ""),
+                    season=int(a.args["season"]), episode=int(a.args["episode"]),
+                    verdict=ev.get("verdict_detail") or {}, chosen_reason=str(f.summary or ""),
+                    ab_bangumi_id=a.args.get("bangumi_id"), run_id=self.run_id, added=added,
+                    evidence=detail)
+        except Exception as e:                       # noqa: BLE001 —— 账本是记账：写不进去写明在审计里，抓取照常算数
+            why = _describe(e)
+            self.ctx.log(f"[grab] {str(a.args.get('title') or '')[:60]}：种子已加入，出处账本没记上（{why}）")
+            return {"ledger_error": why}
+        return {"ledger": "recorded"}
 
     @staticmethod
     def _infohash_v1(blob: bytes) -> str | None:
@@ -1705,6 +1838,8 @@ class Executor:
                 else:
                     move_unsure.append({"hash": h, "error": _describe(e)})
 
+        if moved_ok:
+            self._renamed_dirs[str(old)] = str(new)
         if move_failed or move_unsure:
             # 有种子没搬成功就中止：此时目录处于半迁移状态，
             # 继续 mv 剩余文件只会让情况更糟，交给人处理。
@@ -1753,12 +1888,36 @@ class Executor:
                   if under(prev_savepath, old) else prev_savepath, bid))
             ])
 
+        self._renamed_dirs[str(old)] = str(new)
         self._audit("applied", f, a,
                     {"new_path": str(new), "torrents_moved": len(moved_ok),
                      "leftover_files_moved": leftovers,
                      "stranded_files": stranded,
                      "old_dir_removed": not old.exists(), **skipped_merge},
                     undo=undo)
+        self._carry_identity(f, new)
+
+    def _carry_identity(self, f: Finding, new: Path) -> None:
+        """目录是按哪个 TMDB 条目改的名，下一次扫描就按哪个条目认它：按新目录名记一条（旧格式的按目录名缓存，
+        `scan._search_tmdb` 最先查它）。
+
+        2026-09-27 审查：没钉 tmdb_id 的番，身份是这一轮按**旧目录名**搜到的；写 sidecar（op 10）排在目录改名（op 8）
+        之后、因为目录已不在被跳过，身份没钉进去。下一次扫描（迭代到不动点时就是几毫秒之后）按**新目录名**——也就是
+        TMDB 标题——重新搜：同名的另一个条目（重制版、真人版）让它选了别的（没开模型取第一个、开了问模型再 `pin_tmdb`），
+        而 NFO 与目录名都是按原来那个写的，此后只有人改得了。sidecar 里已经钉着的不需要这一步（扫描照 sidecar 认），
+        记了也无害。写不进缓存只说一句：最坏是下一次扫描照旧重新搜。
+
+        **只记 id，不记标题与季**：`scan._tmdb_meta` 会把带标题的旧格式条目当成元数据迁过去，记了标题，按 id 的缓存过期
+        之后它又顶上 30 天、TMDB 改了的标题迟迟看不见（稳定闸因此认不出"又给回了刚换掉的标题"）。"""
+        tid = (f.evidence or {}).get("tmdb_id")
+        if not tid:
+            return
+        from .cache import Cache
+        try:
+            Cache(self.cfg.cache_db).put_tmdb(new.name, {"id": int(tid)})
+        except Exception as e:                     # noqa: BLE001 —— 说出来；目录改名本身已经做成了
+            self.ctx.log(f"[rename_show_dir] {new.name} 的 TMDB 身份（{tid}）没记进缓存（{type(e).__name__}: {e}），"
+                         f"下一次扫描会按新目录名重新搜")
 
     def _op_trash(self, f: Finding, a: Action) -> None:
         """删除 = 移入隔离区。受配额上限保护，**动手前过删除关口**（`media_agent/gate.py`）。
@@ -2483,15 +2642,22 @@ class Executor:
             return True, ""
 
         if op == "restore_sidecar":
+            from . import sidecar as sc_mod
+            d = Path(u["show_dir"])
+            _, problem = sc_mod.read_raw(d)
+            if problem:
+                # 这一轮之后档案坏了（多半是人手改到一半）：还原会把那份内容盖掉。先备份、不动，等人修
+                bk = None if self.dry_run else sc_mod.backup_corrupt(d)
+                return False, (f"sidecar 此刻解析不了（{problem}），不还原"
+                               + (f"；已备份到 {bk.name}" if bk else "") + "，修好之后再回退")
             if self.dry_run:
                 return True, ""
-            from . import sidecar as sc_mod
-            p = sc_mod.path_for(Path(u["show_dir"]))
+            p = sc_mod.path_for(d)
             self._effect("fs.sidecar")
             if u.get("prev") is None:
                 p.unlink(missing_ok=True)
             else:
-                p.write_text(u["prev"], encoding="utf-8")
+                sc_mod.write_text_atomic(p, u["prev"])
             return True, ""
 
         if op == "restore_title_aliases":
@@ -2511,13 +2677,27 @@ class Executor:
                 return True, ""
             from . import sidecar as sc_mod
             d = Path(u["show_dir"])
-            sc = sc_mod.load(d)
-            info = sc.seasons.get(str(u["season"]))
-            if info:
-                info["have"] = [x for x in (info.get("have") or [])
-                                if x != int(u["episode"])]
+            sc, problem = sc_mod.load_checked(d)
+            if problem:
+                bk = sc_mod.backup_corrupt(d)
+                return False, (f"sidecar 此刻解析不了（{problem}），不改"
+                               + (f"；已备份到 {bk.name}" if bk else "") + "，修好之后再回退")
+            if str(u["season"]) in sc.seasons:
+                def forget(sc) -> None:
+                    info = sc.seasons.get(str(u["season"])) or {}
+                    info["have"] = [x for x in (info.get("have") or []) if x != int(u["episode"])]
                 self._effect("fs.sidecar")
-                sc_mod.save(d, sc)
+                sc_mod.update(d, forget)
+            if u.get("infohash"):
+                # 出处账本里那一行标成撤销：行留着（它仍然是那个种子），只是不再替它的集位作保。
+                # 账本写不进去不让回退失败——sidecar 已经改了；回退的汇报里写明
+                from . import ledger
+                try:
+                    with ledger.Ledger.open(self.cfg.state_dir) as led:
+                        led.retract(u["infohash"], run_id=self.run_id,
+                                    why=f"回退抓取 {(rec or {}).get('run_id') or ''}".strip())
+                except Exception as e:           # noqa: BLE001 —— 撤销账本是记账：没做成写进回退的汇报
+                    self._undo_notes.append(f"出处账本没能把 {str(u['infohash'])[:8]} 标成撤销（{_describe(e)}）")
             return True, ""
 
         if op == "readd_torrent":

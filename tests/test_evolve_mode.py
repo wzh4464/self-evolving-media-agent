@@ -12,7 +12,7 @@ import argparse
 
 import pytest
 
-from media_agent import cli
+from media_agent import cli, health
 from media_agent import config as config_mod
 from media_agent import evolution as evolution_mod
 from media_agent.config import load_config
@@ -35,6 +35,11 @@ def offline_cli(lib, monkeypatch):
         Residue("[…] 测试番 - #.mkv", samples=[{"filename": "[G] 测试番 - 02.mkv"}], count=3)])
     lib.llm.script({"worth_a_rule": False})        # 打开 FakeLLM，记下每次调用
     return lib
+
+
+def _loop_scans(lib) -> int:
+    """这一轮迭代到不动点时自己扫了几次（`converge`：每次迭代一次，到顶时另有一次收尾诊断）。"""
+    return len(health.load_report(lib.cfg.state_dir)["loop"]["iterations"])
 
 
 def _count_scans(monkeypatch) -> dict:
@@ -76,7 +81,7 @@ def test_run_with_evolve_off_touches_neither_llm_nor_agents_dir(offline_cli, mon
 
     assert rc == 0
     assert lib.llm.prompts == []                         # 一次 LLM 调用都没有
-    assert scans["scans"] == 1                           # 没有为演进重扫
+    assert scans["scans"] == _loop_scans(lib)            # 没有为演进重扫（迭代自己的扫描之外一次都没有）
     assert not evolution_mod.RULES_DIR.exists()          # .agents/rules 都没建
     assert not evolution_mod.NOTES_ROOT.exists()
     assert "演进：已冻结（EVOLVE_MODE=off）" in capsys.readouterr().out
@@ -91,7 +96,7 @@ def test_run_with_evolve_propose_keeps_the_old_behaviour(offline_cli, monkeypatc
 
     assert rc == 0
     assert len(lib.llm.prompts) == 1                     # 拿盲区去问了模型
-    assert scans["scans"] == 2                           # 修复后为演进重扫一次
+    assert scans["scans"] == _loop_scans(lib) + 1        # 修复后为演进重扫一次
     assert "演进：提议 1 条，上线 0 条" in capsys.readouterr().out
 
 
@@ -102,7 +107,7 @@ def test_no_evolve_flag_still_wins_in_propose_mode(offline_cli, monkeypatch):
 
     assert cli.cmd_run(_args(no_evolve=True), lib.cfg) == 0
 
-    assert lib.llm.prompts == [] and scans["scans"] == 1
+    assert lib.llm.prompts == [] and scans["scans"] == _loop_scans(lib)
 
 
 def test_manual_evolve_refuses_while_frozen(offline_cli, capsys):

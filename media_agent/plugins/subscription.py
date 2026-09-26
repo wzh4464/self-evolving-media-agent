@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -17,7 +18,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
-from ..cache import Cache, EPISODES_TTL, FEED_TTL, LOOKUP_TTL
+from ..cache import Cache, FEED_TTL, LOOKUP_TTL, season_episodes
 from ..kernel import Action, Context, Finding, LibraryState, have_episodes
 from ..naming import VIDEO_EXTS, parse_episode, season_of_dir
 
@@ -64,6 +65,27 @@ def is_seasonal(dates: list, total: int, today: "date") -> bool:
 
 
 
+# 这个进程里刚请求失败过的网址 → (什么时候, 为什么)。`run` 迭代到不动点（`converge`）时每次迭代都重新诊断：
+# Mikan / RSS 挂着的话，每次迭代都把每个番组页、每条订阅各等一次 25 秒超时。本地动作修不好别人的网站，
+# 所以 `FETCH_FAIL_TTL` 之内同一个网址不再请求、直接报"刚失败过"（调用方照旧说出来、跳过）。进程级：
+# launchd 每轮起一个新进程，下一轮照常再试；测试基座每个 `cycle()` / `loop()` 开头清掉（`reset_process_caches`）。
+FETCH_FAIL_TTL = 1800
+_FETCH_FAILED: dict[str, tuple[float, str]] = {}
+
+
+def _fetch(url: str, timeout: float) -> str:
+    """所有检测器的网页 / RSS 请求都走这里：记下失败、`FETCH_FAIL_TTL` 之内不再请求同一个网址。"""
+    hit = _FETCH_FAILED.get(url)
+    if hit is not None and time.monotonic() - hit[0] < FETCH_FAIL_TTL:
+        raise OSError(f"{hit[1]}（{time.monotonic() - hit[0]:.0f} 秒前刚失败过，这一轮不再请求）")
+    req = urllib.request.Request(url, headers={"User-Agent": "media-agent/0.1"})
+    try:
+        return urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
+    except Exception as e:
+        _FETCH_FAILED[url] = (time.monotonic(), f"{type(e).__name__}: {e}"[:200])
+        raise
+
+
 def _fetch_rss_titles(url: str) -> list[str]:
     """拉 RSS 并取出条目标题。
 
@@ -78,9 +100,7 @@ def _fetch_rss_titles(url: str) -> list[str]:
         safe = urllib.parse.urlunsplit((
             parts.scheme, parts.netloc, urllib.parse.quote(parts.path),
             urllib.parse.quote(parts.query, safe="=&+%"), ""))
-    req = urllib.request.Request(safe, headers={"User-Agent": "media-agent/0.1"})
-    body = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "replace")
-    return rss_item_titles(body)
+    return rss_item_titles(_fetch(safe, timeout=25))
 
 
 def rss_item_titles(body: str) -> list[str]:
@@ -154,8 +174,7 @@ MIKAN = "https://mikanani.me"
 
 
 def _http_get(url: str, timeout: float = 25.0) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "media-agent/0.1"})
-    return urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
+    return _fetch(url, timeout)
 
 
 def _mikan_ids(url: str) -> tuple[str, str] | None:
@@ -361,18 +380,11 @@ class IncompleteSeasonDetector:
             for sn in sorted(have):
                 if sn == 0:
                     continue
-                ck = f"tmdbeps:{show.tmdb_id}:{sn}"
-                cached = cache.get_tmdb(ck, ttl=EPISODES_TTL)
-                if cached is not None:
-                    eps = cached.get("eps", [])
-                else:
-                    try:
-                        eps = ctx.tmdb.season_episodes(show.tmdb_id, sn)
-                    except Exception as e:
-                        ctx.log(f"[incomplete-season] TMDB 第 {sn} 季集表读取失败 {show.dir_name}，"
-                                f"这一季这一轮不评估：{type(e).__name__}: {e}")
-                        continue
-                    cache.put_tmdb(ck, {"eps": eps})
+                eps, why = season_episodes(ctx, cache, show.tmdb_id, sn)
+                if eps is None:
+                    ctx.log(f"[incomplete-season] TMDB 第 {sn} 季集表读取失败 {show.dir_name}，"
+                            f"这一季这一轮不评估：{why}")
+                    continue
 
                 dated = []
                 for e in eps:
@@ -506,18 +518,12 @@ class SourceAbandonedDetector:
             # 源快不快，在内容不缺时不构成问题。
             season = int(b.get("season") or 1)
             disk = _disk_episodes(show).get(season, set())
-            ck0 = f"tmdbeps:{show.tmdb_id}:{season}"
-            c0 = cache.get_tmdb(ck0, ttl=EPISODES_TTL)
-            if c0 is None:
-                try:
-                    c0 = {"eps": ctx.tmdb.season_episodes(show.tmdb_id, season)}
-                except Exception as e:
-                    # 行为不变（照旧按"没有已播的集"往下走、并缓存下来），但要说出来
-                    ctx.log(f"[source-abandoned] TMDB 第 {season} 季集表读取失败 {show.dir_name}："
-                            f"{type(e).__name__}: {e}")
-                    c0 = {"eps": []}
-                cache.put_tmdb(ck0, c0)
-            aired_eps = {e["episode_number"] for e in (c0.get("eps") or [])
+            eps0, why = season_episodes(ctx, cache, show.tmdb_id, season)
+            if eps0 is None:
+                # 行为不变（照旧按"没有已播的集"往下走），但要说出来。以前还把 `{"eps": []}` 当真数据缓存 6 小时，
+                # 排在后面的 incomplete-season / sidecar-sync 随后读到的都是"这一季一集都没有"
+                ctx.log(f"[source-abandoned] TMDB 第 {season} 季集表读取失败 {show.dir_name}：{why}")
+            aired_eps = {e["episode_number"] for e in (eps0 or [])
                          if e.get("air_date") and e["air_date"] <= today.isoformat()}
             if aired_eps and not (aired_eps - disk):
                 continue
@@ -551,18 +557,11 @@ class SourceAbandonedDetector:
                 continue
 
             season = int(b.get("season") or 1)
-            ck2 = f"tmdbeps:{show.tmdb_id}:{season}"
-            cached2 = cache.get_tmdb(ck2, ttl=EPISODES_TTL)
-            if cached2 is not None:
-                eps = cached2.get("eps", [])
-            else:
-                try:
-                    eps = ctx.tmdb.season_episodes(show.tmdb_id, season)
-                except Exception as e:
-                    ctx.log(f"[source-abandoned] TMDB 第 {season} 季集表读取失败 {show.dir_name}，"
-                            f"这一轮不评估：{type(e).__name__}: {e}")
-                    continue
-                cache.put_tmdb(ck2, {"eps": eps})
+            eps, why = season_episodes(ctx, cache, show.tmdb_id, season)
+            if eps is None:
+                ctx.log(f"[source-abandoned] TMDB 第 {season} 季集表读取失败 {show.dir_name}，"
+                        f"这一轮不评估：{why}")
+                continue
 
             dated = []
             for e in eps:

@@ -101,7 +101,8 @@ def test_grab_adds_pinned_torrent_and_bookkeeping_survives_the_batch(lib):
 
     [grab] = c.applied("grab_episode")
     assert grab["undo"] == {"op": "ungrab_episode", "show_dir": str(sh.path),
-                            "season": 1, "episode": 9, "title": title}
+                            "season": 1, "episode": 9, "title": title,
+                            "infohash": item.infohash}        # 回退时把出处账本那一行标成撤销
     assert grab["already_present"] is False
     v = lib.qbit.torrent(item.infohash)
     assert v["tags"] == "ma:S01E09"                       # 无订阅 id → 不给 ab:

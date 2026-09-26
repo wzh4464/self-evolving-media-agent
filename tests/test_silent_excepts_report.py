@@ -25,7 +25,7 @@ def test_tmdb_title_lookup_failure_is_logged_and_the_show_stays_unmatched(lib, t
     def boom(tv_id):
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr(lib.tmdb, "official_title", boom)
+    monkeypatch.setattr(lib.tmdb, "tv_detail", boom)             # 扫描一次 tv_detail 取标题与季
 
     state = lib.scan()
 
@@ -84,7 +84,7 @@ def test_logged_swallowed_errors_are_counted_in_the_health_report(lib, monkeypat
     s = lib.show("测试番")
     s.season(1).local("测试番 S01E01.mkv", size=1000)
     s.tmdb(42, title="测试番", seasons={1: [(1, "2026-01-01")]})
-    monkeypatch.setattr(lib.tmdb, "official_title",
+    monkeypatch.setattr(lib.tmdb, "tv_detail",
                         lambda tv_id: (_ for _ in ()).throw(TimeoutError("timed out")))
 
     cli.cmd_run(argparse.Namespace(dry_run=False, no_tmdb=False, no_evolve=False,

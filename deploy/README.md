@@ -34,8 +34,11 @@
 ## 用户意图放在哪
 
 - **每部番的意图**——"只保留 X 版"（`require_any`）、季内集号换算（`season_offsets`）、
-  备注、来源、`mikan_id`——在媒体根下各番目录的 `.media-agent.json` 里。它们是状态，
-  不入库、部署从不碰；要进备份。
+  备注、`mikan_id`、钉住的字段（`pinned`）、TMDB 身份（`tmdb_id`，代码只在没有时填一次）——在媒体根下
+  各番目录的 `.media-agent.json` 里。它们是状态，不入库、部署从不碰；要进备份。同一个文件里的
+  各季进度、来源、别名是 media-agent 算的，每轮会重写；人写的字段它从不覆盖（字段归属见
+  `media_agent/sidecar.py`）。文件改坏了（解析不了）media-agent 不会覆盖它：拷一份
+  `.media-agent.json.corrupt-<时间>`、每轮健康报告 warn，修好或删掉之后下一轮照常写。
 - **全局择源偏好** `.agents/preferences.json` 是**版本化**的：每轮运行都重新读，在生产上
   改了当轮就生效——但下一次部署时漂移闸门会拦下它、打印 diff、拒绝部署。要保留就用
   `--harvest` 打包带回开发机，提交、打 tag，再部署那个 tag；不要就

@@ -196,13 +196,15 @@ def _trashed_at(rec: dict | None, p: Path, trash_root: Path) -> datetime | None:
 _SUMMARY_SLOT = re.compile(r"^S(\d{1,2})E(\d{1,4})(?!\d)")
 
 
-def _slot_of(c: Candidate) -> tuple | None:
+def _slot_of(c: Candidate, ledger_rows: dict | None = None) -> tuple | None:
     """判重记录的集位：**检测器当时解析出来的那一个**，不从文件名重新猜。
 
     1. 新记录的 `deletion.slot`（删除关口记下：动作给的 slot > 钉子 > 名字）；
     2. 旧记录摘要开头的 `SxxEyy 重复：…`——duplicate-episode 按 `_resolve`（钉子、season_offsets、
        episode_offset）分桶时的集位；
-    3. 都没有才看原文件名，而且名字里得明写季号——猜季号会对到错的集位上。
+    3. 被隔离的那个种子在出处账本里的集位（有效行、那个种子只有这一个要下载的文件——合集的集位说不了单个文件）：
+       关口没认出集位、摘要里没有时，它比文件名可信；
+    4. 都没有才看原文件名，而且名字里得明写季号——猜季号会对到错的集位上。
 
     以前是文件名优先：《超超超超超喜欢你的100个女朋友》第三季（episode_offset -24）的发布名
     `- 25` 会被当成第 25 集去找替代者。
@@ -217,6 +219,11 @@ def _slot_of(c: Candidate) -> tuple | None:
     m = _SUMMARY_SLOT.match(rec.get("summary") or "")
     if m:
         return int(m.group(1)), int(m.group(2))
+    sub = (rec.get("deletion") or {}).get("subject") or {}
+    h = (sub.get("torrent_hash") or (rec.get("args") or {}).get("torrent_hash") or "").lower()
+    row = (ledger_rows or {}).get(h) if h else None
+    if row is not None and row.active and row.slot and sub.get("torrent_files") in (None, 1):
+        return row.slot
     sn, ep = parse_episode(Path(c.origin).name)
     if sn is None or ep is None:
         return None
@@ -284,6 +291,21 @@ def _identity_problem(f, show, slot, keeper: dict | None = None) -> str:
         return ""
     sn, ep = slot
     tag = f"S{sn:02d}E{ep:02d}"
+    # 出处账本先说话（`builtin.recorded_slot` / `ledger_view`）：抓取器定的集位、番组页标题按此刻换算得出的集位
+    # 是名字之外的正面证据；番组页标题声明了别的季、换算不了，名字里的集号就不可信——哪怕内部名（显示名）
+    # 不写季号、按它"认得出"这一集（`[Fyy Raws] Re Zero - 08`，番组页标题是「第三季 - 08」）。
+    rs = B.recorded_slot(f, show)
+    if rs is not None:
+        if tuple(rs) == (sn, ep):
+            return ""
+        return (f"替代者 {f.filename} 按出处账本是 S{rs[0]:02d}E{rs[1]:02d}（{f.ledger.mikan_title[:60]}），"
+                f"不是 {tag}——名字里的集号是按别的编号改的")
+    kind, _ = B.ledger_view(f, show)
+    if kind == "conflict":
+        row = f.ledger
+        return (f"替代者 {f.filename} 的番组页标题（出处账本）声明的是第 {row.declared_season} 季"
+                f"（{row.mikan_title[:60]}），库内是第 {sn} 季、又没有 season_offsets 可换算——"
+                f"名字里的集号可能是按那一季编的（2026-08-31 Re:Zero 的形态）")
     if f.torrent_hash:
         rs = B._release_slot(f, show)
         if rs == (sn, ep):
@@ -327,6 +349,14 @@ class _Pool:
         self.scan_errors: list[str] = []
         self.dur_cache: dict = {}
         self._claims = None
+        self._ledger: dict | None = None
+
+    def ledger(self) -> dict:
+        """出处账本（infohash → `ledger.Row`），一次 build_pool 读一次；读不了当没有（按没有账本的判据走）。"""
+        if self._ledger is None:
+            from . import ledger
+            self._ledger, _problem = ledger.load_rows(self.cfg.state_dir)
+        return self._ledger
 
     def claims(self):
         """此刻的路径占用索引（`claims.ClaimIndex`）。`qbit=None` 时每一问都是"不知道"。"""
@@ -595,7 +625,7 @@ def _season_median_duration(pool: _Pool, show, sn: int, exclude: Path) -> float 
 
 
 def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
-    c.slot = _slot_of(c)
+    c.slot = _slot_of(c, pool.ledger())
     if not c.slot:
         c.why = "解析不出集号"
         return
@@ -693,7 +723,7 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
         complete_why = (f"无种子可校验，改以时长自证：{d_surv:.0f}s 与同季中位数 "
                         f"{med:.0f}s 相符，且尾部可解码")
 
-    why = (_rank_problem(c, surv, show)
+    why = (_rank_problem(c, surv, show, pool.ledger())
            or _origin_problem(pool.claims(), c, surv.path, surv.torrent_hash))
     if why:
         c.why = why
@@ -702,7 +732,7 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
     c.why = f"S{sn:02d}E{ep:02d} 由 {surv.filename} 占位，{complete_why}"
 
 
-def _rank_problem(c: Candidate, surv, show) -> str:
+def _rank_problem(c: Candidate, surv, show, ledger_rows: dict | None = None) -> str:
     """I4 复排：隔离的这份按**现在的**规则该不该赢？该赢（或它自己封存着这一集）就返回不删的理由。
 
     判重的取舍规则一直在改（探到的字幕轨压过名字、体积跨编码折算、偏好分……），隔离区里躺着的是
@@ -729,7 +759,9 @@ def _rank_problem(c: Candidate, surv, show) -> str:
                      torrent_hash=sub.get("torrent_hash") or "",
                      torrent_name=sub.get("name") or "", torrent_progress=1.0,
                      torrent_tags=sub.get("tags") or "",
-                     torrent_category=sub.get("category") or "")
+                     torrent_category=sub.get("category") or "",
+                     # 番组页标题（出处账本）：复排时隔离的这份的版本词（「简繁内封」「邪竜解放版」）也算
+                     ledger=(ledger_rows or {}).get((sub.get("torrent_hash") or "").lower()))
     da, db = content_digest(c.trash_path), content_digest(surv.path)
     if da and db and da == db:
         return ""

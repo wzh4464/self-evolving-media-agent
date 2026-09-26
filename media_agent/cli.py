@@ -5,7 +5,8 @@
     media-agent apply     # 执行修复（--dry-run 预演）
     media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升（需 EVOLVE_MODE=propose）
     media-agent purge     # 隔离区处置预演（--apply 真删，每个都先记 state/purge.jsonl）
-    media-agent run       # 一轮完整自治：diagnose → apply → [evolve] → 隔离区处置
+    media-agent ledger backfill  # 补录出处账本（--dry-run 只报覆盖率）；run 开头自动补增量
+    media-agent run       # 一轮完整自治：(diagnose → apply) 迭代到不动点 → [evolve] → 隔离区处置
                           # evolve 只在 EVOLVE_MODE=propose 时跑，默认 off（见 config.py）
 """
 from __future__ import annotations
@@ -19,7 +20,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, disposal, health, history, notify, pause, runlock, runlog
+from . import __version__, converge, disposal, health, history, notify, pause, runlock, runlog, titles
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -606,6 +607,67 @@ def _remind_commit(path) -> None:
           "（deploy/README.md「用户意图放在哪」）")
 
 
+def _print_backfill(rep, limit: int = 30) -> None:
+    """补录报告：各来源补了几行、覆盖率、仍然没有出处的种子（前 `limit` 个）。"""
+    print(f"═══ 出处账本：{rep.summary()} ═══")
+    for p in rep.problems:
+        print(f"  ⚠️  {p}")
+    if rep.remaining:
+        print(f"  没有出处的种子（{len(rep.remaining)}）：")
+        for r in rep.remaining[:limit]:
+            print(f"    {r['hash'][:8]}  {r['show'] or '(不在媒体库)'}  {str(r['name'])[:70]}")
+        if len(rep.remaining) > limit:
+            print(f"    …另 {len(rep.remaining) - limit} 个")
+
+
+def cmd_ledger_backfill(args, cfg) -> int:
+    """`media-agent ledger backfill [--dry-run]`：从抓取审计、AutoBangumi 库（只读）、番组页 feed 补录出处账本。"""
+    from . import ledger_backfill
+
+    ctx = build_context(cfg)
+    rep = ledger_backfill.backfill(ctx, dry_run=args.dry_run)
+    _print_backfill(rep)
+    return 0 if not rep.problems or rep.torrents else 1
+
+
+def cmd_ledger_show(args, cfg) -> int:
+    """`media-agent ledger show <infohash>`：账本里这一行（没有 / 读不了时说明）。"""
+    from . import ledger
+
+    rows, problem = ledger.load_rows(cfg.state_dir)
+    if problem:
+        print(f"⚠️  出处账本{problem}")
+        return 1
+    h = (args.infohash or "").strip().lower()
+    hits = [r for k, r in rows.items() if k.startswith(h)] if len(h) >= 6 else []
+    if len(hits) != 1:
+        print(f"账本里{'没有' if not hits else '不止一个'}以 {h!r} 开头的种子（至少写 6 位）")
+        return 1
+    print(json.dumps(hits[0].to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def _auto_backfill(ctx, state) -> None:
+    """每轮 `run` 开头的增量补录（只补还没有出处的），补上的挂回这一轮的文件上。永不抛：补不了照常跑。"""
+    from . import ledger_backfill
+
+    if not getattr(state, "qbit_listed", False):
+        return                                       # 这一轮没读到种子列表：没得补
+    try:
+        rep = ledger_backfill.backfill(ctx, torrents=state.torrents)
+    except Exception as e:                           # noqa: BLE001 —— 补录是记账：出错说一句，这一轮照常
+        _log(f"⚠️  出处账本补录出错（{type(e).__name__}: {e}），这一轮按已有的账本走")
+        traceback.print_exc()
+        return
+    state.ledger_backfill = rep.to_dict()
+    if rep.inserted or rep.problems:
+        _print_backfill(rep, limit=10)
+    if rep.inserted and not rep.dry_run:
+        from . import ledger
+        from .scan import attach_ledger
+        attach_ledger(state, *ledger.load_rows(ctx.config.state_dir))
+
+
 def cmd_health(args, cfg) -> int:
     """最近一轮（或 `--run` 指定那一轮）的健康报告；`--json` 原样输出。
 
@@ -749,37 +811,87 @@ def _run(args, cfg, rh) -> int:
     rh.clients(ctx)
     prev = health.load_baseline(cfg.state_dir)
     scanned_at = datetime.now().isoformat(timespec="seconds")
-    state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
-    rh.scanned(state, prev)
-    if not state.qbit_errors:
-        # 这一轮的种子数被采信了：下一轮拿它比（`health.torrent_count_problem`）。时间取扫描之前——
-        # 这一轮自己摘掉的种子也算进下一轮"解释得通"的那部分。被拒绝的一轮不挪基线。
-        problem = health.save_baseline(cfg.state_dir, count=len(state.torrents), run_id=run_id,
-                                       ts=scanned_at, source="run")
-        if problem:
-            _log(f"⚠️  {problem}")
     reg = build_registry()
-
-    findings = reg.run_all(ctx, state)
-    rh.diagnosed(reg, findings)
     dry = args.dry_run or not cfg.auto_apply
-    _record_findings(cfg, run_id, findings, state, "run", dry_run=dry)
-    print(f"═══ 诊断：{len(findings)} 个问题 ═══")
-    _warn_degraded(state)
-    _print_findings(findings, False)
-
     ex = Executor(ctx, dry_run=dry, run_id=run_id)
-    report = ex.apply(findings)
-    if report.refused:
-        # fail closed：不修、不演进（演进器会拿这份残缺快照去立规则）、
-        # 也不处置隔离区——降级的一轮不改动任何东西。
-        rh.refused(report.refused)
-        return _refuse(report.refused)
-    rh.applied(report, findings, state)
-    print(f"\n═══ 修复：{report.summary()} ═══")
+
+    def on_scan(n, state) -> None:
+        if n != 1:
+            return
+        rh.scanned(state, prev)
+        if not state.qbit_errors:
+            # 这一轮的种子数被采信了：下一轮拿它比（`health.torrent_count_problem`）。时间取扫描之前——
+            # 这一轮自己摘掉的种子也算进下一轮"解释得通"的那部分。被拒绝的一轮不挪基线。
+            problem = health.save_baseline(cfg.state_dir, count=len(state.torrents), run_id=run_id,
+                                           ts=scanned_at, source="run")
+            if problem:
+                _log(f"⚠️  {problem}")
+        # 出处账本的增量补录（`ledger_backfill`）：这一轮还没有出处的种子，从抓取审计、AB 库（只读）、番组页找回
+        # 它是什么，诊断之前挂到文件上。后面的迭代不再补：本轮抓的执行器当场记账，扫描每次都重读账本
+        _auto_backfill(ctx, state)
+        rh.ledger(state)
+
+    def on_diagnose(n, state, findings) -> None:
+        if n == 1:
+            print(f"═══ 诊断：{len(findings)} 个问题 ═══")
+            _warn_degraded(state)
+            _print_findings(findings, False)
+            print(f"\n═══ 执行：扫描 → 诊断 → 执行，迭代到不动点（最多 {cfg.max_iterations} 次） ═══")
+        else:
+            _warn_degraded(state)
+
+    # 扫描 → 诊断 → 执行，重复到不动点（`converge` 模块文档）：一个执行器（一个批次 ID、配额跨迭代累计）、
+    # 每次迭代一份新扫描、TMDB 身份照常解析、试过的不再试、撤销本轮已执行动作的拒绝
+    out = converge.Outcome(max_iterations=cfg.max_iterations)
+    try:
+        converge.run(ctx, reg, ex, max_iterations=cfg.max_iterations, out=out,
+                     scan=lambda n: build_state(ctx, resolve_tmdb=not args.no_tmdb),
+                     on_scan=on_scan, on_diagnose=on_diagnose,
+                     on_iteration=lambda it: print(it.line(cfg.max_iterations)))
+    except BaseException:
+        # 半路冲出（后面迭代的扫描出错、Ctrl-C）：前面迭代已经改了的东西审计里都有，健康报告也要有——
+        # "执行"一节是 null 的意思是"没跑到"，而它跑了。异常照常往外抛（`cmd_run` 记 crash）
+        if out.iterations:
+            out.stop = out.stop or converge.CRASHED
+            rh.loop(out)
+            rh.actions(ex.report)
+        raise
+    report, state, findings = ex.report, out.state, out.findings
+    rh.loop(out)
+    # 发现历史、卡住检测、健康报告的"发现"按**最后一次**诊断算：已经在这一轮修好的不算"还在"
+    rh.diagnosed(reg, findings, errors=out.detector_errors)
+    _record_findings(cfg, run_id, findings, state, "run", dry_run=dry)
+    # TMDB 标题稳定闸（`titles`）：新标题要连续两轮 `run` 看到才采用——只有 `run` 数轮次，人手跑的 `diagnose` 不算；
+    # 一轮只记一次（迭代之间记了，同一轮的第二次迭代就会把新标题"确认"下来）。记不下来只说一句：最坏是多等一轮
+    problem = titles.record(cfg.state_dir, out.title_decisions, run_id=run_id)
+    if problem:
+        _log(f"⚠️  标题稳定记录：{problem}")
+
+    if out.stop == converge.REFUSED:
+        # fail closed：这一次迭代起不修、不演进（演进器会拿这份残缺快照去立规则）、也不处置隔离区。
+        # 前面的迭代已经做了的照样报（同一个批次 ID，可整批回退）
+        n = len(out.iterations)
+        why = report.refused
+        if n > 1:
+            why = (f"第 {n} 次迭代：{report.refused}；此前 {n - 1} 次迭代已执行 {len(report.applied)} 项"
+                   f"（批次 {run_id}，可 rollback）")
+            rh.applied(report, findings, state, proposed=out.proposed)
+            print(f"\n═══ 修复：{report.summary()} ═══")
+            _print_unknown(report.unknown)
+        rh.refused(why)
+        return _refuse(why)
+    rh.applied(report, findings, state, proposed=out.proposed)
+    print(f"\n═══ 修复：{report.summary()}（{_loop_brief(out)}） ═══")
     _print_unknown(report.unknown)
+    _print_loop(out)
 
     rc = 0
+    if out.final_degraded:
+        # 到顶之后的收尾诊断读 qBittorrent 不完整：待做的列不出来。与演进重扫读不全同一个口径——修复已经做了，
+        # 处置照跑，退出码 3 让它被看见
+        rh.rescan_degraded(out.final_degraded)
+        print(f"\n═══ 收尾诊断：qBittorrent 数据不完整，列不出还要做什么：{out.final_degraded} ═══")
+        rc = EXIT_DEGRADED
     if cfg.evolve_mode != "propose":
         # 冻结：不重扫、不调 LLM、不构造 Evolver（它的 __init__ 就会建 .agents/rules）
         rh.evolve("frozen")
@@ -820,6 +932,33 @@ def _run(args, cfg, rh) -> int:
     if _report_audit_problems(report.audit_problems, cfg.state_dir):
         return EXIT_AUDIT_INCOMPLETE
     return rc
+
+
+_STOP = {converge.FIXED_POINT: "不动点", converge.CAP: "到上限", converge.DRY_RUN: "预演只跑一次",
+         converge.REFUSED: "拒绝", converge.CRASHED: "半路冲出",
+         converge.MOVING: "qBittorrent 还在搬存储，剩下的下一轮做"}
+
+
+def _loop_brief(out) -> str:
+    n = sum(1 for it in out.iterations if not it.final)
+    return f"{n} 次迭代，{_STOP.get(out.stop, out.stop)}"
+
+
+def _print_loop(out, limit: int = 10) -> None:
+    """到顶时还要做的、两条规则打架的、没等到 qBittorrent 搬完的：逐条说。"""
+    if out.stop == converge.MOVING:
+        print(f"  ⏳ {out.unsettled}")
+    if out.stop == converge.CAP and out.pending:
+        print(f"  ⚠️  迭代到上限 {out.max_iterations} 次仍有 {len(out.pending)} 个动作待做（下一轮 run 接着做）：")
+        for f in out.pending[:limit]:
+            print(f"    ⏳ [{f.rule}] {f.action.op}【{f.show or '-'}】{str(f.summary)[:120]}")
+        if len(out.pending) > limit:
+            print(f"    …另 {len(out.pending) - limit} 个（media-agent health --json 的 loop.pending）")
+    if out.still_blocked:
+        print(f"  ⏸  {len(out.still_blocked)} 个动作每次迭代都被挡着、这一轮也没有别的动作碰得到挡着它的（下一次迭代再试"
+              f"也一样，不算待做）：" + "；".join(f"[{f.rule}] {str(f.summary)[:60]}" for f in out.still_blocked[:3]))
+    for o in out.oscillations[:limit]:
+        print(f"  ⚠️  两条规则在打架：{o.summary}")
 
 
 def main() -> int:
@@ -866,7 +1005,7 @@ def main() -> int:
 
     s = sub.add_parser("evolve", help="自演进：为规则盲区提议新规则")
     s.add_argument("--max-proposals", type=int, default=3)
-    # 会写 .agents/，影子验证还会跑全部检测器（含写 sidecar 的抓取规则）
+    # 会写 .agents/，影子验证还会跑全部检测器（检测本身只读媒体根，但会写 state/ 的缓存）
     s.set_defaults(func=cmd_evolve, lock=True)
 
     s = sub.add_parser("ack", help="确认一个卡住的问题：先不提醒（写 .agents/acks.json，要提交入库）")
@@ -884,6 +1023,16 @@ def main() -> int:
     s.add_argument("--accept-torrent-count", action="store_true",
                    help="把此刻 qBittorrent 的种子数认作新基线（在 qBit 里手动批量删除之后）")
     s.set_defaults(func=cmd_health)
+
+    s = sub.add_parser("ledger", help="出处账本（state/ledger.sqlite）：补录、查一个种子")
+    lsub = s.add_subparsers(dest="ledger_cmd", required=True)
+    b = lsub.add_parser("backfill", help="从抓取审计、AutoBangumi 库（只读）、番组页补录没有出处的种子")
+    b.add_argument("--dry-run", action="store_true", help="只报会补什么、覆盖率，不写账本")
+    # 只写 state/ledger.sqlite（WAL，与 run 的自动补录不冲突）；真补录仍与 run 排队，免得两边同时拉番组页
+    b.set_defaults(func=cmd_ledger_backfill, lock=lambda a: not a.dry_run)
+    b = lsub.add_parser("show", help="账本里某个种子的那一行")
+    b.add_argument("infohash", help="infohash（至少前 6 位）")
+    b.set_defaults(func=cmd_ledger_show)
 
     s = sub.add_parser("run", help="完整自治轮次")
     s.add_argument("--dry-run", action="store_true")

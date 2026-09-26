@@ -17,6 +17,7 @@
 | N1 | 回退 `restore_from_trash` 把空的 `trash_path` 变成 `Path('.')`，`shutil.move('.', dst)` 退回 `copytree(当前目录 → 媒体库)` 再 `rmtree(当前目录)`。根因：`_op_trash` 先删种子记录、后查文件是否存在。生产上 6 条这样的记录：20260830T132317、20260908T022758 ×3、20260908T143348、20260920T170126 | 8f66cab（回退校验参数）、bc8d5a3（隔离前先核对文件） |
 | N2 | qBittorrent **部分**读取失败：`files()` 的任何错误被缓存成空列表，那个种子的文件变成"纯本地文件"，改名走文件系统、隔离跳过种子，而且无声无息 | 5fde004 |
 | N3 | `rollback` / `repair` / `purge --apply` 不看 qBittorrent 在不在：逆改名退化成 `mv`，`repair` 用文件系统搬活种子的文件，purge 丢掉种子证据 | 5fde004；qBit 在线时的目录级搬运见 0fe98b2 |
+| N4 | 扫描时第二条 LLM 身份通路：`scan._pick_tmdb` 在多个 TMDB 候选里问模型，选中的 id 决定改名目标、目录名、分类；扫描从不读 sidecar 的 `tmdb_id`，缓存按目录名存——目录一改名就重新搜 | 第 4 阶段：扫描照 sidecar 的 `tmdb_id` 认、缓存按 id；模型的选择经 `pin_tmdb` 动作钉进 sidecar，见 `architecture/2026-09-26-tmdb-identity-pinning.md` |
 | N5 | 演进规则（LLM 提议、影子验证后上线的 DSL）可以带 `trash` / `retag` 等动作、参数由模型选，上线后不再复核——一条未经人审的"LLM → 改名 / 删除"通路 | ae4a8bb；删除的执法点并入删除关口 680962b（`gate.screen`，trash 与 drop_torrent） |
 | N6 | "这个路径是否已被另一个活种子声明"应当是所有写路径共用的一道闸；`relink_torrent` 只按大小匹配，可能造出两个种子争一个文件 | 第 1 阶段 2577c43 给改名加了 `_claimants`；第 2 阶段换成共用原语 1e7897d，接到改名 9dcf436、抓取后改名 8a0dec9、relink f2c9be8、回退 be0eae6 / 1726d3d、目录改名 4be6339 / 64a2f5b |
 | N7 | `Finding.key()` = `(kind, path)`：同一目录两个死种的 `content_path` 相同，第二条被去重吞掉 | 3ef6825；删除关口按目标（路径 + hash）复核、不按 key，680962b 起 |
@@ -25,6 +26,8 @@
 | N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒） | 0b5a02e |
 | N11 | 没有结构化的发现历史：无动作的发现只以文字进 run.log；没有路径的发现去重键退回 `(show, summary)`，摘要里嵌着计数，跨轮认不出同一个问题——"卡住"检测无从谈起 | 第 3 阶段：发现历史与稳定指纹（`history.py`），见 `architecture/2026-09-26-run-health.md` 第 1 节 |
 | N12 | 回退只写一条汇总：逐步还原了什么没有审计，健康摘要看不见回退改了什么 | 第 3 阶段 8c901f5（逐步记录；回退记录不带逆操作，回退不能再回退）。见 `architecture/2026-09-26-honest-audit.md` 第 8 节 |
+| N13 | 抓取对 AB 带 `episode_offset` 的番无能为力而且不出声：候选按发布的原始集号归拢，只换算声明了季号的偏移；目标集在归拢表里没有时直接 `continue`，不报任何发现。生产上只影响一条有效订阅：AB 37《超超超超超喜欢你的100个女朋友》第三季（`-24`）；退役 AB 会让这部番无声地停抓 | 未处理（第 4 阶段之后）：出处账本不在这一步教抓取认 `episode_offset`，见 `architecture/2026-09-27-provenance-ledger.md` "没做的" |
+| N14 | 集号口径在 `have` 与 `_inflight` 之间不一致：`have_episodes` / `episode_of_file` 不看 `ma:` 钉子，`_inflight` 看；钉着的集号与发布名的原始集号不同、又还没改名的已下完文件从 `have` 里掉出去，被再抓一遍（生产 29 集被抓了不止一次的来源之一） | 第 4 阶段：出处账本，见 `architecture/2026-09-27-provenance-ledger.md` |
 | N15 | 抓取后的即时改名 `rename_single_video` 算目标名时丢掉条目的文件夹层（`_op_rename` 保留）：409 撞上一个已有的 Original 布局种子时，文件被挪到 save_path 根下 | 8a0dec9，见 `architecture/2026-09-26-path-claims.md` 第 4 节 |
 | N17 | `rescue.py` / `vpn-watchdog.sh` 重建 qBittorrent 容器时不看任何锁或维护窗口；运行锁应覆盖 `purge --apply`、`rollback`、`repair` 与手动会话 | 0b5a02e（运行锁）；第 3 阶段：维护暂停（`pause.py`，救援标记 / `state/PAUSE`）与两个脚本重建容器前拿运行锁，见 `architecture/2026-09-26-run-health.md` 第 10、11 节 |
 | §2（对 executor 调研的更正） | executor 调研以为 `list_runs` 把"已回退"标在 `rollback-of-X` 上、`rollback --last` 会再选 X；其实汇总里的字面量 `rollback-of-…` 被随后的 `**result` 覆盖回原批次号，一直标对了（生产 4 条历史汇总都是原批次号） | 第 3 阶段 8c901f5 明写汇总的 `run_id`，逐步记录另用 `rollback-of-…` |
@@ -32,6 +35,9 @@
 | §3.6 | 运行锁不能等到后面的阶段：`purge` / `rollback` / `repair` / 手动会话今天就与 `run` 竞争 | 0b5a02e |
 | §3.7 | 锁文件变更与 launchd：plist 用 `uv run`，每轮按 `uv.lock` 联网同步，引入 pytest 后凌晨那轮就要装包；先把 plist 改成直接跑 `.venv/bin/media-agent` | d504b3c |
 | §3.8 | 改成按 git tag 部署之前先冻结演进：演进器往仓库目录里写规则 / 笔记，会被部署的漂移闸门拦下 | 653aff2 |
+| §3.2 | 任何定点循环之前先保证快照新鲜：清 `ctx._tfile_cache` 与 `builtin._OFFSET_CACHE`、扫描读 qBittorrent 按种子 fail closed（N2）——否则第二次诊断把改名前的条目名当成幻影、改名后的真文件当成本地文件 | 第 1 阶段 d40e506、5fde004；第 4 阶段的循环依赖它，见 `architecture/2026-09-27-converge-within-a-run.md` |
+| §3.3 | 定点循环之前先处理死种：不再隔离 `content_path`（NoSubfolder 种子就是整季目录）、停滞按最后一次活动算而不是加入时间；否则循环会把"relink → recheck → stalledDL → 死种"从 6 小时缩到几秒 | 3ef6825（只摘记录、按停滞时长判死）；第 4 阶段 `converge` 对本轮刚 relink / 搬存储过的种子暂缓死种处置，见 `architecture/2026-09-27-converge-within-a-run.md` |
+| §3.12 | 定点循环的前提：一个执行器（配额、`_grabbed`、批次 ID）、反向动作闸、一轮之内"失败过的不再试"的备忘——否则每次迭代都再撞一次 B2 的 404 与「集位被占」、多写一条审计 | 第 4 阶段 `media_agent/converge.py`，见同一篇 |
 
 ## testinfra：离线测试基座的调研（原型发现的 bug）
 
@@ -47,6 +53,8 @@
 |---|---|---|
 | LAT-01 | 2026-09-19/20 qBittorrent 登录超时的运行照常改动媒体库：run 20260919T225410 把归种子 d08f05a7 所有的「朱音落语 S01E12.mp4」以 `torrent_hash ""` 移进隔离区；下一轮 20260920T170126 又删了那个种子的记录（`freed 0`） | 5fde004（不可用 / 读取失败）、2f4fad8（返回空列表）；留下的幻影见 2577c43 |
 | LAT-02 | 回退一条 `trash_path` 为空的记录会搬走当前目录——即 critic N1 的回退一侧 | 8f66cab |
+| LAT-03 | 2026-09-06 13:51 辉夜大小姐想让我告白 S00E03 / E04 从「第三季 / Kaguya-sama wa Kokurasetai S3 - 03 / 04」两个正片发布抓进了特典位：抓取按裸集号归拢候选、不看发布声明的季号，日期闸只拦"早于播出" | 第 4 阶段：声明别季的发布不是候选（除非 `season_offsets` 换算），见 `bug-fix/2026-09-26-grab-declared-season.md` |
+| LAT-04 | 改名目标随 TMDB 解析翻转：鬼物语的文件 2026-08-20 改成「物语系列 …」，09-19 10:49（run 20260919T104905）缓存过期、重新搜索没命中，改回「鬼物语 …」，16:51（run 20260919T165111）再改回「物语系列 …」；09-16（run 20260916T223029）终物语 下 19 个、续・终物语 6 个文件在重新搜索选中另一个条目后被改名 | 第 4 阶段：身份钉住 + 标题稳定闸，见 `architecture/2026-09-26-tmdb-identity-pinning.md` |
 | LAT-05 | 对本批次早先已删掉种子的文件改名，记成 `failed`（HTTP 404）：20260909T024309、20260911T091146 ×2、20260916T102034、20260918T145907——即 testinfra B2 | af2cbb3 |
 
 ## runloop：运行循环的调研
@@ -56,6 +64,9 @@
 | §4 | 输出与日志：发现与汇总进 stdout、日志进 stderr，launchd 追加到 `state/run.log` / `run.err.log`；两份日志都没有时间戳、批次号、轮次分隔，也不轮转（生产 run.log 1.8 MB / 159 轮）；没有动作的轮次不留任何审计 |
 | §5 | launchd 的实际配置（每 21600 秒 `run`，当时经 `uv run` 启动），以及"`media_agent/` 与 `deploy/` 里没有任何锁"的核实 |
 | §6 | 实测一轮的成本：170 部番、2,325 个文件、539 个种子，`diagnose` 约 44 秒，完整 `run` 约 1.5–2 分钟（运行锁等待时长据此取 10 秒） |
+| §7A | 代码注释里已经写明"要等下一轮"的依赖：抓取之后的改名、`Bangumi` 分类交接之后才判重、sidecar 的诊断期快照、`have` 与 `seasonal` 标记滞后一轮…… 第 4 阶段的一轮之内收敛（`architecture/2026-09-27-converge-within-a-run.md`）把其中能在同一轮做完的做完 |
+| B4 | 演进重扫用 `resolve_tmdb=False`：标题退回 AB 标题 / 目录名，按 TMDB 标题命名的目录（物语系列一组）被提议改回去；把这一行照搬进循环会在一轮之内来回改名。第 4 阶段的循环每次迭代都照常解析 TMDB；演进重扫本身冻结着、没动 |
+| B5 | TMDB 解析失败造成的跨轮来回改名（鬼物语，即 LAT-04）。跨轮的由身份钉住 + 标题稳定闸处理；一轮之内的来回由 `converge` 的反向动作闸拒绝、报 `oscillation` |
 | §8a | 定点循环的设想里对"永远被跳过的动作"的统计：`rename_show_dir`「目标目录已存在」连续 53 轮、「集位被占」28 轮（到 2026-09-24）、`delete_category`「仍有种子」反复出现——每轮单独看都只是一条 skipped |
 | §8b | 每轮健康摘要该收的信号：客户端状况、检测器崩溃数、发现按严重度、执行结果、演进与处置结果、`find_failure_patterns`（当时只在 `cmd_evolve` 里调用）；外加 try/finally 让崩溃的一轮也有摘要。第 3 阶段的健康报告，见 `architecture/2026-09-26-run-health.md` 第 6 节 |
 | §8c | 设想中的"每 30 分钟只抓取"模式：必须与 `run` 共用一把锁，否则落在 `run` 诊断与执行之间的抓取会被诊断期的 sidecar 快照盖掉，同一集再抓一遍 |
@@ -95,6 +106,16 @@
 | purge P7 | unlink 之前按此刻复核，并与 `run` 共用锁 | d123a61；锁见 0b5a02e |
 | destructive I | `run` 末尾的时间清理：超过 30 天的日目录整个 `rmtree`、不写记录（生产 run.log 两次共 6 个文件 4.7 GB） | 8faf076 |
 | destructive J | `purge --apply`：替代者按名字认、`.!qB` 检查形同虚设 | 963f2bc、6e62bd8 |
+
+## state 调研：状态测绘（第 4 阶段引用）
+
+| 编号 | 是什么 |
+|---|---|
+| H1 | 本项目的抓取（`_op_grab_episode`）是记出处的地方：加种之后手上有番组页标题、集位、偏好评分、发布日期、落选的候选，审计却只存 `args` 与摘要——发布日期与结构化的评分哪儿都没留下 |
+| H2 | AutoBangumi 加的种子：出处在 AB 库的 `torrent` 表（`name` = 番组页标题，`url` 里就是 infohash，`qb_hash` 永远是 NULL），本项目以前只在修订阅时按**名字**读它 |
+| H3 | 出处账本该记的生命周期事件：整种子作废与单个条目设为不下载（`_op_trash`）、死种隔离、摘种（`_op_drop_torrent`）、回退时重加、relink、文件改名、显示名改动、目录搬迁（`rename_show_dir`）、扫描里悄悄丢掉的占用认领。第 4 阶段的账本没记这些（审计里有），见 `architecture/2026-09-27-provenance-ledger.md` "没做的" |
+| H4 | 补录的覆盖面（2026-09-26 生产）：539 个种子里 459 个只有 AB 的记录、6 个两边都有、43 个只有本项目的抓取审计、31 个查不到出处；28 个 infohash 被抓了不止一次（42 次多余的抓取，34 次是 409），入间 S4E20 一集 7 次 |
+| H5 | 账本放哪：不放 sidecar（`load()` 丢不认识的键、写档案整份覆盖），放 `state/`；在执行时写、不在检测时写 |
 
 ## 第 2 阶段审查（2026-09-26）：单点变异编号
 

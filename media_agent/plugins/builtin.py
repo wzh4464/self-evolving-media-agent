@@ -17,9 +17,10 @@ from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
 from ..probe import MediaInfo, probe, size_for_compare
 from ..naming import (
-    SUB_EXTS, VIDEO_EXTS, apply_episode_offset, declared_season, is_extra_of,
+    SUB_EXTS, VIDEO_EXTS, declared_season, declared_seasons, is_extra_of,
     is_normalized, normalize, parse_episode,
-    parse_pin, parse_quality, season_of_dir, subtitle_lang_tag, target_filename,
+    parse_pin, parse_quality, release_slot, season_of_dir, subtitle_lang_tag, target_filename,
+    title_slot,
     target_subtitle_filename,
 )
 
@@ -41,18 +42,23 @@ def _episode_offset(show: Show) -> int:
     return int((show.bangumi or {}).get("episode_offset") or 0)
 
 
-def _apply_offset(raw: str, ep: int, show: Show) -> int | None:
-    """绝对集号 → 季内集号；**只换算发布名里的原始集号**（`naming.apply_episode_offset`）。
-
-    出处：《超超超超超喜欢你的100个女朋友》第三季用绝对集号 25-36 发布，
-    实际是 S03E01-E12，靠 AutoBangumi 的 episode_offset=-24 换算。以前连已经
-    规范成 `S03E01` 的名字也再减一次，落进 `(3, -23)`（2026-09-26 修）。
-    """
-    return apply_episode_offset(raw, ep, _episode_offset(show))
-
-
 _OFFSET_CACHE: dict[str, dict] = {}
 
+
+
+def release_text(f: MediaFile) -> str:
+    """这个文件的**名字证据**：出处账本里的番组页标题（有的话）+ 种子显示名（没有种子就是文件名）。
+
+    版本词常常只在番组页标题里：LoliHouse 的内部名只写 `ASSx2`，「简繁内封字幕」只在 Mikan 标题里；尼古喵喵的
+    「邪竜解放版」、合并发布的「无修版」同样。只看内部名，探测不可用时复核判它没有中文字幕、择优给它 0 分。
+    标题说的是整个发布（合集、合并发布的每个文件都一样）——文件之间的差别仍由文件名说（`_prefer_score` 先比文件名）。
+    撤销了的行也算：撤销的是对集位的担保，发布标题还是那个发布的。"""
+    base = f.torrent_name or f.filename
+    row = getattr(f, "ledger", None)
+    title = (getattr(row, "mikan_title", "") or "").strip()
+    if not title or title in base:
+        return base
+    return f"{title} {base}"
 
 
 def _rank_for_keep(f: MediaFile) -> tuple:
@@ -67,9 +73,10 @@ def _rank_for_keep(f: MediaFile) -> tuple:
     - **体积跨编码折算。** 同画质下 HEVC/AV1 只要 AVC 六成，裸比体积等于
       系统性偏向低效编码——上面那次正是 AVC 710MB 赢了 HEVC 566MB。
 
-    探不到（文件不在、没装 ffprobe）就原样退回纯名字判断，不制造新的失败模式。
+    探不到（文件不在、没装 ffprobe）就原样退回纯名字判断，不制造新的失败模式。名字证据含出处账本里的
+    番组页标题（`release_text`：「简繁内封字幕」常常只在那里）。
     """
-    q = parse_quality(f.torrent_name or f.filename, f.size)
+    q = parse_quality(release_text(f), f.size)
     info = probe(f.path)
     if info is None:
         return (q.height, 1 if q.simplified else 0, int(q.is_bdrip), float(f.size))
@@ -109,7 +116,7 @@ def meets_requirements(f: MediaFile) -> tuple[bool, str]:
     所以「零字幕轨」不等于「没字幕」：此时退回名字证据判断，
     不能因为探不到就判它不合格。
     """
-    title = f.torrent_name or f.filename
+    title = release_text(f)          # 番组页标题（出处账本）+ 显示名：LoliHouse 的「简繁内封字幕」只在前者里
     info = probe(f.path)
 
     # **先看文件，再看名字。** 反过来写会把 LoliHouse 整个组判死：它的种子内部
@@ -144,9 +151,11 @@ def _prefer_score(f: MediaFile) -> tuple:
     用 `score_only` 而不是 `evaluate`：硬门槛（必须有中文字幕）是整个发布
     的属性，写在种子标题里，单个文件名通常不含那些关键词，走 `evaluate`
     会双双卡在硬门槛上并列 0 分。硬门槛由 `meets_requirements` 单独把关。
+
+    发布那一档（`joint`）也算出处账本里的番组页标题（`release_text`）：「邪竜解放版」常常只在那里。
     """
     own = preferences.score_only(f.filename)
-    joint = preferences.score_only(f.torrent_name or f.filename)
+    joint = preferences.score_only(release_text(f))
     return (own, joint, f.size)
 
 
@@ -184,14 +193,50 @@ def _release_slot(f: MediaFile, show: Show) -> tuple[int, int] | None:
 
 def _season_offsets(show: Show) -> dict:
     """sidecar 里记的 `season_offsets`：发布方季号 → 该季之前的累计集数。"""
+    return _show_intent(show)["season_offsets"]
+
+
+def _show_intent(show: Show) -> dict:
+    """这部番 sidecar 里人写的、规则要用的两样：`season_offsets` 与 `require_any`。一次扫描读一次
+    （`_OFFSET_CACHE`，扫描开头清空）。"""
     key = str(show.dir_path)
     if key not in _OFFSET_CACHE:
         from .. import sidecar as sc_mod
         try:
-            _OFFSET_CACHE[key] = dict(sc_mod.load(show.dir_path).season_offsets or {})
+            sc = sc_mod.load(show.dir_path)
+            _OFFSET_CACHE[key] = {"season_offsets": dict(sc.season_offsets or {}),
+                                  "require_any": [str(w) for w in (sc.require_any or []) if w]}
         except Exception:   # 坏 JSON / 读不了 sidecar.load 自己兜了；到这里是格式怪异：没有偏移 = 声明季对不上就不认（安全一侧）
-            _OFFSET_CACHE[key] = {}
+            _OFFSET_CACHE[key] = {"season_offsets": {}, "require_any": []}
     return _OFFSET_CACHE[key]
+
+
+def requirement_problem(f: MediaFile, require_any) -> str:
+    """这部番的 `require_any`（只保留某个版本）按出处账本里的**番组页标题**核对：标题里一个要求的词都没有，
+    返回理由；满足、没有要求、或账本里没有这个种子的标题（内部名里常常没有版本词，凭它判"不满足"会误伤），返回空串。
+
+    判重的封存（`_seal_candidates`、`DuplicateEpisodeDetector`）与删除关口的 I4（`gate._seal_problem`）共用这一处：
+    两边对"谁封存着这一集"必须是同一个结论。"""
+    want = [w for w in (require_any or []) if w]
+    row = getattr(f, "ledger", None)
+    title = (getattr(row, "mikan_title", "") or "") if row is not None else ""
+    if not want or not title:
+        return ""
+    text = f"{title} {f.torrent_name or ''} {f.filename}"
+    if any(w in text for w in want):
+        return ""
+    return (f"番组页标题（出处账本）里没有这部番要求的「{'/'.join(want)}」（{title[:70]}），"
+            f"不算这一集的封存")
+
+
+def _meets_show(f: MediaFile, require_any) -> bool:
+    """判重排序的第一档：名字证据（番组页标题 + 显示名 + 文件名）里有这部番要求的词（没有要求时都算满足）。
+    与 `requirement_problem` 不同，没有账本的也按名字算——排序不删任何东西，只决定谁更该留。"""
+    want = [w for w in (require_any or []) if w]
+    if not want:
+        return True
+    text = f"{release_text(f)} {f.filename}"
+    return any(w in text for w in want)
 
 
 def _numbered_from(f: MediaFile, show: Show):
@@ -225,22 +270,110 @@ def _numbering_conflict(f: MediaFile, show: Show) -> tuple[int, int] | None:
     return dec, target
 
 
+def _library_season(f: MediaFile, show: Show) -> int:
+    """这个文件此刻在库里属于第几季：季目录 `Season N` > 文件名里的 `Sxx` > AutoBangumi 订阅的季 > 1。
+    出处账本只在这一季里换算集位——它永远不把一个文件挪到别的季（`ledger_view`）。"""
+    sn = season_of_dir(f.season_dir or "")
+    if sn is not None:
+        return sn
+    return _season_of(f, show, parse_episode(f.filename)[0])
+
+
+def _ab_offset_for(show: Show, season: int) -> int:
+    """AutoBangumi 的 `episode_offset` 只对它订阅的那一季有意义（AB 下的集都进 `Season <订阅季>`）。
+    《超超超超超喜欢你的100个女朋友》的订阅是第三季、-24：Season 1 里的 `第一季 - 05` 不是它下的，不减 24。"""
+    b = show.bangumi or {}
+    if not b or int(b.get("season") or 1) != season:
+        return 0
+    return _episode_offset(show)
+
+
+def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
+    """出处账本对"这个文件是哪一集"怎么说：`("slot", 集位)` / `("conflict", None)` / `("", None)`（没话说）。
+
+    **钉着 `ma:` 的先说**：钉子是抓取器的定论（与抓取行同源），账本里那一行即便是 AB 补录的、"换算不了"，也不能让
+    它变成"名字不可信"。2026-08-31 之前的抓取钉着 `ma:S01E58`、AB 也登记过（补录成 AB 行、标题「第三季 - 08」），
+    以前判重据此把它剔出 S01E58 的桶、报一条说它名字不可信的冲突——这一集的判重永远做不成（2026-09-27 审查）。
+
+    账本说得上话的前提：文件有种子、账本里有这个种子的**有效**行（撤销了的不算）、种子只有**一个**要下载的视频
+    （番组页标题说的是整个发布，合集、合并发布说不了单个文件）、番组页标题里**发布方声明了季号**
+    （没声明的，标题与文件名是同一套编号，账本不比文件名多知道什么）。
+
+    - 抓取行（`Row.grabbed`）：集位是抓取器按番组页 + 播出日期定的，与 `ma:` 钉子同源——照它；
+    - 声明了**不止一个**季号（CR 系的 `第三季 / … S01E25`：中文段是季、英文段是 TMDB 的连续编号）：说不清按哪一季
+      编号，没话说；
+    - 其余：放在文件**此刻所在的库内季**（`_library_season`），按此刻的 `season_offsets`、AB 的 `episode_offset`
+      （只对订阅的那一季）从番组页标题重算（`naming.title_slot`，季内换算与抓取挑候选同一处）——人后来补的换算关系
+      立刻生效。算得出是 `slot`；发布方声明的季号与库内不同、又没有换算关系（或者第三季的正片躺在特典位），是
+      `conflict`：文件名里的集位不可信（2026-08-31 AB 把 `3rd Season - 08` 改成 `S01E08`）。
+
+    2026-09-27 审查：以前按文件名那一套（`release_slot`）算——标题里的 `Sxx` 定季、声明的季号取最小的、特典位也加
+    正片季的偏移。生产快照里《100个女朋友》第三季 10 个名字正确的文件被算成 `S01E25`…`S01E36`、要改名；Re:Zero 的
+    `第四季 / … S04E15` 账本算 (4, 15)、抓取算第 81 集；`第三季 OVA - 01` 在 Season 0 被算成 S00E25。
+    """
+    pin = _pinned(f)
+    if pin:
+        return "slot", pin
+    row = getattr(f, "ledger", None)
+    if row is None or not row.active or not f.torrent_hash or f.torrent_videos != 1:
+        return "", None
+    declared = declared_seasons(row.mikan_title) if row.mikan_title else set()
+    if not declared:
+        return "", None
+    if row.grabbed:
+        return "slot", row.slot
+    if len(declared) > 1:
+        return "", None
+    target = _library_season(f, show)
+    slot, _why = title_slot(row.mikan_title, target=target, offsets=_season_offsets(show),
+                            episode_offset=_ab_offset_for(show, target))
+    return ("slot", slot) if slot else ("conflict", None)
+
+
+def recorded_slot(f: MediaFile, show: Show) -> tuple[int, int] | None:
+    """名字之外**记下来的**集位：`ma:` 钉子 > 出处账本（抓取器定的；声明了季号、按此刻换算得出的）。没有返回 None。
+
+    "已有哪些集"（`kernel.have_episodes`）与"在下哪些集"（`grab._inflight`）都先问它，再看名字——两边以前各看
+    各的（critic N14）：钉着 `ma:S01E08`、还叫着发布名 `- 03` 的已下完文件在 `have` 里算第 3 集，第 8 集被再抓一遍；
+    `_inflight` 则让已经规范的名字压过钉子。账本只替单视频的种子说话（合集、合并发布的标题说不了单个文件）；
+    抓取器定的集位不要求声明了季号（它本来就是定论）。"""
+    pin = _pinned(f)
+    if pin:
+        return pin
+    row = getattr(f, "ledger", None)
+    if row is None or not row.active or not f.torrent_hash or f.torrent_videos != 1:
+        return None
+    if row.grabbed:
+        return row.slot
+    kind, slot = ledger_view(f, show)
+    return slot if kind == "slot" else None
+
+
 def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
     """解析出 (season, episode)，失败返回 None。
 
-    **文件名优先，种子名只作兜底。** 合集种子（一个种子含整季）的 `torrent_name`
-    对所有成员文件都相同（形如 `- 01-12 -`），拿它做逐文件集号识别会把整季
-    误判成同一集的重复——实测差点导致 12 集正片被当重复删掉。
+    **钉子 > 出处账本 > 文件名 > 种子名。**
 
-    **发布方声明的季号与库内季号不一致时，集号不可信。** 此时要么用 sidecar
-    的 `season_offsets` 换算，要么返回 None（宁可不处理，也不要把 `3rd Season
-    - 08` 写成 `S01E08` 去撞 2016 年真正的第 8 集）。
+    - `ma:` 钉子是抓取器的定论。
+    - 出处账本（`ledger_view`）认得出集位、又与文件名说的不同：按账本。2026-08-31 Re:Zero：AB 把
+      `[Fyy Raws] … 3rd Season - 08` 改名成 `S01E08`，文件名骗人；账本记着番组页标题，按 sidecar 的
+      `season_offsets {"3": 50}` 它是 S01E58。账本说"声明了别的季、换算不了"时这里仍按文件名——单独一个的
+      （正相反的你与我按连续编号改好的 `第二季 - 15` → S01E15）不能因此变成认不出；撞进同一个集位时由判重
+      把它剔出来、报 `season_numbering_conflict`（`DuplicateEpisodeDetector`）。
+    - **文件名优先，种子名只作兜底。** 合集种子（一个种子含整季）的 `torrent_name` 对所有成员文件都相同
+      （形如 `- 01-12 -`），拿它做逐文件集号识别会把整季误判成同一集的重复——实测差点导致 12 集正片被当重复删掉。
+    - **发布方声明的季号与库内季号不一致时，集号不可信。** 此时要么用 sidecar 的 `season_offsets` 换算，要么
+      返回 None（宁可不处理，也不要把 `3rd Season - 08` 写成 `S01E08` 去撞 2016 年真正的第 8 集）。
     """
     pin = _pinned(f)
     if pin:
         return pin
     raw, season, ep = _numbered_from(f, show)
-    return _slot_from(raw, season, ep, f, show)
+    mine = _slot_from(raw, season, ep, f, show)
+    kind, slot = ledger_view(f, show)
+    if kind == "slot" and slot != mine and slot[0] == _library_season(f, show):
+        return slot                                  # 账本只在文件所在的这一季里改口，不把它挪到别的季
+    return mine
 
 
 def _slot_from(raw: str, season: int | None, ep: int | None, f: MediaFile,
@@ -249,23 +382,11 @@ def _slot_from(raw: str, season: int | None, ep: int | None, f: MediaFile,
     `_resolve`（文件名优先）与 `_release_slot`（只看发布名）共用，两边不能各算各的。"""
     if ep is None:
         return None
-    target = _season_of(f, show, season)
-
-    dec = declared_season(raw)
-    if dec is not None and dec != target:
-        off = _season_offsets(show).get(str(dec))
-        if off is None:
-            return None                  # 交给 SeasonNumberingConflictDetector 报警
-        # 同一部番里两种编号习惯并存：Fyy Raws 按分季编（3rd Season - 08），
-        # Dynamis One 按连续编（4th Season - 79）。用"该季之前的累计集数"
-        # 当阈值区分——两种解释的取值区间不重叠。
-        if int(ep) <= int(off):
-            ep = int(ep) + int(off)
-
-    ep = _apply_offset(raw, ep, show)
-    if ep is None:
-        return None                      # 换算出非正数：原始集号的口径不对，交给人
-    return target, ep
+    # 季号优先级与 `_season_of` 相同；声明的季号换算不了、`episode_offset` 换算出非正数都返回 None，
+    # 交给 `_numbering_conflict` 报警 / 交给人。换算本身在 `naming.release_slot`（出处账本的补录也用它）
+    return release_slot(raw, parsed=(season, ep), dir_season=season_of_dir(f.season_dir or ""),
+                        ab_season=(show.bangumi or {}).get("season"),
+                        offsets=_season_offsets(show), episode_offset=_episode_offset(show))
 
 
 def _titles(show: Show) -> list[str]:
@@ -305,15 +426,17 @@ def _playable(f: MediaFile) -> bool:
     return size > 0 and not (f.torrent_hash and size < f.size)
 
 
-def _seal_candidates(files: list, season: int, ep: int) -> list:
-    """这一集的封存候选：钉着 `ma:SxxEyy` 的就是这一集、不是幻影、复核通过（`meets_requirements`），
-    按偏好从高到低（`_prefer_score`）。`files` 是这一集的桶（已按路径去重）。
+def _seal_candidates(files: list, season: int, ep: int, show: Show | None = None) -> list:
+    """这一集的封存候选：钉着 `ma:SxxEyy` 的就是这一集、不是幻影、复核通过（`meets_requirements`）、番组页标题
+    满足这部番的 `require_any`（`requirement_problem`），按偏好从高到低（`_prefer_score`）。`files` 是这一集的桶
+    （已按路径去重）。
 
     判重的封存与 `seal_conflicts` 共用这一处——两边对"谁封存着这一集"必须是同一个结论。"""
+    req = _show_intent(show)["require_any"] if show is not None else []
     out = []
     for f in sorted((f for f in files if _pinned(f) == (season, ep) and not is_phantom(f)),
                     key=_prefer_score, reverse=True):
-        if meets_requirements(f)[0]:
+        if meets_requirements(f)[0] and not requirement_problem(f, req):
             out.append(f)
     return out
 
@@ -341,7 +464,7 @@ def seal_conflicts(show: Show) -> dict[tuple[int, int], list[MediaFile]]:
     for (season, ep), files in _episode_buckets(show).items():
         if not any(_pinned(f) == (season, ep) for f in files):
             continue                                  # 没有钉子就没有封存：不必探测
-        seals = _seal_candidates(files, season, ep)
+        seals = _seal_candidates(files, season, ep, show)
         if len({f.torrent_hash for f in seals}) > 1:
             out[(season, ep)] = seals
     return out
@@ -428,6 +551,8 @@ class UnrenamedDetector:
                 # 需人工或模型判断"——本库 45 部电影就是 45 条纯噪音，
                 # 还把真正需要人看的条目淹在里面。
                 continue
+            if show.naming_hold:
+                continue                 # 标题认不准：不按退回的名字改名（LAT-04），tmdb-identity 报原因
             title = show.official_title
             held = None                  # 封存冲突里不该拿集位名的种子：{集位: {hash}}，按需算
             for f in show.files:
@@ -442,9 +567,11 @@ class UnrenamedDetector:
                     # `is_normalized` 只看形式（`标题 SxxExx.ext`），不看集号对不对。
                     # 被别人按错口径改成 `S01E08.mkv` 的文件形式上完全合规，
                     # 就这么永远卡在错误集号上——除非种子上钉了 `ma:` 集号，
-                    # 那它就是权威，跟文件名不一致时必须改回来。
-                    pin = _pinned(f)
-                    if not (pin and parse_episode(stem)[1] not in (None, pin[1])):
+                    # 那它就是权威，跟文件名不一致时必须改回来。出处账本认得出的集位同理
+                    # （AB 把 `3rd Season - 08` 改成的 `S01E08`，按 `{"3": 50}` 是 S01E58）。
+                    kind, lslot = ledger_view(f, show)
+                    auth = _pinned(f) or (lslot if kind == "slot" else None)
+                    if not (auth and parse_episode(stem)[1] not in (None, auth[1])):
                         continue
                 real_ext = Path(stem).suffix.lower()
                 if real_ext not in VIDEO_EXTS and real_ext not in SUB_EXTS:
@@ -544,6 +671,33 @@ class DuplicateEpisodeDetector:
                 if len(files) < 2:
                     continue
 
+                # 出处账本说"发布方声明的是别的季、库内换算不了"的文件（`ledger_view` 的 conflict）：它叫这一集
+                # 只是某次改名的结果。2026-08-31 AB 把 `[Fyy Raws] … 3rd Season - 08` 改成 `S01E08`，分类交接之后
+                # 与 2016 年真正的第 8 集撞进这个桶，原片被当输家清进了隔离区。它不参与这一集的取舍——既不当
+                # 保留方、也不当输家——报 `season_numbering_conflict`，登记了换算关系就按换算后的集位认。
+                # 只在撞车时报：单独占着一个集位的（按连续编号改好名的）照旧按文件名认，不制造噪音。
+                doubtful = [f for f in files if ledger_view(f, show)[0] == "conflict"]
+                for f in doubtful:
+                    row = f.ledger
+                    dec = row.declared_season
+                    yield Finding(
+                        rule=self.id, kind="season_numbering_conflict", severity="important",
+                        classified=True, subject=f"S{season:02d}E{ep:02d}",
+                        summary=(f"{f.filename} 叫 S{season:02d}E{ep:02d}，但出处账本里它的番组页标题写的是"
+                                 f"第 {dec} 季第 {row.raw_episode} 集，库内是 Season {season}、没有换算关系——"
+                                 f"名字里的集号不可信，这一集的判重不带它。在该番 sidecar 的 season_offsets 里写 "
+                                 f'"{dec}": <第{dec}季之前的累计集数> 即可自动换算'),
+                        show=show.dir_name, path=str(f.path), torrent_hash=f.torrent_hash,
+                        evidence={"declared_season": dec, "library_season": season,
+                                  "raw_episode": row.raw_episode, "mikan_title": row.mikan_title,
+                                  "ledger_source": row.source,
+                                  "others": [x.filename for x in files if x is not f]},
+                    )
+                if doubtful:
+                    files = [f for f in files if f not in doubtful]
+                    if len(files) < 2:
+                        continue
+
                 # 归属权还没交接完的，不做不可逆的删除。
                 #
                 # qBittorrent 的**分类**是本项目与 AutoBangumi 的所有权边界：
@@ -598,13 +752,30 @@ class DuplicateEpisodeDetector:
                 #   报 `seal_unknown` 给人看。探得到而且确实不合格的，照旧 `seal_failed`。
                 seals: list = []
                 protected: set[int] = set()
-                passed = {id(f) for f in _seal_candidates(files, season, ep)}
+                passed = {id(f) for f in _seal_candidates(files, season, ep, show)}
+                require_any = _show_intent(show)["require_any"]
                 for f in sorted((f for f in files
                                  if _pinned(f) == (season, ep) and id(f) not in phantoms),
                                 key=_prefer_score, reverse=True):
                     ok, why = meets_requirements(f)
                     if id(f) in passed:
                         seals.append((f, why))
+                        continue
+                    # 番组页标题不满足这部番的 `require_any`（只保留某个版本）：版本不对与探不探得到轨无关，
+                    # 不封存、也不当"封存不可知"护着——交回排序，排序先看版本（`_meets_show`）
+                    req = requirement_problem(f, require_any)
+                    if req:
+                        yield Finding(
+                            rule=self.id, kind="seal_failed", severity="important",
+                            classified=True,
+                            summary=(f"S{season:02d}E{ep:02d} 抓来的这份钉着这一集，但{req}，"
+                                     f"交回排序取舍"),
+                            show=show.dir_name, path=str(f.path),
+                            torrent_hash=f.torrent_hash,
+                            evidence={"file": f.filename, "torrent_name": f.torrent_name,
+                                      "reason": req, "require_any": list(require_any),
+                                      "mikan_title": f.ledger.mikan_title},
+                        )
                         continue
                     if probe(f.path) is None:
                         protected.add(id(f))
@@ -712,8 +883,11 @@ class DuplicateEpisodeDetector:
                 else:
                     # 真文件永远排在幻影前面（见上文 phantoms 的注释）；封存不可知的既不当
                     # 赢家也不当输家
+                    # 这部番登记了 `require_any`（只保留某个版本）：满足的排在前面，再比画质——用户要的是那个版本，
+                    # 不是画质最好的那份（尼古喵喵：720p 的邪竜解放版该压过 1080p 的 TV 版）
                     ranked = sorted((f for f in files if id(f) not in protected),
-                                    key=lambda f: (id(f) not in phantoms, _rank_for_keep(f)),
+                                    key=lambda f: (id(f) not in phantoms,
+                                                   _meets_show(f, require_any), _rank_for_keep(f)),
                                     reverse=True)
                     if not ranked:
                         continue
@@ -1220,7 +1394,7 @@ class TitleDriftDetector:
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         groups = tmdb_groups(state.shows)
         for show in state.shows:
-            if not show.tmdb_id or not show.tmdb_title:
+            if not show.tmdb_id or not show.tmdb_title or show.naming_hold:
                 continue
             if normalize(show.dir_name) == normalize(show.tmdb_title):
                 continue
@@ -1255,7 +1429,7 @@ class MissingNfoDetector:
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         for show in state.shows:
-            if not show.tmdb_id:
+            if not show.tmdb_id or show.naming_hold:
                 continue
             if normalize(show.dir_name) == normalize(show.tmdb_title):
                 continue          # 名字对得上，能自动刮到，不需要 NFO
@@ -1305,6 +1479,8 @@ class CategoryConsolidationDetector:
         t_by_hash = {t.get("hash", ""): t for t in state.torrents}
 
         for show in state.shows:
+            if show.naming_hold:
+                continue                 # 分类名 = 标题；标题认不准就不动分类
             canonical = show.official_title
             # 该目录下每个种子当前的分类
             cur: dict[str, str] = {}
@@ -1500,12 +1676,14 @@ BUILTIN = [
 
 def register_builtins(registry: Registry) -> Registry:
     from .grab import GRAB_DETECTORS
+    from .identity import IDENTITY_DETECTORS
     from .sidecar_sync import SIDECAR_DETECTORS
     from .subscription import SUBSCRIPTION_DETECTORS
-    # 订阅健康度规则排在最前：订阅本身失效时，下游一切规则都无从谈起。
+    # TMDB 身份最先报：它决定下游每条规则用的标题（模型选的条目要钉住、标题在等确认、这部番不改名）。
+    # 订阅健康度规则随后：订阅本身失效时，下游一切规则都无从谈起。
     # 抓取器紧随其后——先补齐缺的集，后面的改名/归类规则才有东西可处理。
     # sidecar 同步放最后，记录本轮结束后的最终状态。
-    for cls in (SUBSCRIPTION_DETECTORS + GRAB_DETECTORS + BUILTIN
+    for cls in (IDENTITY_DETECTORS + SUBSCRIPTION_DETECTORS + GRAB_DETECTORS + BUILTIN
                 + SIDECAR_DETECTORS):
         registry.register(cls())
     return registry

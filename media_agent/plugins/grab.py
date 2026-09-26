@@ -24,16 +24,21 @@ from datetime import date, timedelta
 from typing import Iterable
 
 from .. import preferences
-from ..cache import Cache, FEED_TTL, LOOKUP_TTL
+from ..cache import Cache, FEED_TTL, LOOKUP_TTL, season_episodes
 from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
                       tmdb_groups)
-from ..naming import declared_season, parse_episode, parse_pin, season_of_dir
-from ..sidecar import load as load_sidecar, save as save_sidecar
+from ..naming import (SPECIAL_RE, declared_seasons, parse_episode, parse_pin, season_of_dir,
+                      slot_in_season)
+from ..sidecar import load as load_sidecar
 from .subscription import (MIKAN, _disk_episodes, _http_get,
                            _mikan_search_ids, is_seasonal)
 
 # 单轮为一部番最多提议抓几集，防止新订阅时一次刷屏
 MAX_PER_SHOW = 6
+
+# 上一次为（这部番, 这一季）选中的番组页记多久。它只是下一轮候选里排第一的那个、每轮照样按播出日期
+# 重新打分，所以放得久一点无妨；过期了也只是回到"按 rss_link / 标题重新搜"。
+PICK_TTL = 90 * 86400
 
 # feed 条目的结构版本。**改动 `_feed_items` 返回的字段就必须 +1**，
 # 否则旧缓存会以缺字段的形态喂给新逻辑。
@@ -73,7 +78,7 @@ def _inflight(ctx: Context, show, by_hash: dict) -> dict[int, set[int]]:
     """
     import time
 
-    from .builtin import droppable_dead
+    from .builtin import droppable_dead, recorded_slot
     now = time.time()
     out: dict[int, set[int]] = {}
     for f in show.files:
@@ -84,20 +89,19 @@ def _inflight(ctx: Context, show, by_hash: dict) -> dict[int, set[int]]:
         # 刚加进来的种子还叫着原始发布名，`SxxExx` 要等改名规则跑过才有。
         # 只认改名后的名字，就等于"抓下来到改完名之间"这一整段时间里
         # 这一集是不设防的——同一轮 run 里抓取比改名先跑，下一轮就会再抓一次。
-        # 所以退回去认种子上的 `ma:` 集号钉子，再退回去按发布名解析。
-        key = episode_of_file(f, allow_release_name=False)
+        # 口径与 `have_episodes` 相同（critic N14）：先认记下来的集位（`ma:` 钉子、出处账本），
+        # 再认规范名，再按发布名解析——以前规范名压过钉子，被别人按错口径改成 `S01E03` 的在下文件
+        # 算成第 3 集。
+        key = (recorded_slot(f, show) or parse_pin(t.get("tags") or "")
+               or episode_of_file(f, allow_release_name=False))
         if key:
             sn, ep = key
         else:
-            pin = parse_pin(t.get("tags") or "")
-            if pin:
-                sn, ep = pin
-            else:
-                ep = _episode_of(f.torrent_name or f.filename)
-                if ep is None:
-                    continue
-                sd = season_of_dir(f.season_dir or "")
-                sn = sd if sd is not None else 1   # Season 0 是 0，不能用 `or 1`
+            ep = _episode_of(f.torrent_name or f.filename)
+            if ep is None:
+                continue
+            sd = season_of_dir(f.season_dir or "")
+            sn = sd if sd is not None else 1   # Season 0 是 0，不能用 `or 1`
 
         if t and droppable_dead(ctx, t, now):
             continue        # 死种：本轮 dead-torrent 会摘掉它，放行换源
@@ -185,6 +189,20 @@ def _season_fit(items: list[dict], air: list[str]) -> float:
     return ok / len(items)
 
 
+_SPECIAL_RE = SPECIAL_RE
+
+
+def _declared_seasons(title: str) -> set[int]:
+    """发布标题里明写的季号（`naming.declared_seasons`：按 ` / ` 分段各认一次）。"""
+    return declared_seasons(title)
+
+
+def _slot_in_season(title: str, n: int, target: int,
+                    offsets: dict[int, int]) -> tuple[int | None, str]:
+    """集号为 `n` 的这个发布落在目标季的第几集（`naming.slot_in_season`，出处账本读集位用同一处）。"""
+    return slot_in_season(title, n, target, offsets)
+
+
 def _feed_cached(mid: str, cache) -> list[dict]:
     ck = f"mikanfeed:{FEED_SCHEMA}:{mid}"
     got = cache.get_llm(ck, ttl=FEED_TTL)
@@ -194,29 +212,40 @@ def _feed_cached(mid: str, cache) -> list[dict]:
     return got.get("items") or []
 
 
-def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None) -> str | None:
-    """找这部番在 Mikan 上的番组 id，找到后**写回 sidecar**，省得每轮再搜。
+def _pick_key(show, season: int | None) -> str:
+    """选中的番组页在缓存里的键：按 TMDB id（目录改名不丢）+ 季——同一部番的不同季常在不同的番组页。"""
+    return f"mikanpick:{show.tmdb_id or show.dir_name}:{'' if season is None else season}"
 
-    解析顺序是有讲究的：
-    1. sidecar 里已经存了 —— 直接用，这是落盘的意义
+
+def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
+                      season: int | None = None) -> str | None:
+    """找这部番（这一季）在 Mikan 上的番组 id。
+
+    候选的来源是有讲究的：
+    1. 上一轮为这一季选中的（`state/` 缓存里的 `mikanpick:`）与 sidecar 里的 `mikan_id` —— 先试
     2. 从已有的 rss_link 里抠 —— 番组式链接里就带着 bangumiId，
        这是**已被验证过的**映射（订阅确实从它拿到过内容）
     3. 才轮到按标题搜 —— 最不可靠：Mikan 的番组命名常年错位
        （《入间同学入魔了！》标"第三季"的页面装的是第一季），
        按标题搜到的 id 只能算猜测
 
-    落盘用 try 包住：sidecar 写不进去（只读挂载之类）不该让检测失败，
-    大不了下一轮再搜一次。
+    **选中的记进缓存，不写 sidecar。** 以前在这里 `save_sidecar`——那是检测期：`diagnose`、
+    `apply --dry-run`、演进器的影子验证都会改写媒体库里的 `.media-agent.json`，改动没有审计、回退不了
+    （2026-09-26 状态测绘：生产上 5 份 sidecar 在 12:01–12:02 被改写，最后一条审计停在 11:17）。
+    检测只许读媒体根；sidecar 里的 `mikan_id` 从此只由人写，这里只读它当候选。
     """
     stored = str(getattr(sc, "mikan_id", "") or "")
+    key = _pick_key(show, season)
+    remembered = str((cache.get_llm(key, ttl=PICK_TTL) or {}).get("id") or "")
 
     # 没有播出日期可比时，只能沿用存下来的（老番、TMDB 查不到的情况）
-    if stored and not air:
-        return stored
+    if (remembered or stored) and not air:
+        return remembered or stored
 
     cands: list[str] = []
-    if stored:
-        cands.append(stored)
+    for c in (remembered, stored):
+        if c and c not in cands:
+            cands.append(c)
     for s in sc.sources:
         m = re.search(r"bangumiId=(\d+)", s.get("rss_link") or "")
         if m and m.group(1) not in cands:
@@ -260,12 +289,9 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None) -
         # 返回 None 会让上层报"找不到 Mikan 番组页"，那是准确的描述。
         return None
 
-    sc.mikan_id = str(best)
-    try:
-        save_sidecar(show.dir_path, sc)
-    except OSError:
-        pass
-    return sc.mikan_id
+    if best != remembered:
+        cache.put_llm(key, {"id": str(best), "fit": round(best_fit, 3)})
+    return str(best)
 
 
 class EpisodeAvailableDetector:
@@ -301,8 +327,8 @@ class EpisodeAvailableDetector:
         dup_reported: set[int] = set()
 
         for show in state.shows:
-            if not show.tmdb_id:
-                continue
+            if not show.tmdb_id or show.naming_hold:
+                continue                 # 标题认不准：抓来的会按退回的名字改名、落进那个分类
             g = groups.get(show.tmdb_id) or {}
             if g.get("kind") == "duplicate" and show in g.get("duplicates", []):
                 host = g["host"]
@@ -371,11 +397,13 @@ class EpisodeAvailableDetector:
                 # 这跟 seasonal 标记那次是同一类问题：依赖会滞后一整轮的
                 # 持久化状态。凡是磁盘能直接回答的，就别问镜像。
                 have = set(info.get("have") or []) | disk_eps.get(int(season_key), set())
-                try:
-                    eps = ctx.tmdb.season_episodes(show.tmdb_id, int(season_key))
-                except Exception as e:
+                # 分集表走缓存（`cache.season_episodes`：在播 6 小时、播完 7 天、取不到 6 小时内不再问）。以前这里
+                # 每一遍都不带缓存地问：生产 129 个 sidecar、159 个季键，一次 diagnose 43.98 秒里 31.9 秒是它
+                # （runloop 调研 2026-09-26）——`run` 迭代到不动点时每次迭代都要再付一遍
+                eps, why = season_episodes(ctx, cache, show.tmdb_id, int(season_key))
+                if eps is None:
                     ctx.log(f"[episode-available] TMDB 第 {season_key} 季集表读取失败 {show.dir_name}，"
-                            f"这一季这一轮不抓：{type(e).__name__}: {e}")
+                            f"这一季这一轮不抓：{why}")
                     continue
                 air_of = {e["episode_number"]: e["air_date"] for e in eps
                           if e.get("air_date")}
@@ -405,7 +433,7 @@ class EpisodeAvailableDetector:
                     continue
 
                 mid = _resolve_mikan_id(
-                    sc, show, cache, log=ctx.log,
+                    sc, show, cache, log=ctx.log, season=int(season_key),
                     air=[d for d in (air_of.get(n) for n in aired) if d])
                 if not mid:
                     yield Finding(
@@ -440,23 +468,29 @@ class EpisodeAvailableDetector:
                 # `39 = 14 + 25` 上，而 S0E39 那条特典播于 2021 年，日期校验
                 # 只防"早于播出"、不防"晚于播出"（老番重新做种本来就晚），
                 # 拦不住它——实测差点把 2026 年的第四季第 14 集当成 2021 年的特典抓下来。
+                #
+                # 声明的季号对不上目标季、又没有偏移换算的，**不是候选**（LAT-03）：2026-09-06 辉夜大小姐的
+                # 特典位 S00E03 / E04 被抓进了「第三季 / … S3 - 03 / 04」——以前按裸集号归拢、声明的季号
+                # 只用来加一个换算后的位置，原来的集号照样登记。它们记进 `off_season`，最后照样报出来。
                 off_by_season = {int(k): int(v)
                                  for k, v in (sc.season_offsets or {}).items()
                                  if str(k).isdigit()}
                 by_ep: dict[int, list[dict]] = {}
+                off_season: dict[int, list[tuple[dict, str]]] = {}
                 for it in items:
                     n = _episode_of(it["title"])
                     if n is None:
                         continue
-                    by_ep.setdefault(n, []).append(it)
-                    ds = declared_season(it["title"])
-                    off = off_by_season.get(ds) if ds else None
-                    if off and n <= off:
-                        by_ep.setdefault(n + off, []).append(it)
+                    ep_here, why = _slot_in_season(it["title"], n, int(season_key), off_by_season)
+                    if ep_here is None:
+                        off_season.setdefault(n, []).append((it, why))
+                    else:
+                        by_ep.setdefault(ep_here, []).append(it)
 
                 for ep in missing[:MAX_PER_SHOW]:
                     raw = by_ep.get(ep) or []
-                    if not raw:
+                    elsewhere = off_season.get(ep) or []
+                    if not raw and not elsewhere:
                         continue
 
                     # 先按播出日期把明显错季的剔掉，再交给偏好打分。
@@ -469,17 +503,20 @@ class EpisodeAvailableDetector:
                         (ok if v is True else
                          unknown if v is None else wrong_season).append(it)
                     cands = ok + unknown
+                    by_season = [f"{why} | {c['title'][:90]}" for c, why in elsewhere][:6]
                     if not cands:
-                        if wrong_season:
+                        if wrong_season or elsewhere:
                             yield Finding(
                                 rule=self.id, kind=self.kind, severity="minor",
                                 subject=f"S{int(season_key):02d}E{ep:02d}",
                                 summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
-                                         f"只搜到 {len(wrong_season)} 个明显属于别季的同集号"
-                                         f"发布，全部跳过"),
+                                         f"只搜到 {len(wrong_season) + len(elsewhere)} 个明显属于别季的同集号"
+                                         f"发布（{len(elsewhere)} 个标的是别季 / 不是特典，{len(wrong_season)} 个"
+                                         f"早于播出），全部跳过"),
                                 show=show.dir_name,
                                 evidence={"season": season_key, "episode": ep,
-                                          "air_date": air_of.get(ep, ""),
+                                          "air_date": air_of.get(ep, ""), "mikan_id": mid,
+                                          "rejected_by_season": by_season,
                                           "rejected_by_date":
                                               [f"{c.get('pub','?')} | {c['title'][:90]}"
                                                for c in wrong_season][:6]},
@@ -499,9 +536,10 @@ class EpisodeAvailableDetector:
                                      f"（{'、'.join(sorted({v.blocked_by for _c, v in scored}))}），"
                                      f"暂不抓取"),
                             show=show.dir_name,
-                            evidence={"season": season_key, "episode": ep,
+                            evidence={"season": season_key, "episode": ep, "mikan_id": mid,
                                       "candidates": [c["title"][:110] for c in cands],
-                                      "rejected_by_date": len(wrong_season)},
+                                      "rejected_by_date": len(wrong_season),
+                                      "rejected_by_season": by_season},
                         )
                         continue
                     verdict = next(v for c, v in scored if c is best)
@@ -512,11 +550,20 @@ class EpisodeAvailableDetector:
                                  f"可抓取（{len(cands)} 个候选中选 {verdict.why()}）"),
                         show=show.dir_name,
                         evidence={"season": season_key, "episode": ep,
-                                  "air_date": air_of.get(ep, ""),
+                                  "air_date": air_of.get(ep, ""), "mikan_id": mid,
                                   "chosen": best["title"][:140],
                                   "chosen_pub": best.get("pub", ""),
                                   "rejected_by_date": len(wrong_season),
+                                  "rejected_by_season": by_season,
                                   "verdict": verdict.why(),
+                                  # 结构化的评分与候选数：执行时记进出处账本（审计只存 args，这些以前哪儿都没留下）
+                                  "verdict_detail": {"acceptable": verdict.acceptable,
+                                                     "score": verdict.score,
+                                                     "passed": list(verdict.passed),
+                                                     "penalties": list(verdict.penalties),
+                                                     "blocked_by": verdict.blocked_by},
+                                  "candidates": len(cands),
+                                  "rejected_count": len(scored) - 1,
                                   "rejected": [f"{v.why()} | {c['title'][:90]}"
                                                for c, v in scored if c is not best][:6]},
                         action=Action(
