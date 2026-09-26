@@ -658,3 +658,132 @@ def test_e2e_i1_keeper_deleted_between_diagnose_and_apply(lib):
     [skip] = rep.skipped
     assert skip["reason"].startswith("删除关口：I1") and "不在盘上" in skip["reason"]
     assert loser.path.exists() and lib.qbit.has(loser.hash)
+
+
+# ------------------------------------------------------------------ 每道闸单独的现场
+# 变异验证（逐个关掉关口里的判断）时，下面这些判断被相邻的判断掩护着——关掉它，别的判断照样
+# 拦住原来的现场。每条只让一道闸有机会拦住它。
+
+@pytest.mark.allow("failed_record", match="占用")
+def test_i2_unknown_is_a_failure_even_when_i1_would_not_look(lib):
+    """字幕不是可播文件，I1 不看别的种子；看不全只能由 I2 自己报。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    sub = s1.local("尼古喵喵 S01E07.ass", size=50_000)
+    other = s1.single("尼古喵喵 S01E07.mkv", size=GB)
+    lib.qbit.fail("files", hash=other.hash, times=None)
+
+    rep = lib.apply([_trash(sub, "", rule="manual", kind="manual")])
+
+    [fail] = rep.failed
+    assert "路径的占用情况" in fail["error"]
+    assert sub.exists()
+
+
+def test_i1_keeper_path_already_trashed_in_the_batch_is_refused_by_name(lib):
+    s1, loser, keeper = _pair(lib)
+    ex = Executor(lib.context(), dry_run=False, run_id="u")
+    ex._trashed_paths.add(str(keeper.path))
+
+    v = gate.check_trash(ex, _dup(loser, keeper), loser.path)
+
+    assert v.gate == "I1" and "隔离区" in v.refused
+
+
+def test_i1_partial_keeper_is_not_a_keeper(lib):
+    s1 = lib.show("尼古喵喵").season(1)
+    loser = s1.single("[Z] Yani Neko - 08 [1080p].mkv", size=GB)
+    part = s1.local("尼古喵喵 S01E08.mkv.!qB", size=GB)
+
+    rep = lib.apply([_dup(loser, part, keeper_hash="", keep_size=GB)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "半成品" in skip["reason"]
+
+
+def test_i1_keeper_torrent_gone_from_qbit(lib):
+    s1, loser, keeper = _pair(lib)
+    f = _dup(loser, keeper)
+    lib.qbit.delete([keeper.hash], delete_files=False)       # 诊断之后被人删了记录，文件还在
+
+    rep = lib.apply([f])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "已不在 qBittorrent" in skip["reason"]
+
+
+def test_i1_keeper_torrent_incomplete_though_its_file_is_done(lib):
+    """保留方在一个还没下完的合集里（它这一集下完了）：种子进度不是 1，不作保——判重本来就
+    只收下完的种子，执行时对不上说明状态变了。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    loser = s1.single("[Z] Yani Neko - 08 [1080p].mkv", size=GB)
+    pack = s1.torrent({"尼古喵喵 S01E08.mkv": GB, "尼古喵喵 S01E09.mkv": GB},
+                      name="[P] Yani Neko 08-09", layout="nosub")
+    lib.qbit.raw(pack.hash)["progress"] = 0.5
+    lib.qbit.raw(pack.hash)["_files"][1]["progress"] = 0.0
+    keep = s1.path / "尼古喵喵 S01E08.mkv"
+
+    rep = lib.apply([_dup(loser, keep, keeper_hash=pack.hash)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "还没下完" in skip["reason"]
+
+
+def test_i1_keeper_entry_not_done_is_not_a_keeper(lib):
+    s1, loser, keeper = _pair(lib)
+    lib.qbit.raw(keeper.hash)["_files"][0]["progress"] = 0.5
+
+    rep = lib.apply([_dup(loser, keeper)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "还没下完" in skip["reason"]
+
+
+def test_i1_keeper_entry_set_to_skip_is_not_a_keeper(lib):
+    """保留方的条目被设为不下载（文件还在盘上，但种子不再要它）：不再替这一集作保。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    loser = s1.single("[Z] Yani Neko - 08 [1080p].mkv", size=GB)
+    pack = s1.torrent({"尼古喵喵 S01E08.mkv": GB, "尼古喵喵 S01E09.mkv": GB},
+                      name="[P] Yani Neko 08-09", layout="nosub",
+                      priorities={"尼古喵喵 S01E08.mkv": 0})
+
+    rep = lib.apply([_dup(loser, s1.path / "尼古喵喵 S01E08.mkv", keeper_hash=pack.hash)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "不再声明" in skip["reason"]
+
+
+def test_i1_holder_already_trashed_in_the_batch_does_not_count_by_name(lib):
+    s1 = lib.show("朱音落语").season(1)
+    a = s1.single("朱音落语 S01E12.mp4", size=GB)
+    b = s1.local("朱音落语 S01E12 [b].mp4", size=GB)
+    ex = Executor(lib.context(), dry_run=False, run_id="u")
+    ex._trashed_paths.add(str(b))
+
+    v = gate.check_trash(ex, _trash(a.path, a.hash, rule="manual", kind="manual",
+                                    show="朱音落语"), a.path)
+
+    assert v.gate == "I1"
+
+
+def test_i1_holder_whose_torrent_has_not_finished_it_does_not_count(lib):
+    """另一份的文件已经在盘上（名字是正名），但它的种子说这个条目还没下完（recheck 中）。"""
+    s1 = lib.show("朱音落语").season(1)
+    a = s1.single("朱音落语 S01E12.mp4", size=GB)
+    b = s1.single("朱音落语 S01E12 [b].mp4", size=GB)
+    lib.qbit.raw(b.hash)["_files"][0]["progress"] = 0.9
+
+    rep = lib.apply([_trash(a.path, a.hash, rule="manual", kind="manual", show="朱音落语")])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1")
+
+
+def test_drop_keeper_removed_earlier_in_the_batch(lib):
+    s1, keeper, victim = _collision(lib)
+    [f] = lib.diagnose(detectors=[CollidingTorrentDetector])
+    ex = Executor(lib.context(), dry_run=False, run_id="u")
+    ex._removed_torrents.add(keeper.hash)
+
+    v = gate.check_drop(ex, f, lib.qbit.torrent(victim.hash))
+
+    assert v.gate == "I1" and "本批次" in v.refused
