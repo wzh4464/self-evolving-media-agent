@@ -394,8 +394,8 @@ def test_the_slot_comes_from_the_detector_not_the_file_name(lib, no_rmtree):
                    rule="duplicate-episode", kind="duplicate", days_ago=40,
                    summary="S03E01 重复：保留 女朋友 S03E01.mkv，清理 [Group] Kanojo 100 - 25 [1080p].mkv",
                    deletion={"gate": "passed", "disposition": "duplicate", "slot": [3, 1]})
-    lib.show("女朋友").season(3).single("女朋友 S03E01.mkv", name="[Other] Kanojo 100 - 25.mkv",
-                                        tags="ma:S03E01")
+    lib.show("女朋友").season(3).single("女朋友 S03E01.mkv", tags="ma:S03E01", probe=CHI,
+                                        name="[Other] Kanojo 100 - 25 [1080p].mkv")
 
     [c] = purge.build_pool(lib.context())
 
@@ -505,3 +505,84 @@ def test_nothing_is_eligible_when_qbittorrent_cannot_be_asked(lib):
     [c] = purge.build_pool(lib.context(qbit=None))
 
     assert not c.eligible and "无法确认" in c.why
+
+
+# ------------------------------------------------------------------ I4 复排：按现在的排序它会赢就不删
+QIONGLU = "穹庐下的魔女"
+
+
+def _probed_legacy(lib, spec, name, **kw):
+    """带探测结果的隔离文件（FakeProbe 按路径登记）。"""
+    p = legacy(lib, name, show=QIONGLU, **kw)
+    lib.probe.set(p, spec)
+    return p
+
+
+def test_a_trashed_copy_that_would_now_win_is_kept(lib, no_rmtree):
+    """2026-09-08 穹庐下的魔女 S01E11：带两条中文内封字幕的那份按当时的排序输在体积上，被清进
+    隔离区，当天人工捞回。排序后来改成先看探到的字幕轨——按现在的规则它才是该留的那份。
+    purge 只证明了"库里那份完整"，就会把更好的这份硬删掉。"""
+    moved = _probed_legacy(lib, CHI, f"[LoliHouse] {QIONGLU} - 11 [WebRip 1080p HEVC-10bit AAC ASSx2].mkv",
+                           rule="duplicate-episode", kind="duplicate", days_ago=40,
+                           summary=f"S01E11 重复：保留 {QIONGLU} S01E11.mkv，清理 [LoliHouse] …",
+                           size=GB - 7)
+    lib.show(QIONGLU).season(1).single(f"{QIONGLU} S01E11.mkv", size=GB + 100_000_000,
+                                       name="[Raw] Qionglu - 11 (1080p AVC).mkv", probe=RAW)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert not c.eligible and "排序" in c.why
+
+
+def test_a_sealed_survivor_is_not_re_ranked(lib, no_rmtree):
+    """对照：库里那份钉着这一集、复核通过（封存）——封存不拿画质跟隔离区里的比，与判重同一口径。"""
+    moved = _probed_legacy(lib, video("hevc", height=2160, subs=["chi 简体中文"]),
+                           f"[BD] {QIONGLU} - 11 [2160p].mkv",
+                           rule="duplicate-episode", kind="duplicate", days_ago=40,
+                           summary="S01E11 重复：集位已封存，保留 …")
+    lib.show(QIONGLU).season(1).single(f"{QIONGLU} S01E11.mkv", tags="ma:S01E11",
+                                       name="[LoliHouse] Qionglu - 11 [WebRip 1080p ASSx2].mkv",
+                                       probe=CHI)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.deleted] == [moved]
+
+
+@pytest.mark.parametrize("spec", [CHI, None], ids=["passes-review", "probe-unavailable"])
+def test_a_trashed_copy_that_was_itself_sealed_is_kept(lib, no_rmtree, spec):
+    """隔离的这份钉着这一集、复核通过（或探测不可用——当作封存，与删除关口 I4 同口径）：
+    两份都封存时删哪个由人定。"""
+    p = legacy(lib, f"{QIONGLU} S01E11.mkv", show=QIONGLU, rule="duplicate-episode",
+               kind="duplicate", days_ago=40, summary="S01E11 重复：…",
+               deletion={"gate": "passed", "disposition": "duplicate", "slot": [1, 11],
+                         "subject": {"torrent_hash": "a" * 40, "name": "[SubA] Qionglu - 11.mkv",
+                                     "pin": "S01E11", "tags": "ma:S01E11", "category": QIONGLU,
+                                     "torrent_files": 1}})
+    if spec is not None:
+        lib.probe.set(p, spec)
+    lib.show(QIONGLU).season(1).single(f"{QIONGLU} S01E11 v2.mkv", tags="ma:S01E11",
+                                       name="[SubB] Qionglu - 11.mkv", probe=CHI)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert p.exists() and not rep.deleted
+    [c] = rep.pool
+    assert "封存" in c.why
+
+
+def test_byte_identical_copies_are_not_re_ranked(lib, no_rmtree):
+    """同一份内容（大小 + 头尾摘要相同）谁留都一样，不拿排序挡。"""
+    s1 = lib.show(QIONGLU).season(1)
+    surv = s1.single(f"{QIONGLU} S01E11.mkv", name="[Raw] Qionglu - 11 (1080p AVC).mkv", probe=RAW)
+    p = legacy(lib, "[Better] Qionglu - 11.mkv", show=QIONGLU, rule="duplicate-episode",
+               kind="duplicate", days_ago=40, summary="S01E11 重复：字节完全相同")
+    import shutil as _sh
+    _sh.copyfile(surv.path, p)                       # 同一份字节
+    lib.probe.set(p, CHI)                            # 哪怕探测说它"更好"
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.deleted] == [p]

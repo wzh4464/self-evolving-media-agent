@@ -520,9 +520,58 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
         complete_why = (f"无种子可校验，改以时长自证：{d_surv:.0f}s 与同季中位数 "
                         f"{med:.0f}s 相符，且尾部可解码")
 
-    why = _origin_problem(pool, c, surv)
+    why = _rank_problem(c, surv, show) or _origin_problem(pool, c, surv)
     if why:
         c.why = why
         return
     c.eligible = True
     c.why = f"S{sn:02d}E{ep:02d} 由 {surv.filename} 占位，{complete_why}"
+
+
+def _rank_problem(c: Candidate, surv, show) -> str:
+    """I4 复排：隔离的这份按**现在的**规则该不该赢？该赢（或它自己封存着这一集）就返回不删的理由。
+
+    判重的取舍规则一直在改（探到的字幕轨压过名字、体积跨编码折算、偏好分……），隔离区里躺着的是
+    按**当时的**规则判输的。只证明"库里那份完整"不够：2026-09-08 穹庐下的魔女 S01E11，带两条中文
+    内封字幕的那份当时输在体积上，被清进隔离区、当天人工捞回——按现在的排序它才是该留的。
+
+    与判重同一口径（`builtin`）：
+    - 隔离的这份钉着这一集（删除那一刻记下的 `deletion.subject`）且复核通过 → 它封存着这一集，不删；
+      **探测不可用当作封存**（与删除关口 I4 相同）。两份都封存时删哪个由人定。
+    - 库里那份钉着这一集且复核通过 → 封存不拿画质跟后来的比，照删。
+    - 否则 `_rank_for_keep`（分辨率、探到的字幕能力、BDRip、跨编码折算的体积）隔离的这份更高 → 不删。
+    - 两份字节相同（`dedup.content_digest`）→ 谁留都一样，不比。
+    """
+    from .dedup import content_digest
+    from .kernel import MediaFile
+    from .naming import parse_pin
+    from .plugins import builtin as B
+    from .probe import probe
+
+    sub = ((c.record or {}).get("deletion") or {}).get("subject") or {}
+    name = Path(c.origin).name if c.origin else c.trash_path.name
+    mine = MediaFile(path=c.trash_path, size=c.size, show_dir=show.dir_name,
+                     season_dir=surv.season_dir, filename=name,
+                     torrent_hash=sub.get("torrent_hash") or "",
+                     torrent_name=sub.get("name") or "", torrent_progress=1.0,
+                     torrent_tags=sub.get("tags") or "",
+                     torrent_category=sub.get("category") or "")
+    da, db = content_digest(c.trash_path), content_digest(surv.path)
+    if da and db and da == db:
+        return ""
+    tag = "S%02dE%02d" % tuple(c.slot)
+    pin = parse_pin(sub.get("tags") or "") or parse_pin(f"ma:{sub.get('pin') or ''}")
+    if pin and tuple(pin) == tuple(c.slot):
+        ok, why = B.meets_requirements(mine)
+        if probe(c.trash_path) is None:
+            return (f"隔离的这份钉着 ma:{tag}，探测不可用、复核结论不可知——封存按「已封存」处理，"
+                    f"不删（I4，交给人挑）")
+        if ok:
+            return (f"隔离的这份钉着 ma:{tag} 且复核通过（{why}），它封存着这一集——"
+                    f"两份都封存时留哪份由人定，不删（I4）")
+    if B._pinned(surv) == tuple(c.slot) and B.meets_requirements(surv)[0]:
+        return ""
+    if B._rank_for_keep(mine) > B._rank_for_keep(surv):
+        return (f"按现在的排序，隔离的这份比库里的 {surv.filename} 更该留（I4 复排：判重当时的规则"
+                f"与现在不同，如 2026-09-08 穹庐 S01E11），不删、交给人")
+    return ""
