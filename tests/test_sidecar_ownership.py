@@ -98,12 +98,14 @@ def test_existing_tmdb_id_is_never_changed_by_code(lib, show):
 
 
 def test_sidecar_sync_does_not_propose_a_different_tmdb_id(lib, show):
-    """扫描这一轮搜到了别的条目（缓存过期后重新搜、选中了另一个）：档案里的身份不跟着换。"""
+    """按目录名能搜到另一个条目（以前缓存过期后重新搜、就可能选中它）：档案里的身份不跟着换。"""
     show.sidecar(tmdb_id=111, tmdb_title=SHOW, seasons={"1": {"have": [1, 2, 3]}})
     show.tmdb(222, title=SHOW, seasons={1: weekly(3, first_days_ago=400)})
+    lib.tmdb.add_show(111, SHOW, seasons={1: weekly(3, first_days_ago=400)})
 
-    lib.cycle()
+    c = lib.cycle()
 
+    assert c.state.shows[0].tmdb_id == 111
     assert _raw(show.path)["tmdb_id"] == 111
 
 

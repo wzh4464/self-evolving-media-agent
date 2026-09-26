@@ -428,6 +428,8 @@ class UnrenamedDetector:
                 # 需人工或模型判断"——本库 45 部电影就是 45 条纯噪音，
                 # 还把真正需要人看的条目淹在里面。
                 continue
+            if show.naming_hold:
+                continue                 # 标题认不准：不按退回的名字改名（LAT-04），tmdb-identity 报原因
             title = show.official_title
             held = None                  # 封存冲突里不该拿集位名的种子：{集位: {hash}}，按需算
             for f in show.files:
@@ -1220,7 +1222,7 @@ class TitleDriftDetector:
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         groups = tmdb_groups(state.shows)
         for show in state.shows:
-            if not show.tmdb_id or not show.tmdb_title:
+            if not show.tmdb_id or not show.tmdb_title or show.naming_hold:
                 continue
             if normalize(show.dir_name) == normalize(show.tmdb_title):
                 continue
@@ -1255,7 +1257,7 @@ class MissingNfoDetector:
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         for show in state.shows:
-            if not show.tmdb_id:
+            if not show.tmdb_id or show.naming_hold:
                 continue
             if normalize(show.dir_name) == normalize(show.tmdb_title):
                 continue          # 名字对得上，能自动刮到，不需要 NFO
@@ -1305,6 +1307,8 @@ class CategoryConsolidationDetector:
         t_by_hash = {t.get("hash", ""): t for t in state.torrents}
 
         for show in state.shows:
+            if show.naming_hold:
+                continue                 # 分类名 = 标题；标题认不准就不动分类
             canonical = show.official_title
             # 该目录下每个种子当前的分类
             cur: dict[str, str] = {}
@@ -1500,12 +1504,14 @@ BUILTIN = [
 
 def register_builtins(registry: Registry) -> Registry:
     from .grab import GRAB_DETECTORS
+    from .identity import IDENTITY_DETECTORS
     from .sidecar_sync import SIDECAR_DETECTORS
     from .subscription import SUBSCRIPTION_DETECTORS
-    # 订阅健康度规则排在最前：订阅本身失效时，下游一切规则都无从谈起。
+    # TMDB 身份最先报：它决定下游每条规则用的标题（模型选的条目要钉住、标题在等确认、这部番不改名）。
+    # 订阅健康度规则随后：订阅本身失效时，下游一切规则都无从谈起。
     # 抓取器紧随其后——先补齐缺的集，后面的改名/归类规则才有东西可处理。
     # sidecar 同步放最后，记录本轮结束后的最终状态。
-    for cls in (SUBSCRIPTION_DETECTORS + GRAB_DETECTORS + BUILTIN
+    for cls in (IDENTITY_DETECTORS + SUBSCRIPTION_DETECTORS + GRAB_DETECTORS + BUILTIN
                 + SIDECAR_DETECTORS):
         registry.register(cls())
     return registry

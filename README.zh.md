@@ -173,6 +173,7 @@ media_agent/
   scan.py         磁盘 + qBittorrent + AutoBangumi → 统一的 LibraryState
   plugins/        九条内置检测器
   actions.py      执行器 + 隔离区 + 配额 + 审计日志
+  titles.py       TMDB 标题稳定闸：新标题连看两轮才采用，30 天内不改回去
   evolution.py    残留 → 提议 → 影子验证 → 提升
 .agents/
   notes/          Agent Notes，路径编码 {lifecycle}/{class}/日期-标题.md
@@ -189,8 +190,9 @@ media_agent/
 - **DSL 表达不了所有东西。** 有些真实问题用现有字段/操作符词表写不出规则。
   这些会落进 `.agents/notes/rejected/`，作为扩展词表的依据——
   而扩展词表是人的决定，永远不是模型的。
-- **TMDB 被当作权威。** 如果某部番在 TMDB 上没有中文标题，
-  agent 会写 NFO 锁定 TMDB ID，而不是自己猜一个。
+- **TMDB 被当作权威，但身份是钉住的。** 每部番的 TMDB ID 记在它的 `.media-agent.json` 里，
+  记下之后不再重新搜；TMDB 改了标题要连续两轮都看到才采用，30 天内不改回去。
+  如果某部番在 TMDB 上没有中文标题，agent 会写 NFO 锁定 TMDB ID，而不是自己猜一个。
 - **只在一个库上验证过。** 173 部番、2404 文件、macOS。
   换个环境难免有毛刺——欢迎提 issue 和 PR。
 

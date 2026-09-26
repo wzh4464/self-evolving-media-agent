@@ -52,8 +52,8 @@ class Sidecar:
     # --- 身份：各处叫什么 ---
     canonical_title: str = ""       # 规范名（= 目录名 = TMDB 本地化标题）
     tmdb_id: int | None = None      # 身份：扫描照它认，代码只在还没有时填一次，之后只有人改
-    tmdb_source: str = ""           # 这个 tmdb_id 是怎么来的：search（扫描搜到的）、空 = 历史记录；
-                                    # 人改 tmdb_id 时可以写 human
+    tmdb_source: str = ""           # 这个 tmdb_id 是怎么来的：search（扫描搜到的）、llm（模型在多个候选里选的，
+                                    # 经 pin_tmdb 动作）、空 = 历史记录；人改 tmdb_id 时可以写 human
     tmdb_title: str = ""
     aliases: list[str] = field(default_factory=list)   # 实际发布标题里见过的名字
 
@@ -134,7 +134,8 @@ class Sidecar:
 # DERIVED：sidecar-sync / 抓取按盘上、AutoBangumi、TMDB 算出来的。写的时候用这一轮算的值（`aliases` 只增不减，
 #          取并集；列在 `pinned` 里的除外）。算错了下一轮再算。
 DERIVED = frozenset({"canonical_title", "tmdb_title", "aliases", "bangumi_id", "sources", "seasons"})
-# IDENTITY：TMDB 身份。代码只在**还没有**时填一次（sidecar-sync 按扫描的结果），填上之后只有人改——
+# IDENTITY：TMDB 身份。扫描照 sidecar 里的 tmdb_id 认、不再搜（`scan._resolve_tmdb`）。代码只在**还没有**时
+#           填一次（sidecar-sync 按扫描搜到的；模型在多个候选里选的经 `pin_tmdb` 动作），填上之后只有人改——
 #           身份一变，改名目标、目录名、分类全跟着变（LAT-04：同一个目录的文件在两个标题之间来回改名）。
 IDENTITY = frozenset({"tmdb_id", "tmdb_source"})
 # USER_INTENT：人写的。代码从不写它们；写档案时一律以**此刻文件里的**为准，payload 里带的旧值不算数。
@@ -288,7 +289,7 @@ def merge_for_write(current: dict | None, payload: dict) -> dict:
     pinned = set(current.get("pinned") or [])
     same_identity = True
     if current.get("tmdb_id"):
-        same_identity = payload.get("tmdb_id") in (None, current.get("tmdb_id"))
+        same_identity = payload.get("tmdb_id") is None or str(payload["tmdb_id"]) == str(current["tmdb_id"])
     elif payload.get("tmdb_id"):
         out["tmdb_id"] = payload["tmdb_id"]
         out["tmdb_source"] = payload.get("tmdb_source") or ""

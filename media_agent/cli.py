@@ -19,7 +19,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, disposal, health, history, notify, pause, runlock, runlog
+from . import __version__, disposal, health, history, notify, pause, runlock, runlog, titles
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -764,6 +764,11 @@ def _run(args, cfg, rh) -> int:
     rh.diagnosed(reg, findings)
     dry = args.dry_run or not cfg.auto_apply
     _record_findings(cfg, run_id, findings, state, "run", dry_run=dry)
+    # TMDB 标题稳定闸（`titles`）：新标题要连续两轮 `run` 看到才采用——只有 `run` 数轮次，
+    # 人手跑的 `diagnose` 不算。记不下来只说一句：最坏是一个新标题多等一轮
+    problem = titles.record(cfg.state_dir, state.title_decisions, run_id=run_id)
+    if problem:
+        _log(f"⚠️  标题稳定记录：{problem}")
     print(f"═══ 诊断：{len(findings)} 个问题 ═══")
     _warn_degraded(state)
     _print_findings(findings, False)

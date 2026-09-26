@@ -198,6 +198,7 @@ media_agent/
   plugins/        The nine built-in detectors
   actions.py      Executor + quarantine + caps + audit log
   history.py      Findings history, fingerprints, stuck detection, acknowledgements
+  titles.py       TMDB title stability: a new title needs two consecutive runs, no flip-back within 30 days
   health.py       Per-run health report, torrent-count plausibility
   notify.py       Change-only email notifications
   evolution.py    Residue → propose → shadow-validate → promote
@@ -218,8 +219,10 @@ that are not up for debate (all of them, not just the first few), each one paid 
   rule with the current field/operator vocabulary. Those land in
   `.agents/notes/rejected/` and are the evidence for extending the vocabulary — a
   human decision, never the model's.
-- **TMDB is treated as authoritative.** If it has no localized title for a show, the
-  agent writes an NFO pinning the TMDB ID rather than guessing.
+- **TMDB is treated as authoritative — but pinned.** Each show's TMDB ID lives in its
+  `.media-agent.json` and is never re-searched once set; a changed TMDB title is adopted only
+  after two consecutive runs and never flips back within 30 days. If TMDB has no localized
+  title for a show, the agent writes an NFO pinning the TMDB ID rather than guessing.
 - **Only tested on one library.** 173 shows, 2404 files, macOS. Expect rough edges
   elsewhere — issues and PRs welcome.
 

@@ -449,6 +449,7 @@ class Executor:
         "repoint_rss": 0,        # 同上：链接指错地方，下游同样无从谈起
         "grab_episode": 0,       # 抓取只加种子、不碰已有文件，与下游动作互不干扰
         "write_sidecar": 10,     # 最后写档案，记录本轮结束后的最终状态
+        "pin_tmdb": 10,          # 钉 TMDB 身份：只写 sidecar，与写档案同一档（写档案不改已有的 tmdb_id）
         "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
         "drop_torrent": 1,       # 撞车的种子越早摘掉越好：它占着一条路径的
                                  # 所有权，后面的改名/归位都要以此为前提
@@ -878,6 +879,60 @@ class Executor:
         except Exception as e:
             # 先写临时文件、再原子替换：内容没变就是没生效
             if not self._settle(f, a, e, lambda: self._sidecar_changed(prev, prev_content),
+                                what="写 sidecar ", undo=undo):
+                return
+        self._audit("applied", f, a, undo=undo)
+
+    def _op_pin_tmdb(self, f: Finding, a: Action) -> None:
+        """把模型选的 TMDB 条目钉进 sidecar（`tmdb_id` + `tmdb_source`）。**只在还没有 tmdb_id 时写**：
+        已有的（人钉的、上一轮钉的、sidecar-sync 填的）一律不改——身份只由人改（`sidecar.IDENTITY`）。
+
+        critic N4：模型在多个候选里的选择以前每轮重新做、谁也看不见，直接决定改名目标、目录名、分类。
+        钉进 sidecar 之后扫描照它认，不再问模型；这一步有审计、能回退（`restore_sidecar`）。
+        """
+        from . import sidecar as sc_mod
+        show_dir = Path(a.args["show_dir"])
+        want = int(a.args["tmdb_id"])
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run"})
+            return
+        if not show_dir.is_dir():
+            self._audit("skipped", f, a, {"reason": f"目录已不在：{show_dir}"})
+            return
+        cur, problem = sc_mod.load_checked(show_dir)
+        if problem:
+            bk = sc_mod.backup_corrupt(show_dir)
+            self._audit("skipped", f, a, {"reason": f"sidecar 解析不了（{problem}），不写"
+                                          + (f"；已备份到 {bk.name}" if bk else ""),
+                                          "backup": str(bk) if bk else ""})
+            return
+        if cur.tmdb_id:
+            same = int(cur.tmdb_id) == want if str(cur.tmdb_id).isdigit() else False
+            self._audit("skipped", f, a, {"reason": (
+                "sidecar 里已经钉着这个条目" if same else
+                f"sidecar 里已有 tmdb_id {cur.tmdb_id}（{cur.tmdb_source or '来源未记'}），不改——身份只由人改")})
+            return
+        p = sc_mod.path_for(show_dir)
+        try:
+            prev_content = p.read_text(encoding="utf-8") if p.exists() else None
+        except (OSError, UnicodeDecodeError):
+            prev_content = None
+        undo = {"op": "restore_sidecar", "show_dir": str(show_dir), "prev": prev_content}
+
+        def pin(sc) -> None:
+            sc.tmdb_id, sc.tmdb_source = want, str(a.args.get("source") or "llm")
+            if a.args.get("title"):
+                sc.tmdb_title = str(a.args["title"])
+
+        self._intend(undo)
+        self._effect("fs.sidecar")
+        try:
+            sc_mod.update(show_dir, pin)
+        except sc_mod.SidecarCorrupt as e:
+            self._audit("skipped", f, a, {"reason": str(e), "backup": str(e.backup) if e.backup else ""})
+            return
+        except Exception as e:
+            if not self._settle(f, a, e, lambda: self._sidecar_changed(p, prev_content),
                                 what="写 sidecar ", undo=undo):
                 return
         self._audit("applied", f, a, undo=undo)

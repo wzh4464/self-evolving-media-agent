@@ -14,6 +14,15 @@
 ## [Unreleased]
 
 ### 新增
+- **TMDB 身份钉住**（critic N4、LAT-04）：扫描照 sidecar 里的 `tmdb_id` 认、不再按目录名重新搜；条目的标题与季
+  按 tmdb_id 缓存（目录改名不再换键重查，一次 `tv_detail` 同时取两样）。模型在多个候选里选的条目这一轮不用，
+  报 `tmdb_pick` 并由新动作 `pin_tmdb` 钉进 sidecar（`tmdb_source: llm`，有审计、能回退），下一轮起不再搜、不再问；
+  已有的 tmdb_id 一律不改。搜不到的负缓存 24 小时（以前每轮重搜 40 多个没有条目的目录）；一轮里 TMDB 出过一次错，
+  其余的用缓存兜底、不再打网络。
+- **TMDB 标题稳定闸**（`state/titles.json`）：改名 / 目录名 / 分类用的标题取不到时用上次采用的，**绝不退回目录名**；
+  TMDB 改了标题要连续两轮 `run` 看到才采用（`tmdb_title_pending`），30 天内不改回刚换掉的标题
+  （`tmdb_title_flip_blocked`，要改回去就在 sidecar 里写 `tmdb_title` 并把它加进新字段 `pinned`）。钉着 id 却一个
+  标题都不知道的番这一轮不改名（`naming_held`）。`diagnose` 不推进计数。
 - **发现历史**：每轮 `run` 与 `diagnose` 把全部发现（含没有动作、已归类的）写进
   `state/findings/<批次 ID>.jsonl`，只留最近 60 份。每条带稳定指纹：规则 + 类型 + 目标（集位 / 季、路径、
   种子 hash 或番名），**不含摘要**——「S01 缺 3 集」下一轮变成「缺 2 集」也还是同一个问题（critic N11）。

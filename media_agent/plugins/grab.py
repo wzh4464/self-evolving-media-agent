@@ -313,8 +313,8 @@ class EpisodeAvailableDetector:
         dup_reported: set[int] = set()
 
         for show in state.shows:
-            if not show.tmdb_id:
-                continue
+            if not show.tmdb_id or show.naming_hold:
+                continue                 # 标题认不准：抓来的会按退回的名字改名、落进那个分类
             g = groups.get(show.tmdb_id) or {}
             if g.get("kind") == "duplicate" and show in g.get("duplicates", []):
                 host = g["host"]

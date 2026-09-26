@@ -301,10 +301,7 @@ class TMDBClient:
 
     def official_title(self, tv_id: int) -> tuple[str, str]:
         """返回 (本地化标题, 原始标题)。本地化为空时回退到原始标题。"""
-        d = self.tv_detail(tv_id)
-        local = (d.get("name") or "").strip()
-        original = (d.get("original_name") or "").strip()
-        return (local or original), original
+        return title_of(self.tv_detail(tv_id))
 
     def season_episodes(self, tv_id: int, season: int) -> list[dict]:
         """某一季的分集列表，含每集播出日期。
@@ -320,13 +317,25 @@ class TMDBClient:
 
     def seasons(self, tv_id: int) -> list[dict]:
         """返回 [{season_number, episode_count, name}]，已过滤 specials 之外的空季。"""
-        d = self.tv_detail(tv_id)
-        return [
-            {"season_number": s["season_number"],
-             "episode_count": s.get("episode_count", 0),
-             "name": s.get("name", "")}
-            for s in d.get("seasons", [])
-        ]
+        return seasons_of(self.tv_detail(tv_id))
+
+
+def title_of(detail: dict) -> tuple[str, str]:
+    """`/tv/{id}` 的结果 → (本地化标题, 原始标题)。本地化为空时回退到原始标题。
+    扫描拿一次 `tv_detail` 同时取标题与季（以前 `official_title` + `seasons` 各打一次同一个接口）。"""
+    local = (detail.get("name") or "").strip()
+    original = (detail.get("original_name") or "").strip()
+    return (local or original), original
+
+
+def seasons_of(detail: dict) -> list[dict]:
+    """`/tv/{id}` 的结果 → [{season_number, episode_count, name}]。"""
+    return [
+        {"season_number": s["season_number"],
+         "episode_count": s.get("episode_count", 0),
+         "name": s.get("name", "")}
+        for s in detail.get("seasons", [])
+    ]
 
 
 class AniListClient:

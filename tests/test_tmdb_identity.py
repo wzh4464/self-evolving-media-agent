@@ -1,0 +1,369 @@
+"""TMDB 身份钉住与标题稳定闸（critic N4、LAT-04）。
+
+**现场**：
+- LAT-04（《鬼物语》）：`鬼物语/Season 1/` 的文件 2026-08-20 按 TMDB 46195 改成 `物语系列 S01E0x`；09-19 10:49
+  30 天的缓存过期、按目录名重新搜没搜到，标题退回目录名，文件改回 `鬼物语 …`；16:51 又搜到，再改成 `物语系列 …`。
+  09-16 另有 19 个 `终物语 下` 与 6 个 `续・终物语` 的文件在缓存过期、重新搜索选中了另一个条目之后被改名。
+- critic N4：扫描从不读 sidecar 里的 `tmdb_id`，缓存按目录名存——目录一改名就换了键、重新搜；多个候选时还会问模型，
+  而模型的选择每轮重新做、谁也看不见，直接决定改名目标、目录名、分类。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timedelta
+
+import pytest
+from harness import weekly
+
+from media_agent import cli, titles
+from media_agent import sidecar as sc_mod
+from media_agent.cache import Cache
+
+ID = 46195
+
+
+def _age_cache(lib, key: str, days: float) -> None:
+    c = Cache(lib.cfg.cache_db)
+    c.conn.execute("UPDATE tmdb SET ts = ts - ? WHERE key = ?", (days * 86400, key))
+    c.conn.commit()
+
+
+def _run(lib):
+    """`run` 的那一部分：一轮 扫描 → 诊断 → 执行，然后把这一轮的标题决定记下来（`cmd_run` 同样这么做）。"""
+    c = lib.cycle()
+    assert titles.record(lib.cfg.state_dir, c.state.title_decisions, run_id=c.run_id) == ""
+    return c
+
+
+def _renamed_to(c) -> list[str]:
+    return sorted(r["args"]["new_name"] if r["op"] == "rename_show_dir" else
+                  r["args"].get("new_name") or r["args"].get("target", "")
+                  for r in c.report.applied if r["op"] in ("rename", "rename_show_dir"))
+
+
+def _search_calls(lib) -> list:
+    return [c for c in lib.tmdb.calls if c[0] == "search_tv"]
+
+
+# ------------------------------------------------------------------ LAT-04
+def _monogatari(lib, title: str = "物语系列"):
+    """物语系列：TMDB 把多部作品收成一个条目（46195），库里按作品分目录——两个目录都钉在 46195 上。"""
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(ID, title, seasons={1: weekly(10, first_days_ago=4000)})
+    host = lib.show("化物语")
+    for n in range(1, 11):
+        host.season(1).local(f"物语系列 S01E{n:02d}.mkv")
+    host.sidecar(tmdb_id=ID, tmdb_title="物语系列")
+    oni = lib.show("鬼物语")
+    for n in (1, 2):
+        oni.season(1).local(f"物语系列 S01E{n:02d}.mkv")
+    oni.sidecar(tmdb_id=ID, tmdb_title="物语系列")
+    return oni
+
+
+@pytest.mark.allow("tmdb_unknown", "log_failure")
+def test_lat04_unresolved_tmdb_never_renames_back_to_the_dir_name(lib):
+    oni = _monogatari(lib)
+    first = _run(lib)
+    assert not first.actions("rename")
+
+    # 30 天后缓存过期，这一轮 TMDB 取不到这个条目（2026-09-19 10:49 那一轮）
+    _age_cache(lib, f"tmdbshow:{ID}", 31)
+    lib.tmdb._shows.pop(ID)
+    c = _run(lib)
+
+    assert not c.actions("rename") and not c.actions("rename_show_dir")
+    assert sorted(p.name for p in (oni.path / "Season 1").iterdir()) == [
+        "物语系列 S01E01.mkv", "物语系列 S01E02.mkv"]
+    assert c.state.title_decisions[ID].status == "unresolved"
+    assert {s.tmdb_title for s in c.state.shows} == {"物语系列"}
+
+
+def test_pinned_tmdb_id_is_used_without_searching(lib):
+    _monogatari(lib)
+
+    c = lib.cycle()
+
+    assert _search_calls(lib) == []                             # 身份在 sidecar 里：不搜
+    assert {s.dir_name: s.tmdb_id for s in c.state.shows} == {"化物语": ID, "鬼物语": ID}
+    assert [x for x in lib.tmdb.calls if x[0] == "tv_detail"] == [("tv_detail", ID)]   # 按 id 缓存：两个目录一次
+
+
+def test_tmdb_cache_is_keyed_by_id_so_a_dir_rename_does_not_re_resolve(lib):
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(7, "朱音落语", seasons={1: weekly(3, first_days_ago=900)})
+    sh = lib.show("Akane-banashi")
+    sh.season(1).local("朱音落语 S01E01.mkv")
+    sh.sidecar(tmdb_id=7, tmdb_title="朱音落语")
+
+    first = lib.cycle()
+    assert first.applied("rename_show_dir")                    # title-drift：目录名跟 TMDB 标题
+    calls = len(lib.tmdb.calls)
+    again = lib.cycle()
+
+    assert [s.dir_name for s in again.state.shows] == ["朱音落语"]
+    assert again.state.shows[0].tmdb_id == 7
+    assert lib.tmdb.calls[calls:] == []                        # 换了目录名也不重新查
+
+
+def test_legacy_dir_name_cache_entry_is_reused_for_the_pinned_id(lib):
+    """部署后的第一轮：旧的按目录名缓存的条目 id 对得上，就不打 TMDB。"""
+    _monogatari(lib)
+    Cache(lib.cfg.cache_db).put_tmdb("鬼物语", {"id": ID, "title": "物语系列", "seasons": []})
+    Cache(lib.cfg.cache_db).put_tmdb("化物语", {"id": ID, "title": "物语系列", "seasons": []})
+
+    lib.cycle()
+
+    assert lib.tmdb.calls == [] or all(c[0] == "season_episodes" for c in lib.tmdb.calls)
+
+
+# ------------------------------------------------------------------ 负缓存
+def test_a_failed_search_is_negative_cached(lib):
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.enabled = True
+    lib.show("没有条目的番").season(1).local("没有条目的番 S01E01.mkv")
+
+    lib.cycle()
+    assert _search_calls(lib) == [("search_tv", "没有条目的番")]
+    lib.cycle()
+    assert len(_search_calls(lib)) == 1                         # TTL 内不再搜
+
+    Cache(lib.cfg.cache_db).conn.execute("UPDATE tmdb SET ts = ts - 2 * 86400").connection.commit()
+    lib.cycle()
+    assert len(_search_calls(lib)) == 2                         # 过期了再试
+
+
+# ------------------------------------------------------------------ 标题变了：连看两轮才采用
+def _kusuriya(lib, title: str = "药屋少女的呢喃"):
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(1, title, seasons={1: weekly(3, first_days_ago=900)})
+    sh = lib.show("药屋少女的呢喃")
+    for n in (1, 2, 3):
+        sh.season(1).local(f"药屋少女的呢喃 S01E{n:02d}.mkv")
+    sh.sidecar(tmdb_id=1, tmdb_title="药屋少女的呢喃")
+    return sh
+
+
+def _retitle(lib, tid: int, title: str) -> None:
+    lib.tmdb._shows[tid]["name"] = lib.tmdb._shows[tid]["original_name"] = title
+    _age_cache(lib, f"tmdbshow:{tid}", 31)
+
+
+def test_a_new_title_is_adopted_only_after_two_consecutive_runs(lib):
+    _kusuriya(lib)
+    assert not _renamed_to(_run(lib))
+
+    _retitle(lib, 1, "药屋少女的独语")
+    second = _run(lib)
+    assert not _renamed_to(second)                              # 第一次看到：还用旧的
+    assert second.state.title_decisions[1].status == "pending"
+    assert lib.sidecar("药屋少女的呢喃").tmdb_title == "药屋少女的呢喃"   # 档案里也还是旧的
+    [held] = [f for f in second.findings if f.kind == "tmdb_title_pending"]
+    assert "药屋少女的独语" in held.summary
+
+    third = _run(lib)
+    assert third.state.title_decisions[1].status == "adopted"
+    assert "药屋少女的独语" in _renamed_to(third)               # 连续第二轮：采用，目录名 / 文件名跟上
+
+
+def test_a_gap_restarts_the_count(lib):
+    _kusuriya(lib)
+    _run(lib)
+    _retitle(lib, 1, "药屋少女的独语")
+    _run(lib)                                                   # 看到 1 轮
+    _retitle(lib, 1, "药屋少女的呢喃")
+    _run(lib)                                                   # 又变回去（= 已采用的）：不算
+    _retitle(lib, 1, "药屋少女的独语")
+
+    c = _run(lib)
+
+    assert c.state.title_decisions[1].status == "pending" and c.state.title_decisions[1].runs == 1
+    assert not _renamed_to(c)
+
+
+def test_a_title_does_not_flip_back_within_30_days(lib):
+    sh = _kusuriya(lib)
+    _run(lib)
+    _retitle(lib, 1, "药屋少女的独语")
+    _run(lib)
+    adopted = _run(lib)
+    assert adopted.state.title_decisions[1].status == "adopted"
+    new_dir = lib.media_root / "药屋少女的独语"
+    assert new_dir.is_dir() and not sh.path.exists()
+
+    _retitle(lib, 1, "药屋少女的呢喃")                           # TMDB 又给回刚换掉的那个
+    for _ in range(3):
+        c = _run(lib)
+        assert c.state.title_decisions[1].status == "flip_blocked"
+        assert not _renamed_to(c)
+    [f] = [f for f in c.findings if f.kind == "tmdb_title_flip_blocked"]
+    assert f.severity == "important" and "药屋少女的呢喃" in f.summary
+    assert lib.sidecar("药屋少女的独语").tmdb_title == "药屋少女的独语"   # 档案记的是采用的，不是 TMDB 这一轮给的
+
+    # 31 天之后：按普通的改标题处理（仍要连看两轮）
+    book = json.loads(titles.path_of(lib.cfg.state_dir).read_text(encoding="utf-8"))
+    for e in book["shows"].values():
+        for x in e.get("left", []):
+            x["at"] = (datetime.now() - timedelta(days=31)).isoformat(timespec="seconds")
+    titles.path_of(lib.cfg.state_dir).write_text(json.dumps(book, ensure_ascii=False), encoding="utf-8")
+    _age_cache(lib, "tmdbshow:1", 31)
+    assert _run(lib).state.title_decisions[1].status == "pending"
+    assert _run(lib).state.title_decisions[1].status == "adopted"
+
+
+def test_a_human_pinned_title_wins(lib):
+    sh = _kusuriya(lib, title="The Apothecary Diaries")
+    sh.sidecar(pinned=["tmdb_title"])
+
+    c = _run(lib)
+
+    assert c.state.shows[0].tmdb_title == "药屋少女的呢喃"
+    assert 1 not in c.state.title_decisions                     # 不过稳定闸、不记
+    assert not _renamed_to(c)
+
+
+def test_diagnose_does_not_advance_the_title_count(lib, monkeypatch):
+    """"连续两轮"数的是 `run`：人手跑几次 `diagnose` 不能把一个新标题"确认"下来。"""
+    monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
+    _kusuriya(lib)
+    _run(lib)
+    _retitle(lib, 1, "药屋少女的独语")
+    args = argparse.Namespace(no_tmdb=False, json=False)
+    for _ in range(3):
+        assert cli.cmd_diagnose(args, lib.cfg) == 0
+
+    assert lib.cycle().state.title_decisions[1].status == "pending"
+
+
+def test_cmd_run_records_the_title_decisions(lib, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "build_context", lambda cfg, need_llm=False: lib.context())
+    _kusuriya(lib)
+    args = argparse.Namespace(dry_run=False, no_tmdb=False, no_evolve=True, max_proposals=0,
+                              json=False)
+
+    cli.cmd_run(args, lib.cfg)
+
+    book, problem = titles.load(lib.cfg.state_dir)
+    assert problem == "" and book.seq == 1
+    assert book.entry(1)["adopted"] == "药屋少女的呢喃"
+
+
+@pytest.mark.allow("tmdb_unknown", "log_failure")
+def test_no_known_title_at_all_holds_naming_for_that_show(lib):
+    """人钉了 tmdb_id、sidecar 里没有标题、TMDB 这一轮也取不到：不按目录名 / AB 标题去改任何名字。"""
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.enabled = True
+    sh = lib.show("药屋少女的呢喃")
+    sh.season(1).single("[LoliHouse] Kusuriya no Hitorigoto - 01 [WebRip 1080p][简繁内封字幕].mkv")
+    sh.sidecar(tmdb_id=999)
+
+    c = lib.cycle()
+
+    assert not c.actions("rename") and not c.actions("recategorize")
+    [f] = [f for f in c.findings if f.kind == "naming_held"]
+    assert "999" in f.summary
+
+
+def test_corrupt_sidecar_holds_naming(lib):
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.enabled = True
+    sh = lib.show("药屋少女的呢喃")
+    sh.season(1).single("[LoliHouse] Kusuriya no Hitorigoto - 01 [WebRip 1080p][简繁内封字幕].mkv")
+    sc_mod.path_for(sh.path).write_text('{"tmdb_id": 1,', encoding="utf-8")
+
+    c = lib.cycle()
+
+    assert not c.actions("rename")
+    assert _search_calls(lib) == []                             # 身份认不准：不去搜一个可能不同的条目
+
+
+# ------------------------------------------------------------------ 模型选的条目：钉进 sidecar
+def _ambiguous(lib):
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(11, "葬送的芙莉莲", queries=["Frieren"], first_air_date="2023-09-29",
+                      seasons={1: weekly(3, first_days_ago=900)})
+    lib.tmdb.add_show(12, "葬送的芙莉莲 迷你剧场", queries=["Frieren"], first_air_date="2023-10-06")
+    sh = lib.show("Frieren")
+    sh.season(1).local("Frieren S01E01.mkv")
+    return sh
+
+
+def test_llm_pick_is_proposed_as_a_pin_and_not_used_before_it_is_pinned(lib):
+    sh = _ambiguous(lib)
+    lib.llm.when(lambda s, u: "Frieren" in u, {"id": 11, "confidence": 0.9, "reason": "正篇"})
+
+    c = lib.cycle()
+
+    assert len(lib.llm.prompts) == 1
+    [f] = [f for f in c.findings if f.kind == "tmdb_pick"]
+    assert f.action.op == "pin_tmdb" and f.action.args["tmdb_id"] == 11
+    assert c.state.shows[0].tmdb_id is None                     # 这一轮不按模型的选择改任何名字
+    assert not c.actions("rename_show_dir")
+    [rec] = c.applied("pin_tmdb")
+    assert rec["undo"]["op"] == "restore_sidecar"
+    raw = json.loads(sc_mod.path_for(sh.path).read_text(encoding="utf-8"))
+    assert (raw["tmdb_id"], raw["tmdb_source"]) == (11, "llm")
+
+    again = lib.cycle()
+    assert len(lib.llm.prompts) == 1                            # 钉住了：不再问、不再搜
+    assert again.state.shows[0].tmdb_id == 11
+
+
+def test_llm_pick_is_not_re_asked_every_dry_run(lib):
+    _ambiguous(lib)
+    lib.llm.when(lambda s, u: "Frieren" in u, {"id": 11, "confidence": 0.9, "reason": "正篇"})
+
+    lib.cycle(dry_run=True)
+    c = lib.cycle(dry_run=True)
+
+    assert len(lib.llm.prompts) == 1
+    assert [f.action.args["tmdb_id"] for f in c.findings if f.kind == "tmdb_pick"] == [11]
+
+
+def test_llm_is_never_asked_for_a_pinned_show(lib):
+    sh = _ambiguous(lib)
+    sh.sidecar(tmdb_id=12, tmdb_title="葬送的芙莉莲 迷你剧场")
+    lib.tmdb._shows[12]["seasons"] = {1: weekly(3, first_days_ago=900)}
+    lib.llm.when(lambda s, u: True, {"id": 11, "confidence": 0.99, "reason": "x"})
+
+    c = lib.cycle()
+
+    assert lib.llm.prompts == []
+    assert c.state.shows[0].tmdb_id == 12
+
+
+def test_pin_tmdb_never_overwrites_an_existing_id(lib):
+    sh = _ambiguous(lib)
+    lib.llm.when(lambda s, u: "Frieren" in u, {"id": 11, "confidence": 0.9, "reason": "正篇"})
+    [f] = [f for f in lib.diagnose() if f.kind == "tmdb_pick"]
+    sh.sidecar(tmdb_id=12)                                      # 诊断之后人钉了另一个
+
+    rep = lib.apply([f])
+
+    [rec] = rep.skipped
+    assert "12" in rec["reason"]
+    assert json.loads(sc_mod.path_for(sh.path).read_text(encoding="utf-8"))["tmdb_id"] == 12
+
+
+# ------------------------------------------------------------------ 稳定闸本身
+def test_book_decisions_unit():
+    b = titles.Book()
+    assert b.decide(1, "A").status == "first"
+    assert b.decide(1, "A", fallback="A").status == "stable"
+    d = b.decide(1, "B", fallback="A")
+    assert (d.status, d.title, d.runs) == ("pending", "A", 1)
+    titles.apply(b, {1: d})
+    d2 = b.decide(1, "B")
+    assert (d2.status, d2.title, d2.runs) == ("adopted", "B", 2)
+    titles.apply(b, {1: d2})
+    d3 = b.decide(1, "A")
+    assert (d3.status, d3.title) == ("flip_blocked", "B")
+    assert b.decide(1, None).status == "unresolved" and b.decide(1, None).title == "B"
+
+
+def test_unreadable_book_is_reported_and_treated_as_empty(tmp_path):
+    titles.path_of(tmp_path).write_text("{坏", encoding="utf-8")
+    book, problem = titles.load(tmp_path)
+    assert problem and book.seq == 0
+    assert "没有记标题" in titles.record(tmp_path, {1: titles.Decision(1, "A", "first", "A")})

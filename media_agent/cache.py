@@ -17,6 +17,8 @@ FEED_TTL = 3600            # 番组 feed / RSS 标题：新集的唯一信号，
 LOOKUP_TTL = 7 * 86400     # 标题->番组 id、字幕组列表：映射关系，稳定但不是永恒
 EPISODES_TTL = 6 * 3600     # 分集表 6 小时。在播番每周新增一集，
                             # 用元数据那套 30 天会让新集整整一个月看不见
+TMDB_MISS_TTL = 24 * 3600   # 按目录名 / AB 标题搜不到 TMDB 条目（或模型也选不出）：一天内不再搜。
+                            # 以前每轮重搜库里 40 多个本来就没有条目的目录，扫描白花 8–10 秒
 
 
 class Cache:
@@ -32,6 +34,11 @@ class Cache:
         if not row or time.time() - row[1] > ttl:
             return None
         return json.loads(row[0])
+
+    def get_tmdb_stale(self, key: str) -> dict | None:
+        """不看时效的旧值：这一轮取不到新的时，拿上次的季信息 / 标题兜底（总比当作"没有"强）。"""
+        row = self.conn.execute("SELECT value FROM tmdb WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def put_tmdb(self, key: str, value: dict) -> None:
         self.conn.execute("REPLACE INTO tmdb VALUES (?,?,?)",

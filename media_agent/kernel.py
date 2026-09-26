@@ -165,8 +165,14 @@ class Show:
     dir_path: Path
     bangumi: dict | None = None           # AutoBangumi bangumi 行
     tmdb_id: int | None = None
+    # 改名 / 目录名 / 分类用的 TMDB 标题：过了标题稳定闸的那个（`titles`），不一定是 TMDB 这一轮给的
     tmdb_title: str = ""
     tmdb_seasons: list[dict] = field(default_factory=list)
+    tmdb_source: str = ""         # tmdb_id 从哪来：sidecar（钉住的）/ search（这一轮搜到的）/ cache（旧的按目录名缓存）
+    # 非空 = 这部番这一轮不按标题改任何名字（改名、目录名、分类、NFO、抓取后改名），值是原因：
+    # TMDB 身份认不准（sidecar 坏了），或钉着 tmdb_id 却一个标题都不知道。退回目录名 / AB 标题去改名
+    # 正是 LAT-04 来回改名的那一步。
+    naming_hold: str = ""
     files: list[MediaFile] = field(default_factory=list)
     is_movie: bool = False        # 见 scan.py 的判定：电影没有"集号"可言
 
@@ -332,6 +338,10 @@ class LibraryState:
     qbit_errors: list[str] = field(default_factory=list)
     # `torrents()` 这一轮真的成功返回过（`torrents` 为空时分得清"0 个"与"没读到"，健康报告用）
     qbit_listed: bool = False
+    # 每个 tmdb_id 这一轮用哪个标题、为什么（`titles.Decision`）；`run` 扫描后记进 state/titles.json
+    title_decisions: dict = field(default_factory=dict)
+    # 模型在多个 TMDB 候选里选的：这一轮不用，交给 `pin_tmdb` 动作钉进 sidecar（`identity` 检测器）
+    tmdb_proposals: list = field(default_factory=list)
 
     def all_files(self) -> Iterable[MediaFile]:
         for s in self.shows:

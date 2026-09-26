@@ -48,11 +48,16 @@ class SidecarSyncDetector:
             if sc.canonical_title != show.dir_name:
                 sc.canonical_title = show.dir_name
                 changed.append("规范名")
-            # TMDB 身份（`sidecar.IDENTITY`）：只在还没有时填；填上之后只有人改
+            # TMDB 身份（`sidecar.IDENTITY`）：只在还没有时填；填上之后只有人改，扫描照它认
             if show.tmdb_id and not sc.tmdb_id:
                 sc.tmdb_id, sc.tmdb_title = show.tmdb_id, show.tmdb_title
                 sc.tmdb_source = "search"
                 changed.append("TMDB")
+            elif (show.tmdb_id and str(show.tmdb_id) == str(sc.tmdb_id) and show.tmdb_title
+                  and sc.tmdb_title != show.tmdb_title and "tmdb_title" not in sc.pinned):
+                # 标题是派生的：过了稳定闸（`titles`）的那个才写进来，没钉住的跟着走
+                sc.tmdb_title = show.tmdb_title
+                changed.append("TMDB 标题")
 
             b = b_by_dir.get(show.dir_name)
             if b:
