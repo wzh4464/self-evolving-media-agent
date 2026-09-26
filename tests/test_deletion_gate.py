@@ -616,3 +616,45 @@ def test_evolved_drop_is_refused_by_the_gate_itself(lib):
     [skip] = ex.report.skipped
     assert skip["reason"].startswith("删除关口：") and "演进规则" in skip["reason"]
     assert lib.qbit.has(victim.hash)
+
+
+# ------------------------------------------------------------------ 端到端：检测器 → 关口 → 执行器
+def test_e2e_i2_scan_sees_one_claimer_but_the_gate_sees_both(lib):
+    """两个种子声明同一个文件（合集 P 与单集 L，声明大小相同）：scan 每个路径只出一条，判重只看见
+    其中一个种子。更好的版本 Y 到了，X 判输——以前整种子摘掉看得见的那个、把文件搬走，另一个
+    种子从此缺一集（2026-09-06 尼古喵喵 S01E08 的双声明形态）。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    x = "尼古喵喵 S01E05.mkv"
+    pack = s1.torrent({x: GB, "尼古喵喵 S01E06.mkv": GB}, name="[P] Yani Neko 05-06",
+                      layout="nosub", probe=RAW)
+    loner = s1.single(x, size=GB, name="[L] Yani Neko - 05.mkv", on_disk=False)
+    s1.single("[LoliHouse] Yani Neko - 05 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv",
+              size=GB - 3, probe=CHI)
+    ident = lib.ident(s1.path / x)
+
+    c = lib.cycle()
+
+    [skip] = c.skipped("trash")
+    assert skip["reason"].startswith("删除关口：I2")
+    assert lib.ident(s1.path / x) == ident and lib.trash_files() == []
+    assert lib.qbit.has(pack.hash) and lib.qbit.has(loner.hash)
+    assert not c.failed()
+
+
+def test_e2e_i1_keeper_deleted_between_diagnose_and_apply(lib):
+    """诊断之后、执行之前保留方没了（用户经 Jellyfin 删了它；或者被挪走）：输家不删。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    loser = s1.single("[Dynamis One] Yani Neko - 08 (ABEMA 1920x1080 AVC AAC MKV).mkv",
+                      size=GB + 9, probe=RAW)
+    keeper = s1.single("[LoliHouse] Yani Neko - 08 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv",
+                       size=GB, probe=CHI)
+    ctx = lib.context()
+    findings = [f for f in lib.diagnose(ctx=ctx) if f.action and f.action.op == "trash"]
+    assert [f.action.args["path"] for f in findings] == [str(loser.path)]
+    keeper.path.unlink()
+
+    rep = lib.apply(findings, ctx=ctx)
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "不在盘上" in skip["reason"]
+    assert loser.path.exists() and lib.qbit.has(loser.hash)
