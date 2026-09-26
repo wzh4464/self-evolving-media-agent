@@ -89,7 +89,10 @@
 **全部**，不按迭代挑：挑了的话"最后一次诊断"就成了几次迭代拼起来的，发现历史与卡住检测没法信。能这样做是因为第二次
 迭代起网络全走缓存——TMDB 身份与标题按 id 30 天、搜不到的负缓存 24 小时、分集表 6 小时 / 7 天
 （`cache.season_episodes`，见 [分集表缓存](../bug-fix/2026-09-27-season-episodes-cache.md)）、番组页与 RSS 1 小时、Mikan
-搜索 7 天——而本地动作改变不了其中任何一样。剩下的是 qBittorrent 的种子文件列表（必须是此刻的）与磁盘。
+搜索 7 天——而本地动作改变不了其中任何一样。剩下的是 qBittorrent 的种子文件列表（必须是此刻的）与磁盘。TMDB 挂着时的两个断路器
+（扫描的 `ctx.tmdb_scan_down`、分集表的 `ctx.tmdb_episodes_down`）都跟着 Context 走——一轮 `run` 只等一次超时，不是每次迭代
+各等一次（`test_a_tmdb_outage_costs_one_timeout_per_run_not_per_iteration`：改之前 3 次迭代打了 3 次）。
+`test_iterations_after_the_first_diagnose_without_any_network_call` 钉住：第二次迭代起扫描 + 诊断的 TMDB / 网页 / 模型调用都是 0。
 
 离线基座按生产规模量（129 部番、159 个季键、1833 个种子、TMDB 0.05 秒一次，一处 AB 重复版本让这一轮要两次迭代）：
 

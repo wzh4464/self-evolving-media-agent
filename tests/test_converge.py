@@ -557,3 +557,28 @@ def test_iterations_after_the_first_diagnose_without_any_network_call(lib):
     assert "grab_episode" in [r["op"] for r in ex.report.applied]
     assert spent[1] > 0
     assert [spent[n] for n in (2, 3)] == [0, 0]
+
+
+@pytest.mark.allow("log_failure", match="TMDB")
+def test_a_tmdb_outage_costs_one_timeout_per_run_not_per_iteration(lib):
+    """扫描自己的断路器（"这一轮 TMDB 出过一次错，其余的用缓存兜底"）以前按一次扫描算：TMDB 挂着时每次迭代都再等
+    一次 20 秒超时。一个 Context 就是一轮 `run`，断路器跟着它走。"""
+    import httpx
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(77, "某番", seasons={1: weekly(2, first_days_ago=900)})
+    sh = lib.show("某番")
+    sh.season(1).local("某番 S01E01.mkv")
+    sh.sidecar(tmdb_id=77, tmdb_title="某番")
+    _ab_duplicate(lib)                                               # 让这一轮迭代不止一次
+    calls = []
+
+    def down(tv_id):
+        calls.append(tv_id)
+        raise httpx.ConnectTimeout("connect timed out")
+
+    lib.tmdb.tv_detail = down
+
+    c = lib.loop()
+
+    assert len(c.iterations) >= 2
+    assert calls == [77]

@@ -374,7 +374,11 @@ def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
     if problem:
         ctx.log(f"[scan] 标题稳定记录{problem}：这一轮按没有记录处理（以 sidecar 里的标题为已采用）")
     metas: dict[int, dict | None] = {}
-    net = {"broken": ""}                  # 这一轮 TMDB 出过错：其余的不再打网络，用缓存兜底
+    # 这一轮 TMDB 出过错：其余的不再打网络，用缓存兜底。"这一轮"是这个 Context——`run` 迭代到不动点时每次迭代重扫一次，
+    # 断路器按扫描算的话 TMDB 挂着时每次迭代都再等一次 20 秒超时（`converge`）
+    net = {"broken": str(getattr(ctx, "tmdb_scan_down", "") or "")}
+    if net["broken"]:
+        ctx.log(f"[scan] TMDB 这一轮前面出过错（{net['broken']}），这次扫描不再打网络、用缓存兜底")
 
     for show in state.shows:
         sc, corrupt = sc_mod.load_checked(show.dir_path)
@@ -413,6 +417,8 @@ def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
         if not show.tmdb_title:
             show.naming_hold = (f"TMDB 条目 {tid} 这一轮取不到标题（{net['broken'] or '没有缓存'}），"
                                 f"也没有记录过的标题")
+    if net["broken"]:
+        ctx.tmdb_scan_down = net["broken"]
 
 
 def _tmdb_meta(ctx: Context, cache, tid: int, dir_name: str, net: dict) -> dict | None:
