@@ -1565,8 +1565,12 @@ class Executor:
             # 这条记录还算 reverted。生产上有 78 条已执行的 rename_show_dir，
             # 回退其中较早的任何一条都会命中后一种，不需要任何故障。
             # 所以先问 qBittorrent 此刻谁在这个目录里：有不在记录里的，整条不动。
+            if not cur.is_dir():
+                # 改名后的目录不在了（此后又被改过名、或被人挪走）：记录里的种子此刻在哪
+                # 不知道，照记录把它们逐个 setLocation 回去就是盲目覆盖。与逆改名同口径。
+                return False, f"当前目录已不存在，可能此后又改过名：{cur.name}"
             listed = dict(u.get("torrent_savepaths") or [])
-            owners, claimed = self._live_claims_under(cur) if cur.exists() else ({}, set())
+            owners, claimed = self._live_claims_under(cur)
             strangers = [h for h in owners if h not in listed]
             if strangers:
                 names = "、".join(f"{h[:8]}（{owners[h].get('name', '')[:40]}）"

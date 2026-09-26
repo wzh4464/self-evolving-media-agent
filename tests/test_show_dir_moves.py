@@ -18,6 +18,7 @@ qBit 不在时这两条已由 `qbit_blocker` 整体拒绝（critic N3），这�
 from __future__ import annotations
 
 import json
+import shutil
 
 import pytest
 
@@ -129,6 +130,24 @@ def test_rollback_leftover_merge_never_touches_a_path_a_torrent_still_claims(lib
     lib.qbit.drain()                                          # qBit 搬完
     assert _alive(lib, t) and lib.ident(t.current_paths()[0]) == ident
     assert t.current_paths()[0].parent == show.path / "Season 1"
+
+
+def test_rollback_skips_when_the_renamed_dir_is_gone(lib):
+    """改名后的目录此后又被改过名：以前照记录把种子逐个 setLocation 回原路径，
+    不管它们此刻在哪；现在如实跳过。"""
+    s1 = lib.show("旧名").season(1)
+    t = s1.single("旧名 S01E01.mkv", size=1000)
+    run = _forward(lib)
+    lib.qbit.set_location([t.hash], str(lib.path("第三个名字/Season 1")))   # 经 qBit 又搬走了
+    shutil.rmtree(lib.path("新名"))                                         # 只剩空目录壳
+    before = lib.snapshot()
+
+    res = lib.rollback(run)
+
+    assert res["skipped"] == 1 and res["reverted"] == 0
+    assert "不存在" in res["skipped_detail"][0]["skip_reason"]
+    assert lib.snapshot() == before
+    assert _alive(lib, t)
 
 
 # ------------------------------------------------------------------ repair
