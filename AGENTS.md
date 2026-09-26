@@ -171,6 +171,16 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
 的还要进 `converge.MOVES`（下一次扫描之前先等 qBittorrent 搬完，等不到就停在这一次迭代）。一轮只做一次的事（发现历史、标题稳定闸、卡住检测、健康报告）按**最后一次**诊断做，
     不在迭代里做。见 [一轮之内收敛](.agents/notes/implemented/architecture/2026-09-27-converge-within-a-run.md)。
 
+16. **AutoBangumi 关掉之前，它提供的每一样先由本项目接住；人的意图只"补"不"改"。** 订阅（`subscriptions`：盘上一集都
+    还没有的季也抓）、集号偏移（`episode_offsets`：按库内季）是人的意图，从 AB 迁进来、`media-agent subscribe` / 新季开播
+    登记，都经专门的动作（`adopt_episode_offset` / `subscribe_season` / `create_show_dir`）：只写 sidecar 里还没有的，逆操作
+    （`unset_sidecar`）只摘写下的、且没被人改过的那几项——写档案（`write_sidecar`）永远不碰它们。集号偏移只有一处口径
+    （`builtin.episode_offset_for`），判重、改名、`have`、出处账本、抓取都问它。每 30 分钟的 `media-agent grab`
+    （`grabmode`）只做抓取与收尾：新规则要进抓取模式，得在 `grabmode.registry()` 里注册、在 `Scope.select` 里写明挑法，
+    删除照样过关口；其余治理留给 6 小时的 `run`。见 [接手 AB 订阅](.agents/notes/implemented/architecture/2026-09-27-ab-adoption.md)、
+    [订阅](.agents/notes/implemented/architecture/2026-09-27-subscriptions.md)、
+    [抓取模式](.agents/notes/implemented/architecture/2026-09-27-grab-mode.md)。
+
 ## 自演进的闭环
 
 ```
