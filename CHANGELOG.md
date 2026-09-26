@@ -33,7 +33,8 @@
   里哪些是"老毛病"（同一个规则、动作、错误在 14 天内 ≥2 个批次出现过）单独点名。
 - **通知邮件**（可选，`NOTIFY_EMAIL_TO` / `NOTIFY_SMTP_HOST` / `NOTIFY_SMTP_PORT`=465 / `NOTIFY_SMTP_USER` /
   `NOTIFY_SMTP_PASS`，SMTP over SSL；都不配 = 关闭）：只在**变化**时发、一轮最多一封——健康状态变坏或从 critical
-  恢复、新的卡住问题、新进入整批拒绝、审计开始转写到备用文件。去重状态在 `state/notify.json`；发不出去只在 stderr
+  恢复、新的卡住问题、新进入整批拒绝、审计开始转写到备用文件。去重状态在 `state/notify.json`；被锁挡住、维护暂停、
+  整批拒绝、半路崩溃的一轮看不到的事件原样带着，还卡着的问题不会在下一轮被当成"新卡住"再发一遍。发不出去只在 stderr
   说、下一轮重发，不拦这一轮。信里与健康报告里的密钥（配置里的密码 / key，URL 里的 `api_key=` 等）一律遮掉。
 - **`run` 的每一行输出带时间与批次 ID**（`2026-09-26T12:00:00 [批次 ID] …`），每轮以一行
   `═══ media-agent <版本> run 开始：批次 … ═══` 开头——launchd 追加的 `state/run.log` / `run.err.log` 终于对得上是

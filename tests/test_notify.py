@@ -257,3 +257,83 @@ def test_short_secrets_are_not_replaced_verbatim_everywhere(lib):
     path = "/tmp/pytest-1/test_x/Media/测试番/Season 1/a.mkv"
     assert notify.redact(cfg, path) == path
     assert "test@" not in notify.redact(cfg, "http://admin:test@qbit.invalid/api")
+
+
+# ------------------------------------------------------------------ 没评估的事件原样带着（2026-09-26 复审）
+def _stuck_report(fp="aaaaaaaaaaaaaaaa", status="warn", **extra):
+    return {"status": status, "finished": "2026-09-26T12:00:00", "actions": {"audit_problems": 0},
+            "degraded": {"refused": ""},
+            "stuck": {"open": [{"fp": fp, "rule": "r", "kind": "k", "show": "s", "runs": 4,
+                                "first_seen": "2026-09-25T00:00:00", "summary": "摘要"}],
+                      "acked": 0}, **extra}
+
+
+def _skipped_report(status="warn", **extra):
+    """被锁挡住 / 暂停 / 半路崩溃的一轮：没走到执行器，也没走到卡住检测（`RunHealth` 里是 None）。"""
+    return {"status": status, "finished": "2026-09-26T18:00:00", "actions": None,
+            "degraded": {"refused": ""}, "stuck": None, **extra}
+
+
+def test_a_run_that_never_evaluated_stuck_keeps_the_stuck_fingerprints():
+    """以前 `active` 每轮从零重建，被锁挡住的一轮（stuck 为 None）把 `stuck:<指纹>` 全清了——下一轮正常的 run
+    把每个一直卡着的指纹当「新卡住」再发一遍。部署、看门狗重建容器、救援暂停、qBit 超时都会触发。"""
+    evs, st = notify.events(_stuck_report(), {"last_status": "ok", "active": {}})
+    assert [e["kind"] for e in evs] == ["status", "stuck"]
+
+    evs, st = notify.events(_skipped_report(locked="pid=1 cmd=deploy.sh"), st)
+    assert evs == [] and "stuck:aaaaaaaaaaaaaaaa" in st["active"]
+
+    evs, st = notify.events(_stuck_report(), st)
+    assert evs == []
+
+
+def test_stuck_that_resolves_in_an_evaluated_run_is_mailed_again_when_it_comes_back():
+    """带着走只针对"没评估"的轮次：正常的一轮里指纹不在了（解决了），再出现照发（模块文档的规则）。"""
+    _, st = notify.events(_stuck_report(), {"last_status": "ok", "active": {}})
+    healthy = {**_stuck_report(), "stuck": {"open": [], "acked": 0}}
+    _, st = notify.events(healthy, st)
+    assert not any(k.startswith("stuck:") for k in st["active"])
+    evs, _ = notify.events(_stuck_report(), st)
+    assert [e["kind"] for e in evs] == ["stuck"]
+
+
+def test_refused_then_paused_then_refused_announces_the_refusal_once():
+    """暂停 / 被锁挡住的一轮没走到执行器：不知道还拒不拒绝，`degraded` 原样带着。"""
+    refused = {**_skipped_report(status="critical"), "degraded": {"refused": "qBittorrent 登录超时"}}
+    evs, st = notify.events(refused, {"last_status": "ok", "active": {}})
+    assert [e["kind"] for e in evs] == ["status", "degraded"]
+    _, st = notify.events(_skipped_report(paused="state/PAUSE"), st)
+    assert "degraded" in st["active"]
+    evs, st = notify.events(refused, st)
+    assert "degraded" not in [e["kind"] for e in evs]
+
+
+def test_audit_fallback_is_carried_through_a_run_that_wrote_no_audit():
+    bad = {**_stuck_report(), "stuck": {"open": [], "acked": 0}, "actions": {"audit_problems": 2}}
+    evs, st = notify.events(bad, {"last_status": "warn", "active": {}})
+    assert [e["kind"] for e in evs] == ["audit_fallback"]
+    _, st = notify.events(_skipped_report(locked="pid=1"), st)
+    assert "audit_fallback" in st["active"]
+    evs, _ = notify.events(bad, st)
+    assert evs == []
+
+
+def test_stuck_item_through_refused_paused_and_locked_runs_is_mailed_once(offline_cli, smtp,
+                                                                          capsys):
+    """端到端：卡住之后 qBit 掉线（整批拒绝）、维护暂停、被锁挡住，再回到正常——同一个指纹只报一次「新卡住」。"""
+    lib = offline_cli
+    _seal_conflict(lib)
+    for _ in range(4):
+        _run(lib)                                                 # 第 4 轮：新卡住
+    lib.qbit_down()
+    assert _run(lib) == cli.EXIT_DEGRADED                         # critical：整批拒绝
+    lib.qbit_up = True
+    args = argparse.Namespace(run_id="20260926T180000.000-1", dry_run=False)
+    assert cli._paused_run(args, lib.cfg, "state/PAUSE（测试）") == cli.EXIT_LOCKED
+    args = argparse.Namespace(run_id="20260926T190000.000-1", dry_run=False)
+    assert cli._locked_out_run(args, lib.cfg, "pid=1 cmd=vpn-watchdog.sh") == cli.EXIT_LOCKED
+    _run(lib)
+    _run(lib)
+
+    bodies = [_text(m) for m in smtp.sent]
+    assert sum("新卡住" in b for b in bodies) == 1, bodies

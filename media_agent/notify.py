@@ -10,6 +10,8 @@
 
 **一轮最多一封**：这一轮的事件合在一封里。去重状态在 `state/notify.json`：`last_status`（人最后一次被告知的状态）、
 `active`（正在持续的事件 → 第一次发出的时间：`stuck:<指纹>` / `degraded` / `audit_fallback`）、`failures`。
+"消失"只认**评估过**的轮次：被锁挡住、维护暂停、整批拒绝、半路崩溃的一轮没走到卡住检测（或执行器），它不知道的
+事件原样带到下一轮，不算消失。
 
 **发不出去**（SMTP 连不上、认证失败……）：在 stderr 说一句、`failures` 加一、写进这一轮的健康报告，**不更新**
 `last_status` 与 `active`——下一轮按人最后一次被告知的状态重算，事件不会丢。永远不拦这一轮、不改退出码。
@@ -118,7 +120,15 @@ def events(report: dict, st: dict) -> tuple[list[dict], dict]:
                         "recovery": prev == "critical" and not worse})
     active_before = dict(st.get("active") or {})
     active: dict = {}
-    for s in (report.get("stuck") or {}).get("open") or []:
+    # 这一轮**没评估**的事件原样带着，只有评估了、而且不在了才算"消失"。被锁挡住 / 维护暂停 / 整批拒绝 / 半路
+    # 崩溃的一轮走不到卡住检测（报告里 stuck 是 None）、暂停与被锁挡住的也走不到执行器（actions 是 None）。以前
+    # `active` 每轮从零重建，这样的一轮把 `stuck:<指纹>` 全清了，下一轮正常的 run 把每个一直卡着的指纹当「新卡住」
+    # 再发一遍——每次 qBit 超时、部署撞上一轮、看门狗重建容器、救援暂停都会（2026-09-26 复审，生产 8 月底同时
+    # 卡着 58–66 个）。
+    stuck = report.get("stuck")
+    if stuck is None:
+        active.update({k: v for k, v in active_before.items() if k.startswith("stuck:")})
+    for s in (stuck or {}).get("open") or []:
         key = f"stuck:{s['fp']}"
         active[key] = active_before.get(key, now)
         if key not in active_before:
@@ -126,12 +136,18 @@ def events(report: dict, st: dict) -> tuple[list[dict], dict]:
                         "text": (f"新卡住：[{s['rule']}] {s['kind']}【{s['show'] or '-'}】连续 {s['runs']} 轮"
                                  f"（自 {s['first_seen']}），指纹 {s['fp']}——{s['summary'][:120]}"
                                  f"（要人处理、先不提醒：media-agent ack {s['fp']} --reason …）")})
+    acted = report.get("actions") is not None          # 执行器跑完了：拒不拒绝、审计写没写进去都有了定论
     refused = (report.get("degraded") or {}).get("refused")
     if refused:
         active["degraded"] = active_before.get("degraded", now)
         if "degraded" not in active_before:
             out.append({"kind": "degraded", "text": f"新进入整批拒绝：{refused[:300]}"})
-    if (report.get("actions") or {}).get("audit_problems"):
+    elif not acted and "degraded" in active_before:
+        active["degraded"] = active_before["degraded"]
+    if not acted:
+        if "audit_fallback" in active_before:
+            active["audit_fallback"] = active_before["audit_fallback"]
+    elif report["actions"].get("audit_problems"):
         active["audit_fallback"] = active_before.get("audit_fallback", now)
         if "audit_fallback" not in active_before:
             out.append({"kind": "audit_fallback",
