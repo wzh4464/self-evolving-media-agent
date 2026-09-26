@@ -1,0 +1,61 @@
+name: tests
+
+on:
+  push:
+    branches: [main, "phase/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 生产解释器（zihan_air 是 CPython 3.12）。这一腿装 ffmpeg，
+          # 顺带跑 FakeProbe 与真 ffprobe 的输出一致性测试（其它腿自动跳过）。
+          - { os: ubuntu-latest, python: "3.12", ffmpeg: true }
+          # 开发机的解释器
+          - { os: ubuntu-latest, python: "3.14" }
+          # 生产媒体卷是大小写不敏感的 APFS，路径比较的行为和 ext4 不一样
+          - { os: macos-latest, python: "3.12" }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install ffmpeg
+        if: matrix.ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: uv sync --locked
+      - run: uv run --locked pytest
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
+  # 生产机上是 uv 0.7.2（2025-04）。新 uv 写出的锁文件它必须读得懂、
+  # 并且不带 dev 组也能装起来——否则部署后第一轮 run 就起不来。
+  prod-uv:
+    name: lock readable by prod uv 0.7.2
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      - run: uvx --from 'uv==0.7.2' uv lock --check
+      - run: uvx --from 'uv==0.7.2' uv sync --frozen --no-dev
+      - run: uvx --from 'uv==0.7.2' uv run --frozen --no-dev media-agent --help
+      - name: Lock file untouched
+        run: git diff --exit-code uv.lock
