@@ -39,6 +39,10 @@ class Executor:
         self.report = ExecReport()
         self._deleted_count = 0
         self._deleted_bytes = 0
+        # 本轮 `grab_episode` 写进 sidecar 的集：{show_dir: {(季, 集), …}}。
+        # `write_sidecar` 排在最后、且是整份覆盖，而它的 payload 是**诊断阶段**
+        # 算出来的快照——不带上这些，本轮刚抓的集会被旧快照盖掉。
+        self._grabbed: dict[str, set] = {}
 
     # ---------------- 审计 ----------------
     def _audit(self, status: str, finding: Finding, action: Action,
@@ -277,6 +281,27 @@ class Executor:
         payload = a.args["payload"]
         known = {k for k in sc_mod.Sidecar.__dataclass_fields__}
         sc = sc_mod.Sidecar(**{k: v for k, v in payload.items() if k in known})
+
+        # payload 是**诊断阶段**的快照，而抓取（op 0）排在本动作（op 10）之前，
+        # 已经往磁盘上的 sidecar 写过新集。整份覆盖会把它抹掉：实测 2026-09-26
+        # 「躲在超市后门抽烟的两人」S01E12 文件都落盘了，`have` 还停在 11，
+        # 于是下一轮把同一集又抓一遍（靠 qBittorrent 的 infohash 去重才没真重下）。
+        #
+        # 只并回**本轮自己抓的**那几集，不并磁盘上的旧值——sidecar-sync 的职责
+        # 之一正是把已经删掉的集从 `have` 里摘掉，无脑求并集会让它再也摘不掉。
+        for season, ep in self._grabbed.get(str(show_dir), ()):
+            info = sc.seasons.setdefault(str(season), {})
+            info["have"] = sorted(set(info.get("have") or []) | {ep})
+
+        # 别名是只增不减的（`add_alias` 的语义），抓取时记下的发布名同样要保住。
+        if prev_content:
+            try:
+                import json as _json
+                for al in (_json.loads(prev_content).get("aliases") or []):
+                    sc.add_alias(al)
+            except (ValueError, AttributeError):
+                pass
+
         sc_mod.save(show_dir, sc)
         self._audit("applied", f, a,
                     undo={"op": "restore_sidecar", "show_dir": str(show_dir),
@@ -517,10 +542,10 @@ class Executor:
             if 4 <= len(part) <= 60 and not part.startswith("["):
                 sc.add_alias(part)
         sc_mod.save(show_dir, sc)
+        self._grabbed.setdefault(str(show_dir), set()).add((season, ep))
 
         self._audit("applied", f, a,
-                    {"qbit_status": resp.status_code,
-                     "already_present": already,
+                    {"already_present": already,
                      "save_path": str(save_path),
                      "have_after": have},
                     undo={"op": "ungrab_episode", "show_dir": str(show_dir),
