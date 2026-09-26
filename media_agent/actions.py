@@ -99,6 +99,12 @@ class Executor:
         # `write_sidecar` 排在最后、且是整份覆盖，而它的 payload 是**诊断阶段**
         # 算出来的快照——不带上这些，本轮刚抓的集会被旧快照盖掉。
         self._grabbed: dict[str, set] = {}
+        # 本批次已经处置掉的种子记录与已搬进隔离区的路径。诊断是一次性全量产出的，
+        # 同一个输家常常同时挂着 trash（op 5）和 rename（op 6）：种子删了之后
+        # 再去 `files()` 就是 404，记成 failed 还会污染 `find_failure_patterns`
+        # （testinfra B2，生产 5 次）。后面的动作要先认一认这里。
+        self._removed_torrents: set[str] = set()
+        self._trashed_paths: set[str] = set()
 
     # ---------------- 审计 ----------------
     def _audit(self, status: str, finding: Finding, action: Action,
@@ -222,6 +228,22 @@ class Executor:
             self._audit("skipped", f, a, {"reason": f"非法目标文件名 {new_name!r}"})
             return
         target = path.parent / new_name
+        h = a.args.get("torrent_hash")
+
+        # 先认"本批次已经处置掉的"，再谈别的（testinfra B2）。以前这里先查
+        # 目标名被占：输家被搬走、赢家刚改好名，于是报一条误导的「集位被占」
+        # （20260924T173911 / T234117）；有种子的输家则去问已删种子的 `files()`，
+        # 404 记成 failed（生产 5 次），还被当成"规则本身有问题"。
+        if h and h in self._removed_torrents:
+            self._audit("skipped", f, a, {
+                "reason": "所属种子已在本批次被移除（判重作废 / 死种 / 撞车），不再改名"})
+            return
+        if str(path) in self._trashed_paths:
+            self._audit("skipped", f, a, {"reason": "文件本批次已移入隔离区，不再改名"})
+            return
+        if not h and not os.path.lexists(path):
+            self._audit("skipped", f, a, {"reason": "文件已不在原位，不再改名"})
+            return
 
         if target.exists() and target != path:
             # 走到这里说明腾空没能发生：同一集位有两个文件，而 duplicate-episode
@@ -237,7 +259,6 @@ class Executor:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
 
-        h = a.args.get("torrent_hash")
         via = "filesystem"
         if h and not self.ctx.qbit:
             # AGENTS.md 第 3 条：有种子的文件绝不走文件系统改名。以前 qBit 不在时
@@ -248,30 +269,44 @@ class Executor:
         if h:
             # 有种子的一律走 qBittorrent API。找不到对应条目就报失败，
             # **绝不退化成文件系统改名**——那会让种子路径失效、做种中断。
-            old_rel = self._torrent_rel_path(h, path)
-            if old_rel is None:
+            try:
+                entries = self.ctx.qbit.files(h)
+            except Exception as e:
+                if "404" in str(e):
+                    # 诊断之后、本批次之外被删的（手动删种等）：状态变了，不是规则错
+                    self._audit("skipped", f, a,
+                                {"reason": "所属种子已不在 qBittorrent 里，不再改名"})
+                    return
+                raise
+            entry = next((e for e in entries if Path(e["name"]).name == path.name), None)
+            if entry is None:
                 self._audit("failed", f, a,
                             {"error": "种子文件列表里找不到该文件，拒绝绕过 qBittorrent 改名"})
                 return
+            old_rel = entry["name"]
             # 本轮已经被作废（设为不下载、移进隔离区）的，就别再改名了。
             # 诊断是一次性全量产出的：合并发布种子里的两个文件都会被提「改成
             # 规范名」，而其中一个同时被提「只作废这一个文件」。作废排在改名
             # 之前，等轮到它改名时文件已不在盘上，qBittorrent 却仍列着这个条目
             # （优先级 0）——照改会把一个不存在的文件映射到规范名上。
-            prio = next((e.get("priority", 1) for e in self.ctx.qbit.files(h)
-                         if e["name"] == old_rel), 1)
-            if prio == 0:
+            if entry.get("priority", 1) == 0:
                 self._audit("skipped", f, a,
                             {"reason": "该文件已设为不下载（本轮已作废）", "at": old_rel})
+                return
+            # 种子说这个文件已下完，盘上（连 `.!qB` 都）没有：它是幻影，改名只会把
+            # 一个不存在的文件映射到集位名上，此后它就"宣称"那个集位。
+            # 下载中的文件盘上本来就可能还没有——那种照改，是支持的功能。
+            if (entry.get("progress", 0) >= 1 and not os.path.lexists(path)
+                    and not os.path.lexists(str(path) + ".!qB")):
+                self._audit("skipped", f, a, {
+                    "reason": "种子说已下完、文件却不在原位（幻影或被挪走），不改名",
+                    "at": old_rel})
                 return
             new_rel = str(Path(old_rel).parent / new_name) if "/" in old_rel else new_name
             self.ctx.qbit.rename_file(h, old_rel, new_rel)
             via = "qbittorrent"
         else:
             # 确认无种子关联才允许文件系统改名（纯本地文件，无从同步）
-            if not path.exists():
-                self._audit("skipped", f, a, {"reason": "文件已不在原位（多半本轮已被作废）"})
-                return
             path.rename(target)
         self._audit("applied", f, a, {"new_path": str(target), "via": via},
                     undo={"op": "rename", "path": str(target),
@@ -769,6 +804,7 @@ class Executor:
         # 只能靠 magnet 把这条记录重新加回来。取不到就明说不可回退。
         magnet = victim.get("magnet_uri") or a.args.get("magnet") or ""
         self.ctx.qbit.delete([h], delete_files=False)
+        self._removed_torrents.add(h)
 
         undo = None
         if magnet:
@@ -1022,6 +1058,10 @@ class Executor:
             self._audit("skipped", f, a, {
                 "reason": "有种子的文件，但 qBittorrent 不可用：拒绝只搬文件、不处理种子"})
             return
+        if h and h in self._removed_torrents:
+            # 本批次早先已经整种子作废（比如合集里另一集判重输了）：种子已经没了，
+            # 再问它的文件列表只会 404。文件照常进隔离区，丢记录只算那一次。
+            h = ""
         if h:
             entry = None
             if file_only:
@@ -1054,6 +1094,7 @@ class Executor:
                         "error": f"删除种子记录失败，文件未动：{type(e).__name__}: {e}"})
                     return
                 record_lost = True
+                self._removed_torrents.add(h)
             else:
                 # 只作废种子里的某个文件：设为不下载，保留其余部分
                 try:
@@ -1082,6 +1123,7 @@ class Executor:
             return
         self._deleted_count += 1
         self._deleted_bytes += size
+        self._trashed_paths.add(str(path))
 
         # 文件可从隔离区还原；但被删掉的种子记录还原不了（种子文件本身已不在）
         undo = {"op": "restore_from_trash", "path": str(path),

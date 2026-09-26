@@ -260,7 +260,8 @@ def test_failed_audit_and_swallowed_detector_error_are_recorded(lib, tripwire):
     f = Finding(rule="t", kind="unrenamed", severity="minor", summary="x",
                 action=Action(op="rename", args={"path": str(lib.media_root / "x"),
                                                  "new_name": "y", "torrent_hash": "a" * 40}))
-    lib.qbit.fail("files", exc=QBitError("torrents/files -> HTTP 404: Not Found"))
+    # 用超时而不是 404：种子已不在（404）如今是"状态变了"，记 skipped（testinfra B2）
+    lib.qbit.fail("files", exc=httpx.ReadTimeout("timed out (injected)"))
     report = lib.apply([f])
     assert len(report.failed) == 1                             # ……执行器也吞掉了
     assert sorted(e.kind for e in tripwire.events) == ["detector_error", "failed_record"]
