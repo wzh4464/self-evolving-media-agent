@@ -83,3 +83,75 @@ def test_bundled_sibling_names_the_keeper_in_the_same_torrent(lib):
     assert sib.action.args["keep_path"] == str(xie)
     assert sib.action.args["keep_hash"] == bundle.hash
     assert sib.action.args["slot"] == [1, 11]
+
+
+# ------------------------------------------------------------------ D5：两个种子都封存着同一集
+LOLI = "[LoliHouse] Yani Neko - 08 [WebRip 1080p HEVC-10bit AAC ASSx2].mkv"
+NEST = "[NEST] Yani Neko - 08 [NF WEB-DL 1080p AVC AAC][简繁日内封].mkv"
+
+
+def _two_seals(lib):
+    s1 = lib.show("尼古喵喵").season(1)
+    a = s1.single(LOLI, size=GB, tags="ma:S01E08", probe=CHI)
+    b = s1.single(NEST, size=GB + 5, tags="ma:S01E08", probe=CHI)
+    return s1, a, b
+
+
+def _trash_paths(findings):
+    return {f.action.args["path"] for f in findings if f.action and f.action.op == "trash"}
+
+
+def test_two_torrents_sealing_one_slot_are_both_kept_and_reported(lib):
+    """停滞 48 小时放行换源、或手动加了同钉子的种子之后：两个不同的种子都钉着 S01E08、
+    都复核通过。以前只封存偏好分最高的那个、另一个当输家删掉——两个都是择源的结论，
+    删哪个该由人定。"""
+    s1, a, b = _two_seals(lib)
+
+    found = lib.diagnose(detectors=[DuplicateEpisodeDetector])
+
+    assert _trash_paths(found) == set()
+    [conflict] = [f for f in found if f.kind == "seal_conflict"]
+    assert conflict.action is None and conflict.classified
+    assert sorted(conflict.evidence["torrents"]) == sorted([a.hash, b.hash])
+
+
+def test_seal_conflict_still_clears_an_unsealed_third_copy(lib):
+    """第三份没钉 `ma:` 的照常判输——保留方是偏好分最高的那份封存。"""
+    s1, a, b = _two_seals(lib)
+    raw = s1.single("[Dynamis One] Yani Neko - 08 (ABEMA 1920x1080 AVC AAC MKV).mkv",
+                    size=GB + 9, probe=RAW)
+
+    found = lib.diagnose(detectors=[DuplicateEpisodeDetector])
+
+    assert _trash_paths(found) == {str(raw.path)}
+    [dup] = [f for f in found if f.kind == "duplicate"]
+    assert dup.action.args["keep_hash"] in (a.hash, b.hash)
+    assert [f.kind for f in found if f.kind == "seal_conflict"] == ["seal_conflict"]
+
+
+def test_seal_conflict_cycle_trashes_nothing_sealed(lib):
+    s1, a, b = _two_seals(lib)
+    ia, ib = lib.ident(a.path), lib.ident(b.path)
+
+    lib.converge()
+
+    assert lib.trash_files() == []
+    assert lib.qbit.has(a.hash) and lib.qbit.has(b.hash)
+    assert {lib.ident(p) for p in s1.path.iterdir()} == {ia, ib}
+
+
+# ------------------------------------------------------------------ 封存要稳定
+def test_pinned_copy_whose_probe_is_unavailable_is_not_made_a_loser(lib):
+    """钉着 `ma:S01E08` 的 LoliHouse 版，这一轮 ffprobe 超时（探测返回 None）：只看名字，
+    `ASSx2` 过不了硬门槛。以前它就此失封，排名又输给探得到双字幕轨的另一份，被当输家删掉。
+    现在"不知道"当作封存：它不当输家，也不当赢家，报一条给人看。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    pinned = s1.single(LOLI, size=GB, tags="ma:S01E08", probe=None)
+    s1.single("[ANi] Yani Neko - 08 [1080P][Baha][WEB-DL][AAC AVC][CHT].mkv", size=GB + 5,
+              probe=CHI)
+
+    found = lib.diagnose(detectors=[DuplicateEpisodeDetector])
+
+    assert str(pinned.path) not in _trash_paths(found)
+    [unk] = [f for f in found if f.kind == "seal_unknown"]
+    assert unk.path == str(pinned.path) and unk.action is None

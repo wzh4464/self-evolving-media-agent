@@ -499,14 +499,38 @@ class DuplicateEpisodeDetector:
                                   "torrents": [f.torrent_hash for f in files]},
                     )
                     continue
-                sealed = None
+                #
+                # **封存要稳定，也不替择源随手二选一**（删除关口 I4 的检测器一侧）：
+                # - 复核通过的封存候选来自**不止一个种子**（停滞 48 小时放行换源后、或手动加了
+                #   同钉子的种子）：以前只封存偏好分最高的、其余当输家删掉。两个都是择源的
+                #   结论，删哪个由人定——报 `seal_conflict`，封存候选一个都不删；偏好分最高的
+                #   那个仍当保留方，没封存的照常判输。
+                # - 钉着 `ma:`、复核没过，而**探测不可用**（`probe` 为 None：超时、出错）：只看
+                #   名字的结论不算数（LoliHouse 的 `ASSx2`，`tests/test_seal_slot.py` 第 3 组），
+                #   昨天封存的今天就失封被删。不知道 = 当作封存：它既不当输家、也不当赢家，
+                #   报 `seal_unknown` 给人看。探得到而且确实不合格的，照旧 `seal_failed`。
+                seals: list = []
+                protected: set[int] = set()
                 for f in sorted((f for f in files
                                  if _pinned(f) == (season, ep) and id(f) not in phantoms),
                                 key=_prefer_score, reverse=True):
                     ok, why = meets_requirements(f)
                     if ok:
-                        sealed = (f, why)
-                        break
+                        seals.append((f, why))
+                        continue
+                    if probe(f.path) is None:
+                        protected.add(id(f))
+                        yield Finding(
+                            rule=self.id, kind="seal_unknown", severity="minor",
+                            classified=True,
+                            summary=(f"S{season:02d}E{ep:02d} 抓来的这份探测不可用（{why}），"
+                                     f"封存与否不可知：本轮既不删它、也不拿它当保留方"),
+                            show=show.dir_name, path=str(f.path),
+                            torrent_hash=f.torrent_hash,
+                            evidence={"file": f.filename, "torrent_name": f.torrent_name,
+                                      "reason": why},
+                        )
+                        continue
                     yield Finding(
                         rule=self.id, kind="seal_failed", severity="important",
                         classified=True,
@@ -516,6 +540,21 @@ class DuplicateEpisodeDetector:
                         torrent_hash=f.torrent_hash,
                         evidence={"file": f.filename, "torrent_name": f.torrent_name,
                                   "reason": why},
+                    )
+                sealed = seals[0] if seals else None
+                seal_torrents = sorted({f.torrent_hash for f, _ in seals})
+                if len(seal_torrents) > 1:
+                    top = sealed[0].torrent_hash
+                    protected |= {id(f) for f, _ in seals if f.torrent_hash != top}
+                    yield Finding(
+                        rule=self.id, kind="seal_conflict", severity="important",
+                        classified=True,
+                        summary=(f"S{season:02d}E{ep:02d} 有 {len(seal_torrents)} 个不同的种子都钉着"
+                                 f"这一集且复核通过，封存不替择源二选一：都不删，需人工挑一个"),
+                        show=show.dir_name, path=str(sealed[0].path),
+                        evidence={"files": [f.filename for f, _ in seals],
+                                  "torrents": seal_torrents,
+                                  "reasons": [why for _, why in seals]},
                     )
 
                 pending = [f for f in files if f.torrent_category == "Bangumi"]
@@ -548,7 +587,7 @@ class DuplicateEpisodeDetector:
 
                 if sealed:
                     keeper, seal_why = sealed
-                    losers = [f for f in files if f is not keeper]
+                    losers = [f for f in files if f is not keeper and id(f) not in protected]
                     # 封存能绕过所有权让位，但绕不过集号可信度。还挂在
                     # `Bangumi` 下的文件，此刻叫什么只是"AB 认为的"；
                     # 要在本轮就清理它，得让它的**发布名**独立确认集位。
@@ -570,10 +609,13 @@ class DuplicateEpisodeDetector:
                         losers = [f for f in losers if f not in holdback]
                     reason = "集位已封存：%s" % seal_why
                 else:
-                    # 真文件永远排在幻影前面（见上文 phantoms 的注释）
-                    ranked = sorted(files, key=lambda f: (id(f) not in phantoms,
-                                                          _rank_for_keep(f)),
+                    # 真文件永远排在幻影前面（见上文 phantoms 的注释）；封存不可知的既不当
+                    # 赢家也不当输家
+                    ranked = sorted((f for f in files if id(f) not in protected),
+                                    key=lambda f: (id(f) not in phantoms, _rank_for_keep(f)),
                                     reverse=True)
+                    if not ranked:
+                        continue
                     keeper, losers = ranked[0], ranked[1:]
                     reason = ""
 
