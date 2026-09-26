@@ -59,6 +59,30 @@ uv 0.7.2 能读：`uv lock --check`、`uv sync --frozen`、`uv sync --frozen --n
 （含 dev），部署后第一轮会从 PyPI 装 pytest。部署前应把 plist 改成
 `uv run --frozen --no-dev`（或直接调 `.venv/bin/media-agent`），见部署阶段的整改。
 
+## CI（`.github/workflows/tests.yml`，8edf092 引入，本节补记其取舍）
+
+push 到 `main` / `phase/**` 与 PR 时跑。两个任务：
+
+- **pytest 矩阵**，每条腿都有它存在的理由：
+  - Ubuntu × Python 3.12：生产解释器（zihan_air 是 CPython 3.12）。**只有这条腿装
+    ffmpeg**，`@pytest.mark.ffmpeg` 的一致性测试（FakeProbe 与真 ffprobe 的输出对得上）
+    只在这里真跑，其它腿自动跳过——装 ffmpeg 要一分多钟，一条腿证明就够。
+  - Ubuntu × 3.14：开发机的解释器。
+  - macOS × 3.12：生产媒体卷是大小写不敏感的 APFS，路径比较与 ext4 不同；
+    而且 `tests/test_deploy_scripts.py` 必须在 macOS 自带的 `/bin/bash` 3.2 与 BSD 工具上跑
+    （`deploy.sh` 在生产上就是这么跑的）。
+- **prod-uv**：用生产机上的 uv 0.7.2（`uvx --from 'uv==0.7.2'`）做 `lock --check`、
+  `sync --frozen --no-dev`、`run … --help`，最后 `git diff --exit-code uv.lock`。
+  新 uv 写出的锁文件老 uv 读不懂，部署后第一轮就起不来；这个任务专门挡这一条。
+  **生产机的 uv 升级了才改这里的版本号**，而且两边一起改。
+
+**action 一律钉到 40 位提交 SHA，行尾注明 `# vX.Y.Z`**（`tests/test_ci_workflow.py` 守着）。
+最初写的是 `astral-sh/setup-uv@v10`：setup-uv 从 v8 起不再发布浮动的大版本 tag，上游只有
+`v10.0.0`…`v10.2.0`，`@v10` 解析不到，**每个任务在第一步就失败**——本地测试全绿，
+CI 一次都没真跑过。升级 action 时先
+`git ls-remote https://github.com/<owner>/<repo> 'refs/tags/vX.Y.Z*'` 拿到 SHA
+（没有 `^{}` 行说明是轻量 tag，SHA 就是提交；有的话取 `^{}` 那一行），再改工作流。
+
 ## 怎么用
 
 见 `tests/harness/__init__.py` 的 fixture 表；基座自身的语义断言在 `tests/test_harness.py`；

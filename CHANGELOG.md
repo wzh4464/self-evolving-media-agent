@@ -28,7 +28,9 @@
 - GitHub Actions（`.github/workflows/tests.yml`）：push 到 `main` / `phase/**` 与
   PR 时跑离线测试，矩阵为 Ubuntu × Python 3.12（生产解释器，装 ffmpeg 跑探测一致性）
   / 3.14，以及 macOS × 3.12（生产媒体卷是大小写不敏感的 APFS）；另有一个任务用
-  生产的 uv 0.7.2 核对锁文件可读、不带 dev 组可装、CLI 能起来。
+  生产的 uv 0.7.2 核对锁文件可读、不带 dev 组可装、CLI 能起来。引用的 action 钉在
+  提交 SHA 上（最初写的 `astral-sh/setup-uv@v10` 在上游不存在，所有任务都起不来），
+  由测试守住形状。
 - **跨进程运行锁**（`state/run.lock`，`media_agent/runlock.py`）：`run`、`apply`、
   `rollback`、`repair`、`evolve`、`purge --apply` 同一时刻只能有一个在跑（含 `--dry-run`；
   `scan` / `diagnose` / `runs` / 只预演的 `purge` 不拿锁）。拿不到锁最多等 10 秒，
