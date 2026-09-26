@@ -37,8 +37,8 @@ uv run media-agent scan               # 看库现状
 uv run media-agent diagnose           # 跑全部规则，出问题清单（只读）
 uv run media-agent apply --dry-run    # 预演修复
 uv run media-agent apply              # 执行修复
-uv run media-agent evolve             # 为规则盲区提议新规则
-uv run media-agent run                # 完整自治轮次
+uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
+uv run media-agent run                # 完整自治轮次（演进默认冻结）
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 
@@ -103,6 +103,12 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
 - 与现有规则不重叠
 
 驳回的提议也留档在 `rejected/`，防止后续重复提同样的坏主意。
+
+**默认冻结**（`EVOLVE_MODE=off`，2026-09-26 起）：`run` 不跑演进、不调 LLM、
+不往 `.agents/` 写任何东西。2026-08-20 之后连续 147 轮提议 0 条、现有演进规则
+全无动作，冻结行为中立；而生产改成按 git tag 部署后，工作区里未入库的规则/笔记
+会被部署的漂移闸门拦下。要演进就设 `EVOLVE_MODE=propose`，产出提交入库、打 tag
+再部署。演进规则带的动作无论哪种模式都不自动执行。
 
 ## 写 Agent Note 的时机
 

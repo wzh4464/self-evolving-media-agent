@@ -41,7 +41,7 @@ _CONFIG_ENV = ("MEDIA_ROOT", "QBIT_URL", "QBIT_USER", "QBIT_PASS", "AB_URL", "AB
                "AB_PASS", "AB_DB", "AB_CONTAINER", "DOCKER_BIN", "TMDB_API_KEY",
                "TMDB_LANG", "LLM_BASE", "LLM_KEY", "LLM_MODEL", "AUTO_APPLY",
                "TRASH_RETENTION_DAYS", "MAX_DELETE_PER_RUN", "MAX_DELETE_GB_PER_RUN",
-               "DEAD_TORRENT_HOURS")
+               "DEAD_TORRENT_HOURS", "EVOLVE_MODE")
 
 
 def _is_live(request) -> bool:

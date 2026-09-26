@@ -3,8 +3,9 @@
     media-agent scan      # 只扫描，看看库里现在什么样
     media-agent diagnose  # 跑全部规则，出问题清单（不改动任何东西）
     media-agent apply     # 执行修复（--dry-run 预演）
-    media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升
-    media-agent run       # 一轮完整自治：diagnose → apply → evolve → 清理隔离区
+    media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升（需 EVOLVE_MODE=propose）
+    media-agent run       # 一轮完整自治：diagnose → apply → [evolve] → 清理隔离区
+                          # evolve 只在 EVOLVE_MODE=propose 时跑，默认 off（见 config.py）
 """
 from __future__ import annotations
 
@@ -316,6 +317,11 @@ def cmd_purge(args, cfg) -> int:
 
 
 def cmd_evolve(args, cfg) -> int:
+    if cfg.evolve_mode != "propose":
+        # 手动 evolve 同样往 .agents/ 写规则和笔记——冻结期间工作区要与部署的 tag 一致
+        print(f"演进已冻结（EVOLVE_MODE={cfg.evolve_mode}）。确要手动演进："
+              "EVOLVE_MODE=propose media-agent evolve，产出的规则须提交入库再部署")
+        return 1
     ctx = build_context(cfg, need_llm=True)
     if not ctx.llm.enabled:
         print("未配置 LLM_KEY，无法演进")
@@ -377,7 +383,10 @@ def cmd_run(args, cfg) -> int:
     print(f"\n═══ 修复：{report.summary()} ═══")
 
     rc = 0
-    if ctx.llm.enabled and not args.no_evolve:
+    if cfg.evolve_mode != "propose":
+        # 冻结：不重扫、不调 LLM、不构造 Evolver（它的 __init__ 就会建 .agents/rules）
+        print(f"\n═══ 演进：已冻结（EVOLVE_MODE={cfg.evolve_mode}） ═══")
+    elif ctx.llm.enabled and not args.no_evolve:
         # 修复后重新扫描，残留才是真盲区
         state2 = build_state(ctx, resolve_tmdb=False)
         if state2.qbit_errors:
@@ -447,12 +456,17 @@ def main() -> int:
 
     s = sub.add_parser("run", help="完整自治轮次")
     s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--no-evolve", action="store_true")
+    s.add_argument("--no-evolve", action="store_true",
+                   help="本轮不演进（EVOLVE_MODE=propose 时才有意义，默认 off 本来就不跑）")
     s.add_argument("--max-proposals", type=int, default=3)
     s.set_defaults(func=cmd_run)
 
     args = p.parse_args()
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except ValueError as e:
+        _log(f"配置错误：{e}")
+        return 2
     return args.func(args, cfg)
 
 

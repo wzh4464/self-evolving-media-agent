@@ -42,6 +42,13 @@
   "两个种子宣称同一路径"改为离线搭现场验证；对生产全库的只读检查
   移到 `tests/live/`，默认不跑（`MEDIA_AGENT_LIVE=1 uv run pytest -m live`），
   且媒体卷不在或 qBittorrent 登录失败时明确失败，不再空转通过。
+- **自演进默认冻结**：新配置 `EVOLVE_MODE=off|propose`，默认 `off`——`run` 整段跳过
+  演进（不重扫、不调 LLM、不往 `.agents/` 写规则或笔记），run.log 里记一行
+  「演进：已冻结」；手动 `media-agent evolve` 在 `off` 下拒绝执行。`propose` 保留旧行为，
+  `--no-evolve` 照旧可用。行为中立：2026-08-20 之后连续 147 轮提议 0 条，
+  30 条演进规则全无动作。冻结是按 git tag 部署的前提——运行时往仓库目录写文件
+  会让工作区与部署的 tag 不一致。`EVOLVE_MODE` 写错会以「配置错误」退出码 2 结束，
+  不静默当成某个值。
 
 ### 修复
 - **回退可能清空当前目录**（critic N1 / LAT-02）：审计里 `trash_path` 为空的记录

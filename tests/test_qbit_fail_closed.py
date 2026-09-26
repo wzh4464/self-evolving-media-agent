@@ -228,6 +228,7 @@ def test_cmd_purge_apply_refuses_when_qbit_down(offline_cli, capsys):
 def test_cmd_run_skips_evolve_when_the_rescan_is_degraded(offline_cli, capsys, monkeypatch):
     """apply 之后的演进重扫若读不全，演进器会把有种子的文件当成盲区去立永久规则。"""
     lib = offline_cli
+    lib.configure(evolve_mode="propose")               # 默认冻结；这里要走演进分支
     lib.llm.script({"rules": []})                      # 打开 FakeLLM，演进分支才会走
     calls = {"n": 0}
     real = lib.qbit.torrents
@@ -251,6 +252,7 @@ def test_cmd_run_skips_evolve_when_the_rescan_is_degraded(offline_cli, capsys, m
 
 def test_cmd_evolve_refuses_on_a_degraded_snapshot(offline_cli, monkeypatch):
     lib = offline_cli
+    lib.configure(evolve_mode="propose")
     lib.llm.script({"rules": []})
     lib.qbit_down()
     from media_agent import evolution
