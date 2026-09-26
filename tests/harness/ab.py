@@ -152,7 +152,7 @@ class FakeAB:
     """
 
     SECRET = "not-a-real-password-0000"
-    HOST = "host.docker.internal:1122"
+    HOST = "qbit.invalid:8080"
 
     def __init__(self, tripwire=None, abdb: AutoBangumiDB | None = None):
         self.tripwire = tripwire
