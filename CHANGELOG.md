@@ -63,6 +63,10 @@
 - **订阅模式下抓取不打 `ab:` 标签**（只钉 `ma:SxxEyy`）：AB 不再认领，标签只会让切换之后的核对把本项目抓的认成 AB 加的。
 - **订阅模式下永远不叫 AutoBangumi 刷新**（`refresh_all` 会让它当场拉 RSS、下载，两个开关都关了照样下）：规则不再提议之外，
   执行器也拦下别处来的 `fix_title_aliases` / `repoint_rss`（skipped，不写 AB 库、不停容器、不刷新）。
+- **健康报告写出 AutoBangumi 的模式**（`run` 与 `grab` 都写，`ab: {mode, source}`，文字版多一行 `AB`）；订阅模式下按切换时
+  记的基线核对 AB 真停了没有（启发式）：rssitem 的 `last_checked_at` 又变了 → warn `ab_still_polling`（RSS 线程还在跑、或有人
+  点了刷新）；切换之后 AB 加的种子（`Bangumi` 分类 / `ab:` 标签）不是新订阅那一刻补的那一批（新订阅的保存路径下、1 小时之内）
+  → warn `ab_added_outside_subscribe`；没有基线（模式来自 `AB_MODE`）或读不到 AB 库 → warn `ab_mode_unverified`。
 - **第二个 launchd 任务 `com.zihan.media-agent-grab`**（`deploy/com.zihan.media-agent-grab.plist`：每 30 分钟
   `media-agent grab`，加载时不跑，低优先级与主任务相同，日志 `state/grab.log`）。`deploy.sh` 两份都装、各自只在变了时
   重新加载；任何一份装不上两份一起退回；tag 里没有抓取任务（回滚到更早的版本）就卸掉它；装着的任务与 tag 里的对不上时

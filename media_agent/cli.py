@@ -997,6 +997,7 @@ def _run(args, cfg, rh) -> int:
         if n != 1:
             return
         rh.scanned(state, prev)
+        rh.ab(state)
         if not state.qbit_errors:
             # 这一轮的种子数被采信了：下一轮拿它比（`health.torrent_count_problem`）。时间取扫描之前——
             # 这一轮自己摘掉的种子也算进下一轮"解释得通"的那部分。被拒绝的一轮不挪基线。
@@ -1151,6 +1152,7 @@ def _grab(args, cfg, rh) -> int:
     def on_scan(n, state) -> None:
         if n == 1:
             rh.scanned(state, prev)               # 只看：种子数基线只由 run 挪（`health.save_baseline`）
+            rh.ab(state)
 
     def on_diagnose(n, state, findings) -> None:
         _warn_degraded(state)

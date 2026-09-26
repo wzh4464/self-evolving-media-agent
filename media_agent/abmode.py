@@ -270,6 +270,8 @@ def activity(record: dict | None, *, rss_rows, bangumi_rows, torrents, media_roo
     if not base:
         return out
     last = base.get("rss_last_checked") or {}
+    # 基线里有 rssitem、这一轮一条都没读到：多半是 AB 库读不了（扫描只记一行日志）——没拉过与看不见分不开
+    out["rss_unread"] = bool(last) and not rss_rows
     for r in rss_rows or []:
         rid, now = str(r.get("id")), r.get("last_checked_at")
         if not now:
@@ -312,31 +314,41 @@ def activity(record: dict | None, *, rss_rows, bangumi_rows, torrents, media_roo
     return out
 
 
-def activity_problems(act: dict) -> list[str]:
-    """`activity` 里要人看的：没有基线、还在拉 RSS、在订阅动作之外加了种子（每条一句，健康报告与 `ab-mode show` 共用）。"""
+def activity_problems(act: dict) -> list[dict]:
+    """`activity` 里要人看的，每条 `{code, text}`（健康报告的原因与 `ab-mode show` 共用）：
+
+    - `ab_mode_unverified`：没有切换基线（模式来自 `AB_MODE`、没经命令切过），或这一轮读不到 AB 库的 rssitem；
+    - `ab_still_polling`：切换之后 AB 拉过 RSS；
+    - `ab_added_outside_subscribe`：AB 在订阅动作之外加了种子。"""
     out = []
     if not act.get("baseline"):
-        out.append("没有切换基线（模式来自 AB_MODE、没经 media-agent ab-mode 切过）：AB 的开关关没关、之后还拉不拉 RSS 都"
-                   "核对不了——用 media-agent ab-mode subscription 切一次（开关已关的只重启、核对、记基线）")
+        out.append({"code": "ab_mode_unverified",
+                    "text": "订阅模式没有切换基线（模式来自 AB_MODE、没经 media-agent ab-mode 切过）：AB 的开关关没关、之后还拉"
+                            "不拉 RSS 都核对不了——用 media-agent ab-mode subscription 切一次（开关已关的只重启、核对、记基线）"})
         return out
+    if act.get("rss_unread"):
+        out.append({"code": "ab_mode_unverified",
+                    "text": "这一轮读不到 AB 库的 rssitem（AB_DB 读不了？）：切到 subscription 之后 AB 还拉不拉 RSS 核对不了"})
     polled = act.get("polled") or []
     if polled:
         names = "、".join(f"{p['id']} {p['name']}".strip() for p in polled[:3])
-        out.append(f"切到 subscription（{act.get('since')}）之后 AB 拉过 RSS：{len(polled)} 个 rssitem 的 last_checked_at 变了"
-                   f"（{names}{' 等' if len(polled) > 3 else ''}）——RSS 线程还在跑（没重启 / 开关被改回？）或有人点了刷新；"
-                   f"media-agent ab-mode show 核对")
+        out.append({"code": "ab_still_polling",
+                    "text": f"切到 subscription（{act.get('since')}）之后 AB 拉过 RSS：{len(polled)} 个 rssitem 的 "
+                            f"last_checked_at 变了（{names}{' 等' if len(polled) > 3 else ''}）——RSS 线程还在跑（没重启 / "
+                            f"开关被改回？）或有人点了刷新（刷新也会让它下载）；media-agent ab-mode show 核对"})
     outside = (act.get("adds") or {}).get("outside") or []
     if outside:
         names = "、".join(f"{x['hash']} {x['name'][:40]}" for x in outside[:3])
-        out.append(f"AB 在订阅动作之外加了 {len(outside)} 个种子（{names}{' 等' if len(outside) > 3 else ''}）："
-                   f"RSS 线程 / 刷新 / 对老订阅点了「收集」——订阅之外它不该再下载")
+        out.append({"code": "ab_added_outside_subscribe",
+                    "text": f"AB 在订阅动作之外加了 {len(outside)} 个种子（{names}{' 等' if len(outside) > 3 else ''}）："
+                            f"RSS 线程 / 刷新 / 对老订阅点了「收集」——订阅模式下订阅之外它不该再下载"})
     return out
 
 
 def activity_lines(act: dict) -> list[str]:
     """`ab-mode show` 的几行。"""
     problems = activity_problems(act)
-    lines = [f"  ⚠️  {p}" for p in problems]
+    lines = [f"  ⚠️  {p['text']}" for p in problems]
     if act.get("baseline"):
         if not act.get("polled"):
             lines.append(f"  ✓ 切到 subscription（{act.get('since')}）之后 AB 没再拉过 RSS")

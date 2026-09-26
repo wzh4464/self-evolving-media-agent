@@ -341,7 +341,8 @@ def test_the_switch_takes_the_run_lock(ab_lib, monkeypatch):
 
 
 # ================================================================ 之后的核对（启发式，`abmode.activity`）
-def _act(tmp_path, *, torrents=(), rss_rows=(), bangumi_rows=(), switched=1000.0):
+def _act(tmp_path, *, torrents=(), rss_rows=({"id": 1, "name": "甲番", "last_checked_at": T0},), bangumi_rows=(),
+         switched=1000.0):
     media = tmp_path / "Media"
     rec = {"mode": "subscription", "since": "2026-09-27T12:00:00", "switched_at_epoch": switched,
            "baseline": {"rss_last_checked": {"1": T0}, "bangumi_ids": [1, 2]}}
@@ -367,7 +368,7 @@ def test_a_new_subscriptions_first_burst_is_expected_and_later_adds_are_not(tmp_
     act, _ = _act(tmp_path, torrents=ts, bangumi_rows=[{"id": 1, "save_path": "/app/Media/甲番/Season 1"}, new_sub])
     assert [x["hash"][0] for x in act["adds"]["subscribe"]] == ["a", "b"]
     assert [x["hash"][0] for x in act["adds"]["outside"]] == ["d", "c"]
-    assert len(abmode.activity_problems(act)) == 1 and "订阅动作之外" in abmode.activity_problems(act)[0]
+    assert [p["code"] for p in abmode.activity_problems(act)] == ["ab_added_outside_subscribe"]
 
 
 def test_polling_is_any_change_of_last_checked_at(tmp_path):
@@ -377,10 +378,10 @@ def test_polling_is_any_change_of_last_checked_at(tmp_path):
     act, _ = _act(tmp_path, rss_rows=[{"id": 1, "name": "甲番", "last_checked_at": "2026-09-27T09:00:00+00:00"},
                                       {"id": 5, "name": "新订阅", "last_checked_at": "2026-09-27T09:00:00+00:00"}])
     assert [p["id"] for p in act["polled"]] == [1, 5]
-    assert "拉过 RSS" in abmode.activity_problems(act)[0]
+    assert "拉过 RSS" in abmode.activity_problems(act)[0]["text"]
 
 
 def test_without_a_baseline_nothing_can_be_verified(tmp_path):
     act = abmode.activity(None, rss_rows=[], bangumi_rows=[], torrents=[], media_root=tmp_path)
     assert act["baseline"] is False
-    assert "没有切换基线" in abmode.activity_problems(act)[0]
+    assert "没有切换基线" in abmode.activity_problems(act)[0]["text"]

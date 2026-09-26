@@ -250,7 +250,7 @@ class RunHealth:
             "crash": None, "paused": "", "locked": "", "detectors": None, "findings": None, "actions": None,
             "grab": None, "stuck": None, "unrenamed": None, "trash": None, "torrents": None,
             "evolve": None, "logged_errors": {"count": 0, "by_tag": {}, "samples": []},
-            "ledger": None, "loop": None,
+            "ledger": None, "loop": None, "ab": None,
         }
 
     # ---- 各阶段 ----
@@ -288,6 +288,30 @@ class RunHealth:
         self.data["torrents"] = {"current": len(state.torrents) if listed else None,
                                  "previous": (prev_baseline or {}).get("count"),
                                  "previous_run": (prev_baseline or {}).get("run_id")}
+
+    def ab(self, state) -> None:
+        """AutoBangumi 的模式与来源（`abmode`）；订阅模式下核对切换之后 AB 还做了什么（`abmode.activity`，启发式：还拉不拉
+        RSS、在订阅动作之外加没加种子）。用这一轮**第一次**扫描：交接（分类改成剧名）之前，AB 刚加的还在 `Bangumi` 里。"""
+        from . import abmode
+        cfg = self.cfg
+        d: dict = {"mode": getattr(cfg, "ab_mode", abmode.FULL), "source": getattr(cfg, "ab_mode_source", "default")}
+        if d["mode"] == abmode.SUBSCRIPTION:
+            try:
+                rec = abmode.read_state(cfg.state_dir)
+            except ValueError as e:                 # 起来时 load_config 读过；跑着的时候被人改坏了——当作没有基线，照实说
+                rec, d["state_problem"] = None, str(e)[:200]
+            if rec is not None and rec.get("mode") != abmode.SUBSCRIPTION:
+                rec = None                          # 状态文件说 full（模式来自别处）：它的基线不是这一次的
+            act = abmode.activity(rec, rss_rows=state.rss_rows, bangumi_rows=state.bangumi_rows,
+                                  torrents=state.torrents, media_root=cfg.media_root)
+            adds = act["adds"]
+            d["since"] = act["since"]
+            d["check"] = {"baseline": act["baseline"], "polled": len(act["polled"]),
+                          "polled_detail": act["polled"][:10], "subscribe": len(adds["subscribe"]),
+                          "outside": len(adds["outside"]), "outside_detail": adds["outside"][:10],
+                          "rss_unread": bool(act.get("rss_unread"))}
+            d["problems"] = abmode.activity_problems(act)
+        self.data["ab"] = d
 
     def ledger(self, state, now: float | None = None) -> None:
         """出处账本的覆盖率（`ledger`）：这一轮的种子里有出处的、没有的（其中加进来超过 `PROVENANCE_GRACE_H`
@@ -493,9 +517,13 @@ class RunHealth:
         if un.get("count"):
             add("warn", "unrenamed_old",
                 f"{un['count']} 个文件超过 {un['threshold_hours']:g} 小时还是发布名（刮削器认不出）")
+        for p in (d.get("ab") or {}).get("problems") or []:
+            add("warn", p["code"], p["text"])
         cl = d["clients"] or {}
         if str(cl.get("ab", "")).startswith("down"):
-            add("warn", "ab_down", f"AutoBangumi 连不上（{cl['ab']}），订阅修复这一轮做不了")
+            add("warn", "ab_down", f"AutoBangumi 连不上（{cl['ab']}）："
+                + ("它的 WebUI 订阅用不了、ab-mode 核对不了" if (d.get("ab") or {}).get("mode") == "subscription"
+                   else "订阅修复这一轮做不了"))
         if cl and cl.get("tmdb") != "ok":
             add("warn", "tmdb_off", "TMDB 不可用（未配置 TMDB_API_KEY），标题对齐与抓取相关规则跳过")
         disp = trash.get("disposal")
@@ -596,6 +624,12 @@ def render(rep: dict, path=None) -> list[str]:
         lines.append("  客户端  " + "  ".join(
             f"{name} {mark.get(str(cl.get(k)), '–' if str(cl.get(k)).startswith('off') else '✗')}"
             for k, name in (("qbit", "qBit"), ("ab", "AB"), ("tmdb", "TMDB"), ("llm", "LLM"))))
+    ab = rep.get("ab")
+    if ab:
+        chk = ab.get("check")
+        lines.append(f"  AB      {ab.get('mode')}（{ab.get('source')}" + (f"，自 {ab['since']}" if ab.get("since") else "")
+                     + "）" + ("" if not chk else " · 没有切换基线，核对不了" if not chk.get("baseline") else
+                             f" · 拉 RSS {chk['polled']} · 订阅之外加种 {chk['outside']} · 订阅补集 {chk['subscribe']}"))
     t = rep.get("torrents") or {}
     if t:
         lines.append(f"  种子    {t.get('current') if t.get('current') is not None else '读不到'}"
