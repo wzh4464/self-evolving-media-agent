@@ -377,6 +377,21 @@ def test_i1_keeper_and_target_are_the_same_file(lib):
     assert keeper.path.exists()
 
 
+def test_i1_keeper_that_differs_from_the_target_only_in_case_is_the_same_file(lib, fs):
+    """2026-09-26 审查（G17b）：生产卷是大小写不敏感的 APFS，`s01e05.MKV` 就是 `S01E05.mkv`。保留方
+    路径与要删的只差大小写，按逐字比较会当成两个文件——删掉的正是保留方本身。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    loser = s1.local("尼古喵喵 S01E05.mkv", size=GB)
+    ident = lib.ident(loser)
+
+    rep = lib.apply([_dup(loser, s1.path / "尼古喵喵 s01e05.MKV", keeper_hash="",
+                          slot=(1, 5), keep_size=GB)])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "同一个文件" in skip["reason"]
+    assert lib.ident(loser) == ident and lib.trash_files() == []
+
+
 def test_i1_keeper_now_pinned_to_another_slot(lib):
     """诊断之后保留方的钉子变了（别的流程重打了 `ma:`）：它不再替这个集位作保。"""
     s1, loser, keeper = _pair(lib, tags="ma:S01E09")
