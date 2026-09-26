@@ -878,3 +878,49 @@ def test_drop_keeper_removed_earlier_in_the_batch(lib):
     v = gate.check_drop(ex, f, lib.qbit.torrent(victim.hash))
 
     assert v.gate == "I1" and "本批次" in v.refused
+
+
+# 2026-09-26 审查：没点名保留方时 I1 全靠 `other_holders` 只数"真能播的另一份"。下面四道过滤各自
+# 关掉、全套测试照样全绿（G37 / G36 / G33 / G38）——而关掉任何一道，某集唯一完整的那一份就会被
+# 一个"不是拷贝的东西"作保、删掉。
+@pytest.mark.parametrize("other,size", [
+    ("尼古喵喵 S01E05 [v2].mkv.!qB", GB // 3),           # 盘上的孤儿半成品（没有种子声明）
+    ("尼古喵喵 S01E05 [v0].mkv", 0),                     # 0 字节的本地文件
+    ("尼古喵喵 S01E05 NCED.mkv", GB // 3),               # 名字认得出这一集的特典
+], ids=["orphan-partial", "zero-byte", "extra"])
+def test_i1_the_only_complete_copy_is_not_vouched_for_by_a_non_copy(lib, other, size):
+    s1 = lib.show("尼古喵喵").season(1)
+    only = s1.local("尼古喵喵 S01E05.mkv", size=GB)
+    s1.local(other, size=size)
+
+    rep = lib.apply([_trash(only, "", rule="manual", kind="manual")])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1") and "S01E05" in skip["reason"]
+    assert only.exists() and lib.trash_files() == []
+
+
+def test_i1_a_file_pinned_to_another_episode_does_not_vouch_by_its_name(lib):
+    """名字叫 S01E08、种子钉着 `ma:S01E58`（2026-08-31 Re:Zero 的形态）：钉子是抓取器的定论，它是
+    第 58 集，不替第 8 集作保。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    only = s1.local("尼古喵喵 S01E08.mkv", size=GB)
+    s1.single("尼古喵喵 S01E08 [Fyy].mkv", size=GB, tags="ma:S01E58",
+              name="[Fyy Raws] Yani Neko 3rd Season - 08 [1080p].mkv")
+
+    rep = lib.apply([_trash(only, "", rule="manual", kind="manual")])
+
+    [skip] = rep.skipped
+    assert skip["reason"].startswith("删除关口：I1")
+    assert only.exists()
+
+
+def test_i1_a_real_other_copy_does_vouch(lib):
+    """对照：同一个现场，另一份是完整的本地文件——照删。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    only = s1.local("尼古喵喵 S01E05.mkv", size=GB)
+    s1.local("尼古喵喵 S01E05 [v2].mkv", size=GB)
+
+    rep = lib.apply([_trash(only, "", rule="manual", kind="manual")])
+
+    assert len(rep.applied) == 1 and not only.exists()
