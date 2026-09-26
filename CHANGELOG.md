@@ -147,6 +147,17 @@
   搬运是先拷后删，以前磁盘满时会拷到一半失败——种子已经被摘掉 / 设为不下载、文件却还在原处；回退则会在库里
   留下一个截断的文件。现在放不下（含 1 GB 余量）就跳过并写明，种子与文件都不动。
 
+## [0.2.1] - 2026-09-26
+
+### 修复
+- 部署在切换阶段被 SIGTERM 打断时，调用方会在「自动退回」还没做完就拿到返回码：`deploy.sh`
+  复制自己之前的那一层没设 trap，非交互 bash 收到无 trap 的 SIGTERM 立即退出（SIGINT 才会等
+  前台子进程）。v0.2.0 的 CI 在 Ubuntu 上因此失败——那里持锁的 `flock(1)` 连 SIGINT 都不处理，
+  收到就先死；macOS 的 `lockf` 忽略 SIGINT，所以本机与生产只剩 SIGTERM 这一条、且被时序掩盖。
+  现在持锁的三种实现（lockf / flock / Python）都等命令收尾再退出，外层设 trap 等副本返回，
+  输出转发用的 `tee` 也挡住 INT/TERM，免得退回一打印就吃 SIGPIPE。中断测试对每个平台上可用的
+  每种加锁实现、INT 与 TERM 各跑一遍，并让退回故意变慢，使这个竞态必然暴露。
+
 ## [0.2.0] - 2026-09-26
 
 **安全与可复现。** 整改第 1 阶段：先把一条命令之遥的数据灾难堵上，再让生产行为
@@ -324,6 +335,7 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wzh4464/self-evolving-media-agent/releases/tag/v0.1.0
