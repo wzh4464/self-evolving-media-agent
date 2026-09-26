@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import audit as auditlog
 from . import gate
 from .claims import PARTIAL, fold
 from .naming import parse_episode
@@ -87,15 +88,12 @@ class Candidate:
 
 
 def _audit_by_trash_path(audit_log: Path) -> dict:
-    """`trashed_to` -> 审计记录。同一路径若被多次记录，以最后一条为准。"""
+    """`trashed_to` -> 审计记录。同一路径若被多次记录，以最后一条为准。
+
+    主审计与 audit.fallback.jsonl 一起读（`audit.iter_records`）：磁盘满的那一轮隔离的文件，
+    记录可能只在备用文件里——没有记录的一律交给人，它就永远到不了期。"""
     out: dict[str, dict] = {}
-    if not audit_log.exists():
-        return out
-    for line in audit_log.read_text(encoding="utf-8").splitlines():
-        try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for r in auditlog.iter_records(audit_log):
         if r.get("op") == "trash" and r.get("status") == "applied" and r.get("trashed_to"):
             out[r["trashed_to"]] = r
     return out

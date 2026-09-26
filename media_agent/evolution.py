@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from . import audit as auditlog
 from .kernel import (
     Context, Finding, LibraryState, MediaFile, Registry, RuleSpec, Show,
     _FIELD_GETTERS, _OPS, load_rule_specs,
@@ -136,20 +137,15 @@ def find_failure_patterns(audit_log: Path, min_runs: int = 2,
     事件，不是 30 次；而同一个原因在 5 个不同批次里反复出现，才是"这条规则
     有问题"。计数单位必须是批次，否则一次大规模的一次性故障永远压过真正的顽疾。
     """
-    if not audit_log.exists():
-        return []
     cutoff = (datetime.now() - timedelta(days=within_days)).isoformat()
     runs: dict[tuple, set] = defaultdict(set)
     hits: Counter = Counter()
     detail: dict[tuple, dict] = {}
-    for line in audit_log.read_text(encoding="utf-8").splitlines():
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
+    # 主审计与 audit.fallback.jsonl 一起读（`audit.iter_records`），坏行跳过
+    for rec in auditlog.iter_records(audit_log):
+        if rec.get("status") != "failed" or str(rec.get("ts") or "") < cutoff:
             continue
-        if rec.get("status") != "failed" or (rec.get("ts") or "") < cutoff:
-            continue
-        key = (rec.get("rule"), rec.get("op"), (rec.get("error") or "")[:60])
+        key = (rec.get("rule"), rec.get("op"), str(rec.get("error") or "")[:60])
         runs[key].add(rec.get("run_id") or rec.get("ts"))
         hits[key] += 1
         detail[key] = rec

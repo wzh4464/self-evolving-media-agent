@@ -170,10 +170,13 @@ def _offline(request, monkeypatch, tmp_path, project_root, tripwire, web, fake_p
     real_audit = Executor._audit
 
     def audit(self, status, finding, action, extra=None, undo=None):
+        n = len(self.report.audit_problems)
         real_audit(self, status, finding, action, extra, undo)
         if status == "failed":
             tripwire.record("failed_record",
                             f"{action.op} [{finding.rule}] {(extra or {}).get('error', '')}")
+        for p in self.report.audit_problems[n:]:
+            tripwire.record("audit_fallback", p)
 
     monkeypatch.setattr(Executor, "_audit", audit)
 

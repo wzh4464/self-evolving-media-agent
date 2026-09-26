@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import audit as auditlog
 from . import disposal
 from .claims import PARTIAL, ClaimCheck, ClaimIndex, ClaimsUnknown, fold
 from .clients import is_not_found
@@ -91,6 +92,14 @@ def _bad_rel(rel, what: str) -> str | None:
     return None
 
 
+def _describe(e: BaseException) -> str:
+    """异常的一句话描述，给审计的 `error`。`str(e)` 本身出错也不抛——这是写失败记录的那一步。"""
+    try:
+        return f"{type(e).__name__}: {e}"
+    except Exception:                               # noqa: BLE001
+        return type(e).__name__
+
+
 _last_run_at: datetime | None = None
 
 
@@ -125,11 +134,18 @@ class ExecReport:
     failed: list[dict] = field(default_factory=list)
     # 非空 = 整批被拒绝执行（qBittorrent 不可用或本轮扫描读不全），值是原因
     refused: str = ""
+    # 没能原样写进 audit.jsonl 的记录（每条一句：哪条、怎么了）。写审计永不抛异常（`audit.write`），
+    # 但写不进去必须大声说：cli 打印、退出码非零。记录本身照样在上面三个列表里。
+    audit_problems: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.refused:
             return f"⛔ 拒绝执行本批次：{self.refused}"
-        return f"执行 {len(self.applied)} 项，跳过 {len(self.skipped)} 项，失败 {len(self.failed)} 项"
+        s = f"执行 {len(self.applied)} 项，跳过 {len(self.skipped)} 项，失败 {len(self.failed)} 项"
+        if self.audit_problems:
+            s += (f"；⚠️ {len(self.audit_problems)} 条审计没能原样写进 audit.jsonl"
+                  f"（见 stderr / {auditlog.FALLBACK_NAME}）")
+        return s
 
 
 class Executor:
@@ -160,6 +176,9 @@ class Executor:
         self._claim_index: ClaimIndex | None = None
         # 回退里做成了、但没做全的逆操作（文件搬回了、合集条目的下载没恢复），`rollback` 汇报
         self._undo_notes: list[str] = []
+        # 本批次写出的审计序号（记录的 `seq`，从 1 起）。回退按它排 LIFO：主审计写不进去时，
+        # 同一批的记录会分在 audit.jsonl 与 audit.fallback.jsonl 两个文件里，文件顺序不再是写入顺序。
+        self._seq = 0
 
     def _claims(self) -> ClaimIndex:
         """本批次共用的占用索引。**任何往媒体库里落一个名字的动作，落笔前都问它**
@@ -176,10 +195,18 @@ class Executor:
         `undo` 是**逆操作的完整描述**——有它才谈得上回退。每个真正改动了
         系统状态的动作都必须提供，否则这次改动就是不可逆的，
         `rollback` 会明确报告它跳过了什么，而不是假装回退干净了。
+
+        **永不抛异常**（critic N8 的余项）：以前写盘失败（磁盘满、权限、序列化不了）的异常在
+        改动**之后**冒出来——改动做了、记录没有；`apply()` 的 except 再写一条 failed 又抛，
+        这次冲出 `apply()`，整轮连隔离区处置一起中止。现在记录先进本轮报告，再交给
+        `audit.write`（降级序列化 / 转写 stderr 与 audit.fallback.jsonl），问题记进
+        `report.audit_problems`，由 cli 大声报告。
         """
+        self._seq += 1
         rec = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "run_id": self.run_id,
+            "seq": self._seq,
             "status": status,
             "dry_run": self.dry_run,
             "rule": finding.rule,
@@ -195,12 +222,13 @@ class Executor:
             # applied / failed 都可能已经改了东西（failed 也可能是改到一半）：
             # 占用索引作废，后面的动作看到的是这一步之后的状态。
             self._claim_index.invalidate()
-        with self.cfg.audit_log.open("a", encoding="utf-8") as fp:
-            fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         bucket = {"applied": self.report.applied,
                   "skipped": self.report.skipped,
-                  "failed": self.report.failed}[status]
+                  "failed": self.report.failed}.get(status, self.report.failed)
         bucket.append(rec)
+        for p in auditlog.write(self.cfg.audit_log, rec):
+            self.report.audit_problems.append(
+                f"[{action.op}] {str(finding.summary)[:50]}（{status}）：{p}")
 
     # 动作之间存在安全顺序，与问题严重度无关：
     # 文件改名必须早于目录改名——目录一改，之前算出的文件路径全部失效。
@@ -275,7 +303,7 @@ class Executor:
             try:
                 self._dispatch(f, f.action)
             except Exception as e:
-                self._audit("failed", f, f.action, {"error": f"{type(e).__name__}: {e}"})
+                self._audit("failed", f, f.action, {"error": _describe(e)})
         return self.report
 
     def _dispatch(self, f: Finding, a: Action) -> None:
@@ -1611,28 +1639,29 @@ class Executor:
             "skipped_detail": skipped[:10],
             "failed_detail": failed[:10],
             "refused": "",
+            "audit_problems": [],
         }
         if not self.dry_run:
-            with self.cfg.audit_log.open("a", encoding="utf-8") as fp:
-                fp.write(json.dumps({
-                    "ts": datetime.now().isoformat(timespec="seconds"),
-                    "run_id": f"rollback-of-{run_id}",
-                    "status": "rollback",
-                    **result,
-                }, ensure_ascii=False) + "\n")
+            # 写汇总同样永不抛（`audit.write`）：回退做完了，别因为记不下来而报成异常
+            result["audit_problems"] = auditlog.write(self.cfg.audit_log, {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "run_id": f"rollback-of-{run_id}",
+                "status": "rollback",
+                **result,
+            })
         return result
 
     def _read_audit(self, run_id: str) -> list[dict]:
-        if not self.cfg.audit_log.exists():
-            return []
-        out = []
-        for line in self.cfg.audit_log.read_text(encoding="utf-8").splitlines():
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("run_id") == run_id and not rec.get("dry_run"):
-                out.append(rec)
+        """某一批次的全部非预演记录，按写入顺序。
+
+        主审计与 audit.fallback.jsonl 一起读（`audit.iter_records`）。同一批的记录可能分在两个文件里
+        （写到一半磁盘满了），所以带 `seq` 的按 `seq` 排——回退的 LIFO 靠它；没有 `seq` 的旧记录
+        （第 3 阶段之前）保持文件顺序、排在后面（排序是稳定的）。
+        """
+        out = [rec for rec in auditlog.iter_records(self.cfg.audit_log)
+               if rec.get("run_id") == run_id and not rec.get("dry_run")]
+        big = float("inf")
+        out.sort(key=lambda r: r["seq"] if isinstance(r.get("seq"), int) else big)
         return out
 
     def _undo_problem(self, u: dict) -> str | None:
@@ -2188,15 +2217,9 @@ class Executor:
         return {"pairs": len(pairs), "detail": results, "refused": ""}
 
     def list_runs(self) -> list[dict]:
-        """列出历史 run，供选择回退哪一次。"""
-        if not self.cfg.audit_log.exists():
-            return []
+        """列出历史 run，供选择回退哪一次。主审计与 audit.fallback.jsonl 一起读。"""
         runs: dict[str, dict] = {}
-        for line in self.cfg.audit_log.read_text(encoding="utf-8").splitlines():
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for rec in auditlog.iter_records(self.cfg.audit_log):
             rid = rec.get("run_id")
             if not rid or rec.get("dry_run"):
                 continue

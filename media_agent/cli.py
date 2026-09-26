@@ -43,6 +43,28 @@ EXIT_DEGRADED = 3
 # 与 /usr/bin/lockf 等锁超时的退出码一致：launchd 的 last exit code 75 = "被挡住了，下轮再来"。
 EXIT_LOCKED = 75
 
+# 改动照常做了、整轮也跑完了，但有审计记录没能原样写进 audit.jsonl（磁盘满、权限、序列化不了）时的
+# 退出码。记录已转写到 stderr（run.err.log）与 state/audit.fallback.jsonl，回退照样读得到；但这种
+# 事必须被看见——以前写审计的异常直接冲出执行器、整轮中止（critic N8 的余项），launchd 上只剩一个
+# traceback。与 EXIT_DEGRADED（整批拒绝、什么都没改）分开，看退出码就知道是哪一种。
+EXIT_AUDIT_INCOMPLETE = 4
+
+
+def _report_audit_problems(problems: list[str], state_dir) -> bool:
+    """审计没能原样写进 audit.jsonl：stdout（run.log）与 stderr（run.err.log）各说一遍。返回是否有问题。"""
+    if not problems:
+        return False
+    from .audit import FALLBACK_NAME
+    msg = (f"⚠️  {len(problems)} 条审计没能原样写进 audit.jsonl——已转写到 stderr 与 "
+           f"{Path(state_dir) / FALLBACK_NAME}（rollback / runs 会一起读）")
+    print(f"\n═══ {msg} ═══")
+    for p in problems[:10]:
+        print(f"  ⚠️  {p}")
+    if len(problems) > 10:
+        print(f"  …另 {len(problems) - 10} 条")
+    _log(msg)
+    return True
+
 
 def _needs_lock(args) -> bool:
     """会改动媒体库 / qBittorrent / 状态的子命令才拿运行锁（见 runlock.py）。
@@ -193,6 +215,8 @@ def cmd_apply(args, cfg) -> int:
         print(f"  ⏭️  [{rec['op']}] {rec['summary']} —— {rec.get('reason','')}")
     for rec in report.failed:
         print(f"  ❌ [{rec['op']}] {rec['summary']} —— {rec.get('error','')}")
+    if _report_audit_problems(report.audit_problems, cfg.state_dir):
+        return EXIT_AUDIT_INCOMPLETE
     return 0
 
 
@@ -245,6 +269,8 @@ def cmd_rollback(args, cfg) -> int:
         print(f"    ⏭️  {d.get('skip_reason','')}")
     for d in res["failed_detail"]:
         print(f"    ❌ {d.get('error','')}")
+    if _report_audit_problems(res.get("audit_problems") or [], cfg.state_dir):
+        return EXIT_AUDIT_INCOMPLETE
     return 0
 
 
@@ -497,6 +523,9 @@ def cmd_run(args, cfg) -> int:
     # （Executor.purge_trash，生产上删掉过 6 个文件 4.7GB，说不出是哪几个）。现在按处置类别
     # 逐个判、逐个预写日志后删；要人定的过了保留期只报不删。
     _print_disposal(cfg, disposal.dispose(ctx, mode="run", run_id=ex.run_id, dry_run=dry))
+    # 审计写不进去不中止这一轮（上面的处置照跑——磁盘满时它是唯一腾空间的一步），但在最后大声说
+    if _report_audit_problems(report.audit_problems, cfg.state_dir):
+        return EXIT_AUDIT_INCOMPLETE
     return rc
 
 

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import httpx
 import pytest
-
 from harness import video
+
 from media_agent.clients import QBitClient, QBitError, is_not_found
 from media_agent.plugins.builtin import UnrenamedDetector
 

@@ -205,6 +205,15 @@ cp ~/media-agent/deploy/com.zihan.media-agent.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zihan.media-agent.plist
 ```
 
+`launchctl list | grep media-agent` 的 last exit code：
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 正常 |
+| 3 | 降级、整批拒绝改动（qBittorrent 不可用或读不全），什么都没改 |
+| 4 | 改动照常做了，但有审计记录没能原样写进 `state/audit.jsonl`（磁盘满、权限……）——已转写到 run.err.log 与 `state/audit.fallback.jsonl`，`rollback` / `runs` 会一起读；先腾空间 |
+| 75 | 另一个进程持有运行锁，这一轮什么都没做 |
+
 ## 部署脚本自己的测试
 
 `tests/test_deploy_scripts.py` 在临时目录里模拟生产目录（替身 uv / launchctl），覆盖闸门、
