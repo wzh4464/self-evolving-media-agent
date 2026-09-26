@@ -941,3 +941,47 @@ def test_i1_a_real_other_copy_does_vouch(lib):
     rep = lib.apply([_trash(only, "", rule="manual", kind="manual")])
 
     assert len(rep.applied) == 1 and not only.exists()
+
+
+# 2026-09-26 审查：关口记下的集位"动作给的 slot 优先"关掉（G46）、隔离之前同批整种子作废时记下被摘的
+# 是谁（T05），全套照样全绿——审计里的这两样是 purge 判"证明替代者""复排"的依据。
+def test_the_recorded_slot_is_the_detectors_not_the_raw_number(lib):
+    """episode_offset -24 那一季：判重按 S03E01 分桶，输家的发布名写的是 `- 25`。审计里的
+    `deletion.slot` 必须是 S03E01——purge 按它去找替代者。"""
+    title = "超超超超超喜欢你的100个女朋友"
+    sh = lib.show(title)
+    s3 = sh.season(3)
+    sh.bangumi(37, title_raw="Hyakkano", season=3, episode_offset=-24)
+    s3.single(f"{title} S03E01.mkv", size=GB, tags="ma:S03E01", probe=CHI,
+              name="[ANi] Hyakkano - 25 [1080P].mkv")
+    loser = s3.single("[Nekomoe kissaten] Hyakkano - 25 [720p][JPSC].mkv", size=GB // 2,
+                      probe=RAW)
+    from media_agent.plugins.builtin import DuplicateEpisodeDetector
+
+    c = lib.cycle(detectors=[DuplicateEpisodeDetector])
+
+    [rec] = c.applied("trash")
+    assert rec["args"]["path"] == str(loser.path)
+    assert rec["deletion"]["slot"] == [3, 1]
+
+
+def test_a_later_trash_from_a_torrent_dropped_earlier_in_the_batch_remembers_it(lib):
+    """同一批里先整种子作废了合集（要下载的只剩它自己那一集），后面又隔离它一个不下载的特典：
+    那时种子已经问不到了，`deletion.subject` 用摘除那一刻记下的。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    pack = s1.torrent({"尼古喵喵 S01E05.mkv": GB, "尼古喵喵 SP01.mkv": 90_000_000},
+                      name="[G] Yani Neko 05+SP", layout="nosub",
+                      priorities={"尼古喵喵 SP01.mkv": 0}, tags="ab:7")
+    s1.local("尼古喵喵 S01E05 [BD].mkv", size=GB)
+    e05, sp = s1.path / "尼古喵喵 S01E05.mkv", s1.path / "尼古喵喵 SP01.mkv"
+
+    rep = lib.apply([_trash(e05, pack.hash, rule="manual", kind="manual"),
+                     _trash(sp, pack.hash, rule="extras-in-library", kind="extra_content",
+                            file_only=True)])
+
+    first, second = rep.applied
+    assert first["args"]["path"] == str(e05) and first["undo"]["torrent_record_lost"] is True
+    assert second["args"]["path"] == str(sp)
+    sub = second["deletion"]["subject"]
+    assert sub["removed_this_batch"] is True and sub["name"] == "[G] Yani Neko 05+SP"
+    assert sub["tags"] == "ab:7"

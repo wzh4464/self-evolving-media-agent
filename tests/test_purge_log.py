@@ -210,3 +210,56 @@ def test_cmd_purge_apply_writes_the_intent_before_deleting(lib, monkeypatch):
     assert not victim.exists()
     assert not (lib.cfg.trash_dir / f"{ts:%Y-%m-%d}").exists()  # 空目录逐层 rmdir
     assert os.path.isdir(lib.cfg.trash_dir)
+
+
+# ------------------------------------------------------------------ 每道闸单独的现场
+# 2026-09-26 审查：下面三处关掉全套照样全绿——崩溃恢复的测试直接调 `recover`，`dispose` 下一轮根本不
+# 调它（P06）；意图写完不 fsync（P03：内容在页缓存里，读文件照样读得到）；没有 qBittorrent 时
+# `dispose` 自己不拒绝（P13：判据里另有"原路径问不了就不删"兜着）。
+def test_the_intent_is_fsynced_before_the_unlink(lib, monkeypatch):
+    victim = _trash_file(lib)
+    synced = []
+    real_fsync, real_unlink = os.fsync, disposal._unlink
+    monkeypatch.setattr(disposal.os, "fsync", lambda fd: synced.append(fd) or real_fsync(fd))
+
+    def unlink(p):
+        assert synced, "意图还在页缓存里就 unlink 了"
+        real_unlink(p)
+
+    monkeypatch.setattr(disposal, "_unlink", unlink)
+
+    assert disposal.hard_delete(_plog(lib), victim, 64, disposition="extras", reason="x") == ""
+    assert not victim.exists()
+
+
+def test_the_next_run_closes_the_intents_an_interrupted_one_left_behind(lib):
+    """上一轮死在"写了意图、还没删 / 删了还没记完成"之间：下一轮 run 的处置先把它们补完——
+    文件还在的记 abandoned（这一轮照常重新评估），不在的记 done。"""
+    still = _trash_file(lib, "2026-09-14/尼古喵喵/Season 1/a.mkv")
+    gone = _trash_file(lib, "2026-09-14/尼古喵喵/Season 1/b.mkv")
+    log = _plog(lib, "p001")
+    log.intent(still, 64, disposition="extras")
+    log.intent(gone, 64, disposition="extras")
+    gone.unlink()
+    lib.configure(qbit_allow_empty=True)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p002")
+
+    assert sorted(r["path"] for r in rep.recovered) == sorted([str(still), str(gone)])
+    assert _phases(lib, still) == ["intent", "abandoned"]
+    assert _phases(lib, gone) == ["intent", "done"]
+    assert disposal.pending(lib.cfg.state_dir / disposal.LOG_NAME) == []
+    assert still.exists()                               # 没有记录的它不删（交给人）
+
+
+def test_dispose_refuses_outright_without_qbittorrent(lib, monkeypatch):
+    from media_agent import purge
+
+    _trash_file(lib)
+    monkeypatch.setattr(purge, "build_pool",
+                        lambda *a, **k: pytest.fail("没有 qBittorrent 还去评估待删的"))
+
+    rep = disposal.dispose(lib.context(qbit=None), mode="manual", run_id="p001")
+
+    assert rep.refused and "qBittorrent" in rep.refused
+    assert not rep.deleted and _log(lib) == []

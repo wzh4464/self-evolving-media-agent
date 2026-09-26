@@ -1138,3 +1138,47 @@ def test_a_modest_duration_difference_is_normal(lib, no_rmtree):
     assert [c.trash_path for c in rep.deleted] == [moved]
     [intent] = [r for r in _wal(lib) if r.get("phase") == "intent"]
     assert "时长自证" in intent["reason"]
+
+
+# ------------------------------------------------------------------ 集位与原路径：各自单独的现场
+# 2026-09-26 审查：以下三处关掉全套照样全绿——新记录的 `deletion.slot` 被摘要里的 `SxxEyy` 掩护（P51）；
+# 没有集位线索时按文件名猜季号（P53）；记录里没有原路径（P22）。
+def test_the_slot_the_gate_recorded_wins_over_the_summary(lib, no_rmtree):
+    """季号偏移的番：检测器（与关口）按 `_resolve` 算出 S01E58，摘要写的却是发布名里的 S01E08。"""
+    moved = legacy(lib, f"{REZERO} S01E58.mkv", show=REZERO, rule="duplicate-episode",
+                   kind="duplicate", days_ago=40, summary="S01E08 重复：…（发布名的编号）",
+                   deletion={"gate": "passed", "disposition": "duplicate", "slot": [1, 58]})
+    lib.show(REZERO).season(1).single(f"{REZERO} S01E58 [BD].mkv", tags="ma:S01E58", probe=CHI,
+                                      name="[BD] Re Zero - 58 [1080p].mkv")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    [c] = rep.pool
+    assert c.slot == (1, 58) and [x.trash_path for x in rep.deleted] == [moved]
+
+
+def test_a_legacy_record_whose_name_carries_no_season_is_not_guessed(lib, no_rmtree):
+    """没有 `deletion`、摘要里也没有 `SxxEyy`：原文件名 `- 05` 没写季号——猜成第 1 季就可能对到
+    错的集位上（压平季 / 偏移的番），证明不了、不删。"""
+    moved = legacy(lib, "[Raw] Yani Neko - 05 [1080p].mkv", rule="duplicate-episode",
+                   kind="duplicate", days_ago=40, summary="合成记录")
+    lib.show("尼古喵喵").season(1).single("尼古喵喵 S01E05.mkv", tags="ma:S01E05", probe=CHI,
+                                        name="[LoliHouse] Yani Neko - 05 [1080p].mkv")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    [c] = rep.pool
+    assert c.slot is None and "解析不出集号" in c.why
+    assert moved.exists() and not rep.deleted
+
+
+def test_a_record_without_its_original_path_is_not_deleted(lib, no_rmtree):
+    """原路径不明：问不了有没有种子还要它——哪怕是到期的死种半成品。"""
+    moved = legacy(lib, "尼古喵喵 S01E11.mkv.!qB", rule="dead-torrent", kind="dead_partial",
+                   days_ago=40, args={"path": ""})
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    [c] = rep.pool
+    assert "原路径不明" in c.why
+    assert moved.exists() and not rep.deleted
