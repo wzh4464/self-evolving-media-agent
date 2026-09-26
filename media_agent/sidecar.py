@@ -96,6 +96,15 @@ class Sidecar:
     seasons: dict[str, dict] = field(default_factory=dict)
     # {"1": {"have": [1,2,3], "aired": 7, "total": 12, "next_air": "2026-08-22"}}
 
+    # --- 要抓的季 ---
+    subscriptions: dict[str, dict] = field(default_factory=dict)
+    # {"3": {"source": "autobangumi", "bangumi_id": 37, "mikan_id": "3417", "since": "2026-09-27"}}
+    # = 库里第 3 季要抓，盘上一集都还没有也抓。`seasons` 是 sidecar-sync 按**盘上的文件**记的（派生、每轮重算，
+    # 没有文件的季它不会记）；抓取以前只看它，新番 / 新一季要等别的什么放进第一个文件——今天是 AutoBangumi，
+    # AB 退役就停了（critic §4）。所以订阅是人的意图，单独一个字段，不塞进派生的 `seasons`：诊断期算的 `seasons`
+    # 快照会在同一轮里把刚加的季键盖掉。`mikan_id`：这一季的番组页（AB 订阅的 bangumiId、`subscribe --mikan`），
+    # 抓取把它排在候选的第一个。扫描登记只有订阅档案、还没有文件的番目录（`scan.build_state`）。
+
     # --- 观察记录 ---
     notes: list[str] = field(default_factory=list)
 
@@ -152,8 +161,9 @@ IDENTITY = frozenset({"tmdb_id", "tmdb_source"})
 #              旧值不算数。`mikan_id` 2026-09-26 起也归这里：抓取不再写它（选中的页记在 state/ 缓存）。
 #              `episode_offsets`：人写的换算（在 AutoBangumi 里写下的是订阅行的 `episode_offset`）。只有专门的动作
 #              （`adopt_episode_offset`，有审计、能回退）在这一季还没有登记时把 AB 里的**搬**进来，已有的一律不改。
+#              `subscriptions`：要抓的季（AB 的订阅、`media-agent subscribe`、新一季开播），同样只由专门的动作补。
 USER_INTENT = frozenset({"season_offsets", "episode_offsets", "require_any", "notes", "mikan_id",
-                         "pinned"})
+                         "pinned", "subscriptions"})
 BOOKKEEPING = frozenset({"schema_version", "updated_at"})
 
 

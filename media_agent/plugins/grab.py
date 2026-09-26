@@ -222,10 +222,11 @@ def _pick_key(show, season: int | None) -> str:
 
 
 def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
-                      season: int | None = None) -> str | None:
+                      season: int | None = None, preferred: str = "") -> str | None:
     """找这部番（这一季）在 Mikan 上的番组 id。
 
     候选的来源是有讲究的：
+    0. 这一季的订阅里记着的番组页（`preferred`：AB 订阅的 bangumiId、`subscribe --mikan`）——人为这一季选的，最先试
     1. 上一轮为这一季选中的（`state/` 缓存里的 `mikanpick:`）与 sidecar 里的 `mikan_id` —— 先试
     2. 从已有的 rss_link 里抠 —— 番组式链接里就带着 bangumiId，
        这是**已被验证过的**映射（订阅确实从它拿到过内容）
@@ -242,12 +243,14 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
     key = _pick_key(show, season)
     remembered = str((cache.get_llm(key, ttl=PICK_TTL) or {}).get("id") or "")
 
+    preferred = str(preferred or "")
+
     # 没有播出日期可比时，只能沿用存下来的（老番、TMDB 查不到的情况）
-    if (remembered or stored) and not air:
-        return remembered or stored
+    if (preferred or remembered or stored) and not air:
+        return preferred or remembered or stored
 
     cands: list[str] = []
-    for c in (remembered, stored):
+    for c in (preferred, remembered, stored):
         if c and c not in cands:
             cands.append(c)
     for s in sc.sources:
@@ -354,7 +357,12 @@ class EpisodeAvailableDetector:
                     )
                 continue
             sc = load_sidecar(show.dir_path)
-            if not sc.seasons:
+            # 要看的季：盘上有文件的（sidecar-sync 记在 `seasons` 里）+ 订阅了的（`subscriptions`：盘上一集都还没有
+            # 也抓——新番、新一季以前要等 AutoBangumi 放进第一个文件）
+            subs = {str(k): (v if isinstance(v, dict) else {})
+                    for k, v in (sc.subscriptions or {}).items() if str(k).isdigit()}
+            season_keys = sorted({k for k in sc.seasons if str(k).isdigit()} | set(subs), key=int)
+            if not season_keys:
                 continue
 
             # 库内季号与 TMDB 季号对不上时，`have` 是按库内编号统计的，
@@ -391,7 +399,8 @@ class EpisodeAvailableDetector:
 
             disk_eps = _disk_episodes(show)
 
-            for season_key, info in sc.seasons.items():
+            for season_key in season_keys:
+                info = sc.seasons.get(season_key) or {}
                 # `have` 要并上磁盘实况，不能只信 sidecar。
                 #
                 # 一轮 run 是"先全量诊断、再统一执行"：抓取检测器跑的时候，
@@ -440,7 +449,8 @@ class EpisodeAvailableDetector:
 
                 mid = _resolve_mikan_id(
                     sc, show, cache, log=ctx.log, season=int(season_key),
-                    air=[d for d in (air_of.get(n) for n in aired) if d])
+                    air=[d for d in (air_of.get(n) for n in aired) if d],
+                    preferred=str((subs.get(season_key) or {}).get("mikan_id") or ""))
                 if not mid:
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="minor",

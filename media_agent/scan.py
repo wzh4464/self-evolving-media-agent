@@ -84,6 +84,15 @@ def _looks_like_movie(show_dir: Path, video_count: int) -> bool:
     return video_count <= 2
 
 
+def _subscribed(show_dir: Path) -> bool:
+    """这个目录的 sidecar 里有要抓的季（`subscriptions` 非空）。坏档案、没有档案的不算：没有文件、也没有订阅的目录
+    （历史遗留、人删空了的）照旧不登记——不能因为这一步去抓用户删掉的番。"""
+    from .sidecar import read_raw
+    data, problem = read_raw(show_dir)
+    subs = (data or {}).get("subscriptions") if not problem else None
+    return isinstance(subs, dict) and bool(subs)
+
+
 def _season_dir_of(path: Path, show_dir: Path) -> str:
     try:
         rel = path.relative_to(show_dir)
@@ -296,6 +305,10 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
         if show.files or show.extras_files:
             show.is_movie = _looks_like_movie(
                 show_dir, sum(1 for f in show.files if f.ext in VIDEO_EXTS))
+            state.shows.append(show)
+        elif _subscribed(show_dir):
+            # 订阅了、还一集都没有的番（sidecar 的 `subscriptions`）：以前只登记有文件的目录，抓取于是永远看不到它——
+            # 新番 / 新一季要等别的什么（今天是 AutoBangumi）放进第一个文件。只有订阅档案的目录不是电影
             state.shows.append(show)
 
     # --- 合理性：登录成功却 0 个种子，而库里明明有视频 ---
