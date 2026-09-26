@@ -41,6 +41,8 @@ from datetime import datetime
 from pathlib import Path
 
 LOG_NAMES = ("run.log", "run.err.log")
+# `media-agent grab`（launchd 每 30 分钟）自己的两份日志（deploy/com.zihan.media-agent-grab.plist），同样在拿到锁之后轮转
+GRAB_LOG_NAMES = ("grab.log", "grab.err.log")
 MAX_BYTES = 5 * 1024 * 1024
 KEEP = 5
 

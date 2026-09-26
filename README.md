@@ -193,6 +193,7 @@ uv run media-agent apply --dry-run     # preview fixes
 uv run media-agent apply               # execute
 uv run media-agent evolve              # draft rules for the blind spots
 uv run media-agent run                 # one full autonomous cycle, iterated to a fixed point
+uv run media-agent grab                # grab-only pass: fill missing episodes, finish what it grabbed (every 30 min)
 uv run media-agent health              # the last run's health report
 uv run media-agent ack <fp> --reason … # acknowledge a stuck finding (commit .agents/acks.json)
 uv run media-agent ledger backfill --dry-run   # provenance coverage (every run backfills new torrents)

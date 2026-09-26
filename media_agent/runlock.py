@@ -30,6 +30,10 @@ LOCK_NAME = "run.lock"
 # launchd 的下一轮 6 小时后自然会来，手动命令让人重试即可。短暂等待只为吸收
 # "上一个进程正在退出"这种边界。
 DEFAULT_WAIT = 10.0
+# `run` 拿锁最多等多久。每 30 分钟的 `grab` 与 6 小时的 `run` 由 launchd 按同一个起点计时（`StartInterval`），每 6 小时
+# 同一秒起来（critic N10）；抓取先拿到锁时，`run` 等 10 秒就放弃，整整晚 6 小时。抓取一般一两分钟就完，`run` 等得起。
+# 反过来抓取仍按 `DEFAULT_WAIT` 短等：绝不为一轮 `run` 等上几分钟，30 分钟后它自然再来。
+RUN_WAIT = 300.0
 _POLL = 0.2
 
 

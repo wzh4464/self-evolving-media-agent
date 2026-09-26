@@ -36,8 +36,11 @@ BASELINE_NAME = "torrent-count.json"
 PROVENANCE_GRACE_H = 24.0
 
 
-def health_dir(state_dir) -> Path:
-    return Path(state_dir) / HEALTH_DIR
+def health_dir(state_dir, cmd: str = "run") -> Path:
+    """健康报告放哪：`run` 的在 `state/health/`，`grab`（每 30 分钟一份）的在 `state/health/grab/`——各留各的
+    `KEEP_REPORTS` 份，抓取的报告不把 `run` 的挤出保留窗口，`media-agent health` 默认看的仍是最近一轮 `run`。"""
+    base = Path(state_dir) / HEALTH_DIR
+    return base if cmd == "run" else base / cmd
 
 
 # ---------------------------------------------------------------------------
@@ -521,9 +524,10 @@ class RunHealth:
         return d
 
 
-def write_report(state_dir, report: dict) -> tuple[Path | None, list[str]]:
-    """写 `state/health/<run_id>.json`，只留最近 `KEEP_REPORTS` 份。永不抛异常。"""
-    d = health_dir(state_dir)
+def write_report(state_dir, report: dict, cmd: str = "run") -> tuple[Path | None, list[str]]:
+    """写 `state/health/<run_id>.json`（抓取的写 `state/health/grab/`，`health_dir`），只留最近 `KEEP_REPORTS` 份。
+    永不抛异常。"""
+    d = health_dir(state_dir, cmd)
     path = d / f"{report.get('run_id')}.json"
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -555,9 +559,9 @@ def _prune_reports(d: Path) -> list[str]:
     return out
 
 
-def load_report(state_dir, run_id: str | None = None) -> dict | None:
-    """某一轮（默认最近一轮）的健康报告；没有 / 读不了返回 None。"""
-    d = health_dir(state_dir)
+def load_report(state_dir, run_id: str | None = None, cmd: str = "run") -> dict | None:
+    """某一轮（默认最近一轮）的健康报告；没有 / 读不了返回 None。`cmd="grab"` 读抓取的。"""
+    d = health_dir(state_dir, cmd)
     try:
         cands = [d / f"{run_id}.json"] if run_id else list(reversed(_reports(d)))
     except OSError:
@@ -581,7 +585,7 @@ def render(rep: dict, path=None) -> list[str]:
     status = rep.get("status") or "?"
     reasons = rep.get("reasons") or []
     dur = rep.get("duration_s")
-    lines = [f"\n═══ 健康：{ICON.get(status, '·')} {status}"
+    lines = [f"\n═══ {'抓取的' if rep.get('cmd') == 'grab' else ''}健康：{ICON.get(status, '·')} {status}"
              + (f"（{len(reasons)} 条）" if reasons else "")
              + f"  批次 {rep.get('run_id')}"
              + (f"  用时 {dur:.0f}s" if isinstance(dur, (int, float)) else "")

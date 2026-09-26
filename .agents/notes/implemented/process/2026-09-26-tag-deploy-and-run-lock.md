@@ -27,7 +27,8 @@ AGENTS.md「写 Agent Note 的时机」；分支未推送但不改写历史，�
 
 1. `EVOLVE_MODE=off|propose`，默认 `off`：`run` 不再演进、不调 LLM、不写 `.agents/`。
 2. `media_agent/runlock.py`：`state/run.lock` 上的 `flock`。改动类子命令用
-   `set_defaults(lock=...)` 声明要锁；拿不到最多等 10 秒，报出持有者、退出码 75。
+   `set_defaults(lock=...)` 声明要锁；拿不到最多等 10 秒，报出持有者、退出码 75（2026-09-27 起 `run` 等 300 秒
+   `runlock.RUN_WAIT`：每 30 分钟的 `grab` 与它每 6 小时撞一次，见 `architecture/2026-09-27-grab-mode.md`）。
    批次 ID 改为 `YYYYMMDDTHHMMSS.mmm-<pid>`，旧 ID 照常可用。
 3. plist 直接执行 `.venv/bin/media-agent run`，依赖只在部署时装。
 4. `.gitignore` 挡住 `.env.*`、`*.bak*`、`.DS_Store`。

@@ -341,7 +341,7 @@ URL / Bearer / userinfo 里的）不进信也不进健康报告；发送失败�
 - **不拿运行锁就返回**：救援脚本重建容器时自己拿着那把锁（第 11 节），暂停的 run 不去等那 10 秒。
 - 暂停的 `run` 照样写健康报告（warn，原因 `paused`，退出码 75），ok → warn 发一封通知：一个忘了删的 `state/PAUSE`
   不能让 agent 悄悄停摆——这一阶段要解决的正是这种停摆。
-- 同理，**被运行锁挡住的 `run`**（另一个进程拿着 `state/run.lock`，等满 10 秒）也写 warn 报告（原因 `locked`，带持有者
+- 同理，**被运行锁挡住的 `run`**（另一个进程拿着 `state/run.lock`，等满 10 秒；2026-09-27 起 `run` 等 `RUN_WAIT` 300 秒，每 30 分钟的 `grab` 与它每 6 小时同一秒起来，见 `architecture/2026-09-27-grab-mode.md`）也写 warn 报告（原因 `locked`，带持有者
   的自述：pid、命令、从什么时候起），退出码仍是 75。以前只有一行输出：锁若被一个卡死的进程一直拿着，每一轮都这样
   悄悄结束。与部署偶尔撞上一轮会因此多一封 ok → warn 的通知，下一轮恢复 ok 不再发。
 - 直接构造的 `Config`（测试基座）`rescue_marker=None` = 不看；conftest 另把 `RESCUE_MARKER` 指到临时目录——开发机上

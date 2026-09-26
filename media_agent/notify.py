@@ -22,6 +22,11 @@
 `password=`，`Bearer …`、`user:pass@host` 也遮掉（httpx 的报错会把请求 URL 连同 TMDB 的 `api_key` 一起带出来）。
 健康报告落盘前同样过一遍。
 
+**抓取（`media-agent grab`，每 30 分钟）单独一套**（`scope="grab"`）：去重状态在 `state/notify-grab.json`，与 `run` 的互不
+干扰（交替着读写同一份，每一轮都会把对方的状态当成"变化"）。只为抓取相关的事发（`grab_view`）：critical（崩溃、整批拒绝、
+审计没写全）与 `GRAB_WARN` 里的 warn（抓取动作失败 / 未确认、规则崩了、TMDB 没配）；"运行锁被 `run` 占着"、"维护暂停"
+这类抓取的日常不算——每 6 小时撞一次锁就是一封信。
+
 配置（`.env`）：`NOTIFY_EMAIL_TO`、`NOTIFY_SMTP_HOST`、`NOTIFY_SMTP_PORT`（默认 465）、`NOTIFY_SMTP_USER`、
 `NOTIFY_SMTP_PASS`。收件人与主机都没配 = 关闭；只配了一半 = 关闭并在 stderr 提醒。发件人是 `NOTIFY_SMTP_USER`
 （没配就用收件人）。
@@ -42,6 +47,9 @@ from pathlib import Path
 
 STATE_NAME = "notify.json"
 SUBJECT_PREFIX = "[media-agent]"
+
+# 抓取模式里值得发信的 warn（见模块文档）；critical 一律算
+GRAB_WARN = frozenset({"failed_actions", "unknown_actions", "detector_crash", "tmdb_off"})
 
 # 从 critical 出来都算"恢复"；变坏的方向：ok → warn / critical，warn → critical
 _RANK = {"ok": 0, "warn": 1, "critical": 2}
@@ -87,13 +95,21 @@ def redact_obj(cfg, obj):
         return obj
 
 
-def _state_path(cfg) -> Path:
-    return Path(cfg.state_dir) / STATE_NAME
+def _state_path(cfg, scope: str = "run") -> Path:
+    return Path(cfg.state_dir) / (STATE_NAME if scope == "run" else f"notify-{scope}.json")
 
 
-def load_state(cfg) -> dict:
+def grab_view(report: dict) -> dict:
+    """抓取的健康报告里值得告诉人的那部分：critical 原因，加上 `GRAB_WARN` 里的 warn；状态按它们重算。"""
+    keep = [r for r in report.get("reasons") or []
+            if r.get("level") == "critical" or r.get("code") in GRAB_WARN]
+    status = ("critical" if any(r.get("level") == "critical" for r in keep) else "warn" if keep else "ok")
+    return {**report, "status": status, "reasons": keep}
+
+
+def load_state(cfg, scope: str = "run") -> dict:
     try:
-        data = json.loads(_state_path(cfg).read_text(encoding="utf-8"))
+        data = json.loads(_state_path(cfg, scope).read_text(encoding="utf-8"))
         if isinstance(data, dict):
             data.setdefault("active", {})
             data.setdefault("failures", 0)
@@ -103,8 +119,8 @@ def load_state(cfg) -> dict:
     return {"last_status": None, "active": {}, "failures": 0}
 
 
-def _save_state(cfg, st: dict) -> None:
-    p = _state_path(cfg)
+def _save_state(cfg, st: dict, scope: str = "run") -> None:
+    p = _state_path(cfg, scope)
     tmp = p.with_name(f".{p.name}.tmp")
     tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, p)
@@ -178,11 +194,12 @@ def _subject(report: dict, evs: list[dict]) -> str:
         head = f"{ICON.get(status, '')} {status}"
     first = next((r["text"] for r in report.get("reasons") or []), "")
     tail = first or next((e["text"] for e in evs), "")
-    return f"{SUBJECT_PREFIX} {head}：{tail}"[:180]
+    who = " 抓取" if report.get("cmd") == "grab" else ""
+    return f"{SUBJECT_PREFIX}{who} {head}：{tail}"[:180]
 
 
-def compose(cfg, report: dict, evs: list[dict]) -> EmailMessage:
-    """一封信：纯文本 + 一小段 HTML。全文过 `redact`。"""
+def compose(cfg, report: dict, evs: list[dict], view: dict | None = None) -> EmailMessage:
+    """一封信：纯文本 + 一小段 HTML。全文过 `redact`。`view`：定主题用的那一份（抓取的 `grab_view`），正文照样是整份报告。"""
     from .health import render
     lines = [f"media-agent 批次 {report.get('run_id')}（{report.get('finished')}）", ""]
     lines += [f"• {e['text']}" for e in evs]
@@ -190,7 +207,7 @@ def compose(cfg, report: dict, evs: list[dict]) -> EmailMessage:
     lines += ["", "详情：media-agent health --run " + str(report.get("run_id"))]
     text = redact(cfg, "\n".join(lines))
     msg = EmailMessage()
-    msg["Subject"] = redact(cfg, _subject(report, evs))
+    msg["Subject"] = redact(cfg, _subject(view or report, evs))
     sender = (cfg.notify_smtp_user or cfg.notify_email_to).strip()
     msg["From"] = formataddr(("media-agent", sender))
     msg["To"] = cfg.notify_email_to.strip()
@@ -211,16 +228,18 @@ def send(cfg, msg: EmailMessage) -> None:
         s.send_message(msg)
 
 
-def maybe_send(cfg, report: dict) -> dict:
-    """按这一轮的健康报告决定发不发、发一封。返回写进健康报告的结果。**永不抛异常。**"""
+def maybe_send(cfg, report: dict, scope: str = "run") -> dict:
+    """按这一轮的健康报告决定发不发、发一封。返回写进健康报告的结果。**永不抛异常。**
+    `scope="grab"`：抓取模式——自己的去重状态、只看抓取相关的事（见模块文档）。"""
     on, why = enabled(cfg)
     if not on:
         if why:
             _stderr(f"⚠️  {why}")
         return {"enabled": False, **({"note": why} if why else {})}
+    view = grab_view(report) if scope == "grab" else report
     try:
-        st = load_state(cfg)
-        evs, after = events(report, st)
+        st = load_state(cfg, scope)
+        evs, after = events(view, st)
         pending = [e for e in st.get("undelivered") or [] if isinstance(e, dict) and e.get("text")]
         out = [_late(e) for e in pending] + evs
         if st.get("undelivered_dropped"):
@@ -230,9 +249,9 @@ def maybe_send(cfg, report: dict) -> dict:
         keep = {"last_sent": st["last_sent"]} if st.get("last_sent") else {}
         if not out:
             # 没有要说的：静静跟上此刻的状态（warn → ok 这种不发信的变化也记下来）
-            _save_state(cfg, {**after, "failures": 0, **keep})
+            _save_state(cfg, {**after, "failures": 0, **keep}, scope)
             return {"enabled": True, "events": [], "sent": False}
-        msg = compose(cfg, report, out)
+        msg = compose(cfg, report, out, view)
         try:
             send(cfg, msg)
         except Exception as e:                      # noqa: BLE001 —— 发不出去不拦这一轮；事件留着，下一封补上
@@ -243,11 +262,11 @@ def maybe_send(cfg, report: dict) -> dict:
             _save_state(cfg, {**after, **keep, "failures": failures, "last_error": err,
                               "undelivered": queued,
                               "undelivered_dropped": int(st.get("undelivered_dropped") or 0)
-                              + len(pending) + len(mine) - len(queued)})
+                              + len(pending) + len(mine) - len(queued)}, scope)
             _stderr(f"⚠️  通知邮件没发出去（第 {failures} 次）：{err}；{len(queued)} 条事件留到下一封补发")
             return {"enabled": True, "events": [e["text"] for e in out], "sent": False, "error": err}
         _save_state(cfg, {**after, "failures": 0,
-                          "last_sent": datetime.now().isoformat(timespec="seconds")})
+                          "last_sent": datetime.now().isoformat(timespec="seconds")}, scope)
         return {"enabled": True, "events": [e["text"] for e in out], "sent": True,
                 "subject": msg["Subject"]}
     except Exception as e:                          # noqa: BLE001 —— 通知是观测，任何意外都不拦这一轮

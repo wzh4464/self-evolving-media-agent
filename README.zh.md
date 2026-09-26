@@ -159,6 +159,7 @@ uv run media-agent apply --dry-run     # 预演修复
 uv run media-agent apply               # 执行
 uv run media-agent evolve              # 为盲区起草规则
 uv run media-agent run                 # 一轮完整自治（迭代到不动点）
+uv run media-agent grab                # 只抓取：补缺的集、给刚抓的收尾（每 30 分钟）
 uv run media-agent health              # 最近一轮的健康报告
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题（要提交 .agents/acks.json）
 uv run media-agent ledger backfill --dry-run   # 出处覆盖率（每轮 run 会自动补新种子）

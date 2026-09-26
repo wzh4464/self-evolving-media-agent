@@ -147,6 +147,7 @@ def test_locked_out_run_writes_a_warn_health_report(monkeypatch, marker, capsys,
     每一轮都这样悄悄结束——正是这一阶段要让人看见的停摆。现在写 warn 报告（持有者是谁、从什么时候起）。"""
     _no_real_work(monkeypatch)
     monkeypatch.setattr(cli.runlock, "DEFAULT_WAIT", 0.1)
+    monkeypatch.setattr(cli.runlock, "RUN_WAIT", 0.1)
     lock = RunLock(project_root / "state" / LOCK_NAME, "media-agent purge --apply")
     assert lock.acquire(wait=0)
     try:

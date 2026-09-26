@@ -32,6 +32,7 @@ def lock_path(project_root) -> Path:
 @pytest.fixture
 def fast(monkeypatch):
     monkeypatch.setattr(runlock, "DEFAULT_WAIT", 0.2)
+    monkeypatch.setattr(runlock, "RUN_WAIT", 0.2)       # `run` 平时等得久一点（每 6 小时撞一次抓取），测试里不等
 
 
 # ------------------------------------------------------------------ 两个持有者

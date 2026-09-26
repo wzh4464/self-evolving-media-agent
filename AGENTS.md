@@ -21,6 +21,8 @@ media_agent/
   plugins/        内置检测器（`adopt.py`：把 AB 订阅里只有 AB 知道的东西迁进 sidecar；`new_season.py`：订阅着的番开播新一季时登记）
   actions.py      执行器 + 隔离区 + 配额上限 + 审计日志
   converge.py     一轮之内收敛：扫描 → 诊断 → 执行重复到不动点（一个执行器、试过的不再试、撤销本轮动作的拒绝）
+  grabmode.py     抓取模式（media-agent grab，每 30 分钟）：同一套 converge，只补缺的集、接手 AB 新订的番、给刚抓的收尾
+  subscribe.py    media-agent subscribe：不经 AB 订阅一季（建目录 + sidecar，经执行器），预览下一次抓取会做什么
   audit.py        audit.jsonl 的读写：写永不抛（降级 / 转写 audit.fallback.jsonl），读两个文件一起读
   purge.py        隔离区里每一份能不能真删（按处置类别的判据）
   disposal.py     硬删除的唯一出口：预写 purge.jsonl、容量闸、run / purge 的处置
@@ -32,7 +34,7 @@ media_agent/
   health.py       运行健康：种子数基线（骤降且审计解释不了 → 整轮拒绝）、每轮健康报告
   notify.py       通知邮件：健康报告有变化才发（一轮最多一封），去重在 state/notify.json，永不带密钥
   runlog.py       run 的输出每行带时间与批次 ID；run.log / run.err.log 先拷贝再截断地轮转（launchd 持有描述符）
-  pause.py        维护暂停：VPN 救援标记或 state/PAUSE 在时 run / apply 以 75 结束（diagnose 照常）
+  pause.py        维护暂停：VPN 救援标记或 state/PAUSE 在时 run / apply / grab 以 75 结束（diagnose 照常）
   evolution.py    自演进：残留检测 → 提议 → 影子验证 → 提升
   cli.py          命令行入口
 .agents/
@@ -55,9 +57,10 @@ uv run media-agent apply --dry-run    # 预演修复
 uv run media-agent apply              # 执行修复
 uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
 uv run media-agent run                # 完整自治轮次：迭代到不动点（MAX_ITERATIONS，默认 3；演进默认冻结），末尾处置隔离区
+uv run media-agent grab               # 抓取模式（launchd 每 30 分钟）：补缺的集、给刚抓的改名 / 判重收尾，其余治理留给 run
 uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题、先不提醒（写 .agents/acks.json，要提交）
-uv run media-agent health               # 最近一轮的健康报告（--run ID 指定一轮，--json 原样）
+uv run media-agent health               # 最近一轮的健康报告（--run ID 指定一轮，--json 原样，--grab 看抓取的）
 uv run media-agent ledger backfill      # 补录出处账本（--dry-run 只报覆盖率；run 开头自动补增量）
 uv run media-agent ledger show <hash>   # 账本里某个种子是什么
 uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID] [--dir 名] [--require-any 词 …] [--offset N]

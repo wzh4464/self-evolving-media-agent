@@ -717,15 +717,17 @@ def cmd_health(args, cfg) -> int:
     `--accept-torrent-count`：把此刻 qBittorrent 的种子数认作新基线（人为批量删除之后）。"""
     if getattr(args, "accept_torrent_count", False):
         return _accept_torrent_count(cfg)
-    rep = health.load_report(cfg.state_dir, getattr(args, "run", None))
+    cmd = "grab" if getattr(args, "grab", False) else "run"
+    rep = health.load_report(cfg.state_dir, getattr(args, "run", None), cmd=cmd)
     if rep is None:
         which = f"批次 {args.run} 的" if getattr(args, "run", None) else "任何"
-        print(f"还没有{which}健康报告（state/health/，每轮 run 结束时写）")
+        print(f"还没有{which}{'抓取的' if cmd == 'grab' else ''}健康报告"
+              f"（{health.health_dir(cfg.state_dir, cmd)}，每轮 {cmd} 结束时写）")
         return 1
     if getattr(args, "json", False):
         print(json.dumps(rep, ensure_ascii=False, indent=2))
         return 0
-    for line in health.render(rep, health.health_dir(cfg.state_dir) / f"{rep.get('run_id')}.json"):
+    for line in health.render(rep, health.health_dir(cfg.state_dir, cmd) / f"{rep.get('run_id')}.json"):
         print(line)
     base = health.load_baseline(cfg.state_dir)
     if base:
@@ -833,9 +835,10 @@ def _finish_run(cfg, rh, rc: int) -> int:
     try:
         # 报告里可能混进带凭据的报错（httpx 的异常会带上整个请求 URL，TMDB 的 api_key 就在里面）
         rep = notify.redact_obj(cfg, rh.finish(rc))
-        # 有变化才发通知，一轮最多一封；发不出去只在 stderr 说、记进报告，不改退出码
-        rep["notify"] = notify.maybe_send(cfg, rep)
-        path, problems = health.write_report(cfg.state_dir, rep)
+        cmd = rh.data.get("cmd") or "run"
+        # 有变化才发通知，一轮最多一封；发不出去只在 stderr 说、记进报告，不改退出码。抓取的通知单独一套（`notify` 模块文档）
+        rep["notify"] = notify.maybe_send(cfg, rep, scope=cmd)
+        path, problems = health.write_report(cfg.state_dir, rep, cmd=cmd)
         for line in health.render(rep, path):
             print(line)
         for p in problems:
@@ -982,6 +985,91 @@ _STOP = {converge.FIXED_POINT: "不动点", converge.CAP: "到上限", converge.
          converge.MOVING: "qBittorrent 还在搬存储，剩下的下一轮做"}
 
 
+def cmd_grab(args, cfg) -> int:
+    """抓取模式（`grabmode` 模块文档）：launchd 每 30 分钟一次。补缺的集、接手 AB 里新订的番、给本项目刚抓的收尾（改名、
+    集位里有它的判重）；其余治理留给 6 小时一轮的 `run`。收尾与 `run` 同一个口径——正常结束、整批拒绝、异常冲出都写健康
+    报告（`state/health/grab/`，`cmd: grab`），通知只为抓取相关的事发。不写发现历史、不记标题稳定闸、不处置隔离区。"""
+    rh = health.RunHealth(cfg, run_id=getattr(args, "run_id", None) or new_run_id(), cmd="grab",
+                          dry_run=args.dry_run or not cfg.auto_apply)
+    try:
+        rc = _grab(args, cfg, rh)
+    except Exception as e:
+        rh.crashed(e)
+        traceback.print_exc()
+        rc = EXIT_CRASH
+    except BaseException as e:
+        rh.crashed(e)
+        _finish_run(cfg, rh, EXIT_CRASH)
+        raise
+    return _finish_run(cfg, rh, rc)
+
+
+def _grab(args, cfg, rh) -> int:
+    from . import grabmode
+
+    run_id = rh.data["run_id"]
+    ctx = build_context(cfg)
+    ctx.log = rh.tap(ctx.log)
+    rh.clients(ctx)
+    dry = args.dry_run or not cfg.auto_apply
+    ex = Executor(ctx, dry_run=dry, run_id=run_id)
+    scope = grabmode.Scope()
+    prev = health.load_baseline(cfg.state_dir)
+
+    def on_scan(n, state) -> None:
+        if n == 1:
+            rh.scanned(state, prev)               # 只看：种子数基线只由 run 挪（`health.save_baseline`）
+
+    def on_diagnose(n, state, findings) -> None:
+        _warn_degraded(state)
+        if n == 1:
+            shown = [f for f in findings if scope.relevant(f)]
+            print(f"═══ 抓取：{len(shown)} 个相关的问题（其余治理在 6 小时一轮的 run 里） ═══")
+            _print_findings(shown, False)
+
+    out = converge.Outcome(max_iterations=cfg.max_iterations)
+    try:
+        grabmode.run(ctx, ex, max_iterations=cfg.max_iterations, out=out, scope=scope,
+                     scan=lambda n: build_state(ctx, resolve_tmdb=not args.no_tmdb),
+                     on_scan=on_scan, on_diagnose=on_diagnose,
+                     on_iteration=lambda it: print(it.line(cfg.max_iterations)))
+    except BaseException:
+        if out.iterations:                        # 与 `_run` 同理：前面迭代做了的，健康报告里要有
+            out.stop = out.stop or converge.CRASHED
+            rh.loop(out)
+            rh.actions(ex.report)
+        raise
+    report = ex.report
+    findings = [f for f in out.findings if scope.relevant(f)]
+    rh.loop(out)
+    rh.diagnosed(grabmode.registry(), findings, errors=out.detector_errors)
+    if out.stop == converge.REFUSED:
+        n = len(out.iterations)
+        why = report.refused
+        if n > 1:
+            why = (f"第 {n} 次迭代：{report.refused}；此前 {n - 1} 次迭代已执行 {len(report.applied)} 项"
+                   f"（批次 {run_id}，可 rollback）")
+            rh.applied(report, findings, out.state, proposed=out.proposed)
+        rh.refused(why)
+        return _refuse(why)
+    rh.applied(report, findings, out.state, proposed=out.proposed)
+    print(f"\n═══ 抓取：{report.summary()}（{_loop_brief(out)}） ═══")
+    for rec in report.applied:
+        print(f"  ✅ [{rec['op']}] {rec['summary']}")
+    for rec in report.failed:
+        print(f"  ❌ [{rec['op']}] {rec['summary']} —— {rec.get('error', '')}")
+    _print_unknown(report.unknown)
+    _print_loop(out)
+    rc = 0
+    if out.final_degraded:
+        rh.rescan_degraded(out.final_degraded)
+        print(f"\n═══ 收尾诊断：qBittorrent 数据不完整，列不出还要做什么：{out.final_degraded} ═══")
+        rc = EXIT_DEGRADED
+    if _report_audit_problems(report.audit_problems, cfg.state_dir):
+        return EXIT_AUDIT_INCOMPLETE
+    return rc
+
+
 def _loop_brief(out) -> str:
     n = sum(1 for it in out.iterations if not it.final)
     return f"{n} 次迭代，{_STOP.get(out.stop, out.stop)}"
@@ -1065,6 +1153,7 @@ def main() -> int:
     s.add_argument("--json", action="store_true", help="原样输出 JSON")
     s.add_argument("--accept-torrent-count", action="store_true",
                    help="把此刻 qBittorrent 的种子数认作新基线（在 qBit 里手动批量删除之后）")
+    s.add_argument("--grab", action="store_true", help="看抓取模式（media-agent grab）的报告，不看 run 的")
     s.set_defaults(func=cmd_health)
 
     s = sub.add_parser("subscribe", help="不经 AutoBangumi 订阅一部番的一季：建番目录 + sidecar（有审计、能回退），"
@@ -1095,8 +1184,12 @@ def main() -> int:
     s.add_argument("--no-evolve", action="store_true",
                    help="本轮不演进（EVOLVE_MODE=propose 时才有意义，默认 off 本来就不跑）")
     s.add_argument("--max-proposals", type=int, default=3)
-    # 维护暂停（`pause` 模块文档）：run / apply 与以后的抓取模式声明 pause=True
+    # 维护暂停（`pause` 模块文档）：run / apply / grab 声明 pause=True
     s.set_defaults(func=cmd_run, lock=True, pause=True)
+
+    s = sub.add_parser("grab", help="只抓取：补缺的集、给刚抓的收尾（launchd 每 30 分钟；完整治理仍是 6 小时一轮的 run）")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_grab, lock=True, pause=True)
 
     args = p.parse_args()
     try:
@@ -1130,8 +1223,9 @@ def warn_short_secrets(cfg) -> None:
 
 def _dispatch(args, cfg) -> int:
     paused = pause.reason(cfg) if getattr(args, "pause", False) else ""
-    if args.cmd == "run":
-        # launchd 把这些输出追加进 state/run.log / run.err.log：每一行带时间与批次 ID（`runlog`）
+    if args.cmd in ("run", "grab"):
+        # launchd 把这些输出追加进 state/run.log / run.err.log（抓取的是 grab.log / grab.err.log）：每一行带时间与批次 ID
+        # （`runlog`）；暂停、被锁挡住也写健康报告
         args.run_id = new_run_id()
         with runlog.stamped(args.run_id):
             if paused:
@@ -1152,25 +1246,26 @@ def _paused(why: str) -> int:
 
 
 def _paused_run(args, cfg, why: str) -> int:
-    """暂停的 `run` 也写健康报告（warn）：忘了删的 state/PAUSE 不能让 agent 悄悄停摆。"""
-    rh = health.RunHealth(cfg, run_id=args.run_id, cmd="run",
+    """暂停的 `run` / `grab` 也写健康报告（warn）：忘了删的 state/PAUSE 不能让 agent 悄悄停摆。"""
+    rh = health.RunHealth(cfg, run_id=args.run_id, cmd=getattr(args, "cmd", "run"),
                           dry_run=args.dry_run or not cfg.auto_apply)
     rh.paused(why)
     return _finish_run(cfg, rh, _paused(why))
 
 
 def _locked_out_run(args, cfg, holder: str) -> int:
-    """被运行锁挡住的 `run` 也写健康报告（warn）：锁要是被一个卡死的进程一直拿着，每一轮都这样悄悄结束。"""
-    rh = health.RunHealth(cfg, run_id=args.run_id, cmd="run",
+    """被运行锁挡住的 `run` / `grab` 也写健康报告（warn）：锁要是被一个卡死的进程一直拿着，每一轮都这样悄悄结束。"""
+    rh = health.RunHealth(cfg, run_id=args.run_id, cmd=getattr(args, "cmd", "run"),
                           dry_run=args.dry_run or not cfg.auto_apply)
     rh.locked(holder or "持有者未知，可能是部署脚本")
     return _finish_run(cfg, rh, _locked_out(holder))
 
 
 def _run_banner(args, cfg) -> None:
-    """`run` 拿到锁之后、做任何事之前：轮转日志（锁保证没有别的 media-agent 同时在写），打一行轮次分隔。"""
-    rotated = runlog.rotate(cfg.state_dir)
-    print(f"═══ media-agent {__version__} run 开始：批次 {args.run_id}"
+    """`run` / `grab` 拿到锁之后、做任何事之前：轮转自己的日志（锁保证没有别的 media-agent 同时在写），打一行轮次分隔。"""
+    names = runlog.GRAB_LOG_NAMES if args.cmd == "grab" else runlog.LOG_NAMES
+    rotated = runlog.rotate(cfg.state_dir, names=names)
+    print(f"═══ media-agent {__version__} {args.cmd} 开始：批次 {args.run_id}"
           f"{'（预演）' if args.dry_run or not cfg.auto_apply else ''} ═══")
     for m in rotated:
         _log(m)
@@ -1184,7 +1279,8 @@ def _locked(args, cfg, before=None, locked_out=None) -> int:
             before(args, cfg)
         return args.func(args, cfg)
     lock = RunLock(cfg.state_dir / LOCK_NAME, label=" ".join(["media-agent", *sys.argv[1:]]))
-    if not lock.acquire(wait=runlock.DEFAULT_WAIT):
+    # `run` 等得久一点（`runlock.RUN_WAIT`）：每 30 分钟的 grab 与它每 6 小时同一秒起来；grab 自己只短等，不为 run 等上几分钟
+    if not lock.acquire(wait=runlock.RUN_WAIT if args.cmd == "run" else runlock.DEFAULT_WAIT):
         return (locked_out or _locked_out)(lock.holder())
     try:
         if before:

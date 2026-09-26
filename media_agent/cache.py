@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS llm (key TEXT PRIMARY KEY, value TEXT, ts REAL);
 """
 
 TMDB_TTL = 30 * 24 * 3600   # TMDB 元数据 30 天
-FEED_TTL = 3600            # 番组 feed / RSS 标题：新集的唯一信号，必须远短于调度间隔(6h)
+FEED_TTL = 20 * 60         # 番组 feed / RSS 标题：新集的唯一信号，必须短于调度间隔——抓取每 30 分钟一次
+                           # （`grabmode.GRAB_INTERVAL_S`），以前的 1 小时让每隔一次的抓取看到的都是上一次拉的 feed；
+                           # 一轮之内的几次迭代（几十秒）照样走缓存
 LOOKUP_TTL = 7 * 86400     # 标题->番组 id、字幕组列表：映射关系，稳定但不是永恒
 EPISODES_TTL = 6 * 3600     # 在播的季的分集表 6 小时。在播番每周新增一集，
                             # 用元数据那套 30 天会让新集整整一个月看不见
