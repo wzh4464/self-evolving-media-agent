@@ -111,3 +111,39 @@ def test_the_slot_of_a_record_comes_from_the_ledger_when_nothing_else_names_it(l
     [c] = rep.pool
     assert c.slot == (1, 58)
     assert [x.trash_path for x in rep.deleted] == [moved]
+
+
+def test_a_multi_file_subject_does_not_take_its_torrents_ledger_slot(lib, no_rmtree):
+    """被隔离的那个种子不止一个文件（合集）：账本里那一行的集位说的是整个发布，不是这一个文件——不拿它当集位
+    （2026-09-27 审查：去掉 `torrent_files in (None, 1)` 的变异全套存活）。认不出集位就不删。"""
+    moved = _quarantined(lib, "[Fyy Raws] Re Zero - 08 [1080p].mp4", slot=None, summary="重复",
+                         subject={"torrent_hash": H_GONE, "name": "[Fyy Raws] Re Zero 07-08 [1080p]",
+                                  "torrent_files": 2}, size=487_000_000)
+    lib.show(REZERO).season(1).single(f"{REZERO} S01E58.mkv", size=1_300_000_000, tags="ma:S01E58",
+                                      name="[G] Re Zero - 58 [1080p].mkv", probe=CHI)
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.record_grab(infohash=H_GONE, mikan_title=FYY_MIKAN, season=1, episode=58, run_id="g0")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    [c] = rep.pool
+    assert c.slot is None and not c.eligible
+    assert moved.exists() and not rep.deleted
+
+
+def test_the_quarantined_copy_is_re_ranked_with_its_mikan_title(lib, no_rmtree):
+    """I4 复排：隔离的那份内部名只写 `ASSx2`，「简繁内封字幕」只在它的番组页标题里（出处账本）——按现在的排序它该赢
+    （简体压过体积），不删。以前复排时不带它的账本行，它按内部名输在体积上、到期被硬删（2026-09-27 审查：变异存活）。"""
+    loli = "[LoliHouse] Re Zero - 08 [WebRip 1080p HEVC-10bit AAC ASSx2].mkv"
+    moved = _quarantined(lib, loli, subject={"torrent_hash": H_GONE, "name": loli, "torrent_files": 1},
+                         size=500_000_000)
+    lib.show(REZERO).season(1).single(f"{REZERO} S01E08.mkv", size=600_000_000,
+                                      name="[G] Re Zero - 08 [1080p].mkv", hash=H_SURV)
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.upsert_backfill(infohash=H_GONE, source=ledger.AUTOBANGUMI,
+                            mikan_title="[LoliHouse] Re:从零开始的异世界生活 / Re Zero - 08 [WebRip 1080p][简繁内封字幕]")
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    [c] = rep.pool
+    assert not c.eligible and moved.exists() and not rep.deleted

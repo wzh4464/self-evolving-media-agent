@@ -300,3 +300,19 @@ def test_a_pinned_seal_takes_part_in_its_own_episodes_dedupe(lib):
     c = lib.cycle(detectors=[DuplicateEpisodeDetector], dry_run=True)
     assert "season_numbering_conflict" not in c.kinds()
     assert [t.path for t in c.actions("trash")] == [str(other.path)]     # 钉着的封存这一集，另一份判输
+
+
+def test_the_ledger_is_attached_to_files_found_through_a_torrents_content_path(lib):
+    """扫描的来源 2：Original 布局、save_path 就是媒体根的种子，凭 content_path 认领盘上的文件——它们照样挂上账本那一行
+    （2026-09-27 审查：来源 2 不挂账本的变异全套存活）。"""
+    from harness.library import DirBuilder
+    sh = lib.show(REZERO)
+    t = DirBuilder(sh, lib.media_root).torrent({"Season 1/Re:从零开始的异世界生活 S01E08.mkv": 487_000_000},
+                                               name=REZERO, layout="original")
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.upsert_backfill(infohash=t.hash, source=ledger.AUTOBANGUMI, mikan_title=FYY_MIKAN)
+
+    state = lib.scan()
+
+    [f] = [f for s in state.shows for f in s.files if f.torrent_hash == t.hash]
+    assert f.ledger is not None and f.ledger.mikan_title == FYY_MIKAN

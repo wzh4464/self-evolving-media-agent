@@ -91,3 +91,25 @@ def test_inflight_prefers_the_pin_over_a_normalized_name(lib):
 
     busy = _inflight(lib.context(), show, {t["hash"]: t for t in state.torrents})
     assert busy == {1: {8}}
+
+
+def test_a_grab_row_on_a_two_video_torrent_does_not_name_both_files(lib):
+    """账本只替单视频的种子说话——`recorded_slot` 与 `ledger_view` 同一道闸：合集 / 合并发布的一行说不了单个文件。
+    没有这道闸，抓取行的 (1, 8) 会把同一个种子里的第 9 集也算成第 8 集：`have` 少一集、`_inflight` 也少一集
+    （2026-09-27 审查：去掉 `recorded_slot` 里这一条的变异全套存活，`ledger_view` 的那一条有测试）。"""
+    lib.configure(qbit_allow_empty=True)
+    s1 = lib.show(SHOW).season(1)
+    done = s1.torrent({"[G] Yani Neko - 08 [1080p].mkv": 600_000_000, "[G] Yani Neko - 09 [1080p].mkv": 600_000_000},
+                      name="[G] Yani Neko 08-09", layout="nosub", hash=H8)
+    busy = s1.torrent({"[G] Yani Neko - 10 [1080p].mkv": 600_000_000, "[G] Yani Neko - 11 [1080p].mkv": 600_000_000},
+                      name="[G] Yani Neko 10-11", layout="nosub", hash="8" * 40, progress=0.4,
+                      active_hours_ago=1)
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.record_grab(infohash=done.hash, mikan_title="[G] 尼古喵喵 / Yani Neko 08-09", season=1, episode=8)
+        led.record_grab(infohash=busy.hash, mikan_title="[G] 尼古喵喵 / Yani Neko 10-11", season=1, episode=10)
+
+    state, show = _scan_show(lib)
+
+    assert {8, 9} <= have_episodes(show)[1]
+    # 在下的合集：名字（`10-11`）也说不了单个文件是哪一集——不能因为抓取行写着 (1, 10) 就把两个文件都算成第 10 集
+    assert _inflight(lib.context(), show, {t["hash"]: t for t in state.torrents}) == {}
