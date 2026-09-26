@@ -298,3 +298,37 @@ def test_tags_are_the_last_resort(lib):
     assert rows[H_MA].mikan_title == ""                       # 标题不知道，不编
     assert rows[H_NONE].source == ledger.MANUAL and rows[H_NONE].slot is None
     assert [r["hash"] for r in rep.remaining] == [H_FEED]
+
+
+def test_a_409_grab_in_the_audit_does_not_claim_the_torrent(lib):
+    """审计里这个 infohash 只有 409 的抓取（种子早就在）：集位照样是抓取器的，但不冒认是本项目加的——
+    来源记 unknown，AB 库认得出就补成 autobangumi。"""
+    _rezero_ab(lib)
+    rec = {"ts": "2026-08-31T13:00:00", "run_id": "20260831T130000", "status": "applied",
+           "dry_run": False, "rule": "episode-available", "op": "grab_episode", "summary": "S1E58 可抓取",
+           "already_present": True,
+           "args": {"url": _url(H_AB), "title": FYY_MIKAN, "show_dir": str(lib.path(REZERO)),
+                    "season": 1, "episode": 58}}
+    lib.cfg.audit_log.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    rep = lb.backfill(lib.context())
+
+    row = _rows(lib)[H_AB]
+    assert row.slot == (1, 58) and row.grabbed                   # 抓取器定的集位
+    assert row.source == ledger.AUTOBANGUMI and row.ab_bangumi_id == 9
+    assert rep.inserted == {ledger.UNKNOWN: 1, ledger.AUTOBANGUMI: 1}
+
+
+def test_a_known_row_of_unknown_origin_does_not_refetch_the_feed(lib):
+    """已有一行、只是不知道谁加的（409 时记的）：番组页答不了"谁加的"，每轮开头的补录不为它拉番组页。"""
+    sh = lib.show("尼古喵喵")
+    sh.sidecar(mikan_id="4102")
+    sh.season(1).single("[X] Yani Neko - 10.mkv", hash=H_NONE)
+    lib.mikan("4102", [MikanItem(title=LOLI, pub="2026-08-22", url=_url(H_FEED))])
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.record_grab(infohash=H_NONE, mikan_title=LOLI.replace("- 08", "- 10"), season=1, episode=10,
+                        added=False)
+
+    rep = lb.backfill(lib.context())
+
+    assert lib.web.calls == [] and rep.remaining == [] and rep.inserted == {}

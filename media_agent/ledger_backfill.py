@@ -109,7 +109,10 @@ def _audit_grabs(audit_log: Path) -> dict[str, dict]:
         args = rec.get("args") or {}
         h = (rec.get("infohash") or ledger.infohash_of_url(args.get("url") or "") or "").lower()
         if h:
-            out[h] = rec
+            # 谁加的：只要有一次不是 409（`already_present` 不是 True；旧记录没有这个字段），就是本项目加的。
+            # 全是 409 的——种子早就在，抓取器只是也选中了它：集位照记，来源不冒认
+            added = out.get(h, {}).get("_added", False) or rec.get("already_present") is not True
+            out[h] = {**rec, "_added": added}
     return out
 
 
@@ -174,18 +177,21 @@ def _fill(ctx, rep: BackfillReport, led, rows: dict, misses: set, torrents: list
     todo = {t["hash"].lower(): t for t in torrents
             if t.get("hash") and (t["hash"].lower() not in rows
                                   or rows[t["hash"].lower()].source == ledger.UNKNOWN)}
-    done: set[str] = set()
+    done: set[str] = set()                            # 补到了、而且知道是谁加的：后面的来源不用再看
+    known: set[str] = set(rows)                       # 有一行（含来源 unknown 的）：知道它"是什么"
 
     def put(h: str, **fields) -> None:
         source = fields["source"]
         if led is not None:
             if not led.upsert_backfill(infohash=h, **fields):
                 return
-        elif h in rows:                               # 预演：只有 unknown 的行会被升级
+        elif h in rows or h in known:                 # 预演：只有 unknown 的行会被升级
             if source == ledger.UNKNOWN:
                 return
         rep.inserted[source] = rep.inserted.get(source, 0) + 1
-        done.add(h)
+        known.add(h)
+        if source != ledger.UNKNOWN:
+            done.add(h)                               # unknown 的留在待补里：AB 库认得出就补上是谁加的
 
     # 0. 本项目的抓取审计
     try:
@@ -203,7 +209,8 @@ def _fill(ctx, rep: BackfillReport, led, rows: dict, misses: set, torrents: list
         except (KeyError, TypeError, ValueError):
             season = episode = None
         show_dir, _ = _where(t, media_root)             # 此刻在哪部番（目录可能改过名），不在库里退回抓取时的
-        put(h, source=ledger.MEDIA_AGENT, mikan_title=a.get("title") or "", mikan_url=a.get("url") or "",
+        put(h, source=ledger.MEDIA_AGENT if rec["_added"] else ledger.UNKNOWN,
+            mikan_title=a.get("title") or "", mikan_url=a.get("url") or "",
             show_dir=str(show_dir or a.get("show_dir") or ""), season=season, episode=episode,
             ab_bangumi_id=a.get("bangumi_id"), chosen_reason=str(rec.get("summary") or ""),
             verdict=ledger.verdict_of(a.get("title") or ""), grabbed_at=str(rec.get("ts") or ""),
@@ -236,9 +243,10 @@ def _fill(ctx, rep: BackfillReport, led, rows: dict, misses: set, torrents: list
             verdict=ledger.verdict_of(title), note="补录自 AutoBangumi 库")
     todo = {h: t for h, t in todo.items() if h not in done}
 
-    # 2. 这部番的番组页 feed
-    if network and todo:
-        _from_feeds(ctx, rep, led, shows, todo, misses, put, media_root)
+    # 2. 这部番的番组页 feed——只为还完全不知道是什么的种子拉（已有一行、只差"谁加的"的，番组页也答不了）
+    unseen = {h: t for h, t in todo.items() if h not in known}
+    if network and unseen:
+        _from_feeds(ctx, rep, led, shows, unseen, misses, put, media_root)
         todo = {h: t for h, t in todo.items() if h not in done}
 
     # 3. 只剩标签能说明来路的：`ma:` 钉子只由本项目的抓取打（集位就是钉子）；`manual:` 是人手加种时自己打的。
@@ -257,7 +265,7 @@ def _fill(ctx, rep: BackfillReport, led, rows: dict, misses: set, torrents: list
             note=f"补录自种子标签；显示名 {str(t.get('name') or '')[:80]}")
     todo = {h: t for h, t in todo.items() if h not in done}
 
-    covered = set(rows) | done                        # 来源 unknown 的行也知道它"是什么"
+    covered = known | done                            # 来源 unknown 的行也知道它"是什么"
     for t in torrents:
         h = (t.get("hash") or "").lower()
         if h in covered:
