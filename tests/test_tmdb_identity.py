@@ -118,6 +118,52 @@ def test_legacy_dir_name_cache_entry_is_reused_for_the_pinned_id(lib):
     assert lib.tmdb.calls == [] or all(c[0] == "season_episodes" for c in lib.tmdb.calls)
 
 
+# ------------------------------------------------------------------ 旧版记下的 tmdb_id：要有佐证才钉住
+KIMYO = 71488                              # 生产上《世界奇妙物语》（TV 剧集）的条目
+KIMYO_SP = "世界奇妙物语 2018春之特别篇 (2018)"
+
+
+def _kimyo(lib, **sidecar):
+    """2026-09-27 生产快照：`世界奇妙物语/` 08-17 写的 sidecar（tmdb_id 71488）跟着目录在 media-agent 之外改了名
+    （审计里没有 rename_show_dir；09-15 sidecar-sync 只记了「规范名」）。v0.4.1 按目录名搜不到、这个目录名没有缓存，
+    从不动它；照旧的 tmdb_id 认，title-drift 要把目录改回 `世界奇妙物语`、missing-nfo 要写剧集的 tvshow.nfo。"""
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(KIMYO, "世界奇妙物语", seasons={1: weekly(3, first_days_ago=9000)})
+    sh = lib.show(KIMYO_SP)
+    sh.folder("").local(f"{KIMYO_SP}.mkv", size=2_000_000_000)
+    sh.sidecar(canonical_title=KIMYO_SP, tmdb_id=KIMYO, tmdb_title="世界奇妙物语", **sidecar)
+    return sh
+
+
+def test_a_legacy_id_nothing_vouches_for_is_held_not_acted_on(lib):
+    _kimyo(lib)
+
+    c = lib.cycle(dry_run=True)
+
+    assert not c.actions("rename_show_dir") and not c.actions("write_nfo") and not c.actions("rename")
+    assert c.state.shows[0].tmdb_id is None                     # 这一轮不认这个身份（与 v0.4.1 一样：没有身份）
+    [f] = [f for f in c.findings if f.kind == "naming_held"]
+    assert str(KIMYO) in f.summary and "tmdb_source" in f.summary
+    assert f.severity == "important"
+
+
+@pytest.mark.parametrize("vouch", ["human", "pinned-title", "legacy-cache"])
+def test_a_legacy_id_someone_vouches_for_is_pinned(lib, vouch):
+    """人写了 `tmdb_source`（或钉了标题），或者 v0.4.1 按这个目录名缓存的就是这个条目：照它认，不搜。"""
+    if vouch == "human":
+        _kimyo(lib, tmdb_source="human")
+    elif vouch == "pinned-title":
+        _kimyo(lib, pinned=["tmdb_title"])
+    else:
+        _kimyo(lib)
+        Cache(lib.cfg.cache_db).put_tmdb(KIMYO_SP, {"id": KIMYO, "title": "世界奇妙物语", "seasons": []})
+
+    c = lib.cycle(dry_run=True)
+
+    assert c.state.shows[0].tmdb_id == KIMYO and not c.state.shows[0].naming_hold
+    assert _search_calls(lib) == []
+
+
 # ------------------------------------------------------------------ 负缓存
 def test_a_failed_search_is_negative_cached(lib):
     lib.configure(qbit_allow_empty=True)
@@ -369,7 +415,7 @@ def test_llm_pick_is_not_re_asked_every_dry_run(lib):
 
 def test_llm_is_never_asked_for_a_pinned_show(lib):
     sh = _ambiguous(lib)
-    sh.sidecar(tmdb_id=12, tmdb_title="葬送的芙莉莲 迷你剧场")
+    sh.sidecar(tmdb_id=12, tmdb_title="葬送的芙莉莲 迷你剧场", tmdb_source="human")
     lib.tmdb._shows[12]["seasons"] = {1: weekly(3, first_days_ago=900)}
     lib.llm.when(lambda s, u: True, {"id": 11, "confidence": 0.99, "reason": "x"})
 

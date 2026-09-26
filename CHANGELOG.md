@@ -41,7 +41,10 @@
   按 tmdb_id 缓存（目录改名不再换键重查，一次 `tv_detail` 同时取两样）。模型在多个候选里选的条目这一轮不用，
   报 `tmdb_pick` 并由新动作 `pin_tmdb` 钉进 sidecar（`tmdb_source: llm`，有审计、能回退），下一轮起不再搜、不再问；
   已有的 tmdb_id 一律不改。搜不到的负缓存 24 小时（以前每轮重搜 40 多个没有条目的目录）；一轮里 TMDB 出过一次错，
-  其余的用缓存兜底、不再打网络。
+  其余的用缓存兜底、不再打网络。旧版写下的 tmdb_id（没有 `tmdb_source`）要有佐证才钉住：v0.4.1 按这个目录名缓存的
+  就是它、或目录名 / 文件名就是它的标题；都没有的（目录在 media-agent 之外改过名——生产上
+  `世界奇妙物语 2018春之特别篇 (2018)` 还钉着剧集《世界奇妙物语》）这一轮不认、报 `naming_held`，不把目录改回去、
+  不写剧集的 NFO；在 sidecar 里写 `"tmdb_source": "human"` 确认，或删掉 tmdb_id。
 - **TMDB 标题稳定闸**（`state/titles.json`）：改名 / 目录名 / 分类用的标题取不到时用上次采用的，**绝不退回目录名**；
   TMDB 改了标题要连续两轮 `run` 看到才采用（`tmdb_title_pending`），30 天内不改回刚换掉的标题
   （`tmdb_title_flip_blocked`，要改回去就在 sidecar 里写 `tmdb_title` 并把它加进新字段 `pinned`）。钉着 id 却一个

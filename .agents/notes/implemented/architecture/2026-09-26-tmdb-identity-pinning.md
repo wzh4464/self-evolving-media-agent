@@ -19,6 +19,13 @@
    `tmdb_source=search`；模型选的经 `pin_tmdb`，`llm`），之后只有人改（字段归属见
    `architecture/2026-09-26-sidecar-ownership.md`）。生产上现有的 sidecar 都带着 sidecar-sync 写过的 `tmdb_id`——
    那就是库里此刻按它命名的身份，部署后原样钉住。
+   - **旧版写的（没有 `tmdb_source`）要有佐证**（`scan._unvouched_legacy_id`，2026-09-27 审查）：旧 sidecar-sync 记的
+     是写那一刻按目录名搜到的条目；目录后来在 media-agent 之外改了名，它就不再说明这个目录是什么。佐证任一即可：
+     v0.4.1 按这个目录名缓存的就是它（不看时效）、目录名 / 文件名就是它的标题（TMDB 的、sidecar 的、稳定闸采用的）、
+     人钉过标题。没有佐证：这一轮不认这个身份（与 v0.4.1 一样没有身份）、`naming_hold` 报 `naming_held`，人写
+     `"tmdb_source": "human"` 确认或删掉 tmdb_id。生产快照 129 份里 128 份有旧缓存佐证；唯一没有的是
+     `世界奇妙物语 2018春之特别篇 (2018)`（08-17 在 `世界奇妙物语/` 写下 71488，之后目录被人改名、审计里没有
+     rename_show_dir）——照旧 id 认，title-drift 要把目录改回 `世界奇妙物语`、missing-nfo 要写剧集的 tvshow.nfo。
 3. 没钉住 → 旧的按目录名缓存 → 搜目录名 / AB 标题 → 确定性规则（唯一结果、唯一精确同名）选中的这一轮就用，
    sidecar-sync 随后把它填进 sidecar。
 4. 规则选不出、要问模型的 → **这一轮不用**：答案缓存（`tmdbpick:<目录>`，7 天，预演的轮次不重复问），记进
@@ -71,6 +78,9 @@
 - 部署后钉住的是 sidecar 里**此刻**的 `tmdb_id`——sidecar-sync 以前每次解析变了都跟着改，所以翻转过的番
   （LAT-04 里 09-16 那一轮的 `终物语 下`、`续・终物语`）钉住的可能是翻转之后的那个条目。部署前后核对一遍这几部番的
   `tmdb_id`，不对就直接改 sidecar（可写 `"tmdb_source": "human"`）；改了身份，下一轮起标题照常过稳定闸。
+  2026-09-27 快照里这两部的 sidecar id 与旧缓存一致；**真正会报 `naming_held` 的是
+  `世界奇妙物语 2018春之特别篇 (2018)`**（见上面"旧版写的要有佐证"）：它是单独的特别篇，要么在 TMDB 上找到它自己的
+  条目写进 sidecar（`tmdb_source: human`），要么删掉 sidecar 里的 tmdb_id（与 v0.4.1 一样按目录名搜、搜不到就不动）。
 - 回退一次 `pin_tmdb` 只是把 sidecar 还原成没有 `tmdb_id`：模型的答案缓存 7 天，下一轮会再提议同一个。
   模型选错了，直接在 sidecar 里写对的 `tmdb_id`，比回退管用。
 - 要改回一个 30 天内刚换掉的标题（`tmdb_title_flip_blocked`）：sidecar 里写 `tmdb_title`、`pinned` 里加 `"tmdb_title"`。
@@ -88,4 +98,4 @@
 搜不到负缓存、过期再搜；新标题第 2 轮才采用（档案里也是）；中间断一轮重新数；30 天内不改回去、31 天后照常确认；
 人钉的标题；`diagnose` 不推进计数；`cmd_run` 记录；一个标题都不知道 → 不改名；坏 sidecar → 不改名、不搜；
 模型选的这一轮不用、钉进 sidecar、下一轮不再问；预演不重复问；钉住的番从不问模型；`pin_tmdb` 不改已有的 id；
-稳定闸的单元测试与记录读不了；部署后第一轮 sidecar 的 `tmdb_title` 是旧的、目录与文件已是 TMDB 的（有 / 没有旧的按目录名缓存）→ 两轮都不改名，库里还用旧标题的仍要连看两轮。`tests/test_silent_excepts_report.py` 的注入点从 `official_title` 改成 `tv_detail`。
+旧版写的 tmdb_id 没有佐证（世界奇妙物语 2018 特别篇的形态）→ 不认、不改目录名 / 不写 NFO、报 `naming_held`；人写了 `tmdb_source`、钉了标题、旧缓存是它 → 照它认；稳定闸的单元测试与记录读不了；部署后第一轮 sidecar 的 `tmdb_title` 是旧的、目录与文件已是 TMDB 的（有 / 没有旧的按目录名缓存）→ 两轮都不改名，库里还用旧标题的仍要连看两轮。`tests/test_silent_excepts_report.py` 的注入点从 `official_title` 改成 `tv_detail`。

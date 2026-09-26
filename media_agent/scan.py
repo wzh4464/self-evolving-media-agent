@@ -403,6 +403,11 @@ def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
             metas[tid] = _tmdb_meta(ctx, cache, tid, show.dir_name, net)
         meta = metas[tid]
         stale = meta or cache.get_tmdb_stale(_id_key(tid)) or {}
+        if source == "sidecar":
+            why = _unvouched_legacy_id(cache, show, sc, tid, stale, book.entry(tid).get("adopted", ""))
+            if why:
+                show.naming_hold = why
+                continue
         show.tmdb_id = tid
         show.tmdb_source = source
         show.tmdb_seasons = stale.get("seasons", [])
@@ -419,6 +424,35 @@ def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
                                 f"也没有记录过的标题")
     if net["broken"]:
         ctx.tmdb_scan_down = net["broken"]
+
+
+def _unvouched_legacy_id(cache, show: Show, sc, tid: int, stale: dict, adopted: str = "") -> str:
+    """旧版（本阶段之前）记下的 sidecar `tmdb_id` 有没有佐证：没有返回原因（这一轮不认它、不按它改名），有返回空串。
+
+    本阶段起扫描照 sidecar 的 tmdb_id 认、不再按目录名搜。代码写下的身份都带 `tmdb_source`；**没有 `tmdb_source`
+    的是旧版 sidecar-sync 写的**——它记的是写那一刻按目录名搜到的条目。目录后来在 media-agent 之外改了名，它就不再
+    说明这个目录是什么。2026-09-27 生产快照：`世界奇妙物语/` 08-17 写的 sidecar（71488 世界奇妙物语，TV 剧集）跟着
+    目录被人改成了 `世界奇妙物语 2018春之特别篇 (2018)`（审计里没有 rename_show_dir），v0.4.1 按新目录名搜不到、
+    从不动它；照 sidecar 认，title-drift 要把目录改回去、missing-nfo 要给它写剧集的 tvshow.nfo。
+
+    佐证（任一即可）：v0.4.1 按这个目录名缓存的就是这个条目（不看时效——生产上 129 份里 128 份如此）；目录名或文件名
+    就是这个条目的标题（TMDB 的、sidecar 里的、稳定闸采用的——media-agent 自己按标题改过的目录就是这样）；人钉过标题
+    （`pinned` 里有 `tmdb_title`）。一个标题都不知道的不在这里判（调用方另有说法）。"""
+    if (sc.tmdb_source or "").strip() or "tmdb_title" in (sc.pinned or []):
+        return ""
+    legacy = cache.get_tmdb_stale(show.dir_name) or {}
+    if legacy.get("id") == tid:
+        return ""
+    known = [t for t in dict.fromkeys((stale.get("title", ""), sc.tmdb_title or "", adopted or "")) if t]
+    if not known:
+        return ""
+    names = [f.filename for f in show.files]
+    if any(normalize(t) == normalize(show.dir_name) or any(is_normalized(n, t) for n in names)
+           for t in known):
+        return ""
+    return (f"sidecar 的 tmdb_id {tid}（「{known[0]}」）是旧版记下的，目录名、文件名都不是这个条目的标题，"
+            f"v0.4.1 按这个目录名也没有认过它——目录多半在 media-agent 之外改过名。这一轮不认这个身份；"
+            f"确认是它就在 sidecar 里写 \"tmdb_source\": \"human\"，不是就删掉 tmdb_id")
 
 
 def _title_in_use(cache, show: Show, sc, tid: int, observed: str | None, stale: dict) -> str:
