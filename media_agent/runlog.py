@@ -91,6 +91,76 @@ class Stamped(io.TextIOBase):
         return True
 
 
+class Redacting(io.TextIOBase):
+    """包一层文本流：按整行过 `scrub`（遮掉密钥）再写出去。
+
+    2026-09-27 v0.4.0 上线第一轮：原来被静默吞掉的 TMDB 404 被说了出来，报错里带着请求 URL
+    `…?api_key=<明文>…`——健康报告与邮件过了 `notify.redact`，标准输出没过，密钥原样进了
+    launchd 的 run.log。打码放在输出流这一层，所有子命令、所有打印路径一次性生效。
+
+    按行攒、不按 `write` 调用处理：`print` 常分两次写（正文、换行），一个 URL 也可能被拆开写。
+    **`flush()` 也不吐出半行**：凭据的前缀与值若被拆成两次写、中间 flush 一下，正则就只看得到半截，
+    而写出去的就再也遮不回来（PR #1 审查意见）。CLI 里没有交互提示，半行攒到换行或 `finish()` 再写。
+
+    已配置的密钥按字面替换，但 `notify.redact` 对短于 `_LITERAL_MIN` 的不做字面替换（会误伤正常文本）；
+    这种密钥由 `cli.warn_short_secrets` 在启动时点名告警，而不是悄悄漏过。
+    """
+
+    def __init__(self, inner, scrub):
+        self._inner = inner
+        self._scrub = scrub
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        self._buf += str(s)
+        if "\n" in self._buf:
+            head, self._buf = self._buf.rsplit("\n", 1)
+            self._inner.write(self._scrub(head + "\n"))
+        return len(s)
+
+    def finish(self) -> None:
+        if self._buf:
+            tail, self._buf = self._buf, ""
+            self._inner.write(self._scrub(tail) + "\n")
+        self._inner.flush()
+
+    def flush(self) -> None:
+        self._inner.flush()                  # 半行不吐：见类文档
+
+    def isatty(self) -> bool:
+        return self._inner.isatty()
+
+    def fileno(self) -> int:
+        return self._inner.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._inner, "encoding", "utf-8")
+
+    @property
+    def errors(self):
+        return getattr(self._inner, "errors", "strict")
+
+    def writable(self) -> bool:
+        return True
+
+
+@contextmanager
+def redacting(scrub):
+    """期间 `sys.stdout` / `sys.stderr` 的输出一律按行过 `scrub`；结束（含异常）时换回原来的流。"""
+    out, err = sys.stdout, sys.stderr
+    r_out, r_err = Redacting(out, scrub), Redacting(err, scrub)
+    sys.stdout, sys.stderr = r_out, r_err
+    try:
+        yield
+    finally:
+        try:
+            r_out.finish()
+            r_err.finish()
+        finally:
+            sys.stdout, sys.stderr = out, err
+
+
 @contextmanager
 def stamped(run_id: str):
     """期间 `sys.stdout` / `sys.stderr` 的每一行都带时间与批次 ID；结束（含异常）时换回原来的流。"""
