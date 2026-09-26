@@ -49,6 +49,8 @@
   ssh 断线（SIGHUP）不会把切换腰斩在半路（全程忽略 HUP，输出同时追加到 `state/deploy.log`）；
   切换中途 Ctrl-C / SIGTERM 自动退回并记「被信号中断」；HEAD 已是目标 tag 但 `deploy.history`
   没有它部署成功的记录时（旧脚本被打断留下的现场）不再报"已经是"，而是照常重走一遍补齐。
+  部署到还没有 `deploy/deploy.sh` 的 tag（如 `v0.1.0`）之后，成功信息里的回滚命令改为从带脚本的
+  tag 里 `git show` 出来再跑；部署手册写明转换后第一次部署同样这么做。
   兼容生产的 bash 3.2 / BSD 工具 / uv 0.7.2；同时只能有一个部署在跑。
 - `deploy/convert-to-git.sh <tag>`：一次性把手工 rsync 部署的生产目录**原地**转成 git
   工作区（项目根由 `Path(__file__).resolve()` 定位、审计里存绝对路径，所以不搬家、

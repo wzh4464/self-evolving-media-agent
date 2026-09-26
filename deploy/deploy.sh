@@ -332,17 +332,35 @@ switch_phase() {
     else
         say "✅ 已部署 ${TAG}（$(g rev-parse --short HEAD)）（这个版本还没有 media-agent --version）"
     fi
-    if [ "$PREV" = "$SHA" ]; then
-        say "   （在同一版本上补齐了部署；回滚到更早的版本见 state/deploy.history）"
-    elif printf '%s' "$PREV_DESC" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
-        && g rev-parse -q --verify "refs/tags/$PREV_DESC" >/dev/null; then
-        say "   回滚：deploy/deploy.sh $PREV_DESC"
-    else
-        say "   部署前的版本不是 tag（${PREV_DESC}），回滚只能手工 checkout $PREV"
-    fi
+    rollback_hint
     exit 0
 }
 
+# 部署成功后打印"怎么回到部署前的版本"。刚部署的 tag 里可能**没有** deploy/deploy.sh
+# （v0.1.0 及更早）：那时照着"deploy/deploy.sh v0.2.0"做只会得到 No such file or
+# directory——偏偏是在恢复的时候。所以从带脚本的 tag 里取一份到临时目录再跑。
+rollback_hint() {
+    local src tmp
+    if [ "$PREV" = "$SHA" ]; then
+        say "   （在同一版本上补齐了部署；回滚到更早的版本见 state/deploy.history）"
+        return 0
+    fi
+    if ! printf '%s' "$PREV_DESC" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+        || ! g rev-parse -q --verify "refs/tags/$PREV_DESC" >/dev/null; then
+        say "   部署前的版本不是 tag（${PREV_DESC}），回滚只能手工 checkout $PREV"
+        return 0
+    fi
+    if g cat-file -e "HEAD:deploy/deploy.sh" 2>/dev/null; then
+        say "   回滚：deploy/deploy.sh $PREV_DESC"
+        return 0
+    fi
+    src=$PREV_DESC
+    g cat-file -e "$src:deploy/deploy.sh" 2>/dev/null || src="<任一带 deploy/deploy.sh 的 tag>"
+    tmp="${TMPDIR:-/tmp}"
+    tmp="${tmp%/}/media-agent-deploy.sh"
+    say "   回滚（${TAG} 里没有 deploy/deploy.sh，从 ${src} 里取一份来跑）："
+    say "     git -C $APP show ${src}:deploy/deploy.sh > $tmp && /bin/bash $tmp ${PREV_DESC}"
+}
 
 revert() {
     local why=$1 ok=1

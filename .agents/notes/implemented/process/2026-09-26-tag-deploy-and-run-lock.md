@@ -82,3 +82,17 @@ plist 没换，`ma-*` 临时文件泄漏（rc=129）。再跑 `deploy.sh <同一
 不波及 pytest）后部署照常完成、`deploy.log` 里有结局、临时文件清理；`kill -INT 0` 自动退回并记
 「中断」；手工造出"HEAD 已是新 tag、其余是旧的"的现场后重跑同一 tag 会补齐；转换后与成功部署后
 重跑仍是空操作。沙盒 fixture 补上了 `convert-to-git.sh` 会写的那行 `converted`。
+
+### 目标 tag 里没有 deploy.sh 时，文档与回滚提示仍然可照做
+
+**症状（审查在沙盒里复现，真 uv 0.7.2 + 真 pytest）**：转换停在 `v0.1.0`，它不跟踪
+`deploy/deploy.sh`；README 的「转换之后、第一次部署之前」与「日常部署」却让人
+`cd ~/media-agent && deploy/deploy.sh v0.2.0`。回滚同理：部署 `v0.1.0` 会把脚本从工作区删掉，
+成功信息却打印 `回滚：deploy/deploy.sh v0.2.0`——恢复的那一刻照做得到 No such file or directory。
+
+**修法**：成功信息的回滚提示由 `rollback_hint` 生成——刚部署的 tag（HEAD）里有脚本就照旧；
+没有就从部署前的 tag（它有的话）`git show <tag>:deploy/deploy.sh > $TMPDIR/media-agent-deploy.sh`
+再 `/bin/bash` 跑。README 写明第一次部署与"工作区停在 v0.1.0"时都用这个形式。
+
+**测试**：沙盒上游 `v1.1.0` 起带 `deploy/deploy.sh`（`v1.0.0` 像 `v0.1.0` 一样没有）；部署 v1.1.0
+的提示是 `deploy/deploy.sh v1.0.0`；再回到 v1.0.0 后，把打印出来的那条命令原样执行，能部署回 v1.1.0。

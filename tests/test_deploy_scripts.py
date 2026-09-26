@@ -99,7 +99,7 @@ def _release(root: Path, version: str, *, plist_prog: str, extra: dict[str, str]
     _write(root / "README.md", f"readme {version}\n")
     _write(root / "deploy" / f"{LABEL}.plist", PLIST.format(prog=plist_prog))
     for rel, text in extra.items():
-        _write(root / rel, text)
+        _write(root / rel, text, 0o755 if rel.endswith(".sh") else None)
 
 
 @pytest.fixture(scope="module")
@@ -121,9 +121,11 @@ def upstream(tmp_path_factory) -> Path:
     git("init", "-q", "-b", "main")
     releases = [
         ("1.0.0", "/app/.venv/bin/media-agent", {}),
+        # 与生产的 v0.1.0 → v0.2.0 一样：部署脚本是后来才入库的
         ("1.1.0", "/app/.venv/bin/media-agent --v11",
          {".agents/rules/r2.json": '{"id": "r2"}\n',
-          ".agents/notes/implemented/process/n1.md": "# note\n"}),
+          ".agents/notes/implemented/process/n1.md": "# note\n",
+          "deploy/deploy.sh": DEPLOY.read_text(encoding="utf-8")}),
         ("1.2.0", "/app/.venv/bin/media-agent --v11", {"media_agent/new.py": "X = 1\n"}),
         ("1.3.0", "/app/.venv/bin/media-agent BROKEN", {}),
     ]
@@ -366,6 +368,32 @@ def test_rerun_after_an_interrupted_switch_redoes_the_switch(sandbox):
     assert "--v11" in sandbox.installed_plist()
     assert sandbox.history()[-1][1:5] == ["v1.1.0", sandbox.tag_sha("v1.1.0"),
                                          sandbox.tag_sha("v1.1.0"), "ok"]
+
+
+# ------------------------------------------------------------------ 回滚提示
+def test_rollback_hint_names_the_in_tree_script_when_the_tag_has_one(sandbox):
+    r = sandbox.deploy("v1.1.0")
+    assert r.returncode == 0, _out(r)
+    assert "回滚：deploy/deploy.sh v1.0.0" in r.stdout
+    assert (sandbox.app / "deploy" / "deploy.sh").exists()
+
+
+def test_rollback_hint_works_when_the_deployed_tag_has_no_deploy_script(sandbox):
+    """回滚到 v0.1.0 这类还没有 deploy.sh 的 tag 之后，"回滚：deploy/deploy.sh v0.2.0"
+    指向一个不存在的文件——恢复的那一刻照着提示做却是 No such file or directory。"""
+    assert sandbox.deploy("v1.1.0").returncode == 0
+    r = sandbox.deploy("v1.0.0")
+    assert r.returncode == 0, _out(r)
+    assert not (sandbox.app / "deploy" / "deploy.sh").exists()
+    assert "回滚：deploy/deploy.sh" not in r.stdout
+    [cmd] = [ln.strip() for ln in r.stdout.splitlines()
+             if "show v1.1.0:deploy/deploy.sh" in ln]
+
+    u = subprocess.run([str(sandbox.bash), "-c", cmd], env=sandbox.env,
+                       capture_output=True, text=True)
+
+    assert u.returncode == 0, u.stdout + u.stderr
+    assert sandbox.head() == sandbox.tag_sha("v1.1.0")
 
 
 def test_check_mode_stages_but_does_not_switch(sandbox):

@@ -83,6 +83,17 @@ tar -xzf ~/media-agent-pre-git-<时间>.tgz -C ~
 第一次部署还会把 launchd 换成直接执行 `.venv/bin/media-agent`（见下文），并让
 `EVOLVE_MODE` 的默认值 `off` 生效。
 
+**第一次部署用不了 `deploy/deploy.sh`**：转换停在 `v0.1.0`，而 `v0.1.0` 里还没有这个脚本。
+先取回 tag，再从目标 tag 里把脚本取出来跑（它会先复制自己再执行，从哪里跑都一样）：
+
+```sh
+git -C ~/media-agent fetch --tags origin
+git -C ~/media-agent show v0.2.0:deploy/deploy.sh > /tmp/media-agent-deploy.sh
+/bin/bash /tmp/media-agent-deploy.sh v0.2.0
+```
+
+之后工作区停在带脚本的 tag 上，就可以直接用下面的 `deploy/deploy.sh`。
+
 ## 日常部署
 
 ```sh
@@ -90,6 +101,9 @@ cd ~/media-agent
 deploy/deploy.sh v0.2.0 --check     # 可选：只跑闸门与暂存验证，不切换
 deploy/deploy.sh v0.2.0
 ```
+
+（工作区当前的 tag 里没有 `deploy/deploy.sh` 时——转换后第一次部署、或回滚到了 `v0.1.0`——
+用上一节的 `git show <带脚本的 tag>:deploy/deploy.sh > /tmp/…` 形式。）
 
 1. **只认 tag。** 形如 `v0.2.0` 且 `refs/tags/` 下真有；`git fetch --tags origin` 若发现
    上游挪过同名 tag，git 会拒绝覆盖——已部署过的版本名不许换内容。
@@ -149,6 +163,9 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
 - **代码**：`deploy/deploy.sh <上一个 tag>`（`state/deploy.history` 里查），走同样的闸门与验证。
   注意 `v0.1.0` 不跟踪那 28 条演进规则（它们后来才入库），回到 `v0.1.0` 会移除它们——
   它们全都没有动作、今天零命中，行为不变。
+  **回到 `v0.1.0` 之后工作区里没有 `deploy/deploy.sh`**：成功信息里的"回滚"一行会改成打印
+  `git -C ~/media-agent show v0.2.0:deploy/deploy.sh > <临时文件> && /bin/bash <临时文件> v0.2.0`
+  这种形式——照着复制就能再部署回去（测试里照着打印出来的命令跑过）。
 - **数据**：代码回滚从不回卷 `state/`。撤销某一批改动仍然是
   `media-agent rollback --run <批次 ID>`；因此每个版本都必须能读懂旧版本写下的 state
   （审计格式向后兼容是发版要求）。`state/backups/` 里的副本只供手工比对，不会自动还原。
