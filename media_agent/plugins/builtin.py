@@ -1696,15 +1696,17 @@ BUILTIN = [
 
 
 def register_builtins(registry: Registry) -> Registry:
+    from .adopt import ADOPTION_DETECTORS
     from .grab import GRAB_DETECTORS
     from .identity import IDENTITY_DETECTORS
     from .sidecar_sync import SIDECAR_DETECTORS
     from .subscription import SUBSCRIPTION_DETECTORS
     # TMDB 身份最先报：它决定下游每条规则用的标题（模型选的条目要钉住、标题在等确认、这部番不改名）。
+    # 接手 AutoBangumi 订阅里只有它知道的东西（集号偏移……）随后：它们决定下游怎么认集号。
     # 订阅健康度规则随后：订阅本身失效时，下游一切规则都无从谈起。
     # 抓取器紧随其后——先补齐缺的集，后面的改名/归类规则才有东西可处理。
     # sidecar 同步放最后，记录本轮结束后的最终状态。
-    for cls in (IDENTITY_DETECTORS + SUBSCRIPTION_DETECTORS + GRAB_DETECTORS + BUILTIN
-                + SIDECAR_DETECTORS):
+    for cls in (IDENTITY_DETECTORS + ADOPTION_DETECTORS + SUBSCRIPTION_DETECTORS + GRAB_DETECTORS
+                + BUILTIN + SIDECAR_DETECTORS):
         registry.register(cls())
     return registry

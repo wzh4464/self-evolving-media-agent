@@ -117,6 +117,10 @@ def _bad_rel(rel, what: str) -> str | None:
 # 没有逆操作；2026-09-14 run 20260914T100214 的 `renameFile` 读超时，qBittorrent 其实改了，同样记 failed。
 # 所以执行器在 `apply()` 期间把 qBittorrent / AutoBangumi 数据库包一层，记下每个动作**发出过**的写调用
 # （发出即记，不管它返回还是抛异常——抛了也可能已经生效）；文件系统上的改动由各动作自己 `_effect()`。
+# 逆操作 `unset_sidecar` 能摘的 sidecar 字段 → 字段的类型（dict 按键摘；其余摘成这个类型的空值）。只列正向动作
+# 会**补**的人的意图（`Executor._set_intent`）：回退绝不能借它摘掉别的东西。
+_UNSETTABLE: dict[str, type] = {"episode_offsets": dict}
+
 _QBIT_WRITES = frozenset({
     "add_torrent", "rename_torrent", "rename_file", "set_location", "create_category",
     "set_category", "remove_categories", "add_tags", "remove_tags", "set_file_priority",
@@ -454,6 +458,7 @@ class Executor:
         "grab_episode": 0,       # 抓取只加种子、不碰已有文件，与下游动作互不干扰
         "write_sidecar": 10,     # 最后写档案，记录本轮结束后的最终状态
         "pin_tmdb": 10,          # 钉 TMDB 身份：只写 sidecar，与写档案同一档（写档案不改已有的 tmdb_id）
+        "adopt_episode_offset": 10,   # 把 AB 的集号偏移搬进 sidecar：同上（写档案按写的那一刻合并、不碰人的意图）
         "relink_torrent": 1,     # 再把失联种子接回来，后续规则才看得到它们
         "drop_torrent": 1,       # 撞车的种子越早摘掉越好：它占着一条路径的
                                  # 所有权，后面的改名/归位都要以此为前提
@@ -959,6 +964,78 @@ class Executor:
                                 what="写 sidecar ", undo=undo):
                 return
         self._audit("applied", f, a, undo=undo)
+
+    def _op_adopt_episode_offset(self, f: Finding, a: Action) -> None:
+        """把 AutoBangumi 订阅行上的集号偏移搬进 sidecar 的 `episode_offsets`（`plugins/adopt.py`）。
+
+        **只在这一季还没有登记时写**；已有的（人写的、上一轮搬的，含 `0`）一律不改——执行时按此刻的文件再核一次，诊断
+        之后人写上的也算。逆操作只摘本动作写下的那一项（`unset_sidecar`）：整份还原（`restore_sidecar`）会把之后人改的、
+        sidecar-sync 写的一起盖回去。"""
+        key, off = str(int(a.args["season"])), int(a.args["offset"])
+
+        def adopt(sc) -> list[dict]:
+            if key in (sc.episode_offsets or {}):
+                return []
+            sc.episode_offsets = {**(sc.episode_offsets or {}), key: off}
+            return [{"field": "episode_offsets", "key": key, "value": off}]
+
+        self._set_intent(f, a, adopt, have=lambda sc: (f"sidecar 里第 {key} 季已有 episode_offsets "
+                                                        f"{(sc.episode_offsets or {}).get(key)!r}（人写的为准），不改"))
+
+    def _set_intent(self, f: Finding, a: Action, mutate, *, have) -> None:
+        """往 sidecar 里**补**人的意图（`sidecar.USER_INTENT`：还没有的才写，已有的一律不改）。
+
+        `mutate(sc)` 改一份 Sidecar、返回它写下的每一项 `{"field", "key"?, "value"}`（没得写返回空列表）；`have(sc)`
+        说没得写时为什么。先按此刻的文件试一遍（副本）：没得写就 skipped，不白写一次文件；写的那一刻（`sidecar.update`，
+        读-改-写）再核一次。逆操作 `unset_sidecar` 只摘这几项、而且只在它们还是写下的值时摘。"""
+        import copy
+
+        from . import sidecar as sc_mod
+        show_dir = Path(a.args["show_dir"])
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run"})
+            return
+        if self._dir_renamed(f, a, show_dir):
+            return
+        if not show_dir.is_dir():
+            self._audit("skipped", f, a, {"reason": f"目录已不在：{show_dir}"})
+            return
+        cur, problem = sc_mod.load_checked(show_dir)
+        if problem:
+            bk = sc_mod.backup_corrupt(show_dir)
+            self._audit("skipped", f, a, {"reason": f"sidecar 解析不了（{problem}），不写"
+                                          + (f"；已备份到 {bk.name}" if bk else ""),
+                                          "backup": str(bk) if bk else ""})
+            return
+        if not mutate(copy.deepcopy(cur)):
+            self._audit("skipped", f, a, {"reason": have(cur)})
+            return
+        p = sc_mod.path_for(show_dir)
+        try:
+            prev_content = p.read_text(encoding="utf-8") if p.exists() else None
+        except (OSError, UnicodeDecodeError):
+            prev_content = None
+        wrote: list[dict] = []
+        undo = {"op": "unset_sidecar", "show_dir": str(show_dir), "entries": mutate(copy.deepcopy(cur))}
+        self._intend(undo)
+        self._effect("fs.sidecar")
+        try:
+            after = sc_mod.update(show_dir, lambda sc: wrote.extend(mutate(sc)))
+        except sc_mod.SidecarCorrupt as e:
+            self._audit("skipped", f, a, {"reason": str(e), "backup": str(e.backup) if e.backup else ""})
+            return
+        except Exception as e:
+            if not self._settle(f, a, e, lambda: self._sidecar_changed(p, prev_content),
+                                what="写 sidecar ", undo=undo):
+                return
+            wrote = undo["entries"]
+            after = None
+        if not wrote:
+            # 试的那一刻没有、写的那一刻有了（别的进程 / 人刚写上）：文件只多了一次 updated_at
+            self._audit("skipped", f, a, {"reason": have(after) if after is not None else "写的那一刻已经有了"})
+            return
+        undo["entries"] = wrote
+        self._audit("applied", f, a, {"wrote": wrote}, undo=undo)
 
     def _dir_renamed(self, f: Finding, a: Action, show_dir: Path) -> bool:
         """这个番目录本批次已经改了名（`_renamed_dirs`）：不往旧目录里写，记 skipped。返回是不是。
@@ -2434,6 +2511,20 @@ class Executor:
             if prev and not os.path.isabs(str(prev)):
                 return f"prev_savepath 不是绝对路径：{prev!r}"
             return None
+        if op == "unset_sidecar":
+            why = lib_path("show_dir")
+            if why:
+                return why
+            entries = u.get("entries")
+            if not isinstance(entries, list) or not entries:
+                return f"entries 缺失或不是非空列表：{entries!r}"
+            for e in entries:
+                fld = (e or {}).get("field") if isinstance(e, dict) else None
+                if fld not in _UNSETTABLE:
+                    return f"entries 条目不合法（只能摘 {'/'.join(sorted(_UNSETTABLE))}）：{e!r}"
+                if _UNSETTABLE[fld] is dict and not str(e.get("key") or "").strip():
+                    return f"entries 条目缺 key：{e!r}"
+            return None
         if op in ("restore_sidecar", "ungrab_episode"):
             why = lib_path("show_dir")
             if why:
@@ -2660,6 +2751,9 @@ class Executor:
                 sc_mod.write_text_atomic(p, u["prev"])
             return True, ""
 
+        if op == "unset_sidecar":
+            return self._unset_sidecar(u)
+
         if op == "restore_title_aliases":
             if self.dry_run:
                 return True, ""
@@ -2874,6 +2968,57 @@ class Executor:
             return True, ""
 
         return False, f"未知逆操作 {op}"
+
+    def _unset_sidecar(self, u: dict) -> tuple[bool, str]:
+        """逆操作 `unset_sidecar`：摘掉正向动作往 sidecar 里**补**的那几项（`_set_intent`）。
+
+        只在它们此刻还是写下的值时摘：人后来改过的（`{"3": -24}` 改成 `-23`）是人的意图，回退不碰，整步跳过并说明；
+        已经没了的算已还原。别的字段、别的键、不认识的键都不动（整份还原会把之后人改的、sidecar-sync 写的一起盖回去）。"""
+        from . import sidecar as sc_mod
+        d = Path(u["show_dir"])
+        raw, problem = sc_mod.read_raw(d)
+        if problem:
+            bk = None if self.dry_run else sc_mod.backup_corrupt(d)
+            return False, (f"sidecar 此刻解析不了（{problem}），不改"
+                           + (f"；已备份到 {bk.name}" if bk else "") + "，修好之后再回退")
+        raw = raw or {}
+        _missing = object()
+        todo, changed = [], []
+        for e in u["entries"]:
+            fld, want = e["field"], e.get("value")
+            if _UNSETTABLE[fld] is dict:
+                box = raw.get(fld) if isinstance(raw.get(fld), dict) else {}
+                now = box.get(str(e["key"]), _missing)
+                label = f"{fld}[{e['key']}]"
+            else:
+                now = raw.get(fld, _missing)
+                if now in ("", [], None):
+                    now = _missing
+                label = fld
+            if now is _missing:
+                continue                              # 已经没了：这一项算已还原
+            if now != want:
+                changed.append(f"{label} 此刻是 {json.dumps(now, ensure_ascii=False)}"
+                               f"（这一步写下的是 {json.dumps(want, ensure_ascii=False)}）")
+            else:
+                todo.append(e)
+        if changed:
+            return False, ("sidecar 里" + "；".join(changed) + "——人后来改过，不回退；要摘就手改 sidecar")
+        if not todo or self.dry_run:
+            return True, ""
+
+        def forget(sc) -> None:
+            for e in todo:
+                if _UNSETTABLE[e["field"]] is dict:
+                    box = dict(getattr(sc, e["field"]) or {})
+                    box.pop(str(e["key"]), None)
+                    setattr(sc, e["field"], box)
+                else:
+                    setattr(sc, e["field"], _UNSETTABLE[e["field"]]())
+
+        self._effect("fs.sidecar")
+        sc_mod.update(d, forget)
+        return True, ""
 
     def _try_restore_priority(self, u: dict) -> str:
         """`restore_from_trash` 搬回文件之后恢复条目下载：没恢复成返回理由。这时文件已经回来了，

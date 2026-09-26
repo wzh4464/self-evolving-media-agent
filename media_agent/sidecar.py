@@ -79,8 +79,8 @@ class Sidecar:
     # {"3": -24} = 库里第 3 季的发布按连续集号编，原始集号加上 -24 才是季内集号（`- 25` 是 S03E01）。
     # 与 `season_offsets` 是两回事：那边的键是发布方**声明的**季号、`集号 <= 偏移` 才加；这里的键是**库内季号**
     # （文件落在哪个 `Season N`），这一季的原始集号一律加——AutoBangumi 订阅行上的 `episode_offset` 就是这个意思
-    # （整条订阅一个值，只对它订阅的那一季）。它以前只活在 AB 库里，AB 退役就丢了；这里没登记的季，
-    # 规则暂时退回 AB 订阅行（`builtin.episode_offset_for`）。
+    # （整条订阅一个值，只对它订阅的那一季）。它以前只活在 AB 库里，AB 退役就丢了：`ab-adoption` 把它迁进来
+    # （`adopt_episode_offset` 动作，只在这里还没有这一季时写）；迁之前规则退回 AB 订阅行（`builtin.episode_offset_for`）。
     # 只换算原始集号：文件名里已经是 `SxxEyy` 的不动；换算出非正数 = 认不出（不抓、不改名、不参与判重）。
     # 登记了就算数：`{"3": 0}` = 这一季不换算，盖过 AB 订阅行上的偏移。
 
@@ -150,7 +150,8 @@ DERIVED = frozenset({"canonical_title", "tmdb_title", "aliases", "bangumi_id", "
 IDENTITY = frozenset({"tmdb_id", "tmdb_source"})
 # USER_INTENT：人写的。写档案（`write_sidecar`）从不写它们；写档案时一律以**此刻文件里的**为准，payload 里带的
 #              旧值不算数。`mikan_id` 2026-09-26 起也归这里：抓取不再写它（选中的页记在 state/ 缓存）。
-#              `episode_offsets`：人写的换算（在 AutoBangumi 里写下的是订阅行的 `episode_offset`）。
+#              `episode_offsets`：人写的换算（在 AutoBangumi 里写下的是订阅行的 `episode_offset`）。只有专门的动作
+#              （`adopt_episode_offset`，有审计、能回退）在这一季还没有登记时把 AB 里的**搬**进来，已有的一律不改。
 USER_INTENT = frozenset({"season_offsets", "episode_offsets", "require_any", "notes", "mikan_id",
                          "pinned"})
 BOOKKEEPING = frozenset({"schema_version", "updated_at"})

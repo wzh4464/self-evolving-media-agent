@@ -19,6 +19,9 @@
   出处账本改为一处口径（`builtin.episode_offset_for`）：sidecar 登记了这一季就按它（`0` 也算，盖过 AB）；没登记时退回
   AB 订阅行，只对 AB 下载落进的那一季（`Season <season + season_offset>`）。只换算原始集号，已是 `SxxEyy` 的不动；
   换算出非正数认不出（不收、不改名）。
+- **把 AutoBangumi 订阅行上的集号偏移迁进 sidecar**（新规则 `ab-adoption`、新动作 `adopt_episode_offset`）：只在 sidecar
+  这一季还没有登记时提议（生产上只有 AB 37 一条，部署后第一轮写一次）；按此刻的文件只写这一项。逆操作
+  `unset_sidecar` 只摘这一项、而且只在它还是写下的值时摘——人后来改过的不动，别的字段不碰。
 
 ### 修复
 - **抓取认集号偏移、找不到候选时说出来**（critic N13）：AB 37《超超超超超喜欢你的100个女朋友》第三季的发布按连续集号编
