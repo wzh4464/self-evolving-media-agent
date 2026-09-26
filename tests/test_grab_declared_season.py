@@ -125,6 +125,26 @@ def test_only_other_season_releases_are_reported_not_skipped_silently(lib):
     assert {f.subject for f in fs if "明显属于别季" in f.summary} == {"S04E20", "S04E21"}
 
 
+def test_a_season_declared_only_in_the_chinese_segment_still_counts(lib):
+    """标题按 ` / ` 分成中文名、日文名、英文名，季号常常只写在其中一段：`入间同学入魔了！第3季 / Mairimashita!
+    Iruma-kun - 20` 的英文段不写季。`naming.declared_season` 只看最后一段——`declared_seasons` 每一段各认一次，这是
+    LAT-03 修复的核心（2026-09-27 审查：只看整串 / 最后一段的变异全套存活，测试里的标题最后一段都带着季号）。"""
+    _iruma(lib, ["[桜都字幕组] 入间同学入魔了！第3季 / Mairimashita! Iruma-kun - {ep} [1080p][简繁内封]"])
+
+    fs = lib.diagnose(detectors=[EpisodeAvailableDetector])
+
+    assert not _grabs(fs)                                       # 标的是第 3 季：不是第四季的候选
+    assert {f.subject for f in fs if "明显属于别季" in f.summary} == {"S04E20", "S04E21"}
+
+
+def test_release_facts_read_every_segment():
+    from media_agent import ledger, naming
+    title = "[澄空学园] 辉夜大小姐想让我告白 第三季 / Kaguya-sama wa Kokurasetai - Ultra Romantic - 03 [1080p]"
+    assert naming.declared_season(title) is None                # 只看最后一段：认不出
+    assert naming.declared_seasons(title) == {3}
+    assert ledger.release_facts(title) == (3, 3)
+
+
 def test_season_offsets_map_a_declared_season_in(lib):
     """人在 sidecar 里登记了换算（`{"3": 0}`：桜都的「第3季」就是这里的第 4 季，集号不变）：照常是候选。"""
     _iruma(lib, [SAKURATO], offsets={"3": 0})
