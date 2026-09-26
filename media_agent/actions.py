@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import disposal
-from .claims import ClaimCheck, ClaimIndex, ClaimsUnknown, fold
+from .claims import PARTIAL, ClaimCheck, ClaimIndex, ClaimsUnknown, fold
 from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
 
@@ -2024,6 +2024,21 @@ class Executor:
                 return False, f"无法确认原位置的占用情况，未做任何改动：{chk.unknown}"
             if chk.claimants:
                 return False, f"原位置已被占用：{chk.describe()}"
+            # 半成品 `X.!qB` 属于声明 `X` 的那个种子：`check(X.!qB)` 只比 `X.!qB` 这个字面名字，看不见
+            # 此后坐上 `X` 的新种子（2026-09-26 审查：停滞换源、死种的半成品回退）。搬回去要么躺在新种子
+            # 完整的 `X` 旁边、谁也不认领（scan 把它盖掉，隔离区也没有了），要么被还没开下的新种子当成
+            # 自己的半成品接着写。它当初所属的种子（本批次重加的那个）不算。
+            if dst.name.endswith(PARTIAL):
+                own = ((((rec or {}).get("deletion") or {}).get("subject") or {}).get("torrent_hash")
+                       or ((rec or {}).get("args") or {}).get("torrent_hash") or "")
+                base = Path(str(dst)[: -len(PARTIAL)])
+                bchk = self._claims().check(base, own_hash=own)
+                if bchk.unknown:
+                    return False, f"无法确认半成品正名的占用情况，未做任何改动：{bchk.unknown}"
+                if bchk.claimants:
+                    return False, (f"这是一份半成品（.!qB），它的正名 {base.name} 此刻已归别人"
+                                   f"（{bchk.describe()}）：搬回去就成了没人认领的孤儿，或被那个种子"
+                                   f"当成自己的半成品接着写。留在隔离区")
             # 搬回媒体库同样先拷后删（critic N8）：拷到一半 ENOSPC 会在库里留下一个截断的文件，
             # 下一轮扫描把它当成这一集
             room = disposal.room_problem(self.cfg.media_root, src.stat().st_size, "媒体库")

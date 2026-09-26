@@ -12,6 +12,8 @@ Season 目录，见 `tests/test_dead_torrent.py`）。代价是半成品留在�
 """
 from __future__ import annotations
 
+import pytest
+
 from media_agent import gate
 from media_agent.actions import Executor
 from media_agent.kernel import Action, Finding
@@ -140,6 +142,30 @@ def test_rollback_brings_the_partial_back_and_readds_the_torrent(lib):
 
     assert res["reverted"] == 2, res
     assert lib.ident(partial) == ident and lib.qbit.has(t.hash)
+
+
+@pytest.mark.parametrize("replacement", ["finished", "not-started"])
+def test_rollback_does_not_put_the_partial_back_beside_the_new_owner_of_its_name(lib, replacement):
+    """2026-09-26 审查（复现）：换源的新种子此后声明着 `X`。以前 `restore_from_trash` 只问 `X.!qB`
+    这个字面路径——没人声明它，照搬回库里；下一步重加死种又因为 `X` 被占而拒绝。结果：一份没人
+    认领的半成品躺在新种子的 `X` 旁边（scan 见 `X` 有人声明就把 `X.!qB` 一起盖掉，谁也看不见它，
+    它又不在隔离区里，处置也删不到）。新种子还没开始下时更糟：它开下时会把这份当成自己的半成品。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    _dead(s1, {"尼古喵喵 S01E11.mkv": GB}, "[A] Yani Neko - 11.mkv", layout="single")
+    c = lib.cycle(detectors=[DeadTorrentDetector])
+    [moved] = lib.trash_files()
+    if replacement == "finished":
+        s1.single("尼古喵喵 S01E11.mkv", size=GB, name="[B] Yani Neko - 11.mkv")
+    else:
+        s1.single("尼古喵喵 S01E11.mkv", size=GB, name="[B] Yani Neko - 11.mkv", progress=0.0,
+                  state="downloading")
+
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 0 and res["skipped"] == 2, res
+    assert moved.exists() and not (s1.path / "尼古喵喵 S01E11.mkv.!qB").exists()
+    reasons = " ".join(r["skip_reason"] for r in res["skipped_detail"])
+    assert "半成品" in reasons
 
 
 def test_partial_record_remembers_the_torrent_that_was_dropped_before_it(lib):
