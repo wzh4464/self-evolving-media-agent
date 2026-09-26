@@ -627,7 +627,8 @@ def render(rep: dict, path=None) -> list[str]:
     if lp:
         its = [it for it in lp.get("iterations") or [] if not it.get("final")]
         stop = {"fixed_point": "不动点", "cap": f"到上限，待做 {lp.get('pending_count', 0)}",
-                "refused": "读不全，拒绝", "dry_run": "预演", "crashed": "半路冲出"}.get(lp.get("stop"),
+                "refused": "读不全，拒绝", "dry_run": "预演", "crashed": "半路冲出",
+                "moving": "qBittorrent 还在搬存储，剩下的下一轮做"}.get(lp.get("stop"),
                                                                                      str(lp.get("stop")))
         lines.append(f"  迭代    {len(its)} 次 · {stop}"
                      + (f" · 反向拒绝 {len(lp['oscillations'])}" if lp.get("oscillations") else "")

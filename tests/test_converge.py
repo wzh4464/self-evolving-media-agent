@@ -509,6 +509,63 @@ def test_a_renamed_dir_keeps_the_identity_it_was_renamed_by(lib, llm):
     assert "pin_tmdb" not in [r["op"] for r in ex.report.applied]
 
 
+# ------------------------------------------------------------------ qBittorrent 还在搬：不在半搬的视图上再诊断
+def _moving_show(lib):
+    """`旧名字/` 里两个有种子的文件 + 一个纯本地文件，sidecar 记着 1–3 集；TMDB 标题是 `新名字`——title-drift 改目录名。
+    qBittorrent 5.2.3 的 setLocation 是异步的（`FakeQbit.async_moves`）：搬完之前种子是 `moving`、save_path 不变。"""
+    lib.qbit.async_moves = True
+    lib.tmdb.add_show(77, "新名字", seasons={1: weekly(3, first_days_ago=900)})
+    sh = lib.show("旧名字")
+    s1 = sh.season(1)
+    t = s1.torrent({"新名字 S01E01.mkv": 600_000_000, "新名字 S01E02.mkv": 600_000_000},
+                   name="新名字 01-02", layout="nosub")
+    s1.local("新名字 S01E03.mkv")
+    sh.sidecar(tmdb_id=77, tmdb_title="新名字", seasons={"1": {"have": [1, 2, 3]}})
+    return sh, t
+
+
+def test_the_next_iteration_waits_for_qbittorrent_to_finish_moving(lib, monkeypatch):
+    """2026-09-27 审查：以前下一次迭代在 `apply` 返回的那一刻就扫描——种子还在旧目录里搬（moving），新目录里只有
+    `_merge_tree` 挪过去的纯本地文件与档案。第二次迭代把两个目录当两部番：sidecar-sync 按半搬的视图把新目录的
+    `have` 从 [1, 2, 3] 写成 [3]；第一次迭代给旧目录写的档案（目录还在，因为种子还在搬）留下一个只有档案的幽灵目录。
+    现在先等 qBittorrent 搬完（有上限），再扫描。"""
+    sh, t = _moving_show(lib)
+    polls = []
+
+    def sleep(_s):                                   # 等的这一会儿 qBittorrent 搬完了
+        polls.append(_s)
+        lib.qbit.drain()
+
+    monkeypatch.setattr(converge, "_sleep", sleep)
+
+    c = lib.loop()
+
+    assert polls and c.outcome.stop == converge.FIXED_POINT
+    new = lib.media_root / "新名字"
+    assert lib.sidecar("新名字").seasons["1"]["have"] == [1, 2, 3]
+    assert not [p for p in sh.path.rglob("*") if p.is_file()]      # 旧目录里没有幽灵档案
+    assert sorted(p.name for p in (new / "Season 1").iterdir()) == [
+        "新名字 S01E01.mkv", "新名字 S01E02.mkv", "新名字 S01E03.mkv"]
+
+
+def test_a_move_that_does_not_finish_in_time_stops_the_loop(lib, monkeypatch):
+    """等不到（跨卷搬运、qBittorrent 卡住）：不在半搬的视图上诊断，这一轮到此为止，剩下的下一轮做。第一次迭代给
+    旧目录的写档案也不写（目录本轮已改名，档案跟着新目录走）。"""
+    sh, t = _moving_show(lib)
+    monkeypatch.setattr(converge, "SETTLE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(converge, "_sleep", lambda s: None)
+
+    c = lib.loop()
+
+    assert c.outcome.stop == converge.MOVING and len(c.iterations) == 1
+    assert "还在搬" in c.outcome.unsettled
+    assert lib.sidecar("新名字").seasons["1"]["have"] == [1, 2, 3]
+    [ws] = [r for r in lib.audit(c.run_id) if r["op"] == "write_sidecar"]
+    assert ws["status"] == "skipped" and "改名" in ws["reason"]
+    lib.qbit.drain()
+    assert not (sh.path / ".media-agent.json").exists()           # 没有只剩档案的幽灵目录
+
+
 # ------------------------------------------------------------------ 刚动过的种子：这一轮不按死种摘（critic §3.3）
 def test_a_torrent_relinked_this_run_is_not_dropped_as_dead_in_the_same_run(lib):
     """relink 之后 recheck：校验没全过（同样大小、内容不同的分片）的种子此刻是"下载中、0 做种、0 可用"——刚校验完，

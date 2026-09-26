@@ -161,7 +161,8 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     （`MAX_ITERATIONS`）：配额、批次 ID、`_grabbed` 跨迭代；按路径记的本批次状态每次迭代清掉（`Executor.new_iteration`）。
     **新加的动作**：在 `converge._TARGET` 里写明它"对谁"做（没写的按全部参数认，一轮只试一次）；有逆操作的，让
     `converge.undoes` 认得出它的反向——撤销本轮已执行动作的一律拒绝、报 `oscillation`；只有"此刻被挡着、别的动作能挪开"的
-    跳过才进 `converge.RETRYABLE`；会让种子重新校验 / 搬存储的进 `converge.TOUCHING`（这一轮不按死种摘它）。一轮只做一次的事（发现历史、标题稳定闸、卡住检测、健康报告）按**最后一次**诊断做，
+    跳过才进 `converge.RETRYABLE`；会让种子重新校验 / 搬存储的进 `converge.TOUCHING`（这一轮不按死种摘它），搬存储（setLocation）
+的还要进 `converge.MOVES`（下一次扫描之前先等 qBittorrent 搬完，等不到就停在这一次迭代）。一轮只做一次的事（发现历史、标题稳定闸、卡住检测、健康报告）按**最后一次**诊断做，
     不在迭代里做。见 [一轮之内收敛](.agents/notes/implemented/architecture/2026-09-27-converge-within-a-run.md)。
 
 ## 自演进的闭环

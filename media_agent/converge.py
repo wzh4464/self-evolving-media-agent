@@ -27,7 +27,9 @@ TMDB 身份照常解析（不能像演进重扫那样 `resolve_tmdb=False`：标
 **停在哪。** 某次迭代没有做成任何新动作 = 不动点。到了上限还在做新动作 = 到顶：再扫描、诊断一次（不执行），把
 下一次迭代会做的列成"待做"（健康报告 warn `loop_cap`：到顶多半说明有规则在拉锯）。任何一次迭代的扫描读 qBittorrent
 不完整，执行器照旧整批拒绝（`Executor.qbit_blocker`），循环立刻停，调用方按原来的拒绝语义收尾。预演只跑一次：动作
-都没执行，第二次看到的与第一次相同。
+都没执行，第二次看到的与第一次相同。上一次迭代搬过存储（目录改名、relocate：qBittorrent 的 setLocation 是异步的）
+的种子，下一次扫描之前先等它们搬完（`SETTLE_TIMEOUT_S`）；等不到就停在这里（`MOVING`），不在"一半在旧目录、一半在
+新目录"的视图上诊断，剩下的下一轮做。
 
 **每次迭代花多少。** 第二次迭代起网络全走缓存：TMDB 身份与标题按 id 缓存 30 天、搜不到的负缓存 24 小时、分集表
 6 小时 / 7 天（`cache.season_episodes`），番组页与 RSS 1 小时，Mikan 搜索 7 天；本地动作改变不了其中任何一样。剩下
@@ -53,6 +55,14 @@ CAP = "cap"                      # 到了上限，下一次迭代还有要做的
 REFUSED = "refused"              # 某次迭代的扫描读 qBittorrent 不完整，执行器整批拒绝
 DRY_RUN = "dry_run"              # 预演：只跑一次
 CRASHED = "crashed"              # 半路抛了异常（调用方记下；`run` 自己不接住）
+MOVING = "moving"                # 上一次迭代搬过存储的种子，qBittorrent 在时限内没搬完：不在半搬的视图上再诊断
+
+# 搬存储（setLocation）的动作。qBittorrent 5.2.3 对有元数据的种子是排一个异步搬运任务：搬完之前 `state` 是 `moving`、
+# `save_path` 不变（`Executor._location_landed`）。下一次迭代的扫描要等它们搬完（`_wait_settled`）。
+MOVES = ("rename_show_dir", "relocate")
+SETTLE_TIMEOUT_S = 60.0          # 同一个卷里搬是改名，一两秒；等满还在搬（跨卷拷贝、qBittorrent 卡住）就停在这一次迭代
+SETTLE_POLL_S = 1.0
+_sleep = time.sleep              # 测试替换它（FakeQbit 的异步搬运由 `drain()` 完成）
 
 # 这些跳过是"此刻被别的东西挡着"，本轮别的动作可能把它挪开：后面的迭代再试。其余跳过（删除关口、配额、演进规则、
 # 坏 sidecar、目标目录要人合并、种子已不在……）同一轮里再试结果也一样，按"已试过"处理。
@@ -185,6 +195,8 @@ class Outcome:
     refused: str = ""
     # 到顶之后的收尾诊断读 qBittorrent 不完整：待做的列不出来（空），原因在这里
     final_degraded: str = ""
+    # 停在 `MOVING`：上一次迭代搬过存储的种子还没搬完（原因）
+    unsettled: str = ""
     state: object = None                             # 最后一次扫描的 LibraryState
     findings: list[Finding] = field(default_factory=list)
     oscillations: list[Finding] = field(default_factory=list)
@@ -200,6 +212,7 @@ class Outcome:
             return {"rule": f.rule, "kind": f.kind, "op": f.action.op if f.action else None,
                     "show": f.show, "path": str(f.path or ""), "summary": str(f.summary)[:160]}
         return {"max": self.max_iterations, "stop": self.stop, "final_degraded": self.final_degraded,
+                "unsettled": self.unsettled,
                 "iterations": [it.to_dict() for it in self.iterations],
                 "pending_count": len(self.pending), "pending": [brief(f) for f in self.pending[:limit]],
                 "oscillations": [{**brief(f), "evidence": f.evidence} for f in self.oscillations[:limit]]}
@@ -215,6 +228,47 @@ def _touched_hashes(rec: dict) -> set[str]:
     if rec.get("op") == "rename_show_dir":
         return {str(h).lower() for h, _sp in (rec.get("undo") or {}).get("torrent_savepaths") or []}
     return {str(args.get("torrent_hash") or "").lower()} - {""}
+
+
+def _moved_hashes(recs: list[dict]) -> set[str]:
+    """这些审计记录里搬过存储的种子（`MOVES`，含半途而止、未确认的目录改名：已受理的那几个照样在搬）。"""
+    out: set[str] = set()
+    for rec in recs:
+        if rec.get("op") not in MOVES or rec.get("status") not in (auditlog.APPLIED, auditlog.UNKNOWN,
+                                                                  auditlog.FAILED):
+            continue
+        u = rec.get("undo") or {}
+        if rec.get("op") == "rename_show_dir":
+            out |= {str(h).lower() for h in u.get("moved_hashes") or []}
+            out |= {str(h).lower() for h, _sp in u.get("torrent_savepaths") or []}
+        else:
+            out |= {str((rec.get("args") or {}).get("torrent_hash") or "").lower()} - {""}
+    return out
+
+
+def _wait_settled(ctx, hashes: set[str]) -> str:
+    """等上一次迭代搬过存储的种子搬完（没有一个还是 `moving`），最多 `SETTLE_TIMEOUT_S` 秒。搬完了返回空串，
+    否则返回原因。
+
+    2026-09-27 审查：以前下一次迭代在 `apply` 返回的那一刻就扫描（以前隔 6 小时）。目录改名之后种子还在旧目录里搬，
+    新目录里只有 `_merge_tree` 挪过去的纯本地文件、NFO 与档案——扫描把两个目录当成两部番：sidecar-sync 按半搬的视图把
+    新目录的 `have` 从 [1, 2, 3] 写成 [3]，任何别的检测器在这份拆开的视图上都可能出错。读不到 qBittorrent 同样当作
+    "不知道搬完没有"。"""
+    if not hashes:
+        return ""
+    deadline = time.monotonic() + SETTLE_TIMEOUT_S
+    while True:
+        try:
+            moving = sorted(str(t.get("hash") or "").lower() for t in ctx.qbit.torrents()
+                            if str(t.get("hash") or "").lower() in hashes and t.get("state") == "moving")
+        except Exception as e:                      # noqa: BLE001 —— 交给调用方：原因进 Outcome.unsettled、这一轮停在这里
+            return f"读不到 qBittorrent，确认不了刚搬过存储的 {len(hashes)} 个种子搬完没有（{type(e).__name__}: {e}）"
+        if not moving:
+            return ""
+        if time.monotonic() >= deadline:
+            return (f"qBittorrent 还在搬这一轮改过存储位置的 {len(moving)} 个种子（等了 {SETTLE_TIMEOUT_S:.0f} 秒）："
+                    f"{', '.join(h[:8] for h in moving[:5])}——不在半搬的视图上再诊断，剩下的下一轮做")
+        _sleep(SETTLE_POLL_S)
 
 
 class _Guard:
@@ -363,10 +417,21 @@ def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
         out.state, out.findings = state, findings
         return state, findings
 
+    moved: set[str] = set()
+
+    def settled() -> bool:
+        """下一次扫描之前：上一次迭代搬过存储的种子搬完了没有。没搬完就停在这里（`MOVING`）。"""
+        why = _wait_settled(ctx, moved)
+        if why:
+            out.stop, out.unsettled = MOVING, why
+        return not why
+
     while n < max_iterations:
         n += 1
         if n > 1:
             ex.new_iteration()
+            if not settled():
+                break
         it = Iteration(n)
         state, findings = diagnose(it)
         if on_diagnose:
@@ -390,6 +455,7 @@ def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
             it.refused = out.refused = ex.report.refused
         else:
             guard.note([r for recs in new.values() for r in recs], n)
+            moved = _moved_hashes([r for recs in new.values() for r in recs])
         if on_iteration:
             on_iteration(it)
         if it.refused:
@@ -402,24 +468,25 @@ def run(ctx, reg, ex, *, scan: Callable[[int], object], max_iterations: int,
             out.stop = FIXED_POINT
             break
     else:
-        # 到顶：上一次迭代还做成了新动作。再看一次（不执行），把下一次迭代会做的列成待做
+        # 到顶：上一次迭代还做成了新动作。再看一次（不执行），把下一次迭代会做的列成待做——同样先等搬完
         ex.new_iteration()
-        it = Iteration(n + 1, final=True)
-        state, findings = diagnose(it)
-        errs = list(getattr(state, "qbit_errors", None) or [])
-        if errs:
-            # 残缺的种子视图里"还要做什么"不可信：待做的不列，原因交给调用方（`cmd_run` 按重扫读不全报 critical）
-            out.final_degraded = errs[0]
-            out.stop = CAP
-        else:
-            todo, it.memo, osc, it.deferred = guard.screen(findings, n + 1, select=select, write=False)
-            it.attempted, it.reversed = len(todo), len(osc)
-            out.oscillations += osc
-            out.pending = todo
-            out.stop = CAP if todo else FIXED_POINT
-        out.iterations.append(it)
-        if on_iteration:
-            on_iteration(it)
+        if settled():
+            it = Iteration(n + 1, final=True)
+            state, findings = diagnose(it)
+            errs = list(getattr(state, "qbit_errors", None) or [])
+            if errs:
+                # 残缺的种子视图里"还要做什么"不可信：待做的不列，原因交给调用方（`cmd_run` 按重扫读不全报 critical）
+                out.final_degraded = errs[0]
+                out.stop = CAP
+            else:
+                todo, it.memo, osc, it.deferred = guard.screen(findings, n + 1, select=select, write=False)
+                it.attempted, it.reversed = len(todo), len(osc)
+                out.oscillations += osc
+                out.pending = todo
+                out.stop = CAP if todo else FIXED_POINT
+            out.iterations.append(it)
+            if on_iteration:
+                on_iteration(it)
 
     out.detector_errors = list(errors.values())
     fps = set()

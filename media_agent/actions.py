@@ -218,6 +218,10 @@ class Executor:
         # `write_sidecar` 排在最后、且是整份覆盖，而它的 payload 是**诊断阶段**
         # 算出来的快照——不带上这些，本轮刚抓的集会被旧快照盖掉。
         self._grabbed: dict[str, set] = {}
+        # 本批次改了名的番目录：{旧目录: 新目录}（跨迭代留着）。qBittorrent 的搬运是异步的，改名之后旧目录常常还在
+        # （种子还在里面搬）——往它里面写档案 / 钉身份，就在搬空之后留下一个只剩 `.media-agent.json` 的幽灵目录
+        # （2026-09-27 审查）。档案跟着新目录走，下一次扫描按新目录重算。
+        self._renamed_dirs: dict[str, str] = {}
         # 本批次已经处置掉的种子记录与已搬进隔离区的路径。诊断是一次性全量产出的，
         # 同一个输家常常同时挂着 trash（op 5）和 rename（op 6）：种子删了之后
         # 再去 `files()` 就是 404，记成 failed 还会污染 `find_failure_patterns`
@@ -858,6 +862,8 @@ class Executor:
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
+        if self._dir_renamed(f, a, show_dir):
+            return
         if not show_dir.is_dir():
             # 目录改名（op 8）排在写档案（op 10）之前：诊断期的路径已经不在了。档案跟着目录走了，
             # 下一轮按新目录重算；往旧路径写只会凭空建一个目录或失败。
@@ -911,6 +917,8 @@ class Executor:
         if self.dry_run:
             self._audit("skipped", f, a, {"reason": "dry-run"})
             return
+        if self._dir_renamed(f, a, show_dir):
+            return
         if not show_dir.is_dir():
             self._audit("skipped", f, a, {"reason": f"目录已不在：{show_dir}"})
             return
@@ -951,6 +959,18 @@ class Executor:
                                 what="写 sidecar ", undo=undo):
                 return
         self._audit("applied", f, a, undo=undo)
+
+    def _dir_renamed(self, f: Finding, a: Action, show_dir: Path) -> bool:
+        """这个番目录本批次已经改了名（`_renamed_dirs`）：不往旧目录里写，记 skipped。返回是不是。
+
+        只看 `is_dir()` 不够：qBittorrent 的 setLocation 是异步的，种子还在旧目录里搬的时候旧目录还在，写进去的档案
+        等搬空之后就是一个只剩 `.media-agent.json` 的幽灵目录（2026-09-27 审查：`FakeQbit.async_moves` 复现）。"""
+        new = self._renamed_dirs.get(str(show_dir))
+        if new is None:
+            return False
+        self._audit("skipped", f, a, {"reason": (f"目录本批次已改名为 {Path(new).name}（qBittorrent 可能还在搬旧目录里的"
+                                                 f"文件）：不往旧目录写，档案按新目录重算")})
+        return True
 
     @staticmethod
     def _sidecar_changed(p: Path, before: str | None) -> bool | None:
@@ -1818,6 +1838,8 @@ class Executor:
                 else:
                     move_unsure.append({"hash": h, "error": _describe(e)})
 
+        if moved_ok:
+            self._renamed_dirs[str(old)] = str(new)
         if move_failed or move_unsure:
             # 有种子没搬成功就中止：此时目录处于半迁移状态，
             # 继续 mv 剩余文件只会让情况更糟，交给人处理。
@@ -1866,6 +1888,7 @@ class Executor:
                   if under(prev_savepath, old) else prev_savepath, bid))
             ])
 
+        self._renamed_dirs[str(old)] = str(new)
         self._audit("applied", f, a,
                     {"new_path": str(new), "torrents_moved": len(moved_ok),
                      "leftover_files_moved": leftovers,

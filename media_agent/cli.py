@@ -935,7 +935,8 @@ def _run(args, cfg, rh) -> int:
 
 
 _STOP = {converge.FIXED_POINT: "不动点", converge.CAP: "到上限", converge.DRY_RUN: "预演只跑一次",
-         converge.REFUSED: "拒绝", converge.CRASHED: "半路冲出"}
+         converge.REFUSED: "拒绝", converge.CRASHED: "半路冲出",
+         converge.MOVING: "qBittorrent 还在搬存储，剩下的下一轮做"}
 
 
 def _loop_brief(out) -> str:
@@ -944,7 +945,9 @@ def _loop_brief(out) -> str:
 
 
 def _print_loop(out, limit: int = 10) -> None:
-    """到顶时还要做的、两条规则打架的：逐条说。"""
+    """到顶时还要做的、两条规则打架的、没等到 qBittorrent 搬完的：逐条说。"""
+    if out.stop == converge.MOVING:
+        print(f"  ⏳ {out.unsettled}")
     if out.stop == converge.CAP and out.pending:
         print(f"  ⚠️  迭代到上限 {out.max_iterations} 次仍有 {len(out.pending)} 个动作待做（下一轮 run 接着做）：")
         for f in out.pending[:limit]:

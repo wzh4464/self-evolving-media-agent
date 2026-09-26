@@ -322,6 +322,29 @@ def test_run_renames_a_show_dir_and_writes_its_sidecar_in_one_run(offline_cli):
     assert rep["status"] == "ok", rep["reasons"]
 
 
+def test_run_stops_while_qbittorrent_is_still_moving_and_says_so(offline_cli, monkeypatch, capsys):
+    """目录改名之后 qBittorrent 在时限内没搬完：这一轮停在第一次迭代（不在半搬的视图上诊断），退出码 0，输出与健康
+    报告写明为什么停、剩下的下一轮做。"""
+    lib = offline_cli
+    lib.qbit.async_moves = True
+    monkeypatch.setattr(converge, "SETTLE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(converge, "_sleep", lambda s: None)
+    lib.tmdb.add_show(77, "新名字", seasons={1: weekly(2, first_days_ago=900)})
+    sh = lib.show("旧名字")
+    sh.season(1).torrent({"新名字 S01E01.mkv": 600_000_000, "新名字 S01E02.mkv": 600_000_000},
+                         name="新名字 01-02", layout="nosub")
+    sh.sidecar(tmdb_id=77, tmdb_title="新名字")
+
+    assert cli.cmd_run(_args(no_tmdb=False), lib.cfg) == 0
+
+    rep = _latest(lib)
+    assert rep["loop"]["stop"] == converge.MOVING and "还在搬" in rep["loop"]["unsettled"]
+    assert len(rep["loop"]["iterations"]) == 1
+    out = capsys.readouterr().out
+    assert "qBittorrent 还在搬存储" in out and "剩下的下一轮做" in out
+    assert any("qBittorrent 还在搬存储" in line for line in health.render(rep))
+
+
 # ------------------------------------------------------------------ 半路冲出
 def test_a_crash_in_a_later_iteration_still_reports_what_earlier_iterations_did(offline_cli, monkeypatch,
                                                                                 capsys):
