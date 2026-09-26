@@ -13,6 +13,10 @@
 
 ## [Unreleased]
 
+条目里的 `critic N…` / `critic §…`、`testinfra B…`、`LAT-…`、`runloop §…` 是整改前那轮只读测绘的
+编号，逐条的说明、日期与批次 ID 见
+[审计编号索引](.agents/notes/implemented/process/2026-09-26-phase1-audit-index.md)。
+
 ### 新增
 - `CHANGELOG.md` 与版本约定。
 - 离线测试基座（`uv run pytest`）：按生产 qBittorrent v5.2.3 实测语义建模的
