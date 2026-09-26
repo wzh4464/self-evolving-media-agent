@@ -22,6 +22,7 @@ media_agent/
   audit.py        audit.jsonl 的读写：写永不抛（降级 / 转写 audit.fallback.jsonl），读两个文件一起读
   purge.py        隔离区里每一份能不能真删（按处置类别的判据）
   disposal.py     硬删除的唯一出口：预写 purge.jsonl、容量闸、run / purge 的处置
+  history.py      发现历史：每轮全部发现落 state/findings/，指纹 = 规则 + 类型 + 目标（不含摘要）
   evolution.py    自演进：残留检测 → 提议 → 影子验证 → 提升
   cli.py          命令行入口
 .agents/

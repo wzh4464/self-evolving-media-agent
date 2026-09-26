@@ -16,7 +16,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from . import __version__, disposal, runlock
+from . import __version__, disposal, history, runlock
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -172,10 +172,19 @@ def cmd_scan(args, cfg) -> int:
     return 0
 
 
+def _record_findings(cfg, run_id: str, findings, state, cmd: str) -> None:
+    """这一轮的全部发现写进发现历史（`history`，critic N11）。写不进去只在 stderr 说一句：观测不拦正事。"""
+    _, problems = history.write_snapshot(cfg.state_dir, run_id, findings, cmd=cmd,
+                                         degraded=bool(state.qbit_errors))
+    for p in problems:
+        _log(f"⚠️  发现历史：{p}")
+
+
 def cmd_diagnose(args, cfg) -> int:
     ctx = build_context(cfg)
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
     findings = build_registry().run_all(ctx, state)
+    _record_findings(cfg, new_run_id(), findings, state, "diagnose")
     if not args.json:
         _warn_degraded(state)
     _print_findings(findings, args.json)
@@ -506,17 +515,20 @@ def cmd_evolve(args, cfg) -> int:
 
 def cmd_run(args, cfg) -> int:
     """一轮完整自治。"""
+    # 批次 ID 先定下来：发现历史、审计、隔离区处置、健康报告都用这一个，彼此对得上
+    run_id = new_run_id()
     ctx = build_context(cfg, need_llm=True)
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
     reg = build_registry()
 
     findings = reg.run_all(ctx, state)
+    _record_findings(cfg, run_id, findings, state, "run")
     print(f"═══ 诊断：{len(findings)} 个问题 ═══")
     _warn_degraded(state)
     _print_findings(findings, False)
 
     dry = args.dry_run or not cfg.auto_apply
-    ex = Executor(ctx, dry_run=dry)
+    ex = Executor(ctx, dry_run=dry, run_id=run_id)
     report = ex.apply(findings)
     if report.refused:
         # fail closed：不修、不演进（演进器会拿这份残缺快照去立规则）、

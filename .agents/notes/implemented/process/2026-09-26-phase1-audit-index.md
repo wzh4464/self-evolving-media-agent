@@ -22,6 +22,7 @@
 | N7 | `Finding.key()` = `(kind, path)`：同一目录两个死种的 `content_path` 相同，第二条被去重吞掉 | 3ef6825；删除关口按目标（路径 + hash）复核、不按 key，680962b 起 |
 | N8 | 隔离区与媒体在同一个 APFS 容器（约 94% 满）：隔离不腾空间，跨卷搬运是先拷后删，磁盘满时搬到一半失败 | 第 2 阶段：容量闸 `MIN_FREE_GB` 86b1cc5；搬进 / 搬出隔离区先看放不放得下 1a3e5c6。见 `architecture/2026-09-26-quarantine-disposal.md`。余项（写审计本身在磁盘满时抛异常，冲出 `apply()`、整轮连隔离区处置一起中止）：第 3 阶段 105aeee；搬到一半失败的结局按盘上状态认 d6d7d6b |
 | N10 | 批次 ID 只精确到秒，同一秒起的两个执行器共用一个回退单元（launchd 上 media-agent 与 vpn-watchdog 周期同为 21600 秒） | 0b5a02e |
+| N11 | 没有结构化的发现历史：无动作的发现只以文字进 run.log；没有路径的发现去重键退回 `(show, summary)`，摘要里嵌着计数，跨轮认不出同一个问题——"卡住"检测无从谈起 | 第 3 阶段：发现历史与稳定指纹（`history.py`），见 `architecture/2026-09-26-run-health.md` 第 1 节 |
 | N12 | 回退只写一条汇总：逐步还原了什么没有审计，健康摘要看不见回退改了什么 | 第 3 阶段 8c901f5（逐步记录；回退记录不带逆操作，回退不能再回退）。见 `architecture/2026-09-26-honest-audit.md` 第 8 节 |
 | N15 | 抓取后的即时改名 `rename_single_video` 算目标名时丢掉条目的文件夹层（`_op_rename` 保留）：409 撞上一个已有的 Original 布局种子时，文件被挪到 save_path 根下 | 8a0dec9，见 `architecture/2026-09-26-path-claims.md` 第 4 节 |
 | N17 | `rescue.py` / `vpn-watchdog.sh` 重建 qBittorrent 容器时不看任何锁或维护窗口；运行锁应覆盖 `purge --apply`、`rollback`、`repair` 与手动会话 | 部分：0b5a02e（运行锁）；两个脚本仍不看锁 |
@@ -51,8 +52,10 @@
 
 | 编号 | 是什么 |
 |---|---|
+| §4 | 输出与日志：发现与汇总进 stdout、日志进 stderr，launchd 追加到 `state/run.log` / `run.err.log`；两份日志都没有时间戳、批次号、轮次分隔，也不轮转（生产 run.log 1.8 MB / 159 轮）；没有动作的轮次不留任何审计 |
 | §5 | launchd 的实际配置（每 21600 秒 `run`，当时经 `uv run` 启动），以及"`media_agent/` 与 `deploy/` 里没有任何锁"的核实 |
 | §6 | 实测一轮的成本：170 部番、2,325 个文件、539 个种子，`diagnose` 约 44 秒，完整 `run` 约 1.5–2 分钟（运行锁等待时长据此取 10 秒） |
+| §8a | 定点循环的设想里对"永远被跳过的动作"的统计：`rename_show_dir`「目标目录已存在」连续 53 轮、「集位被占」28 轮（到 2026-09-24）、`delete_category`「仍有种子」反复出现——每轮单独看都只是一条 skipped |
 | §8c | 设想中的"每 30 分钟只抓取"模式：必须与 `run` 共用一把锁，否则落在 `run` 诊断与执行之间的抓取会被诊断期的 sidecar 快照盖掉，同一集再抓一遍 |
 
 ## deploy 调研

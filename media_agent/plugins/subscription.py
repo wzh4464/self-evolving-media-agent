@@ -408,6 +408,7 @@ class IncompleteSeasonDetector:
                             for e in eps if e["episode_number"] == n and d > today]
                 yield Finding(
                     rule=self.id, kind=self.kind, severity=sev,
+                    subject=f"S{sn:02d}",
                     summary=(f"S{sn:02d} 缺 {len(missing)} 集（已播 {len(aired)} 集，"
                              f"已有 {len(have[sn] & aired)} 集）：{missing[:10]}{tail}"),
                     show=show.dir_name,

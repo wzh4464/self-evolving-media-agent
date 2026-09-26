@@ -404,6 +404,7 @@ class EpisodeAvailableDetector:
                 if not mid:
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="minor",
+                        subject=f"S{int(season_key):02d}",
                         summary=(f"「{show.official_title}」缺 {len(missing)} 集"
                                  f"{missing[:8]}，但找不到 Mikan 番组页，无从抓取"),
                         show=show.dir_name,
@@ -466,6 +467,7 @@ class EpisodeAvailableDetector:
                         if wrong_season:
                             yield Finding(
                                 rule=self.id, kind=self.kind, severity="minor",
+                                subject=f"S{int(season_key):02d}E{ep:02d}",
                                 summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                          f"只搜到 {len(wrong_season)} 个明显属于别季的同集号"
                                          f"发布，全部跳过"),
@@ -485,6 +487,7 @@ class EpisodeAvailableDetector:
                         # 有人发了但没一个合格——报出来，别悄悄跳过
                         yield Finding(
                             rule=self.id, kind=self.kind, severity="minor",
+                            subject=f"S{int(season_key):02d}E{ep:02d}",
                             summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                      f"已有 {len(cands)} 个发布，但都未通过硬门槛"
                                      f"（{'、'.join(sorted({v.blocked_by for _c, v in scored}))}），"
@@ -498,6 +501,7 @@ class EpisodeAvailableDetector:
                     verdict = next(v for c, v in scored if c is best)
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="important",
+                        subject=f"S{int(season_key):02d}E{ep:02d}",
                         summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                  f"可抓取（{len(cands)} 个候选中选 {verdict.why()}）"),
                         show=show.dir_name,

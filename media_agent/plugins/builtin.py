@@ -527,6 +527,7 @@ class DuplicateEpisodeDetector:
                 if len(phantoms) == len(files):
                     yield Finding(
                         rule=self.id, kind="phantom_only", severity="minor",
+                        subject=f"S{season:02d}E{ep:02d}",
                         classified=True,
                         summary=(f"S{season:02d}E{ep:02d} 的 {len(files)} 个候选都是种子声明了、"
                                  f"盘上却没有的幻影，没有可保留的真文件，本轮不做取舍"),
@@ -584,6 +585,7 @@ class DuplicateEpisodeDetector:
                     protected |= {id(f) for f, _ in seals if f.torrent_hash != top}
                     yield Finding(
                         rule=self.id, kind="seal_conflict", severity="important",
+                        subject=f"S{season:02d}E{ep:02d}",
                         classified=True,
                         summary=(f"S{season:02d}E{ep:02d} 有 {len(seal_torrents)} 个不同的种子都钉着"
                                  f"这一集且复核通过，封存不替择源二选一：都不删，需人工挑一个"),
@@ -597,6 +599,7 @@ class DuplicateEpisodeDetector:
                 if pending and not sealed:
                     yield Finding(
                         rule=self.id, kind="pending_ownership", severity="minor",
+                        subject=f"S{season:02d}E{ep:02d}",
                         classified=True,
                         summary=(f"S{season:02d}E{ep:02d} 有 {len(files)} 个候选，但其中 "
                                  f"{len(pending)} 个仍在 AutoBangumi 的分类下"
@@ -613,6 +616,7 @@ class DuplicateEpisodeDetector:
                 if len(files) > 3:
                     yield Finding(
                         rule=self.id, kind="suspicious_episode_parse", severity="minor",
+                        subject=f"S{season:02d}E{ep:02d}",
                         summary=(f"S{season:02d}E{ep:02d} 竟有 {len(files)} 个文件声称是同一集，"
                                  f"判定为集号解析异常而非重复，已跳过删除"),
                         show=show.dir_name, path=str(files[0].path),
@@ -633,6 +637,7 @@ class DuplicateEpisodeDetector:
                     if holdback:
                         yield Finding(
                             rule=self.id, kind="pending_ownership", severity="minor",
+                            subject=f"S{season:02d}E{ep:02d}",
                             classified=True,
                             summary=(f"S{season:02d}E{ep:02d} 已封存 {keeper.filename}，"
                                      f"但另 {len(holdback)} 个候选的发布名认不出这个集位，"
@@ -1267,6 +1272,7 @@ class CategoryConsolidationDetector:
                 continue          # 还有种子留在这个分类里，不能删
             yield Finding(
                 rule=self.id, kind="empty_category", severity="minor",
+                subject=f"分类:{cat}",
                 summary=f"分类 `{cat}` 合并后已无种子，可删除",
                 evidence={"had_torrents": len(members)},
                 action=Action(op="delete_category", args={"category": cat},
