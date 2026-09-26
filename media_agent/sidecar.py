@@ -75,6 +75,14 @@ class Sidecar:
     # 集号 <= 偏移量时才加——两种解释的取值区间不重叠。
     # 登记了就是"这个季号换算得进来"：`{"3": 0}` = 发布方写的第 3 季就是库里这一季、集号不变
     # （桜都把入间同学的第四季标成「第3季」）。没登记的别季发布，抓取不收、改名不认（LAT-03）。
+    episode_offsets: dict[str, int] = field(default_factory=dict)
+    # {"3": -24} = 库里第 3 季的发布按连续集号编，原始集号加上 -24 才是季内集号（`- 25` 是 S03E01）。
+    # 与 `season_offsets` 是两回事：那边的键是发布方**声明的**季号、`集号 <= 偏移` 才加；这里的键是**库内季号**
+    # （文件落在哪个 `Season N`），这一季的原始集号一律加——AutoBangumi 订阅行上的 `episode_offset` 就是这个意思
+    # （整条订阅一个值，只对它订阅的那一季）。它以前只活在 AB 库里，AB 退役就丢了；这里没登记的季，
+    # 规则暂时退回 AB 订阅行（`builtin.episode_offset_for`）。
+    # 只换算原始集号：文件名里已经是 `SxxEyy` 的不动；换算出非正数 = 认不出（不抓、不改名、不参与判重）。
+    # 登记了就算数：`{"3": 0}` = 这一季不换算，盖过 AB 订阅行上的偏移。
 
     # --- 版本 ---
     require_any: list[str] = field(default_factory=list)
@@ -140,9 +148,11 @@ DERIVED = frozenset({"canonical_title", "tmdb_title", "aliases", "bangumi_id", "
 #           填一次（sidecar-sync 按扫描搜到的；模型在多个候选里选的经 `pin_tmdb` 动作），填上之后只有人改——
 #           身份一变，改名目标、目录名、分类全跟着变（LAT-04：同一个目录的文件在两个标题之间来回改名）。
 IDENTITY = frozenset({"tmdb_id", "tmdb_source"})
-# USER_INTENT：人写的。代码从不写它们；写档案时一律以**此刻文件里的**为准，payload 里带的旧值不算数。
-#              `mikan_id` 2026-09-26 起也归这里：抓取不再写它（选中的页记在 state/ 缓存）。
-USER_INTENT = frozenset({"season_offsets", "require_any", "notes", "mikan_id", "pinned"})
+# USER_INTENT：人写的。写档案（`write_sidecar`）从不写它们；写档案时一律以**此刻文件里的**为准，payload 里带的
+#              旧值不算数。`mikan_id` 2026-09-26 起也归这里：抓取不再写它（选中的页记在 state/ 缓存）。
+#              `episode_offsets`：人写的换算（在 AutoBangumi 里写下的是订阅行的 `episode_offset`）。
+USER_INTENT = frozenset({"season_offsets", "episode_offsets", "require_any", "notes", "mikan_id",
+                         "pinned"})
 BOOKKEEPING = frozenset({"schema_version", "updated_at"})
 
 

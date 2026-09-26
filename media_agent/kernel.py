@@ -202,15 +202,16 @@ class Show:
 
 
 def episode_of_file(f: "MediaFile", *, allow_release_name: bool = True,
-                    episode_offset: int = 0) -> tuple | None:
+                    episode_offset=0) -> tuple | None:
     """一个文件对应哪一 (季, 集)；认不出返回 None。**集号解析的唯一入口。**
 
     `allow_release_name=False` 时只认已改名成 `SxxExx` 的规范名。需要区分
     "库里已经规整好的" 与 "下完了但还没改名的" 时用它。
 
-    `episode_offset`：AutoBangumi 订阅的集号偏移，与判重的 `builtin._resolve` 同一口径
+    `episode_offset`：集号偏移，与判重的 `builtin._resolve` 同一口径
     （`naming.apply_episode_offset`）——只换算发布名里的原始集号，已规范的 `SxxEyy` 不动；
-    换算出非正数就是认不出。以前这里完全不看偏移：生产 AB id 37 的 `- 25` 在判重里是
+    换算出非正数就是认不出。一个整数，或 `库内季号 → 偏移` 的函数（`builtin.episode_offset_for`：
+    偏移是按季登记的，按这个文件落在的那一季取）。以前这里完全不看偏移：生产 AB id 37 的 `- 25` 在判重里是
     S03E01、在 `have` / 抓取 / 订阅健康里是第 25 集（2026-09-26 修）。
 
     2026-09-07 审计前，这段逻辑在 `kernel` / `sidecar_sync` / `subscription`
@@ -220,20 +221,20 @@ def episode_of_file(f: "MediaFile", *, allow_release_name: bool = True,
     第 20 集（片名里的 20），`Isekai Quartet 3 - 08` 被读成第 3 集（季号），
     `Despicable Me 4` 这种电影还会凭空生出集号。
     """
-    from .naming import apply_episode_offset, parse_episode
+    from .naming import apply_episode_offset, parse_episode, season_of_dir
 
     sn, ep = parse_episode(f.filename)
+    # 发布名里几乎不带季号，落到目录指示的那一季；目录也没有就算第 1 季。
+    sd = season_of_dir(f.season_dir or "")
+    season = sn if sn is not None else (sd if sd is not None else 1)
     if ep is not None:
-        ep = apply_episode_offset(f.filename, ep, episode_offset)
+        shift = episode_offset(season) if callable(episode_offset) else episode_offset
+        ep = apply_episode_offset(f.filename, ep, shift)
     if ep is not None and sn is not None:
         return sn, ep
     if ep is None or not allow_release_name:
         return None
-    # 发布名里几乎不带季号，落到目录指示的那一季；目录也没有就算第 1 季。
-    from .naming import season_of_dir
-
-    sd = season_of_dir(f.season_dir or "")
-    return (sd if sd is not None else 1), ep
+    return season, ep
 
 
 def have_episodes(show: "Show", *, allow_release_names: bool = True) -> dict:
@@ -255,9 +256,11 @@ def have_episodes(show: "Show", *, allow_release_names: bool = True) -> dict:
         return out
     from .naming import VIDEO_EXTS
     # 插件层的判据（钉子、账本的换算要 sidecar 的 season_offsets），按需导入：builtin 在模块层导入 kernel
-    from .plugins.builtin import recorded_slot
+    from .plugins.builtin import episode_offset_for, recorded_slot
 
-    offset = int((show.bangumi or {}).get("episode_offset") or 0)
+    def offset(season: int) -> int:
+        return episode_offset_for(show, season)
+
     for f in show.files:
         if f.is_incomplete or f.path.suffix.lower() not in VIDEO_EXTS:
             continue

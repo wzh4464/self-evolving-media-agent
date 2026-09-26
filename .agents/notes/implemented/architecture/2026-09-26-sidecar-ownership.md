@@ -25,6 +25,7 @@
 | `seasons` | 派生（`have` 按盘上规范名；`aired/total/next_air/seasonal` 按 TMDB 缓存） | sidecar-sync、抓取（`have` 加一集）、回退（`have` 减一集） | 用这一轮算的，再并回**本轮抓的**集（`_grabbed`） |
 | `tmdb_id` / `tmdb_source` | 身份（扫描照它认，见 `architecture/2026-09-26-tmdb-identity-pinning.md`） | 只在**还没有**时填：sidecar-sync 按扫描搜到的（`search`）、`pin_tmdb` 动作（模型选的，`llm`）；之后只有人改（可写 `human`） | 文件里已有就不动；没有才填 |
 | `season_offsets` / `require_any` / `notes` | 人的意图 | 只有人 | 一律以此刻文件里的为准，payload 里的旧值不算数 |
+| `episode_offsets`（2026-09-27 起） | 人的意图：按库内季的集号偏移（AB `episode_offset` 的语义，见 `architecture/2026-09-27-episode-offsets.md`） | 人 | 同上 |
 | `mikan_id` | 人的意图（2026-09-26 起代码不再写，见 `bug-fix/2026-09-26-diagnose-writes-sidecars.md`） | 人（现存值有历史上自动写的） | 同上 |
 | `pinned` | 人的意图：列出的字段由人说了算 | 只有人 | 同上 |
 | `schema_version` / `updated_at` | 记账 | 每次写 | 每次写时重设 |

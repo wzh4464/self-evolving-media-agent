@@ -94,8 +94,19 @@ def explicit_slot(raw: str) -> tuple[int, int] | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def offset_episode(n: int, offset: int) -> int | None:
+    """原始集号加上这一季的集号偏移（sidecar 的 `episode_offsets`，迁移之前是 AutoBangumi 的 `episode_offset`）；
+    换算出非正数返回 None。**文件名、番组页标题、抓取挑候选都用这一处**，三边对"这是第几集"不能各说各的。
+
+    换算出非正数说明原始集号本来就是季内编号（`第三季 - 01` 配上 `-24`）。AutoBangumi 这时悄悄退回原始集号；
+    这里不猜：一季里两种编号混着来的发布说不清是哪一集，认不出（不收、不改名、不参与判重），交给人——
+    抓取把它报成"换算不进这一季"（`plugins/grab.py`）。"""
+    m = int(n) + int(offset or 0)
+    return m if m > 0 else None
+
+
 def apply_episode_offset(raw: str, ep: int, offset: int) -> int | None:
-    """AutoBangumi 的 `episode_offset`（整条订阅一个值）换算成季内集号。
+    """集号偏移（这一季一个值）换算成季内集号。
 
     **只换算发布名里的原始集号，不碰已经是 `SxxEyy` 的名字**——那是换算过之后的结果。
     生产 AB 订阅 id 37（《超超超超超喜欢你的100个女朋友》第三季，`-24`）：`- 25` 换算成
@@ -103,12 +114,11 @@ def apply_episode_offset(raw: str, ep: int, offset: int) -> int | None:
     `(3, -23)`，与刚下完的 `- 25`（`(3, 1)`）永远不在同一个桶里。
 
     换算出来不是正数（原始集号本来就是季内编号）返回 None——认不出，交给人，
-    不要提议改成 `S03E-23`。偏移为 0 时原样返回。
+    不要提议改成 `S03E-23`（`offset_episode`）。偏移为 0 时原样返回。
     """
     if not offset or _SXXEYY_RE.search(raw.rsplit("/", 1)[-1]):
         return ep
-    ep = int(ep) + int(offset)
-    return ep if ep > 0 else None
+    return offset_episode(ep, offset)
 
 
 def parse_episode(raw: str) -> tuple[int | None, int | None]:
@@ -249,7 +259,7 @@ _AUTO = object()
 
 
 def release_slot(raw: str, *, dir_season: int | None = None, ab_season: int | None = None,
-                 offsets: dict | None = None, episode_offset: int = 0,
+                 offsets: dict | None = None, episode_offset=0,
                  declared=_AUTO, parsed: tuple | None = None) -> tuple[int, int] | None:
     """一个名字（文件名、种子显示名、番组页标题）→ 库内集位；认不出、换算不了返回 None。
 
@@ -260,7 +270,9 @@ def release_slot(raw: str, *, dir_season: int | None = None, ab_season: int | No
       `season_offsets` 有它才换算（`集号 <= 偏移` 才加上偏移——Fyy Raws 的 `3rd Season - 08` 是第 58 集，
       Dynamis One 的 `4th Season - 79` 就是第 79 集），没有就返回 None（2026-08-31：把 `3rd Season - 08` 写成
       `S01E08`，撞掉了 2016 年真正的第 8 集）；
-    - AutoBangumi 的 `episode_offset` 只换算原始集号（`apply_episode_offset`），换算出非正数返回 None。
+    - 集号偏移只换算原始集号（`apply_episode_offset`），换算出非正数返回 None。`episode_offset` 是一个整数，
+      或者 `库内季号 → 偏移` 的函数（`builtin.episode_offset_for`：sidecar 的 `episode_offsets` 按季登记，
+      AutoBangumi 的只对它订阅的那一季）——按上面算出的季取。
 
     `parsed`：调用方已经 `parse_episode(raw)` 过就传进来，免得再解析一遍。"""
     season, ep = parsed if parsed is not None else parse_episode(raw)
@@ -279,7 +291,8 @@ def release_slot(raw: str, *, dir_season: int | None = None, ab_season: int | No
             return None
         if int(ep) <= int(off):
             ep = int(ep) + int(off)
-    ep = apply_episode_offset(raw, ep, int(episode_offset or 0))
+    shift = episode_offset(target) if callable(episode_offset) else episode_offset
+    ep = apply_episode_offset(raw, ep, int(shift or 0))
     if ep is None:
         return None
     return target, ep
@@ -346,9 +359,9 @@ def title_slot(title: str, *, target: int, offsets: dict | None = None,
       文件挪到别的季。
     - **季内的换算与抓取同一套**（`slot_in_season`）：偏移只进正片季，特典位只认标着特典的。
     - **声明了不止一个季号**（`第三季 / … S01E25`）说不清按哪一季编号：返回 None，不取其中一个。
-    - AutoBangumi 的 `episode_offset` 由调用方决定给不给（只有 AB 订阅的那一季、而且 AB 就是按这个标题下的才用；
-      给了就对标题里的原始集号换算——标题从来不是 AB 改出来的名字，`S01E25` 也照换，AB 自己就是这么做的）。
-      特典位不换算。
+    - 集号偏移（`episode_offset`）由调用方按目标季取（`builtin.episode_offset_for`：sidecar 的 `episode_offsets`，
+      没登记时是 AB 订阅在它那一季上的）；给了就对标题里的原始集号换算——标题从来不是改出来的名字，`S01E25` 也照换，
+      AB 自己就是这么做的；换算出非正数认不出（`offset_episode`）。特典位不换算。
     """
     ep = parse_episode(title)[1]
     if ep is None:
@@ -361,9 +374,10 @@ def title_slot(title: str, *, target: int, offsets: dict | None = None,
     if n is None:
         return None, why
     if episode_offset and target != 0:
-        n = int(n) + int(episode_offset)
-        if n <= 0:
-            return None, f"AutoBangumi 的 episode_offset {episode_offset} 换算出非正数"
+        shifted = offset_episode(n, episode_offset)
+        if shifted is None:
+            return None, f"集号偏移 {int(episode_offset):+d} 换算出非正数（{n} → {int(n) + int(episode_offset)}）"
+        n = shifted
     return (int(target), int(n)), ""
 
 

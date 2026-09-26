@@ -37,9 +37,37 @@ def _season_of(f: MediaFile, show: Show, parsed_season: int | None) -> int:
     return 1
 
 
-def _episode_offset(show: Show) -> int:
-    """AutoBangumi 订阅行上的 `episode_offset`；没有订阅或为 0 时返回 0。"""
-    return int((show.bangumi or {}).get("episode_offset") or 0)
+def episode_offset_for(show: Show, season: int) -> int:
+    """库内第 `season` 季的原始集号要加的偏移。**判重、改名、`have`、出处账本、抓取都问这一处**（critic N13）。
+
+    - sidecar 的 `episode_offsets` 登记了这一季：按它（`0` 也算——人说这一季不换算）；
+    - 没登记：退回 AutoBangumi 订阅行上的 `episode_offset`，**只对 AB 下载落进的那一季**
+      （`Season <season + season_offset>`，`abrow.library_season`）。
+
+    以前三处各算各的：`_slot_from` 与 `kernel.have_episodes` 对整部番都减 AB 的偏移（《100个女朋友》Season 1 的
+    `- 05` 换算成 -19、认不出），出处账本只对订阅的那一季，抓取压根不看（N13：`- 25` 进不了 S03E01、也不报）；
+    而且只认 AB 库——订阅一删（或 `deleted=1`），换算无声地没了。"""
+    offs = _show_intent(show)["episode_offsets"]
+    if str(season) in offs:
+        return offs[str(season)]
+    b = show.bangumi
+    if not b:
+        return 0
+    from ..abrow import episode_offset, library_season
+    return episode_offset(b) if library_season(b) == int(season) else 0
+
+
+def _clean_offsets(raw) -> dict[str, int]:
+    """sidecar 里人写的 `episode_offsets`：季号是数字的、值是整数（或写成字符串的整数）的才算，其余当没写。"""
+    out: dict[str, int] = {}
+    for k, v in (raw.items() if isinstance(raw, dict) else ()):
+        if not str(k).strip().isdigit() or isinstance(v, bool):
+            continue
+        try:
+            out[str(int(str(k).strip()))] = int(str(v).strip())
+        except (TypeError, ValueError):
+            continue                    # 写坏的一项：按没写认（判重不能因为人手误崩掉）
+    return out
 
 
 _OFFSET_CACHE: dict[str, dict] = {}
@@ -197,7 +225,7 @@ def _season_offsets(show: Show) -> dict:
 
 
 def _show_intent(show: Show) -> dict:
-    """这部番 sidecar 里人写的、规则要用的两样：`season_offsets` 与 `require_any`。一次扫描读一次
+    """这部番 sidecar 里人写的、规则要用的三样：`season_offsets`、`episode_offsets` 与 `require_any`。一次扫描读一次
     （`_OFFSET_CACHE`，扫描开头清空）。"""
     key = str(show.dir_path)
     if key not in _OFFSET_CACHE:
@@ -205,9 +233,10 @@ def _show_intent(show: Show) -> dict:
         try:
             sc = sc_mod.load(show.dir_path)
             _OFFSET_CACHE[key] = {"season_offsets": dict(sc.season_offsets or {}),
+                                  "episode_offsets": _clean_offsets(sc.episode_offsets),
                                   "require_any": [str(w) for w in (sc.require_any or []) if w]}
         except Exception:   # 坏 JSON / 读不了 sidecar.load 自己兜了；到这里是格式怪异：没有偏移 = 声明季对不上就不认（安全一侧）
-            _OFFSET_CACHE[key] = {"season_offsets": {}, "require_any": []}
+            _OFFSET_CACHE[key] = {"season_offsets": {}, "episode_offsets": {}, "require_any": []}
     return _OFFSET_CACHE[key]
 
 
@@ -279,15 +308,6 @@ def _library_season(f: MediaFile, show: Show) -> int:
     return _season_of(f, show, parse_episode(f.filename)[0])
 
 
-def _ab_offset_for(show: Show, season: int) -> int:
-    """AutoBangumi 的 `episode_offset` 只对它订阅的那一季有意义（AB 下的集都进 `Season <订阅季>`）。
-    《超超超超超喜欢你的100个女朋友》的订阅是第三季、-24：Season 1 里的 `第一季 - 05` 不是它下的，不减 24。"""
-    b = show.bangumi or {}
-    if not b or int(b.get("season") or 1) != season:
-        return 0
-    return _episode_offset(show)
-
-
 def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
     """出处账本对"这个文件是哪一集"怎么说：`("slot", 集位)` / `("conflict", None)` / `("", None)`（没话说）。
 
@@ -302,8 +322,8 @@ def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
     - 抓取行（`Row.grabbed`）：集位是抓取器按番组页 + 播出日期定的，与 `ma:` 钉子同源——照它；
     - 声明了**不止一个**季号（CR 系的 `第三季 / … S01E25`：中文段是季、英文段是 TMDB 的连续编号）：说不清按哪一季
       编号，没话说；
-    - 其余：放在文件**此刻所在的库内季**（`_library_season`），按此刻的 `season_offsets`、AB 的 `episode_offset`
-      （只对订阅的那一季）从番组页标题重算（`naming.title_slot`，季内换算与抓取挑候选同一处）——人后来补的换算关系
+    - 其余：放在文件**此刻所在的库内季**（`_library_season`），按此刻的 `season_offsets`、这一季的集号偏移
+      （`episode_offset_for`）从番组页标题重算（`naming.title_slot`，季内换算与抓取挑候选同一处）——人后来补的换算关系
       立刻生效。算得出是 `slot`；发布方声明的季号与库内不同、又没有换算关系（或者第三季的正片躺在特典位），是
       `conflict`：文件名里的集位不可信（2026-08-31 AB 把 `3rd Season - 08` 改成 `S01E08`）。
 
@@ -326,7 +346,7 @@ def ledger_view(f: MediaFile, show: Show) -> tuple[str, tuple[int, int] | None]:
         return "", None
     target = _library_season(f, show)
     slot, _why = title_slot(row.mikan_title, target=target, offsets=_season_offsets(show),
-                            episode_offset=_ab_offset_for(show, target))
+                            episode_offset=episode_offset_for(show, target))
     return ("slot", slot) if slot else ("conflict", None)
 
 
@@ -378,15 +398,16 @@ def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
 
 def _slot_from(raw: str, season: int | None, ep: int | None, f: MediaFile,
                show: Show) -> tuple[int, int] | None:
-    """`parse_episode(raw)` 的结果 → 库内集位：季号偏移、`episode_offset` 的换算。
+    """`parse_episode(raw)` 的结果 → 库内集位：季号偏移、集号偏移的换算。
     `_resolve`（文件名优先）与 `_release_slot`（只看发布名）共用，两边不能各算各的。"""
     if ep is None:
         return None
-    # 季号优先级与 `_season_of` 相同；声明的季号换算不了、`episode_offset` 换算出非正数都返回 None，
-    # 交给 `_numbering_conflict` 报警 / 交给人。换算本身在 `naming.release_slot`（出处账本的补录也用它）
+    # 季号优先级与 `_season_of` 相同；声明的季号换算不了、集号偏移换算出非正数都返回 None，
+    # 交给 `_numbering_conflict` 报警 / 交给人。换算本身在 `naming.release_slot`；集号偏移按算出来的那一季取
     return release_slot(raw, parsed=(season, ep), dir_season=season_of_dir(f.season_dir or ""),
                         ab_season=(show.bangumi or {}).get("season"),
-                        offsets=_season_offsets(show), episode_offset=_episode_offset(show))
+                        offsets=_season_offsets(show),
+                        episode_offset=lambda sn: episode_offset_for(show, sn))
 
 
 def _titles(show: Show) -> list[str]:

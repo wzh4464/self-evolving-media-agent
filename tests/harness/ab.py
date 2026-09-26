@@ -69,15 +69,16 @@ def make_ab_db(root: Path, container: str = "autobangumi") -> tuple[AutoBangumiD
 
 def insert_bangumi(abdb: AutoBangumiDB, *, id: int, official_title: str, title_raw: str,
                    save_path: str = "", season: int = 1, group_name: str = "",
-                   rss_link: str = "", episode_offset: int = 0,
+                   rss_link: str = "", episode_offset: int = 0, season_offset: int = 0,
                    aliases: list[str] | None = None, deleted: bool = False) -> dict:
     """直接写一行 bangumi（绕过 docker：这是布置测试现场，不是被测动作）。"""
     conn = sqlite3.connect(abdb.db_path)
     conn.execute(
         "INSERT INTO bangumi (id, official_title, title_raw, season, group_name, rss_link,"
-        " episode_offset, save_path, deleted, title_aliases) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " episode_offset, season_offset, save_path, deleted, title_aliases)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (id, official_title, title_raw, season, group_name, rss_link, episode_offset,
-         save_path, int(deleted), json.dumps(aliases or [], ensure_ascii=False)))
+         season_offset, save_path, int(deleted), json.dumps(aliases or [], ensure_ascii=False)))
     conn.commit()
     conn.close()
     return abdb.query("SELECT * FROM bangumi WHERE id=?", (id,))[0]
