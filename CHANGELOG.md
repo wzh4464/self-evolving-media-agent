@@ -18,6 +18,10 @@
   发布日期、落在哪部番、库内集位、发布方声明的季号与原始集号、版本词、偏好评分、为什么选它。抓取加种之后当场记
   （含以前只进了发现、审计里没有的发布日期、结构化评分、候选与落选数）；抓取的审计记录与逆操作带上 `infohash`，
   回退抓取把那一行标成撤销（不删）。账本写不进去不让抓取失败，审计里记 `ledger_error`。
+- **`media-agent ledger backfill [--dry-run]`**：给还没有出处的种子补账本——本项目的抓取审计（集位是抓取器定的）、
+  AutoBangumi 库的 `torrent` 表（只读，URL 里就是 infohash）、番组页 feed（按 enclosure 文件名认，7 天内不重复拉），
+  最后是 `ma:` / `manual:` 标签；报覆盖率与仍没有出处的种子。每轮 `run` 扫描之后自动补一次增量（只看新的）。
+  `media-agent ledger show <infohash>` 看某个种子那一行。
 - **TMDB 身份钉住**（critic N4、LAT-04）：扫描照 sidecar 里的 `tmdb_id` 认、不再按目录名重新搜；条目的标题与季
   按 tmdb_id 缓存（目录改名不再换键重查，一次 `tv_detail` 同时取两样）。模型在多个候选里选的条目这一轮不用，
   报 `tmdb_pick` 并由新动作 `pin_tmdb` 钉进 sidecar（`tmdb_source: llm`，有审计、能回退），下一轮起不再搜、不再问；

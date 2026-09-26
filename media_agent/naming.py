@@ -245,6 +245,46 @@ def declared_season(raw: str) -> int | None:
     return None
 
 
+_AUTO = object()
+
+
+def release_slot(raw: str, *, dir_season: int | None = None, ab_season: int | None = None,
+                 offsets: dict | None = None, episode_offset: int = 0,
+                 declared=_AUTO, parsed: tuple | None = None) -> tuple[int, int] | None:
+    """一个名字（文件名、种子显示名、番组页标题）→ 库内集位；认不出、换算不了返回 None。
+
+    判重分桶（`builtin._resolve`）、发布名独立确认（`builtin._release_slot`）、出处账本的补录与读取共用这一处，
+    不能各算各的：
+    - 季：名字里写的 `Sxx` > 季目录 `Season N`（`dir_season`）> AutoBangumi 订阅的季（`ab_season`）> 1；
+    - 发布方**声明**的季号（`declared`，默认按 `declared_season(raw)`）与库内季号不同：只有 sidecar 的
+      `season_offsets` 有它才换算（`集号 <= 偏移` 才加上偏移——Fyy Raws 的 `3rd Season - 08` 是第 58 集，
+      Dynamis One 的 `4th Season - 79` 就是第 79 集），没有就返回 None（2026-08-31：把 `3rd Season - 08` 写成
+      `S01E08`，撞掉了 2016 年真正的第 8 集）；
+    - AutoBangumi 的 `episode_offset` 只换算原始集号（`apply_episode_offset`），换算出非正数返回 None。
+
+    `parsed`：调用方已经 `parse_episode(raw)` 过就传进来，免得再解析一遍。"""
+    season, ep = parsed if parsed is not None else parse_episode(raw)
+    if ep is None:
+        return None
+    if season is not None:
+        target = season
+    elif dir_season is not None:
+        target = dir_season
+    else:
+        target = int(ab_season) if ab_season else 1
+    dec = declared_season(raw) if declared is _AUTO else declared
+    if dec is not None and dec != target:
+        off = (offsets or {}).get(str(dec))
+        if off is None:
+            return None
+        if int(ep) <= int(off):
+            ep = int(ep) + int(off)
+    ep = apply_episode_offset(raw, ep, int(episode_offset or 0))
+    if ep is None:
+        return None
+    return target, ep
+
+
 def declared_seasons(title: str) -> set[int]:
     """番组页发布标题里明写的季号。按 ` / ` 分开的每一段各认一次：中文名、日文名、英文名常各写各的
     （`辉夜大小姐想让我告白 第三季 / Kaguya-sama wa Kokurasetai S3 - 03`），`declared_season` 只看最后一段。

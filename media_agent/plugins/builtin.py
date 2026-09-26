@@ -17,9 +17,9 @@ from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
                       Registry, Show, tmdb_groups)
 from ..probe import MediaInfo, probe, size_for_compare
 from ..naming import (
-    SUB_EXTS, VIDEO_EXTS, apply_episode_offset, declared_season, is_extra_of,
+    SUB_EXTS, VIDEO_EXTS, declared_season, is_extra_of,
     is_normalized, normalize, parse_episode,
-    parse_pin, parse_quality, season_of_dir, subtitle_lang_tag, target_filename,
+    parse_pin, parse_quality, release_slot, season_of_dir, subtitle_lang_tag, target_filename,
     target_subtitle_filename,
 )
 
@@ -39,16 +39,6 @@ def _season_of(f: MediaFile, show: Show, parsed_season: int | None) -> int:
 def _episode_offset(show: Show) -> int:
     """AutoBangumi 订阅行上的 `episode_offset`；没有订阅或为 0 时返回 0。"""
     return int((show.bangumi or {}).get("episode_offset") or 0)
-
-
-def _apply_offset(raw: str, ep: int, show: Show) -> int | None:
-    """绝对集号 → 季内集号；**只换算发布名里的原始集号**（`naming.apply_episode_offset`）。
-
-    出处：《超超超超超喜欢你的100个女朋友》第三季用绝对集号 25-36 发布，
-    实际是 S03E01-E12，靠 AutoBangumi 的 episode_offset=-24 换算。以前连已经
-    规范成 `S03E01` 的名字也再减一次，落进 `(3, -23)`（2026-09-26 修）。
-    """
-    return apply_episode_offset(raw, ep, _episode_offset(show))
 
 
 _OFFSET_CACHE: dict[str, dict] = {}
@@ -249,23 +239,11 @@ def _slot_from(raw: str, season: int | None, ep: int | None, f: MediaFile,
     `_resolve`（文件名优先）与 `_release_slot`（只看发布名）共用，两边不能各算各的。"""
     if ep is None:
         return None
-    target = _season_of(f, show, season)
-
-    dec = declared_season(raw)
-    if dec is not None and dec != target:
-        off = _season_offsets(show).get(str(dec))
-        if off is None:
-            return None                  # 交给 SeasonNumberingConflictDetector 报警
-        # 同一部番里两种编号习惯并存：Fyy Raws 按分季编（3rd Season - 08），
-        # Dynamis One 按连续编（4th Season - 79）。用"该季之前的累计集数"
-        # 当阈值区分——两种解释的取值区间不重叠。
-        if int(ep) <= int(off):
-            ep = int(ep) + int(off)
-
-    ep = _apply_offset(raw, ep, show)
-    if ep is None:
-        return None                      # 换算出非正数：原始集号的口径不对，交给人
-    return target, ep
+    # 季号优先级与 `_season_of` 相同；声明的季号换算不了、`episode_offset` 换算出非正数都返回 None，
+    # 交给 `_numbering_conflict` 报警 / 交给人。换算本身在 `naming.release_slot`（出处账本的补录也用它）
+    return release_slot(raw, parsed=(season, ep), dir_season=season_of_dir(f.season_dir or ""),
+                        ab_season=(show.bangumi or {}).get("season"),
+                        offsets=_season_offsets(show), episode_offset=_episode_offset(show))
 
 
 def _titles(show: Show) -> list[str]:

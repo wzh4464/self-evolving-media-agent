@@ -55,7 +55,34 @@ AutoBangumi 登记它那一刻——而之后每条规则都在从文件名、�
 - **回退抓取**（`ungrab_episode`）：sidecar 的 `have` 摘掉这一集，账本那一行标 `retracted`（行留着）；
   账本写不进去写进回退汇报，不让回退失败。
 
+## 补录（`media_agent/ledger_backfill.py`）
+
+`media-agent ledger backfill [--dry-run]` 人手跑全量；每轮 `run` 扫描之后、诊断之前自动跑一次**增量**（只看还没有
+一行、或来源还是 `unknown` 的种子，用扫描读到的那份种子列表，不再问一遍 qBittorrent）。来源按可信程度：
+
+0. **抓取审计**（`grab_episode`；applied / unknown / **failed** 都认——补录只针对此刻就在 qBittorrent 里的种子，
+   它在，加种就发生过：2026-09-16 … 09-26 的 12 次抓取种子加上了、之后 NameError，全记成了 failed）。集位是
+   抓取器的，照记为定论。URL 的文件名就是 infohash。
+1. **AutoBangumi 库的 `torrent` 表**，只读（`mode=ro`，不停容器）：`name` = 番组页标题、`url` 里是 infohash
+   （`qb_hash` 永远 NULL），连带番组行的季与 `episode_offset`。
+2. 还剩下的、所在的番 sidecar 里有 `mikan_id`（或订阅链接里带番组 id）的：拉番组页 feed（与抓取共用 1 小时缓存），
+   按 enclosure URL 的文件名认——不下 .torrent。认不出的记 `lookup_miss`，7 天内不再为它们拉番组页。
+   认出了、但不知道谁加的：来源 `unknown`（钉着 `ma:` 的是本项目）。
+3. 最后只剩标签的：`ma:` 钉子（只有本项目的抓取打它，集位就是钉子）、`manual:`（人手加种时自己打的）；标题不知道，不编。
+
+集位按 `naming.release_slot` 算（判重分桶也用它：名字里的 Sxx > 季目录 > AB 的季；声明的季号只有 `season_offsets`
+有它才换算；AB 的 `episode_offset` 只换算原始集号）；钉着 `ma:` 的按钉子；换算不了的留空。只补没有的：幂等。
+任何一个来源读不了只说一句（`problems`），其余照补；账本打不开整个跳过，不重建。`run` 里补录出错说一句、照常跑。
+
+离线核对（生产 2026-09-26 的只读快照，不联网、不含第 2 步）：539 个种子补上 514 个——AB 458、本项目 54（审计里的
+抓取 + 只有钉子的）、人手 2；剩 25 个（多为 `group:` 标签的人手加种与合集）。有集位的 498 个；声明了别的季、
+换算不了、集位留空的 14 个（正相反的你与我 12 个 `第二季 - 13…23`，Re:Zero 2 个）。
+
 ## 测试
+
+`tests/test_ledger_backfill.py`：AB 库补录（只读、不停容器、集位留空不猜）；`season_offsets` 与 `episode_offset`
+的换算；审计里的旧抓取（含记成 failed 的）；番组页按 URL 认出、钉子的按钉子；认不出的报出来、7 天内不再拉番组页；
+幂等；预演不建库；抓取行不被覆盖；坏账本不重建；命令行报覆盖率；`run` 开头自动补；标签兜底。
 
 `tests/test_ledger_grab.py`：抓取记下它是什么（集位是抓取器的 58 不是标题里的 08、发布方编号、评分、落选数、
 番组页 id）；409 也记（来源 unknown）；预演不记；账本坏了抓取照样 applied、账本文件不动；回退只标撤销；

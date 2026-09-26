@@ -342,6 +342,8 @@ class LibraryState:
     title_decisions: dict = field(default_factory=dict)
     # 模型在多个 TMDB 候选里选的：这一轮不用，交给 `pin_tmdb` 动作钉进 sidecar（`identity` 检测器）
     tmdb_proposals: list = field(default_factory=list)
+    # `run` 开头出处账本增量补录的结果（`ledger_backfill.BackfillReport.to_dict()`）；没补过为 None
+    ledger_backfill: dict | None = None
 
     def all_files(self) -> Iterable[MediaFile]:
         for s in self.shows:

@@ -5,6 +5,7 @@
     media-agent apply     # 执行修复（--dry-run 预演）
     media-agent evolve    # 找规则盲区 → 提议新规则 → 验证 → 提升（需 EVOLVE_MODE=propose）
     media-agent purge     # 隔离区处置预演（--apply 真删，每个都先记 state/purge.jsonl）
+    media-agent ledger backfill  # 补录出处账本（--dry-run 只报覆盖率）；run 开头自动补增量
     media-agent run       # 一轮完整自治：diagnose → apply → [evolve] → 隔离区处置
                           # evolve 只在 EVOLVE_MODE=propose 时跑，默认 off（见 config.py）
 """
@@ -606,6 +607,63 @@ def _remind_commit(path) -> None:
           "（deploy/README.md「用户意图放在哪」）")
 
 
+def _print_backfill(rep, limit: int = 30) -> None:
+    """补录报告：各来源补了几行、覆盖率、仍然没有出处的种子（前 `limit` 个）。"""
+    print(f"═══ 出处账本：{rep.summary()} ═══")
+    for p in rep.problems:
+        print(f"  ⚠️  {p}")
+    if rep.remaining:
+        print(f"  没有出处的种子（{len(rep.remaining)}）：")
+        for r in rep.remaining[:limit]:
+            print(f"    {r['hash'][:8]}  {r['show'] or '(不在媒体库)'}  {str(r['name'])[:70]}")
+        if len(rep.remaining) > limit:
+            print(f"    …另 {len(rep.remaining) - limit} 个")
+
+
+def cmd_ledger_backfill(args, cfg) -> int:
+    """`media-agent ledger backfill [--dry-run]`：从抓取审计、AutoBangumi 库（只读）、番组页 feed 补录出处账本。"""
+    from . import ledger_backfill
+
+    ctx = build_context(cfg)
+    rep = ledger_backfill.backfill(ctx, dry_run=args.dry_run)
+    _print_backfill(rep)
+    return 0 if not rep.problems or rep.torrents else 1
+
+
+def cmd_ledger_show(args, cfg) -> int:
+    """`media-agent ledger show <infohash>`：账本里这一行（没有 / 读不了时说明）。"""
+    from . import ledger
+
+    rows, problem = ledger.load_rows(cfg.state_dir)
+    if problem:
+        print(f"⚠️  出处账本{problem}")
+        return 1
+    h = (args.infohash or "").strip().lower()
+    hits = [r for k, r in rows.items() if k.startswith(h)] if len(h) >= 6 else []
+    if len(hits) != 1:
+        print(f"账本里{'没有' if not hits else '不止一个'}以 {h!r} 开头的种子（至少写 6 位）")
+        return 1
+    print(json.dumps(hits[0].to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def _auto_backfill(ctx, state) -> None:
+    """每轮 `run` 开头的增量补录（只补还没有出处的），补上的挂回这一轮的文件上。永不抛：补不了照常跑。"""
+    from . import ledger_backfill
+
+    if not getattr(state, "qbit_listed", False):
+        return                                       # 这一轮没读到种子列表：没得补
+    try:
+        rep = ledger_backfill.backfill(ctx, torrents=state.torrents)
+    except Exception as e:                           # noqa: BLE001 —— 补录是记账：出错说一句，这一轮照常
+        _log(f"⚠️  出处账本补录出错（{type(e).__name__}: {e}），这一轮按已有的账本走")
+        traceback.print_exc()
+        return
+    state.ledger_backfill = rep.to_dict()
+    if rep.inserted or rep.problems:
+        _print_backfill(rep, limit=10)
+
+
 def cmd_health(args, cfg) -> int:
     """最近一轮（或 `--run` 指定那一轮）的健康报告；`--json` 原样输出。
 
@@ -758,6 +816,9 @@ def _run(args, cfg, rh) -> int:
                                        ts=scanned_at, source="run")
         if problem:
             _log(f"⚠️  {problem}")
+    # 出处账本的增量补录（`ledger_backfill`）：这一轮还没有出处的种子，从抓取审计、AB 库（只读）、番组页找回
+    # 它是什么，诊断之前挂到文件上
+    _auto_backfill(ctx, state)
     reg = build_registry()
 
     findings = reg.run_all(ctx, state)
@@ -889,6 +950,16 @@ def main() -> int:
     s.add_argument("--accept-torrent-count", action="store_true",
                    help="把此刻 qBittorrent 的种子数认作新基线（在 qBit 里手动批量删除之后）")
     s.set_defaults(func=cmd_health)
+
+    s = sub.add_parser("ledger", help="出处账本（state/ledger.sqlite）：补录、查一个种子")
+    lsub = s.add_subparsers(dest="ledger_cmd", required=True)
+    b = lsub.add_parser("backfill", help="从抓取审计、AutoBangumi 库（只读）、番组页补录没有出处的种子")
+    b.add_argument("--dry-run", action="store_true", help="只报会补什么、覆盖率，不写账本")
+    # 只写 state/ledger.sqlite（WAL，与 run 的自动补录不冲突）；真补录仍与 run 排队，免得两边同时拉番组页
+    b.set_defaults(func=cmd_ledger_backfill, lock=lambda a: not a.dry_run)
+    b = lsub.add_parser("show", help="账本里某个种子的那一行")
+    b.add_argument("infohash", help="infohash（至少前 6 位）")
+    b.set_defaults(func=cmd_ledger_show)
 
     s = sub.add_parser("run", help="完整自治轮次")
     s.add_argument("--dry-run", action="store_true")

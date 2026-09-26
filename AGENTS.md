@@ -26,6 +26,7 @@ media_agent/
   titles.py       TMDB 标题稳定闸：取不到不退回目录名、新标题连续两轮 run 才采用、30 天内不改回去（state/titles.json）
   sidecar.py      每部番的 .media-agent.json：字段归属（派生 / 身份 / 人的意图），按写的那一刻合并，坏文件不覆盖
   ledger.py       出处账本 state/ledger.sqlite：按 infohash 记每个种子是什么（番组页标题、集位、发布方编号、版本词、评分）
+  ledger_backfill.py  补录账本：抓取审计 → AB 库（只读）→ 番组页 feed → ma: / manual: 标签；run 开头自动补增量
   health.py       运行健康：种子数基线（骤降且审计解释不了 → 整轮拒绝）、每轮健康报告
   notify.py       通知邮件：健康报告有变化才发（一轮最多一封），去重在 state/notify.json，永不带密钥
   runlog.py       run 的输出每行带时间与批次 ID；run.log / run.err.log 先拷贝再截断地轮转（launchd 持有描述符）
@@ -55,6 +56,8 @@ uv run media-agent run                # 完整自治轮次（演进默认冻结�
 uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题、先不提醒（写 .agents/acks.json，要提交）
 uv run media-agent health               # 最近一轮的健康报告（--run ID 指定一轮，--json 原样）
+uv run media-agent ledger backfill      # 补录出处账本（--dry-run 只报覆盖率；run 开头自动补增量）
+uv run media-agent ledger show <hash>   # 账本里某个种子是什么
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 
