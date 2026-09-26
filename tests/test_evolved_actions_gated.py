@@ -57,6 +57,7 @@ def test_evolved_rule_actions_are_never_executed(lib, action):
 
 def test_rule_file_cannot_claim_to_be_builtin(lib):
     """`source` 字段来自 JSON 本身，模型写 `"source": "builtin"` 也不能绕过。"""
+    lib.configure(qbit_allow_empty=True)        # 纯本地文件的库：0 个种子是真的
     s1 = lib.show("测试番").season(1)
     s1.local("测试番 S01E01.mkv", size=1000)
     spec = RuleSpec.from_json(_rule({"op": "trash", "args": {}}, source="builtin"))

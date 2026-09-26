@@ -85,6 +85,7 @@ def test_grab_adds_pinned_torrent_and_bookkeeping_survives_the_batch(lib):
     `have` 那条断言守的是 2026-09-26 的记账事故：抓取（op 0）写进 sidecar 的新集
     被同批次 write_sidecar（op 10）用诊断期快照整份盖掉。
     """
+    lib.configure(qbit_allow_empty=True)        # 前 8 集是纯本地文件，qBit 里本来没有种子
     sh = lib.show("尼古喵喵")
     s1 = sh.season(1)
     for n in range(1, 9):

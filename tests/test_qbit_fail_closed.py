@@ -84,6 +84,55 @@ def test_torrents_failure_fails_closed_instead_of_crashing(lib):
     assert lib.snapshot() == before
 
 
+def _empty_session(lib, monkeypatch):
+    """qBit 登录正常、`torrents()` 成功，却一个种子都不报（端着空会话的 qBit）。"""
+    monkeypatch.setattr(lib.qbit, "torrents", lambda category=None: [])
+
+
+@pytest.mark.allow("log_failure", match="不可信")
+def test_empty_torrent_list_with_a_populated_library_fails_closed(lib, monkeypatch):
+    """审查复现：以前 refused 为空，`[Group] Akane-banashi - 13` 经文件系统改名成
+    `朱音落语 S01E13.mp4`，qBit 仍声明着原名——种子失联（LAT-01 的形态，且没有任何报错）。"""
+    s1, owned, fresh = _akane(lib)
+    _empty_session(lib, monkeypatch)
+    before = lib.snapshot()
+
+    c = lib.cycle()
+
+    assert c.report.refused and "0 个种子" in c.report.refused
+    assert lib.snapshot() == before
+    assert lib.qbit.file_names(fresh.hash) == ["[Group] Akane-banashi - 13 [1080p].mp4"]
+    assert fresh.path.exists()
+
+
+def test_empty_torrent_list_is_fine_for_an_empty_library(lib, monkeypatch):
+    lib.show("空番").season(1)
+    _empty_session(lib, monkeypatch)
+
+    c = lib.cycle()
+
+    assert not c.state.qbit_errors and not c.report.refused
+
+
+def test_empty_torrent_list_override_for_a_torrentless_library(lib, monkeypatch):
+    """库里确实一个种子都不用：`QBIT_ALLOW_EMPTY=1` 放行。"""
+    lib.configure(qbit_allow_empty=True)
+    s1 = lib.show("测试番").season(1)
+    s1.local("测试番 S01E01.mkv", size=1000)
+    _empty_session(lib, monkeypatch)
+
+    c = lib.cycle()
+
+    assert not c.state.qbit_errors and not c.report.refused
+
+
+def test_qbit_allow_empty_env_is_parsed(monkeypatch):
+    from media_agent.config import load_config
+    assert load_config().qbit_allow_empty is False
+    monkeypatch.setenv("QBIT_ALLOW_EMPTY", "1")
+    assert load_config().qbit_allow_empty is True
+
+
 def test_rollback_refuses_without_qbit(lib):
     _akane(lib)
     c = lib.cycle()

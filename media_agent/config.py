@@ -67,6 +67,9 @@ class Config:
     max_delete_gb_per_run: float
     dead_torrent_hours: int
     evolve_mode: str = "off"
+    # qBittorrent 登录成功却报 0 个种子、而媒体库里有视频时，扫描按"数据不完整"处理
+    # （见 scan.build_state）。库里确实一个种子都不用的，设 QBIT_ALLOW_EMPTY=1。
+    qbit_allow_empty: bool = False
 
     @property
     def state_dir(self) -> Path:
@@ -114,4 +117,5 @@ def load_config(env_file: Path | None = None) -> Config:
         max_delete_gb_per_run=float(g("MAX_DELETE_GB_PER_RUN", "200")),
         dead_torrent_hours=int(g("DEAD_TORRENT_HOURS", "48")),
         evolve_mode=_evolve_mode(g("EVOLVE_MODE", "off")),
+        qbit_allow_empty=_bool(g("QBIT_ALLOW_EMPTY", "false")),
     )

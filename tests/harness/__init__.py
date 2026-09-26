@@ -15,6 +15,10 @@ conftest.py 提供的 fixture（都是函数级）：
 
 marker：`live`（只读核对生产库，默认不跑）、`ffmpeg`（要真 ffprobe）、
 `allow(*kinds, match=None)`（声明预期的 tripwire 事件，种类见 `tripwire.KINDS`）。
+
+**只有本地文件、一个种子都没有的库**：扫描会把"qBit 报 0 个种子而库里有视频"当成
+数据不完整、整轮拒绝改动（生产的保护，见 scan.build_state）。这种测试先
+`lib.configure(qbit_allow_empty=True)`——等同生产上设 `QBIT_ALLOW_EMPTY=1`。
 """
 from .ab import FakeAB, make_ab_db
 from .library import Cycle, DirBuilder, LibraryBuilder, ShowBuilder, TorrentHandle
