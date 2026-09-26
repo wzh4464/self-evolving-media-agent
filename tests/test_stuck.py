@@ -281,7 +281,8 @@ def test_ack_command_writes_the_versioned_file_and_says_commit_it(offline_cli, c
 
 @pytest.mark.parametrize("kw, msg", [
     (dict(fingerprint="0123456789abcdef", reason="x"), "发现历史里没有"),
-    (dict(fingerprint="zz", reason="x"), "指纹"),
+    # 具体到格式那一句：「发现历史里没有指纹 zz」同样含「指纹」，放宽了格式检查也照样绿（复审变异 H2j）
+    (dict(fingerprint="zz", reason="x"), "6–16 位十六进制"),
     (dict(fingerprint="SEAL", reason=""), "--reason"),
     (dict(fingerprint="SEAL", reason="x", until="2026/12/31"), "YYYY-MM-DD"),
 ])
@@ -296,6 +297,66 @@ def test_ack_command_refuses_bad_input(offline_cli, capsys, kw, msg):
     assert cli.cmd_ack(_args(**kw), lib.cfg) != 0
     assert msg in capsys.readouterr().out
     assert not history.acks_path().exists()
+
+
+def test_ack_refuses_to_overwrite_an_unreadable_acks_file(offline_cli, capsys):
+    """读不了就不写：覆盖一个坏掉的文件会丢掉里面别的确认（复审变异 H2i：去掉这道闸全套照绿）。"""
+    lib = offline_cli
+    _seal_conflict(lib)
+    cli.cmd_run(_args(), lib.cfg)
+    p = history.acks_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    broken = '{"aaaaaaaaaaaaaaaa": {"reason": "别的确认"}, 坏'.encode()
+    p.write_bytes(broken)
+    capsys.readouterr()
+
+    assert cli.cmd_ack(_args(fingerprint=_conflict_fp(lib), reason="x"), lib.cfg) == 2
+    assert p.read_bytes() == broken
+    assert "先修好它" in capsys.readouterr().out
+    assert cli.cmd_ack(_args(fingerprint="aaaaaaaa", remove=True), lib.cfg) == 2
+    assert p.read_bytes() == broken
+
+
+def test_ack_refuses_an_ambiguous_prefix(offline_cli, capsys, monkeypatch):
+    """前缀对上不止一个指纹：不替人挑第一个（复审变异 H2m）。"""
+    lib = offline_cli
+    seen = {"abcdef0000000001": {"rule": "r", "kind": "k", "target": "a"},
+            "abcdef0000000002": {"rule": "r", "kind": "k", "target": "b"}}
+    monkeypatch.setattr(cli.history, "seen_fingerprints", lambda state_dir: seen)
+
+    assert cli.cmd_ack(_args(fingerprint="abcdef", reason="x"), lib.cfg) == 2
+    assert "不止一个" in capsys.readouterr().out
+    assert not history.acks_path().exists()
+
+    assert cli.cmd_ack(_args(fingerprint="abcdef0000000002", reason="x"), lib.cfg) == 0
+    assert list(json.loads(history.acks_path().read_text(encoding="utf-8"))) == ["abcdef0000000002"]
+
+
+def test_ack_remove_accepts_a_unique_prefix_and_refuses_an_ambiguous_one(offline_cli, capsys):
+    lib = offline_cli
+    history.save_acks({"abcdef0000000001": {"reason": "a"}, "abcdef0000000002": {"reason": "b"},
+                       "0123456789abcdef": {"reason": "c"}})
+
+    assert cli.cmd_ack(_args(fingerprint="abcdef", remove=True), lib.cfg) == 1
+    assert "不止一个" in capsys.readouterr().out
+    assert cli.cmd_ack(_args(fingerprint="01234567", remove=True), lib.cfg) == 0   # 复审变异 H2s
+    assert sorted(json.loads(history.acks_path().read_text(encoding="utf-8"))) == [
+        "abcdef0000000001", "abcdef0000000002"]
+
+
+def test_ack_force_needs_all_16_hex_digits(offline_cli, capsys):
+    """预先确认一个还没出现的问题要写全 16 位：短前缀以后可能对上别的指纹（复审变异 H2k）。"""
+    lib = offline_cli
+    assert cli.cmd_ack(_args(fingerprint="01234567", reason="x", force=True), lib.cfg) == 1
+    assert "写全 16 位" in capsys.readouterr().out
+    assert not history.acks_path().exists()
+
+
+def test_an_ack_with_an_invalid_until_is_not_active():
+    """`until` 写错了（13 月 40 日）当作过期：宁可多提醒，也不无限期静音（复审变异 H2g）。"""
+    acks = {"f": {"reason": "x", "until": "2026-13-40"}, "g": {"reason": "y", "until": "2026-12-31"}}
+    assert history.active_ack(acks, "f", date(2026, 9, 26)) is None
+    assert history.active_ack(acks, "g", date(2026, 9, 26)) == acks["g"]
 
 
 def test_ack_force_allows_a_fingerprint_not_seen_yet(offline_cli, capsys):
