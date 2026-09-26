@@ -375,6 +375,153 @@ def test_the_rezero_slot_with_its_real_pinned_episode_is_provable(lib, no_rmtree
     assert [c.trash_path for c in rep.deleted] == [moved]
 
 
+# 2026-09-26 审查（数据丢失向）：生产上 Re:Zero 的 sidecar **带着** season_offsets（{"3": 50}），
+# 上面"发布名声明了另一季、又没有偏移可换算"那条就不拦了——偏移只被当成"有换算依据"，从没真的
+# 换算过：`3rd Season - 08` 按 `_resolve` 自己的算法（集号 <= 偏移就加上偏移）是 S01E58。替代者的
+# 种子后来被摘了（保种到期、手动删种留文件）时连发布名都没有，文件名 `S01E08` 被当成定论，时长自证
+# 也分不出第 8 集和第 58 集。两条路都会把 2016 年唯一的原片硬删掉，容量闸下第 4 天就删。
+def _rezero_offsets(lib):
+    sh = lib.show(REZERO)
+    sh.sidecar(season_offsets={"3": 50})
+    return sh
+
+
+@pytest.mark.parametrize("category", ["Bangumi", REZERO], ids=["ab-owned", "handed-over"])
+def test_the_offset_is_applied_before_a_release_vouches(lib, no_rmtree, category):
+    moved = _rezero_trashed(lib)
+    _rezero_offsets(lib).season(1).single("Re:从零开始的异世界生活 S01E08.mkv", size=487_000_000,
+                                          name=FYY, category=category)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert not c.eligible and c.survivor is not None
+    if category != "Bangumi":
+        assert "S01E58" in c.why
+
+
+def test_a_release_the_offset_maps_onto_the_slot_vouches(lib, no_rmtree):
+    """对照：同一个发布名，隔离的是 S01E58 的输家——换算之后正是这一集，照删。"""
+    moved = legacy(lib, f"{REZERO} S01E58.mkv", show=REZERO, rule="duplicate-episode",
+                   kind="duplicate", days_ago=40, summary="S01E58 重复：…")
+    _rezero_offsets(lib).season(1).single("Re:从零开始的异世界生活 S01E58.mkv", size=487_000_000,
+                                          name=FYY)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.deleted] == [moved]
+
+
+def test_rezero_end_to_end_the_original_survives_the_retention(lib, no_rmtree):
+    """整条链：判重（按名字）把 1.41 GB 的原片清进隔离区、关口放行（隔离可回退）；31 天后 run
+    的处置不能把它硬删——替代者的发布名换算出来是 S01E58。"""
+    s1 = _rezero_offsets(lib).season(1)
+    real = s1.local(f"{REZERO} S01E08.mkv", size=1_410_655_350, probe=RAW)
+    s1.single("Re:从零开始的异世界生活 S01E08.mkv", size=487_000_000, name=FYY, probe=CHI)
+    ident = lib.ident(real)
+    lib.cycle()
+    [moved] = [p for p in lib.trash_files() if lib.ident(p) == ident]
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001", now=_later(31))
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert "S01E58" in c.why
+
+
+def test_rezero_is_not_released_early_under_the_capacity_guard(lib, no_rmtree):
+    moved = legacy(lib, f"{REZERO} S01E08.mkv", show=REZERO, rule="duplicate-episode",
+                   kind="duplicate", days_ago=4, summary="S01E08 重复：…",
+                   deletion={"gate": "passed", "disposition": "duplicate", "slot": [1, 8]})
+    _rezero_offsets(lib).season(1).single("Re:从零开始的异世界生活 S01E08.mkv", size=487_000_000,
+                                          name=FYY)
+    lib.configure(min_free_gb=10**9)                    # 空间"永远"不够
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert rep.low_space and not rep.early and not rep.deleted and moved.exists()
+
+
+def _episodes(s1, title, eps, spec):
+    """同季的时长参照（纯本地）；再在别处放一个种子——qBittorrent 一个种子都没有时重扫按
+    "会话没恢复"拒绝（QBIT_ALLOW_EMPTY），与这里要测的无关。"""
+    for n in eps:
+        s1.local(f"{title} S01E{n:02d}.mkv", size=1_300_000_000, probe=spec)
+    s1.show.lib.show("银八").season(1).single("银八 S01E01.mkv", name="[G] Gintama - 01.mkv")
+
+
+EP_LEN = video("hevc", duration=1440.0, subs=["chi 简体中文"])
+
+
+def test_a_survivor_without_a_torrent_is_not_trusted_by_its_name(lib, no_rmtree):
+    """AB 改错名的那份后来种子被摘、文件留着：发布名没了，名字 `S01E08` 无从核对。"""
+    moved = _rezero_trashed(lib)
+    s1 = lib.show(REZERO).season(1)
+    s1.local("Re:从零开始的异世界生活 S01E08.mkv", size=487_000_000, probe=EP_LEN)   # 其实是 E58
+    _episodes(s1, REZERO, (1, 2, 3), EP_LEN)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = [c for c in rep.pool if c.trash_path == moved]
+    assert not c.eligible and "没有种子" in c.why
+
+
+def _keeper_record(lib, surv, *, digest=None, keep_hash=""):
+    from media_agent.dedup import content_digest
+    return legacy(lib, "[Raw] Akane-banashi - 05.mkv", show="朱音落语", rule="duplicate-episode",
+                  kind="duplicate", days_ago=40, summary="S01E05 重复：…",
+                  deletion={"gate": "passed", "disposition": "duplicate", "slot": [1, 5],
+                            "keeper": {"path": str(surv), "hash": keep_hash,
+                                       "digest": digest or content_digest(surv)}})
+
+
+def test_a_torrentless_survivor_vouches_as_the_keeper_the_gate_recorded(lib, no_rmtree):
+    """没有种子的替代者只有一种能作保：它就是删除关口当初记下的那个保留方（内容摘要相同），
+    而且那时它也没有种子——判重当时凭的就是这份证据，此后没有丢掉任何东西。"""
+    s1 = lib.show("朱音落语").season(1)
+    surv = s1.local("朱音落语 S01E05.mkv", size=1_300_000_000, probe=EP_LEN)
+    _episodes(s1, "朱音落语", (1, 2, 3), EP_LEN)
+    moved = _keeper_record(lib, surv)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.deleted] == [moved]
+
+
+@pytest.mark.parametrize("change", ["replaced", "torrent-lost"])
+def test_a_torrentless_survivor_that_is_not_the_recorded_keeper_does_not_vouch(
+        lib, no_rmtree, change):
+    """摘要对不上（诊断之后换过文件）；或保留方当初有种子、现在没了（发布名这份证据丢了）。"""
+    s1 = lib.show("朱音落语").season(1)
+    surv = s1.local("朱音落语 S01E05.mkv", size=1_300_000_000, probe=EP_LEN)
+    _episodes(s1, "朱音落语", (1, 2, 3), EP_LEN)
+    moved = (_keeper_record(lib, surv, digest="1300000000:" + "0" * 32) if change == "replaced"
+             else _keeper_record(lib, surv, keep_hash="b" * 40))
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = [c for c in rep.pool if c.trash_path == moved]
+    assert "没有种子" in c.why
+
+
+def test_a_pack_member_whose_release_names_no_episode_does_not_vouch(lib, no_rmtree):
+    """合集的发布名认不出单集：没钉子的成员叫 S01E05 只是某次改名的结果，不作保（交给人）。"""
+    moved = legacy(lib, "[Raw] Yani Neko - 05.mkv", rule="duplicate-episode", kind="duplicate",
+                   days_ago=40, summary="S01E05 重复：…")
+    lib.show("尼古喵喵").season(1).torrent({"尼古喵喵 S01E05.mkv": GB, "尼古喵喵 S01E06.mkv": GB},
+                                         name="[G] Yani Neko [01-12][1080p]", layout="nosub",
+                                         probe=CHI)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert not c.eligible and "认不出" in c.why
+
+
 def test_a_survivor_still_under_its_release_name_is_found(lib, no_rmtree):
     """替代者还没改名（发布名里只有 `- 05`）：文件名正则找不到它，检测器的解析找得到。"""
     moved = legacy(lib, "朱音落语 S01E05.mp4", show="朱音落语", rule="duplicate-episode",

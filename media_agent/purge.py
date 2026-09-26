@@ -17,8 +17,9 @@
    旧记录摘要里的 `SxxEyy 重复`），剧目录取自当初的路径；看库里**现在**有没有、且只有一个文件
    占着这个集位——"占着"与 duplicate-episode 分桶同一个定义（`builtin._resolve`：钉子优先、
    季号偏移照算，不是文件名正则）。查的是当前实际状态，不是信审计日志里记的"保留了谁"——
-   日志是历史，文件可能后来又被换过。替代者的名字若只是 AutoBangumi 认为的、或者发布名明写着
-   另一季，它不能作保（2026-08-31 Re:Zero）。
+   日志是历史，文件可能后来又被换过。没钉子的替代者，名字要有名字之外的证据：发布名按同一套
+   换算（季号偏移照算）也落在这一集上；没有种子的只有它就是删除关口记下的那个无种子保留方时
+   才算（2026-08-31 Re:Zero，`_identity_problem`）。
 
 2. **替代者是完整的。** 有两条互斥的证明路径，满足其一即可：
 
@@ -223,18 +224,24 @@ def _holders(show, slot) -> list:
     return out
 
 
-def _identity_problem(f, show, slot) -> str:
+def _identity_problem(f, show, slot, keeper: dict | None = None) -> str:
     """替代者"是这一集"可信吗？返回不可信的理由，可信返回空串。
 
-    `_resolve` 认的是它此刻的名字。名字由谁定的，决定了能不能拿它当证据：
+    `_resolve` 认的是它此刻的名字（文件名优先）。名字可能是 AutoBangumi 按错的编号改的——
+    分类交接之后、甚至种子被摘之后，名字照样在，所以**每一个没钉子的替代者都要有名字之外的
+    正面证据**，不分分类：
 
     - **钉着 `ma:`**：抓取器按番组页 + 播出日期定的，是定论（`_resolve` 先认钉子，能走到这里
       就说明钉子就是这个集位）。
-    - **还在 AutoBangumi 的分类（`Bangumi`）下**：名字只是"AB 认为的"（AGENTS.md 第 6 条），发布名
-      也得认这个集位（`_release_agrees`）——判重封存的快车道对 AB 名下的输家是同一条要求。
-    - **发布名明写了另一季**、又没有 `season_offsets` 可换算：名字里的集号多半是按那一季编的。
-      2026-08-31 Re:Zero：AB 把 `3rd Season - 08` 改成 `S01E08`，判重把 2016 年真正的第 8 集清进
-      隔离区；分类交接之后检测器照样认这个名字，purge 再拿它当替代者，就把唯一的原片硬删了。
+    - **有种子**：发布名（`renameFile` 改不动的显示名）按 `_resolve` 同一套换算（季号偏移、
+      `episode_offset`）也得落在这个集位上（`builtin._release_slot`）。2026-08-31 Re:Zero：AB 把
+      `3rd Season - 08` 改成 `S01E08`，判重把 2016 年真正的第 8 集清进隔离区；生产 sidecar 带着
+      `season_offsets {"3": 50}`，以前"声明的季有偏移"就放行、从不换算——换算出来是 S01E58
+      （2026-09-26 审查）。合集的发布名认不出单集的，成员叫什么只是某次改名的结果，同样不作保。
+    - **没有种子**：发布名这份证据已经没了（保种到期、手动删种留文件——AB 改错名的那份摘了种子
+      就是这个样子），名字无从核对，时长自证也分不出第 8 集和第 58 集。唯一的例外是它就是删除
+      关口当初记下的保留方（`deletion.keeper`：内容摘要相同），而且那时它也没有种子——判重当时
+      凭的就是这份证据，此后什么都没丢。
     """
     from .naming import declared_season
     from .plugins import builtin as B
@@ -242,14 +249,32 @@ def _identity_problem(f, show, slot) -> str:
     if B._pinned(f):
         return ""
     sn, ep = slot
-    if f.torrent_category == "Bangumi" and not B._release_agrees(f, show, sn, ep):
-        return (f"替代者 {f.filename} 还在 AutoBangumi 的分类下（改名权未交接），发布名也认不出"
-                f" S{sn:02d}E{ep:02d}——它叫这个名字只是 AB 认为的")
-    dec = declared_season(f.torrent_name or "")
-    if dec is not None and dec != sn and str(dec) not in B._season_offsets(show):
-        return (f"替代者 {f.filename} 的发布名声明的是第 {dec} 季（{f.torrent_name[:60]}），"
-                f"库内是第 {sn} 季、又没有 season_offsets 可换算——名字里的集号可能是按那一季编的")
-    return ""
+    tag = f"S{sn:02d}E{ep:02d}"
+    if f.torrent_hash:
+        rs = B._release_slot(f, show)
+        if rs == (sn, ep):
+            return ""
+        rel = (f.torrent_name or "")[:60]
+        if f.torrent_category == "Bangumi":
+            return (f"替代者 {f.filename} 还在 AutoBangumi 的分类下（改名权未交接），发布名也认不出"
+                    f" {tag}——它叫这个名字只是 AB 认为的")
+        if rs is not None:
+            return (f"替代者 {f.filename} 的发布名（{rel}）按季号偏移换算是 S{rs[0]:02d}E{rs[1]:02d}，"
+                    f"不是 {tag}——名字里的集号是按别的编号改的（2026-08-31 Re:Zero 的形态）")
+        dec = declared_season(f.torrent_name or "")
+        if dec is not None and dec != sn and str(dec) not in B._season_offsets(show):
+            return (f"替代者 {f.filename} 的发布名声明的是第 {dec} 季（{rel}），"
+                    f"库内是第 {sn} 季、又没有 season_offsets 可换算——名字里的集号可能是按那一季编的")
+        return (f"替代者 {f.filename} 的发布名（{rel}）认不出 {tag}（合集、或没写集号），没钉子："
+                f"它叫这个名字只是某次改名的结果，不作保、交给人")
+    kp = keeper or {}
+    if kp.get("digest") and not kp.get("hash"):
+        from .dedup import content_digest
+        if content_digest(Path(f.path)) == kp["digest"]:
+            return ""
+    return (f"替代者 {f.filename} 没有种子也没钉子：名字是谁定的无从核对（AB 改错名的文件摘了"
+            f"种子就是这个样子，2026-08-31 Re:Zero），也不是删除关口当初记下的那个无种子保留方——"
+            f"不作保、交给人")
 
 
 class _Pool:
@@ -473,7 +498,8 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
         return
     surv = holders[0]
     c.survivor, c.survivor_hash = surv.path, surv.torrent_hash
-    why = _identity_problem(surv, show, c.slot)
+    why = _identity_problem(surv, show, c.slot,
+                            ((c.record or {}).get("deletion") or {}).get("keeper"))
     if why:
         c.why = why
         return

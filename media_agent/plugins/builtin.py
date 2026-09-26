@@ -161,16 +161,25 @@ def _release_agrees(f: MediaFile, show: Show, season: int, ep: int) -> bool:
 
     「封存集位、当轮清理其余」是一条绕过所有权让位的快车道，走这条道之前
     必须让发布名独立确认一次。确认不了就走原来的慢车道，不急这一轮。
+
+    **按 `_resolve` 的同一套算法换算**（`_release_slot`），不是"声明的季在
+    `season_offsets` 里就放行"：生产上 Re:Zero 的 sidecar 带着 `{"3": 50}`，
+    `3rd Season - 08` 换算出来是 S01E58——以前拿它确认 S01E08（2026-09-26 审查）。
     """
+    return _release_slot(f, show) == (season, ep)
+
+
+def _release_slot(f: MediaFile, show: Show) -> tuple[int, int] | None:
+    """只凭种子**发布名**（显示名）解析出的集位，与 `_resolve` 同一套换算（季号偏移、
+    `episode_offset`）；没有发布名、认不出集号、声明的季换算不了返回 None。
+
+    `_resolve` 是文件名优先的（合集成员共用一个发布名），AB 改过的名字就在那里说了算；
+    要问"这个名字可信吗"，得拿改名权之外的那份证据独立算一遍。"""
     raw = (f.torrent_name or "").strip()
     if not raw:
-        return False
-    if parse_episode(raw)[1] != ep:
-        return False
-    dec = declared_season(raw)
-    if dec is not None and dec != season and str(dec) not in _season_offsets(show):
-        return False
-    return True
+        return None
+    season, ep = parse_episode(raw)
+    return _slot_from(raw, season, ep, f, show)
 
 
 def _season_offsets(show: Show) -> dict:
@@ -230,8 +239,14 @@ def _resolve(f: MediaFile, show: Show) -> tuple[int, int] | None:
     pin = _pinned(f)
     if pin:
         return pin
-
     raw, season, ep = _numbered_from(f, show)
+    return _slot_from(raw, season, ep, f, show)
+
+
+def _slot_from(raw: str, season: int | None, ep: int | None, f: MediaFile,
+               show: Show) -> tuple[int, int] | None:
+    """`parse_episode(raw)` 的结果 → 库内集位：季号偏移、`episode_offset` 的换算。
+    `_resolve`（文件名优先）与 `_release_slot`（只看发布名）共用，两边不能各算各的。"""
     if ep is None:
         return None
     target = _season_of(f, show, season)
