@@ -83,6 +83,8 @@ plist 没换，`ma-*` 临时文件泄漏（rc=129）。再跑 `deploy.sh <同一
 - 短路改为看 `deploy.history`：最近一次动过生产目录的记录（`ok / converted /
   converted-tests-failed / reverted / revert-failed`）是这个 commit 的 `ok` 或 `converted` 才算
   "已经是"；否则照常重走（HEAD 已在目标 commit 时 checkout 是空操作，sync / 测试 / plist 幂等）。
+  2026-09-27 起还要装着的 launchd 任务与 tag 里的一字不差：v0.6.0 多了抓取任务（`com.zihan.media-agent-grab`），
+  旧脚本部署它只装主任务，用新脚本再部署同一个 tag 才补得上（`architecture/2026-09-27-grab-mode.md`）。
 
 **测试**：`tests/test_deploy_scripts.py`——对整个进程组发 `kill -HUP 0`（`start_new_session`，
 不波及 pytest）后部署照常完成、`deploy.log` 里有结局、临时文件清理；`kill -INT 0` 自动退回并记

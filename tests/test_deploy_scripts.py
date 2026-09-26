@@ -27,6 +27,7 @@ REPO = Path(__file__).resolve().parent.parent
 DEPLOY = REPO / "deploy" / "deploy.sh"
 CONVERT = REPO / "deploy" / "convert-to-git.sh"
 LABEL = "com.zihan.media-agent"
+GRAB = "com.zihan.media-agent-grab"              # 抓取模式的任务（v1.4.0 起才有，与生产的 v0.6.0 起一样）
 
 pytestmark = [
     pytest.mark.skipif(os.environ.get("MEDIA_AGENT_DEPLOYING") == "1",
@@ -53,6 +54,8 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 </dict>
 </plist>
 """
+
+GRAB_PLIST = PLIST.replace("com.zihan.media-agent<", GRAB + "<").replace(">run<", ">grab<")
 
 FAKE_UV = r"""#!/bin/sh
 echo "$PWD uv $*" >> "$SANDBOX/uv.log"
@@ -103,13 +106,17 @@ def _release(root: Path, version: str, *, plist_prog: str, extra: dict[str, str]
     _write(root / "README.md", f"readme {version}\n")
     _write(root / "deploy" / f"{LABEL}.plist", PLIST.format(prog=plist_prog))
     for rel, text in extra.items():
+        if text is None:                                   # 这个发布里删掉了它
+            (root / rel).unlink(missing_ok=True)
+            continue
         _write(root / rel, text, 0o755 if rel.endswith(".sh") else None)
 
 
 @pytest.fixture(scope="module")
 def upstream(tmp_path_factory) -> Path:
     """上游仓库：v1.0.0（基线）→ v1.1.0（多一条规则、一篇笔记，plist 变了）→
-    v1.2.0（代码变了）→ v1.3.0（plist 装不上）。
+    v1.2.0（代码变了）→ v1.3.0（plist 装不上）→ v1.4.0（多了抓取的任务）→ v1.5.0（抓取的任务变了）
+    → v1.6.0（抓取的任务装不上）→ v1.7.0（又没有抓取的任务了）。v1.4.0 起主任务与 v1.2.0 相同。
 
     模块级 fixture 先于每个测试的子进程守卫建立，这里直接用 subprocess。
     """
@@ -132,6 +139,13 @@ def upstream(tmp_path_factory) -> Path:
           "deploy/deploy.sh": DEPLOY.read_text(encoding="utf-8")}),
         ("1.2.0", "/app/.venv/bin/media-agent --v11", {"media_agent/new.py": "X = 1\n"}),
         ("1.3.0", "/app/.venv/bin/media-agent BROKEN", {}),
+        ("1.4.0", "/app/.venv/bin/media-agent --v11",
+         {f"deploy/{GRAB}.plist": GRAB_PLIST.format(prog="/app/.venv/bin/media-agent")}),
+        ("1.5.0", "/app/.venv/bin/media-agent --v11",
+         {f"deploy/{GRAB}.plist": GRAB_PLIST.format(prog="/app/.venv/bin/media-agent --v15")}),
+        ("1.6.0", "/app/.venv/bin/media-agent --v11",
+         {f"deploy/{GRAB}.plist": GRAB_PLIST.format(prog="/app/.venv/bin/media-agent BROKEN")}),
+        ("1.7.0", "/app/.venv/bin/media-agent --v11", {f"deploy/{GRAB}.plist": None}),
     ]
     for version, prog, extra in releases:
         _release(work, version, plist_prog=prog, extra=extra)
@@ -192,8 +206,22 @@ class Sandbox:
         p = self.root / "launchctl.log"
         return p.read_text().splitlines() if p.exists() else []
 
-    def installed_plist(self) -> str:
-        return (self.agents_dir / f"{LABEL}.plist").read_text()
+    def installed_plist(self, label: str = LABEL) -> str:
+        return (self.agents_dir / f"{label}.plist").read_text()
+
+    def installed(self, label: str) -> bool:
+        return (self.agents_dir / f"{label}.plist").exists()
+
+    def reloads(self, label: str) -> list[str]:
+        """launchctl 对这个任务的 bootout / bootstrap（按调用顺序）。"""
+        uid = os.getuid()
+        out = []
+        for c in self.launchctl_calls():
+            if c == f"launchctl bootout gui/{uid}/{label}":
+                out.append("bootout")
+            elif c.startswith(f"launchctl bootstrap gui/{uid} ") and c.endswith(f"/{label}.plist"):
+                out.append("bootstrap")
+        return out
 
     def fingerprint(self) -> str:
         """工作区（不含 state/、.venv、.git）的内容指纹。"""
@@ -547,6 +575,95 @@ def test_plist_that_fails_to_load_reverts_code_and_launchd(sandbox):
     assert sandbox.installed_plist() == old_plist           # 旧 plist 装回去并重新加载了
     assert sandbox.launchctl_calls()[-1].startswith(f"launchctl bootstrap gui/{os.getuid()} ")
     assert sandbox.history()[-1][4:] == ["reverted", "安装 launchd 配置"]
+
+
+# ------------------------------------------------------------------ 两个 launchd 任务（run 与 grab）
+# 第 5 阶段起有两份 plist：每 6 小时的 `run` 与每 30 分钟的 `grab`。部署两份都装、都只在变了时重新加载；
+# 装不上就两份一起退回；tag 里没有抓取任务（回滚到更早的版本）就卸掉它——留着的话它每 30 分钟调一个不存在的子命令。
+def test_deploy_installs_both_jobs(sandbox):
+    r = sandbox.deploy("v1.4.0")
+
+    assert r.returncode == 0, _out(r)
+    assert "--v11" in sandbox.installed_plist()
+    assert ">grab<" in sandbox.installed_plist(GRAB)
+    assert sandbox.reloads(LABEL) == ["bootout", "bootstrap"]
+    assert sandbox.reloads(GRAB) == ["bootout", "bootstrap"]
+
+
+def test_only_the_changed_job_is_reloaded(sandbox):
+    assert sandbox.deploy("v1.4.0").returncode == 0
+    (sandbox.root / "launchctl.log").unlink()
+
+    r = sandbox.deploy("v1.5.0")
+
+    assert r.returncode == 0, _out(r)
+    assert "--v15" in sandbox.installed_plist(GRAB)
+    assert sandbox.reloads(GRAB) == ["bootout", "bootstrap"]
+    assert sandbox.reloads(LABEL) == []
+    assert "launchd 配置未变" in r.stdout
+
+
+def test_a_grab_job_that_fails_to_load_reverts_both(sandbox):
+    old_main = sandbox.installed_plist()
+
+    r = sandbox.deploy("v1.6.0")
+
+    assert r.returncode == 1, _out(r)
+    assert sandbox.head() == sandbox.tag_sha("v1.0.0")
+    assert sandbox.installed_plist() == old_main                  # 主任务的旧 plist 装回去并重新加载
+    assert sandbox.reloads(LABEL)[-1] == "bootstrap"
+    assert not sandbox.installed(GRAB)                             # 部署前没有抓取任务：卸掉
+    assert sandbox.reloads(GRAB)[-1] == "bootout"
+    assert sandbox.history()[-1][4:] == ["reverted", "安装 launchd 配置"]
+
+
+def test_rolling_back_to_a_tag_without_the_grab_job_uninstalls_it(sandbox):
+    assert sandbox.deploy("v1.4.0").returncode == 0
+    (sandbox.root / "launchctl.log").unlink()
+
+    r = sandbox.deploy("v1.7.0")
+
+    assert r.returncode == 0, _out(r)
+    assert not sandbox.installed(GRAB)
+    assert sandbox.reloads(GRAB) == ["bootout"]
+    assert sandbox.reloads(LABEL) == []
+    [bk] = sorted((sandbox.app / "state" / "backups").iterdir())[-1:]
+    assert (bk / f"{GRAB}.plist").exists()                        # 卸掉之前留了一份
+
+
+def test_a_failed_switch_restores_an_uninstalled_grab_job(sandbox):
+    assert sandbox.deploy("v1.4.0").returncode == 0
+    grab_before = sandbox.installed_plist(GRAB)
+    only_in_place = 'case "$PWD" in *media-agent-stage*) exit 0;; *) exit 1;; esac'
+
+    r = sandbox.deploy("v1.7.0", DEPLOY_TEST_CMD=only_in_place)
+
+    assert r.returncode == 1, _out(r)
+    assert sandbox.installed_plist(GRAB) == grab_before          # 测试在装 plist 之前就失败了：没动过
+
+
+def test_redeploying_the_same_tag_installs_a_missing_job(sandbox):
+    """旧版的 deploy.sh（只认一个 plist）部署了带抓取任务的 tag：代码是新的，抓取任务没装上。用新脚本再部署同一个
+    tag，不能被"已经是这个版本"短路——要把缺的任务装上（生产上 v0.5.x → v0.6.0 的头一次就是这样）。"""
+    assert sandbox.deploy("v1.4.0").returncode == 0
+    (sandbox.agents_dir / f"{GRAB}.plist").unlink()
+
+    r = sandbox.deploy("v1.4.0")
+
+    assert r.returncode == 0, _out(r)
+    assert "无需部署" not in r.stdout
+    assert sandbox.installed(GRAB)
+    assert sandbox.history()[-1][4] == "ok"
+
+
+def test_redeploying_with_both_jobs_current_is_a_no_op(sandbox):
+    assert sandbox.deploy("v1.4.0").returncode == 0
+    n = len(sandbox.history())
+
+    r = sandbox.deploy("v1.4.0")
+
+    assert r.returncode == 0 and "已经是 v1.4.0" in r.stdout
+    assert len(sandbox.history()) == n
 
 
 # ------------------------------------------------------------------ 锁

@@ -203,7 +203,7 @@ uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID]   # subscribe w
 Start with `diagnose`, then `apply --dry-run`. Only flip `AUTO_APPLY=true` once
 you've read what it wants to do.
 
-A launchd plist for a 6-hourly cycle is in [`deploy/`](deploy/). Production is deployed in place from git tags (`deploy/deploy.sh <tag>`); see [deploy/README.md](deploy/README.md) for the flow, rollback and the run lock.
+launchd plists for the 6-hourly `run` and the 30-minute `grab` pass are in [`deploy/`](deploy/). Production is deployed in place from git tags (`deploy/deploy.sh <tag>`); see [deploy/README.md](deploy/README.md) for the flow, rollback and the run lock.
 
 ### What it needs
 

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.zihan.media-agent-grab</string>
+
+  <!-- 抓取模式（media_agent/grabmode.py）：补缺的集、接手 AutoBangumi 里新订的番、给刚抓的收尾。
+       完整治理仍是 com.zihan.media-agent 每 6 小时一轮的 run。与 run 同一把运行锁（state/run.lock）：
+       拿不到只等 10 秒、以 75 结束，30 分钟后再来；run 等它最多 5 分钟。
+       与主任务一样直接跑 venv 里的入口，不经 `uv run`（依赖只在部署时装，critic §3.7）。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/zihan/media-agent/.venv/bin/media-agent</string>
+    <string>grab</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/zihan/media-agent</string>
+
+  <!-- 每 30 分钟一次（grabmode.GRAB_INTERVAL_S；番组页 feed 的缓存 cache.FEED_TTL 比它短）。
+       加载时不跑：部署重新加载时不该紧跟着起一轮 -->
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- 自己的两份日志，拿到锁之后与 run.log 一样轮转（runlog.GRAB_LOG_NAMES） -->
+  <key>StandardOutPath</key>
+  <string>/Users/zihan/media-agent/state/grab.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/zihan/media-agent/state/grab.err.log</string>
+
+  <!-- 低优先级，不跟下载/播放抢 IO（与主任务相同） -->
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

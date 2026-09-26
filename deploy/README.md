@@ -128,9 +128,11 @@ deploy/deploy.sh v0.2.0
    `state/backups/<时间>-<部署前版本>/`，原地 `git checkout --detach <tag>`、
    `uv sync --frozen`、再跑一遍离线测试。任何一步失败都**自动退回**部署前的版本
    （含 venv 与被接管的文件），`deploy.history` 记 `reverted`。
-5. **launchd。** tag 里的 plist 与已装的不同才重装（`plutil -lint` → `launchctl bootout` →
-   `bootstrap gui/$(id -u)`）；装不上就把旧 plist 装回去，代码也一起退回。
-   重装会让 `StartInterval` 从那一刻重新计时。
+5. **launchd。** 两个任务（v0.6.0 起）：每 6 小时的 `com.zihan.media-agent`（`run`）与每 30 分钟的
+   `com.zihan.media-agent-grab`（`grab`），各自一份 `deploy/<label>.plist`。每一份都是 tag 里的与已装的不同才重装
+   （`plutil -lint` → `launchctl bootout` → `bootstrap gui/$(id -u)`），没变的不动；**tag 里没有抓取任务**（回滚到
+   v0.6.0 之前）就把它卸掉——留着它每 30 分钟调一个那个版本里不存在的子命令。任何一份装不上，这次动过的都装回部署
+   前的那份（部署前没有的卸掉），代码也一起退回。重装会让 `StartInterval` 从那一刻重新计时。
 6. **记录与确认。** `state/deploy.history` 每次尝试一行：
    `时间 ⇥ tag ⇥ 目标 commit ⇥ 部署前 commit ⇥ 结果 ⇥ 说明`，结果是
    `ok / reverted / revert-failed / drift / stage-failed / lock-timeout / busy / checked / converted`。
@@ -149,8 +151,19 @@ deploy/deploy.sh v0.2.0
   **自动退回**部署前的版本，`deploy.history` 记 `reverted`、说明写「被信号中断」。
 - **旧版本脚本被杀留下的现场**（HEAD 已是新 tag、venv 与 plist 还是旧的）：再跑一次同一个 tag
   即可。`HEAD == tag` 不再被当成"已经部署过"——只有 `deploy.history` 里最近一次动过生产目录的
-  记录（`ok / converted / reverted / revert-failed`）正是这个 commit 的 `ok` 或 `converted` 时才短路，
-  否则照常走一遍，依赖、测试、launchd 配置都重新落实（对完好的目录这一遍是幂等的）。
+  记录（`ok / converted / reverted / revert-failed`）正是这个 commit 的 `ok` 或 `converted`、**而且装着的
+  launchd 任务与 tag 里的一字不差**时才短路，否则照常走一遍，依赖、测试、launchd 配置都重新落实（对完好的目录
+  这一遍是幂等的）。
+
+**从 v0.5.x 升到 v0.6.0（第一次有抓取任务）要跑两遍。** 部署跑的是**工作区里当前那一版**的 `deploy.sh`
+（先复制一份再执行），v0.5.x 的脚本只认主任务的 plist：第一遍把代码切到 v0.6.0、装好主任务，抓取任务没装。
+再跑一遍同一个 tag（这时工作区里已是 v0.6.0 的脚本）：代码不变，它发现抓取任务没装上、不短路，把它装上。
+
+```sh
+deploy/deploy.sh v0.6.0      # 用 v0.5.x 的脚本：代码切过去，只装主任务
+deploy/deploy.sh v0.6.0      # 用 v0.6.0 的脚本：装上 com.zihan.media-agent-grab
+launchctl print gui/$(id -u)/com.zihan.media-agent-grab | grep -E 'state|run interval'
+```
 
 **GitHub 不通时**用 bundle 带 tag 过去：
 
@@ -185,14 +198,17 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
 
 | 拿锁 | 不拿锁 |
 |---|---|
-| `run`、`apply`、`rollback`、`repair`、`evolve`、`purge --apply`（含 `--dry-run`） | `scan`、`diagnose`、`runs`、只预演的 `purge` |
+| `run`、`grab`、`apply`、`rollback`、`repair`、`evolve`、`subscribe`、`purge --apply`（含 `--dry-run`） | `scan`、`diagnose`、`runs`、只预演的 `purge` |
 
-- 拿不到锁最多等 10 秒，然后打印持有者（pid、命令、开始时间）、以**退出码 75** 结束，
-  什么都不做。launchd 的一轮撞上部署或手动操作就是这样：`last exit code = 75`，6 小时后再来。
+- 拿不到锁最多等 10 秒（`run` 等 300 秒，见下），然后打印持有者（pid、命令、开始时间）、以**退出码 75** 结束，
+  什么都不做。launchd 的一轮撞上部署或手动操作就是这样：`last exit code = 75`，6 小时（抓取是 30 分钟）后再来。
+- **`run` 与 `grab` 每 6 小时撞一次**：两个任务的 `StartInterval`（21600 / 1800）都从加载那一刻起计时，每 6 小时
+  同一秒起来。所以 `run` 等锁最多 300 秒（`runlock.RUN_WAIT`，抓取一般一两分钟就完）；`grab` 只等 10 秒——
+  绝不为一轮 `run` 等上几分钟，30 分钟后它自然再来。
 - 进程被 kill 锁自动释放，不会留下要人去删的锁。**不要删 `run.lock` 文件**——
   删了之后持有者锁住的是一个没有名字的 inode，下一个进程会拿到另一把锁。
 - `deploy.sh` 用 `/usr/bin/lockf -k`（Linux 上是 `flock(1)`）拿同一把锁，切换期间一直持有。
-- 手工维护时想让 agent 暂停：`touch ~/media-agent/state/PAUSE`（里面可以写一句为什么），`run` / `apply` 就以 75 结束、健康报告 warn；维护完 `rm` 掉。VPN 救援期间（`~/gluetun/.rescue-active` 在）自动暂停。要在自己干活的那几分钟里连手动命令也挡住，就自己拿着锁：
+- 手工维护时想让 agent 暂停：`touch ~/media-agent/state/PAUSE`（里面可以写一句为什么），`run` / `apply` / `grab` 就以 75 结束、健康报告 warn；维护完 `rm` 掉。VPN 救援期间（`~/gluetun/.rescue-active` 在）自动暂停。要在自己干活的那几分钟里连手动命令也挡住，就自己拿着锁：
   `/usr/bin/lockf -k ~/media-agent/state/run.lock zsh`（退出这个 shell 即释放）。
 - `vpn-watchdog.sh` 与 `rescue.py` 重建 qBittorrent 容器之前同样拿这把锁（critic N17）：最多等 900 秒
   （`RUNLOCK_WAIT` / `RESCUE_LOCK_WAIT`），等不到就这次不重建、退出码 75。见下文「vpn-watchdog.sh / rescue.py」。
@@ -203,13 +219,24 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
 **不经 `uv run`**：`uv run` 每轮都会按 `uv.lock` 同步环境，锁文件一变就在凌晨联网装依赖，
 PyPI 不通这一轮就起不来。依赖只在部署时装。周期 21600 秒、`RunAtLoad false`、`Nice 10`、
 `LowPriorityIO`，stdout / stderr 追加到 `state/run.log` / `state/run.err.log`。每一行带时间与批次 ID，每轮以「run 开始：批次 …」一行开头；两个文件超过 5 MB 时由 `run` 自己先拷贝再截断地轮转成 `.1` … `.5`（`media_agent/runlog.py`：launchd 持有描述符，不能改名；不需要 newsyslog）。
-plist 由 `deploy.sh` 在变化时自动重装；手工重装：
+`com.zihan.media-agent-grab.plist`（v0.6.0 起）执行 `~/media-agent/.venv/bin/media-agent grab`：周期 1800 秒，
+其余（`RunAtLoad false`、`Nice 10`、`LowPriorityIO`、不经 `uv run`）与主任务相同；输出追加到 `state/grab.log` /
+`state/grab.err.log`，同样带时间与批次 ID、超过 5 MB 由 `grab` 自己轮转。它只补缺的集、接手 AB 里新订的番、给刚抓的
+改名 / 判重收尾，其余治理仍是 6 小时一轮的 `run`（`media_agent/grabmode.py`）；健康报告在 `state/health/grab/`
+（`media-agent health --grab`），通知只为抓取相关的事发（崩溃、整批拒绝、审计没写全、抓取动作失败），"锁被 run 占着"
+不发信。退出码与主任务同一张表。
+
+两份 plist 都由 `deploy.sh` 在变化时自动重装；手工重装（抓取任务把 label 换成 `com.zihan.media-agent-grab`）：
 
 ```sh
 launchctl bootout gui/$(id -u)/com.zihan.media-agent
 cp ~/media-agent/deploy/com.zihan.media-agent.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zihan.media-agent.plist
 ```
+
+临时停掉抓取、保留 6 小时的 `run`：`launchctl bootout gui/$(id -u)/com.zihan.media-agent-grab`。plist 文件还在
+`~/Library/LaunchAgents/`，下次登录（重启）时 launchd 会重新加载它；部署只比文件，文件没变就不会替你装回来——恢复用
+上面的 `bootstrap` 那一行。想连 `run` 一起停就用 `state/PAUSE`。
 
 `launchctl list | grep media-agent` 的 last exit code（每轮的详情在 `state/health/<批次 ID>.json`，`media-agent health` 看最近一轮）：
 
@@ -225,7 +252,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zihan.media-agent.pl
 ## 部署脚本自己的测试
 
 `tests/test_deploy_scripts.py` 在临时目录里模拟生产目录（替身 uv / launchctl），覆盖闸门、
-暂存失败、原地失败自动退回、plist 装不上、锁、转换与撤销；CI 的 macOS 腿用的正是生产机上的
+暂存失败、原地失败自动退回、plist 装不上（两个任务各自、一起退回）、只重装变了的任务、tag 里没有抓取任务时卸掉、
+同一个 tag 再部署补上缺的任务、锁、转换与撤销；CI 的 macOS 腿用的正是生产机上的
 `/bin/bash` 3.2。2026-09-26 另按生产文件清单复原了一个目录，用真 uv 0.7.2 + 真 pytest
 走完了 转换 → 闸门拦下 37 篇笔记 → 入库打 tag → 部署 → 回滚到 v0.1.0 → 再部署。
 

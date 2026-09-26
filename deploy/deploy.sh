@@ -15,7 +15,8 @@
 # 规则、偏好都会跟着"分家"；隔离区审计里存的又是绝对路径（deploy 调研 §5）。
 #
 # 给测试用的环境变量：MEDIA_AGENT_HOME UV_BIN DEPLOY_REMOTE DEPLOY_LOCK_WAIT
-# LAUNCHCTL LAUNCH_AGENTS_DIR MA_LAUNCHD_LABEL DEPLOY_TEST_CMD LAUNCHD_BOOTSTRAP_TRIES
+# LAUNCHCTL LAUNCH_AGENTS_DIR MA_LAUNCHD_LABEL MA_LAUNCHD_GRAB_LABEL DEPLOY_TEST_CMD
+# LAUNCHD_BOOTSTRAP_TRIES
 set -u
 set -o pipefail
 # ssh 断线（SIGHUP）不许把部署腰斩在半路。以前只有切换阶段的 `trap … EXIT`：断线打在
@@ -33,9 +34,12 @@ UV=${UV_BIN:-$HOME/.local/bin/uv}
 REMOTE=${DEPLOY_REMOTE:-origin}
 LOCK_WAIT=${DEPLOY_LOCK_WAIT:-900}
 LABEL=${MA_LAUNCHD_LABEL:-com.zihan.media-agent}
+# 两个 launchd 任务：每 6 小时的 run（主任务）与每 30 分钟的 grab（v0.6.0 起）。各自一份 deploy/<label>.plist，
+# 部署时都装、各自只在变了时重新加载。主任务在前：它装不上就不必再碰抓取任务。
+GRAB_LABEL=${MA_LAUNCHD_GRAB_LABEL:-$LABEL-grab}
+LABELS="$LABEL $GRAB_LABEL"
 LAUNCHCTL=${LAUNCHCTL:-/bin/launchctl}
 AGENTS_DIR=${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}
-PLIST_NAME="$LABEL.plist"
 BOOTSTRAP_TRIES=${LAUNCHD_BOOTSTRAP_TRIES:-5}
 
 TAG=""
@@ -257,49 +261,85 @@ wait_launchd_idle() {
     return 0
 }
 
-PLIST_CHANGED=0
+# 这次部署动过的任务（装了新的 / 换了 / 卸了），退回时只还原它们。bash 3.2 没有关联数组：空格分隔的 label 列表。
+CHANGED_LABELS=""
 
-launchd_load() {   # launchd_load <plist>：bootout 旧的（没装过也无妨）再 bootstrap
-    local domain n=0
+launchd_load() {   # launchd_load <label> <plist>：bootout 旧的（没装过也无妨）再 bootstrap
+    local label=$1 plist=$2 domain n=0
     domain="gui/$(id -u)"
-    "$LAUNCHCTL" bootout "$domain/$LABEL" >/dev/null 2>&1 || true
+    "$LAUNCHCTL" bootout "$domain/$label" >/dev/null 2>&1 || true
     # bootout 是异步收尾的，紧接着 bootstrap 偶尔报 "Input/output error"，重试几次
-    until "$LAUNCHCTL" bootstrap "$domain" "$1"; do
+    until "$LAUNCHCTL" bootstrap "$domain" "$plist"; do
         n=$((n + 1))
         [ "$n" -ge "$BOOTSTRAP_TRIES" ] && return 1
         sleep 1
     done
 }
 
-install_plist() {
-    local src="$APP/deploy/$PLIST_NAME" dst="$AGENTS_DIR/$PLIST_NAME"
+install_plist() {   # install_plist <label>
+    local label=$1 src dst
+    src="$APP/deploy/$label.plist"
+    dst="$AGENTS_DIR/$label.plist"
     if [ ! -f "$src" ]; then
-        say "   tag 里没有 deploy/${PLIST_NAME}，launchd 不动"
+        if [ "$label" = "$LABEL" ]; then
+            say "   tag 里没有 deploy/${label}.plist，launchd 不动"
+            return 0
+        fi
+        # 附属任务（抓取）跟着代码版本走：回滚到没有它的版本时卸掉——留着它，每 30 分钟调一次这个版本里
+        # 不存在的子命令（argparse 退出码 2），launchd 上一直是红的
+        [ -f "$dst" ] || return 0
+        CHANGED_LABELS="$CHANGED_LABELS $label"
+        "$LAUNCHCTL" bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+        rm -f "$dst" || return 1
+        say "   tag 里没有 deploy/${label}.plist：卸下这个任务"
         return 0
     fi
     if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
-        say "   launchd 配置未变"
+        say "   launchd 配置未变（${label}）"
         return 0
     fi
     if command -v plutil >/dev/null 2>&1; then
         plutil -lint -s "$src" || { warn "plutil 校验失败：$src"; return 1; }
     fi
-    PLIST_CHANGED=1
+    CHANGED_LABELS="$CHANGED_LABELS $label"
     mkdir -p "$AGENTS_DIR"
     cp "$src" "$dst.new" && mv "$dst.new" "$dst" || return 1
-    launchd_load "$dst" || { warn "launchctl bootstrap 失败"; return 1; }
-    say "   launchd 配置已更新并重新加载（StartInterval 从现在重新计时）"
+    launchd_load "$label" "$dst" || { warn "launchctl bootstrap 失败（${label}）"; return 1; }
+    say "   launchd 配置已更新并重新加载（${label}，StartInterval 从现在重新计时）"
 }
 
-restore_plist() {
-    local dst="$AGENTS_DIR/$PLIST_NAME"
-    [ "$PLIST_CHANGED" = 1 ] || return 0
-    if [ -f "$BK/$PLIST_NAME" ]; then
-        cp "$BK/$PLIST_NAME" "$dst" && launchd_load "$dst"
-    else
-        "$LAUNCHCTL" bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-        rm -f "$dst"
-    fi
+install_plists() {   # 两个任务都装；主任务在前，装不上就停
+    local label
+    for label in $LABELS; do
+        install_plist "$label" || return 1
+    done
+}
+
+restore_plists() {   # 退回：这次动过的任务装回部署前的那份（部署前没有的卸掉）。一个没还原成照样还原下一个
+    local label dst ok=0
+    for label in $CHANGED_LABELS; do
+        dst="$AGENTS_DIR/$label.plist"
+        if [ -f "$BK/$label.plist" ]; then
+            { cp "$BK/$label.plist" "$dst" && launchd_load "$label" "$dst"; } || ok=1
+        else
+            "$LAUNCHCTL" bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+            rm -f "$dst" || ok=1
+        fi
+    done
+    return "$ok"
+}
+
+plists_current() {   # 装着的 launchd 任务与目标 tag 里的一字不差（tag 里没有的附属任务也没装着）
+    local label dst
+    for label in $LABELS; do
+        dst="$AGENTS_DIR/$label.plist"
+        if g cat-file -e "$SHA:deploy/$label.plist" 2>/dev/null; then
+            g show "$SHA:deploy/$label.plist" | cmp -s - "$dst" || return 1
+        elif [ "$label" != "$LABEL" ] && [ -f "$dst" ]; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 # ===================================================================== 切换阶段
@@ -330,7 +370,9 @@ switch_phase() {
     for f in audit.jsonl audit.fallback.jsonl purge.jsonl cache.sqlite3 deploy.history; do
         [ -f "$APP/state/$f" ] && cp -p "$APP/state/$f" "$BK/"
     done
-    [ -f "$AGENTS_DIR/$PLIST_NAME" ] && cp -p "$AGENTS_DIR/$PLIST_NAME" "$BK/"
+    for f in $LABELS; do
+        [ -f "$AGENTS_DIR/$f.plist" ] && cp -p "$AGENTS_DIR/$f.plist" "$BK/"
+    done
 
     # 从这里开始动生产目录。Ctrl-C / SIGTERM 一律自动退回（HUP 在脚本开头就忽略了）：
     # 被打断的切换不能停在"新代码 + 旧 venv + 旧 plist"上。
@@ -352,7 +394,7 @@ switch_phase() {
     uv_in "$APP" sync --frozen || revert "uv sync --frozen"
     say "   离线测试（原地）"
     run_tests "$APP" || revert "原地离线测试"
-    install_plist || revert "安装 launchd 配置"
+    install_plists || revert "安装 launchd 配置"
 
     trap - INT TERM                   # 已经完整切换，此后的中断不该再退回
     record ok "from $PREV_DESC"
@@ -405,7 +447,7 @@ revert() {
         tar -xzf "$BK/replaced-untracked.tgz" -C "$APP" || ok=0
     fi
     uv_in "$APP" sync --frozen || ok=0
-    restore_plist || ok=0
+    restore_plists || ok=0
     if [ "$ok" = 1 ]; then
         record reverted "$why"
         die "部署 $TAG 失败（${why}），已退回 $PREV_DESC"
@@ -505,11 +547,18 @@ last_effective() {
 if [ "$SHA" = "$PREV" ] && [ "$MODE" = deploy ]; then
     case "$(last_effective)" in
         "$SHA ok"|"$SHA converted")
-            say "✅ 已经是 ${TAG}，无需部署"
-            exit 0 ;;
+            if plists_current; then
+                say "✅ 已经是 ${TAG}，无需部署"
+                exit 0
+            fi
+            # 旧版 deploy.sh 只认一个 plist：用它部署了带抓取任务的 tag，代码是新的、抓取任务没装上。
+            # 用这一版的脚本再部署同一个 tag，就在这里补上
+            say "   HEAD 已是 ${TAG}、也部署成功过，但装着的 launchd 任务与 tag 里的对不上（缺了 / 多了 / 变了）："
+            say "   照常走一遍，把任务落实" ;;
+        *)
+            say "   HEAD 已是 ${TAG}，但 deploy.history 里没有它部署成功的记录（上次部署可能中途被打断）："
+            say "   照常走一遍，把依赖、测试、launchd 配置重新落实" ;;
     esac
-    say "   HEAD 已是 ${TAG}，但 deploy.history 里没有它部署成功的记录（上次部署可能中途被打断）："
-    say "   照常走一遍，把依赖、测试、launchd 配置重新落实"
 fi
 
 # ------------------------------------------------------------------ 漂移闸门

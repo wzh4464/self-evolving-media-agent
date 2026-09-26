@@ -45,6 +45,11 @@
   两个任务每 6 小时同一秒起来）；认维护暂停；健康报告写 `state/health/grab/`（`media-agent health --grab`），通知只为抓取
   相关的事发（崩溃、整批拒绝、审计、抓取动作失败），去重状态单独一份；不写发现历史；日志 `state/grab.log`，与 run.log
   一样轮转。番组页 feed 的缓存从 1 小时改成 20 分钟，比抓取的节奏短。
+- **第二个 launchd 任务 `com.zihan.media-agent-grab`**（`deploy/com.zihan.media-agent-grab.plist`：每 30 分钟
+  `media-agent grab`，加载时不跑，低优先级与主任务相同，日志 `state/grab.log`）。`deploy.sh` 两份都装、各自只在变了时
+  重新加载；任何一份装不上两份一起退回；tag 里没有抓取任务（回滚到更早的版本）就卸掉它；装着的任务与 tag 里的对不上时
+  「已经是这个版本」不再短路。**从 v0.5.x 升级要跑两遍 `deploy.sh v0.6.0`**：第一遍用的是旧脚本、只装主任务
+  （`deploy/README.md`）。
 
 ### 修复
 - **抓取认集号偏移、找不到候选时说出来**（critic N13）：AB 37《超超超超超喜欢你的100个女朋友》第三季的发布按连续集号编

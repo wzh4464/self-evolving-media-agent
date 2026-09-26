@@ -34,3 +34,34 @@ def test_schedule_priority_and_logs_are_kept():
     assert Path(p["StandardOutPath"]) == home / "state" / "run.log"
     assert Path(p["StandardErrorPath"]) == home / "state" / "run.err.log"
     assert p["Label"] == "com.zihan.media-agent"
+
+
+# ------------------------------------------------------------------ 抓取模式的任务
+GRAB = PLIST.with_name("com.zihan.media-agent-grab.plist")
+
+
+def _load_grab() -> dict:
+    with GRAB.open("rb") as fh:
+        return plistlib.load(fh)
+
+
+def test_grab_job_runs_the_grab_subcommand_every_half_hour():
+    """`media-agent grab` 每 30 分钟一次（`grabmode.GRAB_INTERVAL_S`），加载时不跑；同一个 venv 入口、同一个工作目录。"""
+    from media_agent import cache, grabmode
+
+    g, main = _load_grab(), _load()
+    assert g["Label"] == "com.zihan.media-agent-grab"
+    assert g["ProgramArguments"] == [main["ProgramArguments"][0], "grab"]
+    assert g["WorkingDirectory"] == main["WorkingDirectory"]
+    assert g["StartInterval"] == grabmode.GRAB_INTERVAL_S == 1800 and g["RunAtLoad"] is False
+    assert cache.FEED_TTL < g["StartInterval"]       # 每一次抓取都看到新拉的番组页 feed
+
+
+def test_grab_job_is_as_gentle_as_the_main_one_and_logs_apart():
+    g, main = _load_grab(), _load()
+    assert (g["Nice"], g["LowPriorityIO"]) == (main["Nice"], main["LowPriorityIO"])
+    home = Path(g["WorkingDirectory"])
+    assert Path(g["StandardOutPath"]) == home / "state" / "grab.log"
+    assert Path(g["StandardErrorPath"]) == home / "state" / "grab.err.log"
+    from media_agent import runlog
+    assert runlog.GRAB_LOG_NAMES == ("grab.log", "grab.err.log")
