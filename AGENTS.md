@@ -19,6 +19,8 @@ media_agent/
   clients.py      capability 的 provider 实现（qBit/AutoBangumi/TMDB/AniList/LLM）
   plugins/        内置检测器
   actions.py      执行器 + 隔离区 + 配额上限 + 审计日志
+  purge.py        隔离区里每一份能不能真删（按处置类别的判据）
+  disposal.py     硬删除的唯一出口：预写 purge.jsonl、容量闸、run / purge 的处置
   evolution.py    自演进：残留检测 → 提议 → 影子验证 → 提升
   cli.py          命令行入口
 .agents/
@@ -39,7 +41,8 @@ uv run media-agent diagnose           # 跑全部规则，出问题清单（只�
 uv run media-agent apply --dry-run    # 预演修复
 uv run media-agent apply              # 执行修复
 uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
-uv run media-agent run                # 完整自治轮次（演进默认冻结）
+uv run media-agent run                # 完整自治轮次（演进默认冻结），末尾处置隔离区
+uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 
@@ -103,6 +106,14 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
    failed。新加删除类动作必须接关口；判重类检测器要在动作里给保留方与集位（`keep_path` /
    `keep_hash` / `keep_size` / `keep_digest` / `slot`）。每条隔离记录带 `deletion`（给 purge）。见
    [删除关口](.agents/notes/implemented/architecture/2026-09-26-deletion-gate.md)。
+10. **隔离区的硬删除只经 `disposal.hard_delete`**：先往 `state/purge.jsonl` 写意图并 fsync，再 unlink，
+    再记完成；只删普通文件、逐个删，空目录逐层 rmdir，**永不 `rmtree`**，也不按日期整批清。删不删由
+    `purge.build_pool` 按处置类别判（特典 / 死种 `.!qB` 到期删；判重要证明替代者——按 `_resolve` 认、
+    名字可信、完整、按现在的排序不输、原路径没有种子还要；合并发布 / 手动 / 其它 / 没有记录的永不自动删），
+    不满 `QUARANTINE_MIN_AGE_DAYS` 的一律不删，unlink 之前按此刻再复核一遍（`purge.recheck`）。
+    `MIN_FREE_GB` 只在"已证明可删"的里面提前放，证明不了的不为空间删。搬进 / 搬出隔离区先看目标卷
+    放不放得下（跨卷是先拷后删）。见
+    [隔离区处置](.agents/notes/implemented/architecture/2026-09-26-quarantine-disposal.md)。
 
 ## 自演进的闭环
 
