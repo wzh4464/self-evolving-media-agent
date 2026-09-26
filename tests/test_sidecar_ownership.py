@@ -255,3 +255,79 @@ def test_run_health_warns_about_a_corrupt_sidecar(lib, show, monkeypatch):
     rep = health.load_report(lib.cfg.state_dir)
     [r] = [r for r in rep["reasons"] if r["code"] == "sidecar_corrupt"]
     assert r["level"] == "warn" and SHOW in r["text"]
+
+
+# ------------------------------------------------------------------ 读-改-写的另外两条路、非 UTF-8、备份、回退抓取
+FUTURE = {"future_field": {"from": "a newer media-agent"}}
+
+
+def test_pin_tmdb_keeps_keys_this_version_does_not_know(lib, show):
+    """`update()`（pin_tmdb、抓取记账、回退抓取都走它）与 `write_merged` 一样保留不认识的键。以前只有后者有测试：
+    `update` / `save` 丢键的变异全套存活，一次抓取就能把更新版本写的字段抹掉（2026-09-27 审查）。"""
+    sc_mod.path_for(show.path).write_text(json.dumps({"canonical_title": SHOW, **FUTURE}), encoding="utf-8")
+    pin = Finding(rule="tmdb-identity", kind="tmdb_pick", severity="important", summary="钉 TMDB", show=SHOW,
+                  action=Action(op="pin_tmdb", args={"show_dir": str(show.path), "tmdb_id": 11,
+                                                    "title": SHOW, "source": "llm"}))
+
+    [rec] = lib.apply([pin]).applied
+
+    raw = _raw(show.path)
+    assert raw["tmdb_id"] == 11 and raw["future_field"] == FUTURE["future_field"]
+
+
+def test_save_keeps_keys_this_version_does_not_know(show):
+    sc_mod.path_for(show.path).write_text(json.dumps({"canonical_title": SHOW, **FUTURE}), encoding="utf-8")
+    sc = sc_mod.load(show.path)
+    sc.notes = "人写的"
+
+    sc_mod.save(show.path, sc)
+
+    raw = _raw(show.path)
+    assert raw["notes"] == "人写的" and raw["future_field"] == FUTURE["future_field"]
+
+
+def test_a_sidecar_that_is_not_utf8_is_corrupt_not_a_crash(lib, show):
+    """一份不是 UTF-8 的档案（人用别的编辑器存的）：读的一方当坏档案报、写的一方不覆盖——以前没测，`read_raw` 不接
+    `UnicodeDecodeError` 的变异下扫描直接抛出去（2026-09-27 审查）。"""
+    lib.tmdb.enabled = True
+    p = sc_mod.path_for(show.path)
+    p.write_bytes(b"\xff\xfe{\x00}\x00")
+    before = p.read_bytes()
+
+    c = lib.cycle()
+
+    assert [f.kind for f in c.findings if f.kind == "sidecar_corrupt"] == ["sidecar_corrupt"]
+    assert p.read_bytes() == before
+    assert c.state.shows[0].naming_hold                            # 身份认不准：这一轮不按标题改名
+
+
+def test_an_identical_older_backup_is_not_copied_again(lib, show):
+    """"内容相同的备份不重复拷"：同一秒里两轮的备份文件名本来就一样，上面那条测试因此测不出去重（变异存活）。
+    这里先有一份更早的、内容相同的备份。"""
+    before = _break(show)
+    old = show.path / (sc_mod.SIDECAR_NAME + ".corrupt-20260101T000000")
+    old.write_bytes(before)
+
+    lib.cycle()
+
+    assert _backups(show) == [old]
+
+
+def test_rolling_back_a_grab_leaves_a_sidecar_that_broke_since_alone(lib, show):
+    """回退抓取（`ungrab_episode`）只从 `have` 里摘掉那一集——档案此刻坏了：干净地跳过（写明原因、已备份），不当它是
+    空档案继续（2026-09-27 审查：去掉这道检查的变异全套存活）。"""
+    title = "[LoliHouse] 药屋少女的呢喃 / Kusuriya no Hitorigoto - 04 [WebRip 1080p][简繁内封字幕]"
+    url, h = lib.web.torrent(title)
+    grab = Finding(rule="episode-available", kind="episode_grabbable", severity="important",
+                   summary="S01E04 可抓取", show=SHOW,
+                   action=Action(op="grab_episode", args={
+                       "url": url, "title": title, "show_dir": str(show.path), "season": 1,
+                       "episode": 4, "bangumi_id": None, "category": SHOW, "official_title": SHOW}))
+    lib.apply([grab], run_id="g1")
+    before = _break(show)
+
+    res = lib.rollback("g1")
+
+    assert (res["reverted"], res["skipped"], res["failed"]) == (0, 1, 0)
+    assert "解析不了" in res["skipped_detail"][0]["skip_reason"]
+    assert sc_mod.path_for(show.path).read_bytes() == before and _backups(show)
