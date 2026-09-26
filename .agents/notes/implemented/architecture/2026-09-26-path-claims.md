@@ -93,3 +93,47 @@ tests / tools / deploy、生产机上全部 `*.py` / `*.sh` 都查过（grab 调
 `grabber.py` 的模块文档却说它是"加种子的唯一入口"。两条路径并存，占用闸门只接一条
 等于没接，所以删掉，并把文档改成实情：加种的唯一 HTTP 入口是 `QBitClient.add_torrent`
 （调用方 `_op_grab_episode` 与回退的 `readd_torrent`），`grabber` 只放加种之后的两步。
+
+## 4. 抓取后的即时改名走闸门；保留文件夹层（N15）
+
+**以前**：`_rename_grabbed` → `rename_single_video` 加完种子就 `renameFile` 到
+`{标题} SxxEyy.ext`，什么都不查，返回值被丢掉，异常吞进一行日志——结局到不了审计。
+新种子刚拿到元数据，libtorrent 只改映射，于是：
+
+- **S3 与 AutoBangumi 赛跑**（grab 调研 S3）：诊断之后、加种之前 AB 下完并改名到 X。新种子
+  被映射到 X，完成时 `X.!qB → X` 撞 EEXIST，偏好的版本作为孤儿半成品静默留下。
+- **S1 停滞放行换源**（grab 调研 S1）：抓取是 op 0、摘死种是 op 1。改名那一刻旧种子还声明
+  着 X、盘上有它的 `X.!qB`，新种子接着往那份半成品里写。
+- 同一形态就是 2026-09-06 尼古喵喵 S01E08 丢片的根因：两个种子声明同一路径。
+
+另外 `want = stem + 扩展名` 丢了条目的文件夹层（N15）：409 撞上已有的 Original 布局种子时，
+文件被挪到 save_path 根下。
+
+**现在**：
+- `rename_single_video(qbit, h, stem, files, *, claims=None) -> RenameOutcome`：目标
+  `save_path/文件夹/stem.ext`（save_path 问 qBittorrent 要，409 时可能在别处），
+  `claims.check(target, own_hash=h, own_path=当前路径)` 不空闲（被占或看不全）就不改；
+  改了就 `claims.invalidate()`。不给 `claims` 就现建一个。
+- `RenameOutcome.audit()` → 抓取 applied 记录的新字段 `rename`：
+  `{"renamed": 新条目名|None, "skipped"?: 原因, "claims"?: ClaimCheck.audit()}`。
+  被拦时另记一行 `[grab] 加种后不改名：…` 日志（不含"失败"字样；真出错时仍是
+  `[grab] 加种后改名失败`）。
+- 加种之后 `_claims().invalidate()`：多了一个种子。
+- 被占时 `ma:` 钉子本来就在（加种时打的），没有任何东西摘它。收敛靠已有流程：新种子下完，
+  duplicate-episode 凭钉子封存它、把占位的清进隔离区（op 5），同一轮 unrenamed-file 把它
+  改到集位名（op 6，再问一次闸门，此时已空闲）。
+
+**S1 还没收敛**（有意为之）：死种只摘记录，`X.!qB` 留在盘上；新种子下完也改不过去——闸门
+按设计拦下，改过去就是往那份半成品里写。处置"种子已摘、没人认领的 `.!qB`"属于删除闸门。
+`test_grab_stale_bypass.py` 里有一条 `xfail(strict=True)` 记着它，那边落地后应当转绿。
+
+**基座**：FakeWeb 拿 Mikan 站点标题当单文件名，标题常带 ` / `；libtorrent 把路径元素里的
+分隔符换成 `_`，FakeQbit 以前没做，出现了生产上不存在的"文件夹/文件"条目（前一个提交已对齐）。
+
+**测试**：`tests/test_grab_claims.py`——0% 的他人声明、AB 的完整文件（盘上 + 种子）、孤儿
+`.!qB` 都不改且钉子与记账照旧、日志写明占用者；邻居 `files()` 读不到也不改；空闲时照改、
+审计 `{"renamed": 集位名}`；409 撞上 Original 布局保留文件夹；`rename_single_video` 自建
+索引、只改大小写放行；**端到端 S3**：诊断后 AB 抢先改名 → 抓取不改名 → 新种子下完 →
+`converge()` 第一轮判重封存新种子、AB 那份进隔离区、同轮改名，最后只有新种子声明集位名。
+`tests/test_grab_stale_bypass.py` 的换源用例改为断言"不改到旧种子仍声明的名字上"，另加上面
+那条 xfail。

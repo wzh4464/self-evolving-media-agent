@@ -769,6 +769,7 @@ class Executor:
             self._audit("failed", f, a, {"error": f"加种子失败: {e}"})
             return
         already = not added
+        self._claims().invalidate()          # 多了一个种子：占用索引要重新问
 
         # 发布方的分季编号与库内连续编号不一致时，改写 qBittorrent 里的**种子名**。
         #
@@ -795,7 +796,10 @@ class Executor:
         # 换成自己管之后反而慢了六小时——这是所有权改动带来的回归。
         #
         # 集号在这里是确定的（就是钉进 `ma:` 标签的那个），不需要再解析文件名。
-        self._rename_grabbed(blob, a.args.get("official_title") or cat, season, ep)
+        #
+        # 集位被占就不改（占用闸门，见 `grabber.rename_single_video`）：留在发布名上、
+        # 钉子留着，下完后判重封存它、清走占位的，同一轮再改名。结局写进审计。
+        renamed = self._rename_grabbed(blob, a.args.get("official_title") or cat, season, ep)
 
         # 写 sidecar：加进 have，并把这个发布名记成别名（下次匹配用得上）
         sc = sc_mod.load(show_dir)
@@ -813,7 +817,8 @@ class Executor:
         self._audit("applied", f, a,
                     {"already_present": already,
                      "save_path": str(save_path),
-                     "have_after": have},
+                     "have_after": have,
+                     "rename": renamed},
                     undo={"op": "ungrab_episode", "show_dir": str(show_dir),
                           "season": season, "episode": ep,
                           "title": title})
@@ -872,26 +877,33 @@ class Executor:
         except Exception:
             pass
 
-    def _rename_grabbed(self, blob: bytes, title: str, season: int, ep: int) -> None:
-        """把刚加进去的种子里那个正片文件改成规范名。
+    def _rename_grabbed(self, blob: bytes, title: str, season: int, ep: int) -> dict:
+        """把刚加进去的种子里那个正片文件改成规范名，返回写进审计的结局
+        （`RenameOutcome.audit()` 的形状：`{"renamed": 新条目名|None, "skipped"?, "claims"?}`）。
 
         只处理"恰好一个视频文件"的种子；合集或带特典的交给 `unrenamed-file`
-        按文件逐个判断，这里不猜。失败只记日志——改名没成功不该让抓取算失败，
-        下一轮的改名规则会兜底。
+        按文件逐个判断，这里不猜。没改成不让抓取算失败——下一轮的改名规则会兜底；
+        但**为什么没改**要进审计与日志，以前全被吞进一行日志、审计里什么都没有。
         """
         from .grabber import rename_single_video, wait_metadata
 
         h = self._infohash_v1(blob)
         if not h:
-            return
+            return {"renamed": None, "skipped": "算不出 v1 infohash（纯 v2 种子？），交给 unrenamed-file"}
+        stem = "%s S%02dE%02d" % (title, season, ep)
         try:
             files = wait_metadata(self.ctx.qbit, h, timeout=10.0)
             if not files:
-                return           # 元数据还没到，交给 unrenamed-file 兜底
-            stem = "%s S%02dE%02d" % (title, season, ep)
-            rename_single_video(self.ctx.qbit, h, stem, files)
+                # 元数据还没到，交给 unrenamed-file 兜底
+                return {"renamed": None, "skipped": "元数据 10 秒内未到，交给 unrenamed-file"}
+            out = rename_single_video(self.ctx.qbit, h, stem, files, claims=self._claims())
         except Exception as e:
             self.ctx.log(f"[grab] 加种后改名失败（下一轮会补）: {e}")
+            return {"renamed": None, "skipped": f"改名出错：{type(e).__name__}: {e}"}
+        if out.blocked:
+            self.ctx.log(f"[grab] 加种后不改名：{stem} {out.skipped}（{out.check.describe()}）；"
+                         f"留在发布名上、保留 ma: 钉子，下完后交给判重封存与改名规则收敛")
+        return out.audit()
 
     def _op_drop_torrent(self, f: Finding, a: Action) -> None:
         """把种子记录从 qBittorrent 摘掉，**文件一个字节都不动**。

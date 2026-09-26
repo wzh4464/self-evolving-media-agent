@@ -16,10 +16,14 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
 from harness import MikanItem, weekly
 
 GB = 600_000_000
 TITLE = "[LoliHouse] 尼古喵喵 / Yani Neko - 09 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"
+RELEASE = TITLE.replace("/", "_") + ".mkv"          # libtorrent 规范化后的单文件名
+SLOT = "尼古喵喵 S01E09.mkv"
 
 
 def _scene(lib, **old_kw):
@@ -64,11 +68,34 @@ def test_truly_stalled_torrent_is_replaced_and_dropped_in_the_same_run(lib):
 
     c = lib.cycle()
 
-    assert c.applied("grab_episode")
+    [grab] = c.applied("grab_episode")
     [drop] = c.applied("drop_torrent")
     assert drop["args"]["torrent_hash"] == old.hash
     assert not lib.qbit.has(old.hash)
-    assert _claims(lib, s1) == [item.infohash]            # 只剩新种子声明这个集位
+    # 抓取（op 0）早于摘死种（op 1）：改名那一刻旧种子还声明着集位名、盘上还有它的
+    # `X.!qB`。以前照改——两个种子争同一个文件，新种子接着往旧种子的半成品里写
+    # （grab 调研 S1）。现在走占用闸门：留在发布名上，钉子留着。
+    assert grab["rename"]["renamed"] is None
+    assert old.hash in [c.get("hash") for c in grab["rename"]["claims"]["claimants"]]
+    assert _claims(lib, s1) == []                         # 没有两个种子同时声明它
+    assert lib.qbit.file_names(item.infohash) == [RELEASE]
+    assert "ma:S01E09" in lib.qbit.torrent(item.infohash)["tags"]
+    assert (s1.path / (SLOT + ".!qB")).exists()           # 死种只摘记录，半成品留在盘上
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "死种摘记录后，它的 X.!qB 孤儿半成品留在盘上占着集位名，新种子下完也改不过去"
+    "（占用闸门按设计拦下，改过去就是接着往那份半成品里写）。处置"
+    "「种子已摘、没人认领的 .!qB」属于删除闸门，届时这条应当转绿、去掉 xfail"))
+def test_replacement_takes_the_slot_once_the_dead_partial_is_disposed_of(lib):
+    s1, old, item = _scene(lib, active_hours_ago=72)
+    lib.cycle()
+    lib.qbit.complete(item.infohash)
+
+    lib.converge()
+
+    assert lib.qbit.file_names(item.infohash) == [SLOT]
+    assert not (s1.path / (SLOT + ".!qB")).exists()
 
 
 def test_stalled_but_seen_complete_recently_is_not_replaced(lib):

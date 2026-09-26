@@ -24,8 +24,10 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
+from .claims import ClaimCheck, ClaimIndex, ClaimsUnknown
 from .naming import VIDEO_EXTS
 
 
@@ -53,23 +55,76 @@ def wait_metadata(qbit, torrent_hash: str, timeout: float = 30.0,
         time.sleep(interval)
 
 
+@dataclass
+class RenameOutcome:
+    """`rename_single_video` 的结果。以前返回 `str | None`，把"改了""不是单文件"
+    "已是目标名""集位被占"四种结局混成一个 None，被占的原因从来到不了审计。"""
+    renamed: str = ""                   # 改成的新条目名（种子内相对路径）；空 = 没改
+    skipped: str = ""                   # 没改的原因
+    check: ClaimCheck | None = None     # 占用查询结果（被占 / 看不全时才有）
+
+    @property
+    def blocked(self) -> bool:
+        """是被占用闸门拦下的（被占，或看不全）。"""
+        return self.check is not None and not self.check.free
+
+    def audit(self) -> dict:
+        """写进抓取审计记录的形状：`{"renamed": 新条目名|None, "skipped"?, "claims"?}`。"""
+        d: dict = {"renamed": self.renamed or None}
+        if self.skipped:
+            d["skipped"] = self.skipped
+        if self.blocked:
+            d["claims"] = self.check.audit()
+        return d
+
+
 def rename_single_video(qbit, torrent_hash: str, target_stem: str,
-                        files: list[dict] | None = None) -> str | None:
-    """把种子里**唯一**的正片文件改成 `target_stem + 原扩展名`，返回新文件名。
+                        files: list[dict] | None = None, *,
+                        claims: ClaimIndex | None = None) -> RenameOutcome:
+    """把种子里**唯一**的正片文件改成 `target_stem + 原扩展名`（保留它所在的文件夹）。
 
     只处理"恰好一个视频文件"的种子。合集、带特典的多文件种子在这里不猜——
     哪个文件对应哪一集需要逐个判断，那是 `unrenamed-file` 规则的职责。
-    返回 None 表示没改（不是单文件、已经是目标名、或元数据没到）。
+
+    **目标名被占就不改**（`claims`，critic N6）。新种子刚拿到元数据、一个字节都没下，
+    libtorrent 只改映射：目标名此刻若被别的种子声明着、或盘上有别人的 `X` / `X.!qB`，
+    改过去就是两个种子无声地宣称同一路径——2026-09-06 尼古喵喵 S01E08 丢片的形态。
+    被占时留在发布名上；调用方打的 `ma:` 钉子让判重认得出它，下完后由
+    duplicate-episode 封存、清走占位的（op 5），unrenamed-file 同一轮改名（op 6）。
+    看不全（qBittorrent 读失败）同样不改。
+
+    **保留文件夹层**（critic N15）：条目是 `文件夹/x.mkv` 时目标是 `文件夹/<stem>.mkv`，
+    与 `_op_rename` 一致。以前直接改成 `<stem>.mkv`：409 撞上一个已有的 Original 布局
+    种子时，文件被挪到 save_path 根下。
+
+    `claims` 是调用方这一批次的占用索引；不给就现建一个。改名之后作废它。
     """
+    if claims is None:
+        claims = ClaimIndex(qbit)
     if files is None:
         files = [f for f in (qbit.files(torrent_hash) or [])
                  if f.get("priority", 1) != 0]
     vids = [f for f in files if Path(f["name"]).suffix.lower() in VIDEO_EXTS]
     if len(vids) != 1:
-        return None
+        return RenameOutcome(skipped=f"不是单一正片（{len(vids)} 个视频文件），交给 unrenamed-file")
     cur = vids[0]["name"]
-    want = target_stem + Path(cur).suffix.lower()
+    want_name = target_stem + Path(cur).suffix.lower()
+    want = str(Path(cur).parent / want_name) if "/" in cur else want_name
     if cur == want:
-        return None
+        return RenameOutcome(skipped="已是目标名")
+    # save_path 问 qBittorrent 要，不用调用方算的：409（种子已存在）时它可能在别处。
+    try:
+        t = claims.torrent(torrent_hash)
+    except ClaimsUnknown as e:
+        return RenameOutcome(skipped="无法确认目标路径的占用情况",
+                             check=ClaimCheck(want, unknown=str(e)))
+    if t is None:
+        return RenameOutcome(skipped="种子不在 qBittorrent 的列表里")
+    sp = Path((t.get("save_path") or "").rstrip("/") or "/")
+    chk = claims.check(sp / want, own_hash=torrent_hash, own_path=sp / cur)
+    if not chk.free:
+        return RenameOutcome(
+            skipped=("无法确认目标路径的占用情况" if chk.unknown else "集位被占"), check=chk)
     qbit.rename_file(torrent_hash, cur, want)
-    return want
+    claims.invalidate()
+    return RenameOutcome(renamed=want)
