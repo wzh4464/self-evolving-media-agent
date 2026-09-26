@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .claims import ClaimCheck, ClaimIndex
 from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
 
@@ -132,6 +133,16 @@ class Executor:
         # （testinfra B2，生产 5 次）。后面的动作要先认一认这里。
         self._removed_torrents: set[str] = set()
         self._trashed_paths: set[str] = set()
+        # 路径占用索引（`claims.ClaimIndex`），一批次一份、按需建。每做完一次改动
+        # （任何不是 skipped 的审计，见 `_audit`）就作废，下一次查询重新问 qBittorrent。
+        self._claim_index: ClaimIndex | None = None
+
+    def _claims(self) -> ClaimIndex:
+        """本批次共用的占用索引。**任何往媒体库里落一个名字的动作，落笔前都问它**
+        （critic N6）。本批次摘掉的种子按引用传进去，qBittorrent 的删除是异步的。"""
+        if self._claim_index is None:
+            self._claim_index = ClaimIndex(self.ctx.qbit, ignore=self._removed_torrents)
+        return self._claim_index
 
     # ---------------- 审计 ----------------
     def _audit(self, status: str, finding: Finding, action: Action,
@@ -156,6 +167,10 @@ class Executor:
         }
         if undo is not None:
             rec["undo"] = undo
+        if status != "skipped" and self._claim_index is not None:
+            # applied / failed 都可能已经改了东西（failed 也可能是改到一半）：
+            # 占用索引作废，后面的动作看到的是这一步之后的状态。
+            self._claim_index.invalidate()
         with self.cfg.audit_log.open("a", encoding="utf-8") as fp:
             fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         bucket = {"applied": self.report.applied,
@@ -282,57 +297,49 @@ class Executor:
             self._audit("skipped", f, a, {"reason": "文件已不在原位，不再改名"})
             return
 
-        if target.exists() and target != path:
-            # 走到这里说明腾空没能发生：同一集位有两个文件，而 duplicate-episode
-            # 这一轮没有（或不能）判出赢家。不是命名问题，别当命名问题报。
-            self._audit("skipped", f, a, {
-                "reason": "集位被占：目标名已被另一个文件占用，且本轮没有腾空",
-                "occupant": target.name,
-                "hint": "同一集有多个版本，等 duplicate-episode 判出取舍；"
-                        "若它也判不了（画质无法比较等），需要人工介入",
-            })
-            return
-        # 盘上没有不等于没人占：另一个活种子的 `torrents/files` 可能还声明着这个路径
-        # （幻影、或还没落盘的下载）。改过去就是两个种子宣称同一个文件——scan 每个
-        # 路径只出一条、colliding-torrent 不管两个都 100% 的，此后每轮都看不见；
-        # 那个种子一旦 recheck，还会把这份文件当成它自己的来校验、覆盖
-        # （2026-09-26 审查复现：幻影输家没摘，赢家就被改到了它的名字上）。
-        others = self._claimants(target, exclude=h or "") if self.ctx.qbit else []
-        if others and target != path:
-            self._audit("skipped", f, a, {
-                "reason": ("集位被占：目标路径仍被另一个种子声明（"
-                           + "、".join(f"{t['hash'][:8]} {t.get('name', '')[:40]}"
-                                      for t in others[:2])
-                           + "），改过去就是两个种子争同一个文件"),
-                "occupant": target.name,
-                "hint": "多半是幻影（种子说已下完、盘上没有）；判重会摘掉幻影输家，"
-                        "其余情形需要人工核对",
-            })
-            return
-        if self.dry_run:
-            self._audit("skipped", f, a, {"reason": "dry-run"})
-            return
-
-        via = "filesystem"
         if h and not self.ctx.qbit:
             # AGENTS.md 第 3 条：有种子的文件绝不走文件系统改名。以前 qBit 不在时
             # 这里直接落到下面的 `path.rename`（apply 的总闸之外的纵深防御）。
             self._audit("skipped", f, a, {
                 "reason": "有种子的文件，但 qBittorrent 不可用：拒绝绕过它改名"})
             return
+        # 目标名此刻归谁——盘上的 X / X.!qB、别的种子的条目，大小写与 Unicode 规范化
+        # 不敏感（claims 模块文档）。以前只看 `target.exists()` 加一个逐字符比较的
+        # `_claimants`：别人的孤儿 `X.!qB`、只差大小写的声明都看不见；自己只改大小写
+        # 反被 APFS 上的 `exists()` 当成集位被占。
+        chk = self._claims().check(target, own_hash=h or "", own_path=path)
+        if chk.unknown:
+            self._audit("failed", f, a, {
+                "error": f"无法确认目标路径的占用情况，未做任何改动：{chk.unknown}",
+                "claims": chk.audit()})
+            return
+        if chk.claimants:
+            self._audit("skipped", f, a, self._occupied(target, chk))
+            return
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run"})
+            return
+
+        via = "filesystem"
         if h:
             # 有种子的一律走 qBittorrent API。找不到对应条目就报失败，
             # **绝不退化成文件系统改名**——那会让种子路径失效、做种中断。
+            gone = {"reason": "所属种子已不在 qBittorrent 里，不再改名"}
+            t = self._claims().torrent(h)
+            if t is None:
+                # 诊断之后、本批次之外被删的（手动删种等）：状态变了，不是规则错
+                self._audit("skipped", f, a, gone)
+                return
             try:
                 entries = self.ctx.qbit.files(h)
             except Exception as e:
                 if "404" in str(e):
-                    # 诊断之后、本批次之外被删的（手动删种等）：状态变了，不是规则错
-                    self._audit("skipped", f, a,
-                                {"reason": "所属种子已不在 qBittorrent 里，不再改名"})
+                    self._audit("skipped", f, a, gone)
                     return
                 raise
-            entry = next((e for e in entries if Path(e["name"]).name == path.name), None)
+            # 按完整路径（save_path + 条目名）认，不按文件名：合集里不同子目录下
+            # 同名的文件（`a/E05.mkv`、`b/E05.mkv`）按文件名会认错、改掉另一个。
+            entry = self._entry_at(t, entries, path)
             if entry is None:
                 self._audit("failed", f, a,
                             {"error": "种子文件列表里找不到该文件，拒绝绕过 qBittorrent 改名"})
@@ -423,23 +430,38 @@ class Executor:
             pass
         return moved, stranded
 
-    def _claimants(self, target: Path, exclude: str = "") -> list[dict]:
-        """此刻有哪些活种子（`exclude` 之外）在 `torrents/files` 里声明着 `target`。
-
-        优先级 0 的条目不算：qBittorrent 不会往那里写，scan 也不把它当成种子的文件。
-        只问 save_path 是 target 祖先的种子——别的种子的条目不可能落到 target 上。
-        """
-        out = []
-        for t in self.ctx.qbit.torrents():
-            if t["hash"] == exclude or t["hash"] in self._removed_torrents:
-                continue
-            sp = (t.get("save_path") or "").rstrip("/")
-            if not sp or not under(target, sp):
-                continue
-            if any(e.get("priority", 1) != 0 and Path(sp) / e["name"] == target
-                   for e in self.ctx.qbit.files(t["hash"])):
-                out.append(t)
-        return out
+    @staticmethod
+    def _occupied(target: Path, chk: ClaimCheck) -> dict:
+        """「集位被占」的跳过记录。走到这里说明腾空没能发生。"""
+        extra = {"occupant": target.name,
+                 "claimants": [c.as_dict() for c in chk.claimants]}
+        if chk.in_qbit:
+            # 另一个活种子声明着它（幻影、还没落盘的下载、只差大小写的名字）。改过去
+            # 就是两个种子宣称同一个文件——scan 每个路径只出一条、colliding-torrent
+            # 不管两个都 100% 的，此后每轮都看不见；那个种子一旦 recheck，还会把这份
+            # 文件当成它自己的来校验、覆盖（2026-09-26 审查复现）。
+            extra["reason"] = ("集位被占：目标路径仍被另一个种子声明（"
+                               + "、".join(f"{c.hash[:8]} {c.name[:40]}"
+                                          for c in chk.in_qbit[:2])
+                               + "），改过去就是两个种子争同一个文件")
+            extra["hint"] = ("多半是幻影（种子说已下完、盘上没有）或还在下的另一个版本；"
+                             "判重会摘掉幻影输家，其余情形需要人工核对")
+        elif any(c.partial for c in chk.on_disk):
+            # 盘上只有别人的 `X.!qB`：下载中的文件改名是 `A.!qB → X.!qB`，撞上它就是
+            # 覆盖或 "File exists"；已下完的改过去，旁边还躺着一份谁也不认的半成品。
+            extra["reason"] = ("集位被占：盘上已有别人的半成品 "
+                               + "、".join(c.path.rsplit("/", 1)[-1]
+                                          for c in chk.on_disk if c.partial)
+                               + "，改过去会与它撞在一起")
+            extra["hint"] = ("没有种子认领的是孤儿半成品（种子已摘，死种处置会留下），"
+                             "需要人工清理；有种子的等它下完交给 duplicate-episode")
+        else:
+            # 同一集位有两个文件，而 duplicate-episode 这一轮没有（或不能）判出赢家。
+            # 不是命名问题，别当命名问题报。
+            extra["reason"] = "集位被占：目标名已被另一个文件占用，且本轮没有腾空"
+            extra["hint"] = ("同一集有多个版本，等 duplicate-episode 判出取舍；"
+                             "若它也判不了（画质无法比较等），需要人工介入")
+        return extra
 
     def _live_claims_under(self, root: Path) -> tuple[dict[str, dict], set[Path]]:
         """此刻 qBittorrent 里谁在 `root` 之下有文件——问活的，不信审计记录。
@@ -471,12 +493,27 @@ class Executor:
                 owners[t["hash"]] = t
         return owners, claimed
 
+    @staticmethod
+    def _entry_at(t: dict, entries: list[dict], abs_path: Path) -> dict | None:
+        """种子 `t` 的条目里，`save_path + 条目名` 恰好是 `abs_path` 的那一条。
+
+        按完整路径认，**不按文件名**：合集里不同子目录下同名的文件（`a/E05.mkv`、
+        `b/E05.mkv`）按文件名会认到第一个。scan 给 MediaFile 的路径就是
+        `save_path.rstrip("/") + "/" + 条目名`，逆改名记下的路径也由它推出，逐字相等。
+        """
+        sp = Path((t.get("save_path") or "").rstrip("/") or "/")
+        return next((e for e in entries if sp / e["name"] == abs_path), None)
+
     def _torrent_rel_path(self, torrent_hash: str, abs_path: Path) -> str | None:
-        """qBittorrent 的 renameFile 用的是种子内相对路径，不是绝对路径。"""
-        for entry in self.ctx.qbit.files(torrent_hash):
-            if Path(entry["name"]).name == abs_path.name:
-                return entry["name"]
-        return None
+        """qBittorrent 的 renameFile 用的是种子内相对路径，不是绝对路径。
+
+        种子已不在、或它的条目里没有这个路径，返回 None。
+        """
+        t = self._claims().torrent(torrent_hash)
+        if t is None:
+            return None
+        e = self._entry_at(t, self.ctx.qbit.files(torrent_hash), abs_path)
+        return e["name"] if e else None
 
     def _op_retag(self, f: Finding, a: Action) -> None:
         if self.dry_run:

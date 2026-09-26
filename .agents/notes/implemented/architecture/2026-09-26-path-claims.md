@@ -56,3 +56,31 @@ save_path 看得到。`download_path`（生产 `temp_path_enabled=False`）不�
 缓存与作废、目录查询。盘上相关的用例在"本机原生"与"模拟区分大小写的 lstat"两种语义下各跑
 一遍（本机临时目录是 APFS，不模拟的话折叠列目录那一支在本机永远走不到；变异验证：
 关掉列目录或 `fold` 都会变红）。
+
+## 2. `_op_rename` 接上原语；条目按完整相对路径认
+
+**以前**：盘上 `target.exists()` 加第 1 阶段的 `_claimants`（另一个种子的条目与目标逐字符
+相等）。看不见的：别人的孤儿 `X.!qB`（种子已摘、半成品留下——死种处置就是这样）；只差
+大小写 / 规范化的声明。反过来，自己的文件只改大小写时 APFS 上 `exists()` 为真，被误报成
+「集位被占」、永远改不成。`_torrent_rel_path` 按**文件名**找条目，合集里不同子目录下同名的
+文件（`a/E05.mkv`、`b/E05.mkv`）改名与逆改名都会改到第一个（第 1 阶段只修了 file_only 隔离）。
+
+**现在**：`chk = self._claims().check(target, own_hash=h, own_path=path)`：
+- `unknown` → **failed**「无法确认目标路径的占用情况，未做任何改动」（与 `_op_trash` 读不到
+  文件列表同口径：没改东西，但这一轮确实读失败了）；
+- 有占用者 → skipped「集位被占」，`claimants` 列出每一个（kind / path / hash / name /
+  progress / state / category）；理由分三种：别的种子声明着（含 hash 前 8 位，沿用第 9 条的
+  措辞）、盘上有别人的半成品、盘上有别的完整文件（原措辞）。
+- 有 hash 而 qBit 不可用的纵深防御提到占用查询之前，理由不变。
+- 条目用 `_entry_at(t, entries, path)`：`save_path + 条目名 == path`，逐字相等（scan 就是这样
+  拼出 MediaFile 路径的，逆改名记下的路径也由它推出）。`_torrent_rel_path` 同口径；种子不在
+  列表里直接当"已不在"，不再去问 `files()`。
+
+**执行器的索引**：`Executor._claims()` 一批次一份，`ignore` 按引用传入 `_removed_torrents`。
+`_audit` 写任何非 skipped 记录时作废它——applied 与 failed 都可能已经改了东西。
+
+**测试**：`tests/test_rename_claims.py`——下载中的文件不改到孤儿 `.!qB` 上；拒绝只差大小写的
+他人声明；自己的种子文件 / 本地文件只改大小写照改；`torrents()` 读失败、同目录邻居的
+`files()` 读失败都 failed 且没有 renameFile；合集按完整路径改对条目、逆改名也改对；找不到
+条目仍然报失败、不退化成 mv。`tests/test_harness.py` 的 failed 审计样例把超时从 `files()`
+挪到 `torrents()`：那个 hash 本就不在种子列表里，如今直接认作"已不在"。
