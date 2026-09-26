@@ -61,5 +61,6 @@ uv 0.7.2 能读：`uv lock --check`、`uv sync --frozen`、`uv sync --frozen --n
 
 ## 怎么用
 
-见 `tests/harness/__init__.py` 的 fixture 表；基座自身的语义断言在 `tests/test_harness.py`。
+见 `tests/harness/__init__.py` 的 fixture 表；基座自身的语义断言在 `tests/test_harness.py`；
+五个真实流程的范例在 `tests/test_e2e_smoke.py`（改名、判重腾空、回退、抓取、订阅修复）。
 跑法：`uv run pytest`；生产只读核对：`MEDIA_AGENT_LIVE=1 uv run pytest -m live`（zihan_air）。

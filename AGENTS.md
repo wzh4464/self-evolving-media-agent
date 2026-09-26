@@ -43,7 +43,8 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
 ```
 
 **改动删改类逻辑前先写离线测试。** 用 `tests/harness` 的 `LibraryBuilder`
-把事故现场搭出来（fixture 一览见 `tests/harness/__init__.py`），`lib.cycle()` 跑一轮
+把事故现场搭出来（范例见 `tests/test_e2e_smoke.py`，fixture 一览见
+`tests/harness/__init__.py`），`lib.cycle()` 跑一轮
 扫描 → 全量规则 → 执行。测试里触发的 failed 审计、被吞的检测器异常、
 没配路由的 URL 都会让测试变红，需要时用 `@pytest.mark.allow(...)` 显式声明。
 见 [离线测试基座](.agents/notes/implemented/testing/2026-09-26-offline-test-harness.md)。
