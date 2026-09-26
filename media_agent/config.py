@@ -44,6 +44,17 @@ def _evolve_mode(v: str) -> str:
     return mode
 
 
+def _seconds(v: str, name: str) -> float:
+    """非负、有限的秒数。写错了大声失败——静默退回默认值会让人以为改生效了。"""
+    try:
+        x = float(v.strip())
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} 要写成秒数（如 30），收到 {v!r}") from None
+    if not (x >= 0 and x != float("inf")):          # 也挡住 nan
+        raise ValueError(f"{name} 要写成非负的有限秒数，收到 {v!r}")
+    return x
+
+
 @dataclass
 class Config:
     media_root: Path
@@ -78,6 +89,10 @@ class Config:
     # 从最老的开始提前删，直到回到阈值以上（`disposal`）。隔离区与媒体在同一个 APFS 容器里（critic N8，
     # 约 94% 满），隔离不腾空间，只有硬删除腾；时间清理换掉之后，空间紧张时靠这一条。
     min_free_gb: float = 50.0
+    # 抓取加种后等元数据（`torrents/files` 有内容）最多多少秒，等到了就在下载过程中把正片改成规范名
+    # （`grabber.wait_metadata`）；等不到交给 unrenamed-file 下一轮兜底。以前写死 10 秒，而 wait_metadata
+    # 的默认值与文档一直是 30 秒（磁力 / 连不上 peer 时元数据可能要几分钟）。每次等的结局写进抓取审计。
+    grab_metadata_timeout: float = 30.0
 
     @property
     def state_dir(self) -> Path:
@@ -128,4 +143,5 @@ def load_config(env_file: Path | None = None) -> Config:
         qbit_allow_empty=_bool(g("QBIT_ALLOW_EMPTY", "false")),
         quarantine_min_age_days=float(g("QUARANTINE_MIN_AGE_DAYS", "3")),
         min_free_gb=float(g("MIN_FREE_GB", "50")),
+        grab_metadata_timeout=_seconds(g("GRAB_METADATA_TIMEOUT", "30"), "GRAB_METADATA_TIMEOUT"),
     )

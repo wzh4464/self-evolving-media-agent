@@ -1122,7 +1122,7 @@ class Executor:
         #
         # 集位被占就不改（占用闸门，见 `grabber.rename_single_video`）：留在发布名上、
         # 钉子留着，下完后判重封存它、清走占位的，同一轮再改名。结局写进审计。
-        renamed = self._rename_grabbed(blob, a.args.get("official_title") or cat, season, ep)
+        renamed, metadata = self._rename_grabbed(blob, a.args.get("official_title") or cat, season, ep)
 
         # 写 sidecar：加进 have，并把这个发布名记成别名（下次匹配用得上）
         title = a.args.get("title", "")
@@ -1153,7 +1153,7 @@ class Executor:
                     {"already_present": already,
                      "save_path": str(save_path),
                      "have_after": have,
-                     "rename": renamed, **sidecar},
+                     "rename": renamed, "metadata": metadata, **sidecar},
                     undo={"op": "ungrab_episode", "show_dir": str(show_dir),
                           "season": season, "episode": ep,
                           "title": title})
@@ -1212,33 +1212,48 @@ class Executor:
         except Exception:
             pass
 
-    def _rename_grabbed(self, blob: bytes, title: str, season: int, ep: int) -> dict:
-        """把刚加进去的种子里那个正片文件改成规范名，返回写进审计的结局
-        （`RenameOutcome.audit()` 的形状：`{"renamed": 新条目名|None, "skipped"?, "claims"?}`）。
+    def _rename_grabbed(self, blob: bytes, title: str, season: int, ep: int) -> tuple[dict, dict]:
+        """把刚加进去的种子里那个正片文件改成规范名，返回写进审计的两段结局：
+
+        - 改名（`RenameOutcome.audit()` 的形状：`{"renamed": 新条目名|None, "skipped"?, "claims"?}`）；
+        - 等元数据（`{"outcome": "ready"|"timeout"|"not_attempted", "timeout_s", "waited_s"?, "last_error"?}`）。
 
         只处理"恰好一个视频文件"的种子；合集或带特典的交给 `unrenamed-file`
         按文件逐个判断，这里不猜。没改成不让抓取算失败——下一轮的改名规则会兜底；
         但**为什么没改**要进审计与日志，以前全被吞进一行日志、审计里什么都没有。
-        """
-        from .grabber import rename_single_video, wait_metadata
 
+        等元数据最多 `GRAB_METADATA_TIMEOUT` 秒（默认 30）。以前写死 10 秒，而 `wait_metadata` 的默认值与文档
+        一直是 30；审计里只有一句「元数据 10 秒内未到」，等了多久、是真没元数据还是 qBittorrent 一直报错，查不到。
+        """
+        from . import grabber
+
+        timeout = float(self.cfg.grab_metadata_timeout)
         h = self._infohash_v1(blob)
         if not h:
-            return {"renamed": None, "skipped": "算不出 v1 infohash（纯 v2 种子？），交给 unrenamed-file"}
+            return ({"renamed": None, "skipped": "算不出 v1 infohash（纯 v2 种子？），交给 unrenamed-file"},
+                    {"outcome": "not_attempted", "timeout_s": timeout})
         stem = "%s S%02dE%02d" % (title, season, ep)
+        errors: list[str] = []
+        started = time.monotonic()
+        files = grabber.wait_metadata(self.ctx.qbit, h, timeout=timeout, errors=errors)
+        metadata = {"outcome": "ready" if files else "timeout", "timeout_s": timeout,
+                    "waited_s": round(time.monotonic() - started, 1)}
+        if errors:
+            metadata["last_error"] = errors[-1]
+            metadata["errors"] = len(errors)
+        if not files:
+            # 元数据还没到，交给 unrenamed-file 兜底
+            return ({"renamed": None,
+                     "skipped": f"元数据 {timeout:g} 秒内未到，交给 unrenamed-file"}, metadata)
         try:
-            files = wait_metadata(self.ctx.qbit, h, timeout=10.0)
-            if not files:
-                # 元数据还没到，交给 unrenamed-file 兜底
-                return {"renamed": None, "skipped": "元数据 10 秒内未到，交给 unrenamed-file"}
-            out = rename_single_video(self.ctx.qbit, h, stem, files, claims=self._claims())
+            out = grabber.rename_single_video(self.ctx.qbit, h, stem, files, claims=self._claims())
         except Exception as e:
             self.ctx.log(f"[grab] 加种后改名失败（下一轮会补）: {e}")
-            return {"renamed": None, "skipped": f"改名出错：{type(e).__name__}: {e}"}
+            return {"renamed": None, "skipped": f"改名出错：{type(e).__name__}: {e}"}, metadata
         if out.blocked:
             self.ctx.log(f"[grab] 加种后不改名：{stem} {out.skipped}（{out.check.describe()}）；"
                          f"留在发布名上、保留 ma: 钉子，下完后交给判重封存与改名规则收敛")
-        return out.audit()
+        return out.audit(), metadata
 
     def _op_drop_torrent(self, f: Finding, a: Action) -> None:
         """把种子记录从 qBittorrent 摘掉，**文件一个字节都不动**。
