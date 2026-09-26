@@ -895,7 +895,8 @@ def main() -> int:
         with runlog.stamped(args.run_id):
             if paused:
                 return _paused_run(args, cfg, paused)
-            return _locked(args, cfg, before=_run_banner)
+            return _locked(args, cfg, before=_run_banner,
+                           locked_out=lambda holder: _locked_out_run(args, cfg, holder))
     if paused:
         return _paused(paused)
     return _locked(args, cfg)
@@ -917,6 +918,14 @@ def _paused_run(args, cfg, why: str) -> int:
     return _finish_run(cfg, rh, _paused(why))
 
 
+def _locked_out_run(args, cfg, holder: str) -> int:
+    """被运行锁挡住的 `run` 也写健康报告（warn）：锁要是被一个卡死的进程一直拿着，每一轮都这样悄悄结束。"""
+    rh = health.RunHealth(cfg, run_id=args.run_id, cmd="run",
+                          dry_run=args.dry_run or not cfg.auto_apply)
+    rh.locked(holder or "持有者未知，可能是部署脚本")
+    return _finish_run(cfg, rh, _locked_out(holder))
+
+
 def _run_banner(args, cfg) -> None:
     """`run` 拿到锁之后、做任何事之前：轮转日志（锁保证没有别的 media-agent 同时在写），打一行轮次分隔。"""
     rotated = runlog.rotate(cfg.state_dir)
@@ -926,15 +935,16 @@ def _run_banner(args, cfg) -> None:
         _log(m)
 
 
-def _locked(args, cfg, before=None) -> int:
-    """需要运行锁的子命令先拿锁（见 runlock.py），拿不到以 75 结束。`before` 在拿到锁之后、执行之前调用。"""
+def _locked(args, cfg, before=None, locked_out=None) -> int:
+    """需要运行锁的子命令先拿锁（见 runlock.py），拿不到以 75 结束（`locked_out(持有者)` 给了就交给它）。
+    `before` 在拿到锁之后、执行之前调用。"""
     if not _needs_lock(args):
         if before:
             before(args, cfg)
         return args.func(args, cfg)
     lock = RunLock(cfg.state_dir / LOCK_NAME, label=" ".join(["media-agent", *sys.argv[1:]]))
     if not lock.acquire(wait=runlock.DEFAULT_WAIT):
-        return _locked_out(lock.holder())
+        return (locked_out or _locked_out)(lock.holder())
     try:
         if before:
             before(args, cfg)

@@ -141,3 +141,22 @@ def test_other_mutating_commands_are_marked_pausable_or_not(monkeypatch):
         _main(monkeypatch, *argv)
     assert captured == {"run": True, "apply": True, "rollback": False, "repair": False,
                         "purge": False}
+
+
+def test_locked_out_run_writes_a_warn_health_report(monkeypatch, marker, capsys, project_root):
+    """运行锁被占的一轮同样什么都没做：以前只打一行、退出码 75、没有健康报告。锁若被一个卡死的进程一直拿着，
+    每一轮都这样悄悄结束——正是这一阶段要让人看见的停摆。现在写 warn 报告（持有者是谁、从什么时候起）。"""
+    _no_real_work(monkeypatch)
+    monkeypatch.setattr(cli.runlock, "DEFAULT_WAIT", 0.1)
+    lock = RunLock(project_root / "state" / LOCK_NAME, "media-agent purge --apply")
+    assert lock.acquire(wait=0)
+    try:
+        assert _main(monkeypatch, "run") == 75
+    finally:
+        lock.release()
+
+    rep = health.load_report(project_root / "state")
+    assert rep["status"] == "warn" and rep["exit_code"] == 75
+    [r] = rep["reasons"]
+    assert r["code"] == "locked" and "media-agent purge --apply" in r["text"]
+    assert "<cmd_run 跑了>" not in capsys.readouterr().out

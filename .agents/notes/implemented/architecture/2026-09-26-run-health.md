@@ -286,12 +286,15 @@ URL / Bearer / userinfo 里的）不进信也不进健康报告；发送失败�
 - **不拿运行锁就返回**：救援脚本重建容器时自己拿着那把锁（第 11 节），暂停的 run 不去等那 10 秒。
 - 暂停的 `run` 照样写健康报告（warn，原因 `paused`，退出码 75），ok → warn 发一封通知：一个忘了删的 `state/PAUSE`
   不能让 agent 悄悄停摆——这一阶段要解决的正是这种停摆。
+- 同理，**被运行锁挡住的 `run`**（另一个进程拿着 `state/run.lock`，等满 10 秒）也写 warn 报告（原因 `locked`，带持有者
+  的自述：pid、命令、从什么时候起），退出码仍是 75。以前只有一行输出：锁若被一个卡死的进程一直拿着，每一轮都这样
+  悄悄结束。与部署偶尔撞上一轮会因此多一封 ok → warn 的通知，下一轮恢复 ok 不再发。
 - 直接构造的 `Config`（测试基座）`rescue_marker=None` = 不看；conftest 另把 `RESCUE_MARKER` 指到临时目录——开发机上
   真有 `~/gluetun` 时测试也不会被暂停。
 
 **测试**：`tests/test_pause.py`——救援标记让 `run` / `apply` 以 75 结束、说清原因；`state/PAUSE` 的内容与怎么恢复；
 `diagnose` 照常；不暂停照常；暂停的 run 不等锁；暂停的 run 写 warn 健康报告；时长；默认路径；测试基座不看；哪些子命令
-声明了暂停。把 `run` 的 `pause=True` 去掉，5 个红。
+声明了暂停。把 `run` 的 `pause=True` 去掉，5 个红。被锁挡住的 run 写 warn 报告、带持有者。
 
 ## 11. 救援脚本与看门狗重建容器时拿运行锁（`deploy/rescue.py`、`deploy/vpn-watchdog.sh`）
 

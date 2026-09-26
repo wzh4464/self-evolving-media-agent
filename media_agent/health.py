@@ -216,7 +216,7 @@ class RunHealth:
             "started": datetime.now().isoformat(timespec="seconds"), "finished": None,
             "duration_s": None, "status": None, "exit_code": None, "reasons": [],
             "clients": None, "degraded": {"refused": "", "qbit_errors": [], "rescan": ""},
-            "crash": None, "paused": "", "detectors": None, "findings": None, "actions": None,
+            "crash": None, "paused": "", "locked": "", "detectors": None, "findings": None, "actions": None,
             "grab": None, "stuck": None, "unrenamed": None, "trash": None, "torrents": None,
             "evolve": None, "logged_errors": {"count": 0, "by_tag": {}, "samples": []},
         }
@@ -309,6 +309,9 @@ class RunHealth:
     def paused(self, why: str) -> None:
         self.data["paused"] = why
 
+    def locked(self, holder: str) -> None:
+        self.data["locked"] = holder
+
     def crashed(self, e: BaseException) -> None:
         from .kernel import _where
         try:
@@ -342,6 +345,8 @@ class RunHealth:
                 f"{trash['min_free_bytes'] / gb:.0f} GB，证明得了可删的都删了——要人腾空间")
         if d["paused"]:
             add("warn", "paused", f"维护暂停：{d['paused']}")
+        if d["locked"]:
+            add("warn", "locked", f"运行锁被占着（{d['locked']}），这一轮什么都没做")
         det = d["detectors"] or {}
         if det.get("errors"):
             rules = "、".join(dict.fromkeys(e["rule"] for e in det["errors"]))
