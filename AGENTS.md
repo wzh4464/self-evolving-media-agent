@@ -113,9 +113,14 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
    还没交接的文件（仍在 `Bangumi` 下）**不做不可逆的处置**——它此刻叫什么
    只是"AB 认为的"，不是定论。见
    [压平季误删](.agents/notes/implemented/bug-fix/2026-08-31-flattened-season-numbering.md)。
+
+   这张表是 `AB_MODE=full`（默认）的。**订阅模式**（`AB_MODE=subscription`，第 17 条）下 AB 的改名线程停了，
+   `Bangumi` 里只剩订阅那一刻 AB 补的集、名字就是发布名：它们归本项目——判重不让位，`media-agent grab` 当场交接、
+   改名。判断一律问 `abmode.ab_renames(cfg)`，不要自己比较 `torrent_category == "Bangumi"` 就认定"归 AB"。
 7. **修订阅时三步顺序不能反**：先改 `title_aliases`/`rss_link` → 再清"已登记但
    不在 qBittorrent"的 torrent 记录 → 最后刷新。`pull_rss` 只处理 `check_new()`
    筛出的新条目，顺序反了会让 AutoBangumi 用**仍然失效**的规则把条目重新登记一遍。
+   这只在 `full` 模式下成立：订阅模式下本项目**不修 AB 的订阅、永远不叫它刷新**（第 17 条）。
 8. **往媒体库里落一个名字之前，先问 `claims` 它此刻归谁。** 盘上看不到不等于没人占：
    0% 的种子、只有 `X.!qB` 的下载、只差大小写的名字（生产卷是大小写不敏感的 APFS）
    都算占用。改名、抓取后改名、relink、目录改名、回退里的每个写路径都走
@@ -183,6 +188,20 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     删除照样过关口；其余治理留给 6 小时的 `run`。见 [接手 AB 订阅](.agents/notes/implemented/architecture/2026-09-27-ab-adoption.md)、
     [订阅](.agents/notes/implemented/architecture/2026-09-27-subscriptions.md)、
     [抓取模式](.agents/notes/implemented/architecture/2026-09-27-grab-mode.md)。
+
+17. **AutoBangumi 的模式只经 `media-agent ab-mode` 切；按模式开关，不删为 AB 写的代码。** `full`（默认）= AB 拉 RSS、下载、
+    改名；`subscription` = AB 只当订阅的前端（它的 RSS 与改名两个线程关掉，WebUI 订阅照旧），抓取与改名全归本项目。
+    - **判断只有一处**：`abmode.ab_renames(cfg)`（`Bangumi` 分类归不归 AB）与 `abmode.ab_downloads(cfg)`（只为 AB 存在的规则
+      开不开）。新写的"因为 AB 在下载 / 改名"才需要的逻辑都按它们开关——`full` 是回退的路，切回去当场恢复。
+    - **订阅模式下永远不叫 AB 刷新**（`refresh_all` / `refresh` 会让它当场下载，两个开关管不住），不写它的订阅，抓的种子
+      不打 `ab:` 标签。
+    - **改 AB 的配置只能整份写回**（漏掉的段 AB 会退回默认值）；开关只在程序重启时生效；读回核对之后才改本项目的模式
+      （`state/ab_mode.json`，盖过 `AB_MODE`；`.env` 代码不写）。说不清就记 unknown、模式不动。
+    - 切换之后 AB 真停了没有，`/api/v1/status` 说不出来：按切换时的基线核对（`abmode.activity`，健康报告的
+      `ab_still_polling` / `ab_added_outside_subscribe` / `ab_mode_unverified`）。
+    - AB 里停用订阅（`deleted=1`）会让本项目看不见这条订阅（`AutoBangumiDB.bangumi` 只读 `deleted=0`）：不要为了"停"
+      而停用订阅。
+    见 [AB 的模式](.agents/notes/implemented/architecture/2026-09-27-ab-mode.md)，步骤与回退见 `deploy/README.md`。
 
 ## 自演进的闭环
 

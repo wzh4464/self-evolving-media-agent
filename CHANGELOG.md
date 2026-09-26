@@ -54,6 +54,8 @@
   （配了 `AB_CONFIG` 就只读 AB 的 config.json 说一句看到了什么）；重启之后等不到它回来记 unknown、本项目的模式不动、说清怎么
   核对与退回；切回 `full` 提醒补下载（AB 按 URL 判新，停着期间发布的一口气下）。`show` 说两边各认什么、一不一致，切换之后
   AB 还拉没拉 RSS、在订阅之外加没加种子（不一致 / 有问题退出码 1）。`AB_MODE` 写错、状态文件坏了大声失败。
+  **订阅照旧**：AB 的 WebUI（或 `autobangumi-subscribe-verify` 流程）、或 `media-agent subscribe`；切换之前的准备、切换后的
+  核对与回退步骤见 `deploy/README.md`「AutoBangumi 的模式」（代码回滚到 v0.6.0 之前要先切回 `full`）。
 - **订阅模式下 `Bangumi` 分类不再归 AutoBangumi**：AB 的改名线程停了，`Bangumi` 里只剩订阅那一刻它补的集、名字就是发布名。
   判重不再为它让位（不报 `pending_ownership`、封存集位里不再 holdback 发布名认不出这一集的）；`media-agent grab` 当场把
   `Bangumi` / `BangumiCollection` 里的种子交接到剧名分类、改名、判重（以前要等 6 小时的 `run`）。`full` 模式照旧。

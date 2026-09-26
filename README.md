@@ -177,6 +177,48 @@ days of grabs failing into the audit log while launchd reported exit code 0. So:
   exit 75 without touching anything; the rescue and watchdog scripts take the run
   lock before recreating the qBittorrent container.
 
+## AutoBangumi as a subscription front-end
+
+Two downloaders racing for the same episode kept producing duplicates and rename
+tug-of-wars. media-agent now takes over everything AutoBangumi did after you
+subscribe — grabbing (every 30 minutes, any fansub group), renaming, new seasons,
+per-season episode offsets — so AutoBangumi can be reduced to what it is good at:
+the place where you subscribe.
+
+`AB_MODE` (`.env`, default `full`) says which world you are in, and
+`media-agent ab-mode` switches it, reversibly:
+
+| Mode | AutoBangumi | media-agent |
+|---|---|---|
+| `full` (default) | polls RSS every 15 min, downloads, renames every 60 s | defers to AB's `Bangumi` category; AB-only rules on |
+| `subscription` | only its WebUI/API subscribe: the moment you subscribe it fetches the episodes already out into `Bangumi`, then goes quiet | hands those over and renames them within 30 min; grabs every later episode itself; AB-only rules off; never asks AB to refresh |
+
+**How subscribing works now** — nothing changes for you:
+
+- keep subscribing in AutoBangumi's WebUI (or with the `autobangumi-subscribe-verify`
+  workflow). The next `media-agent grab` (≤ 30 min) creates the show directory if
+  needed, records the subscription and the episode offset in the show's
+  `.media-agent.json`, and starts grabbing;
+- or skip AutoBangumi entirely: `media-agent subscribe --tmdb ID [--season N] [--mikan ID]`;
+- new seasons of a show you follow are registered automatically a week before they air.
+
+```sh
+uv run media-agent ab-mode                          # both sides' view, and whether they agree
+uv run media-agent ab-mode subscription --dry-run   # what the switch would change
+uv run media-agent ab-mode subscription             # turn AB's RSS + rename threads off
+uv run media-agent ab-mode full                     # and back
+```
+
+The switch reads AutoBangumi's whole config, flips only `rss_parser.enable` and
+`bangumi_manage.enable`, writes the **whole** object back (AB resets any section you
+leave out), restarts its program (not the container), and reads the flags back before
+recording the mode in `state/ab_mode.json` — which then wins over `AB_MODE`. It is an
+audited action with an undo (`media-agent rollback`). From then on every run's health
+report checks, against a baseline taken at the switch, that AB really stopped polling
+RSS and adds nothing outside a subscribe. Switching back to `full` brings a burst of
+downloads: AB dedupes by URL, so everything published while it was off looks new.
+See [deploy/README.md](deploy/README.md#autobangumi-的模式) for the procedure.
+
 ## Quick start
 
 ```sh
@@ -198,6 +240,7 @@ uv run media-agent health              # the last run's health report
 uv run media-agent ack <fp> --reason … # acknowledge a stuck finding (commit .agents/acks.json)
 uv run media-agent ledger backfill --dry-run   # provenance coverage (every run backfills new torrents)
 uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID]   # subscribe without AutoBangumi
+uv run media-agent ab-mode [show|subscription|full]                # AutoBangumi as a subscription front-end, reversibly
 ```
 
 Start with `diagnose`, then `apply --dry-run`. Only flip `AUTO_APPLY=true` once
@@ -210,7 +253,7 @@ launchd plists for the 6-hourly `run` and the 30-minute `grab` pass are in [`dep
 | Service | Required? | Without it |
 |---|---|---|
 | qBittorrent WebUI | yes | — |
-| AutoBangumi | optional | Loses `ab:` tag rules and AB-subscription adoption; subscribe with `media-agent subscribe` instead |
+| AutoBangumi | optional | Loses AB-subscription adoption (subscribe with `media-agent subscribe` instead); with `AB_MODE=subscription` it is only the subscription front-end |
 | TMDB API key | optional | Title-alignment rules skip (free at [themoviedb.org](https://www.themoviedb.org/settings/api)) |
 | LLM (OpenAI-compatible) | optional | Self-evolution skips; everything else works |
 
@@ -234,6 +277,7 @@ media_agent/
   converge.py     One run to a fixed point: scan → diagnose → execute, no retries, no flip-flops
   grabmode.py     The 30-minute grab pass: same machinery, only grab / adopt AB subscriptions / finish its own grabs
   subscribe.py    `media-agent subscribe`: subscribe to a season without AutoBangumi
+  abmode.py       AutoBangumi's mode (AB_MODE / `media-agent ab-mode`): full, or subscription front-end only
   history.py      Findings history, fingerprints, stuck detection, acknowledgements
   titles.py       TMDB title stability: a new title needs two consecutive runs, no flip-back within 30 days
   health.py       Per-run health report, torrent-count plausibility

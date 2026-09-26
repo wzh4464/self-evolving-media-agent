@@ -28,7 +28,7 @@
 | `.agents/acks.json` | git（tag） | 已确认、先不提醒的"卡住"问题（`media-agent ack` 写），与偏好同理是版本化的用户意图 |
 | `.env` | 只在生产（600） | 凭据与开关；`.env.*`（含 `.env.bak-*`）被忽略 |
 | `.venv/` | 只在生产 | 由部署用 `uv sync --frozen` 维护，运行时不再同步 |
-| `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`audit.fallback.jsonl`（审计写不进主文件时的转写，回退一起读）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`deploy.log`、`backups/`、`harvest/` |
+| `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`audit.fallback.jsonl`（审计写不进主文件时的转写，回退一起读）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`deploy.log`、`backups/`、`harvest/`、`ab_mode.json`（`media-agent ab-mode` 写的 AutoBangumi 模式，见「AutoBangumi 的模式」） |
 | 各番目录里的 `.media-agent.json` | 媒体根下 | 每部番的用户意图，不归部署管，见下节 |
 
 ## 用户意图放在哪
@@ -185,6 +185,8 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
   **回到 `v0.1.0` 之后工作区里没有 `deploy/deploy.sh`**：成功信息里的"回滚"一行会改成打印
   `git -C ~/media-agent show v0.2.0:deploy/deploy.sh > <临时文件> && /bin/bash <临时文件> v0.2.0`
   这种形式——照着复制就能再部署回去（测试里照着打印出来的命令跑过）。
+- **AutoBangumi 在订阅模式时**，先 `media-agent ab-mode full` 再回滚到 v0.6.0 之前：旧代码不认 `state/ab_mode.json`，会把一个
+  已经停了改名的 AB 当成还在改名（`Bangumi` 分类永远让位、新订阅补的集没人改名），还会在修订阅时叫它刷新。
 - **数据**：代码回滚从不回卷 `state/`。撤销某一批改动仍然是
   `media-agent rollback --run <批次 ID>`；因此每个版本都必须能读懂旧版本写下的 state
   （审计格式向后兼容是发版要求）。`state/backups/` 里的副本只供手工比对，不会自动还原。
@@ -198,7 +200,7 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
 
 | 拿锁 | 不拿锁 |
 |---|---|
-| `run`、`grab`、`apply`、`rollback`、`repair`、`evolve`、`subscribe`、`purge --apply`（含 `--dry-run`） | `scan`、`diagnose`、`runs`、只预演的 `purge` |
+| `run`、`grab`、`apply`、`rollback`、`repair`、`evolve`、`subscribe`、`purge --apply`（含 `--dry-run`）、`ab-mode subscription\|full` | `scan`、`diagnose`、`runs`、只预演的 `purge`、`ab-mode`（show）与 `ab-mode … --dry-run` |
 
 - 拿不到锁最多等 10 秒（`run` 等 300 秒，见下），然后打印持有者（pid、命令、开始时间）、以**退出码 75** 结束，
   什么都不做。launchd 的一轮撞上部署或手动操作就是这样：`last exit code = 75`，6 小时（抓取是 30 分钟）后再来。
@@ -248,6 +250,87 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zihan.media-agent.pl
 | 4 | 改动照常做了，但有审计记录没能原样写进 `state/audit.jsonl`：写不进去的（磁盘满、权限……）已转写到 run.err.log 与 `state/audit.fallback.jsonl`，`rollback` / `runs` 会一起读——先腾空间；值序列化不了的已按字符串降级写进 `audit.jsonl` 本身（run.log 末尾写明是哪一种）——多半是代码 bug |
 | 5 | 这一轮跑完了，但健康报告 critical：隔离区处置之后媒体卷剩余仍低于 `MIN_FREE_GB`——要人腾空间 |
 | 75 | 另一个进程持有运行锁，或维护暂停中（VPN 救援进行中 / 有 `state/PAUSE`），这一轮什么都没做 |
+
+## AutoBangumi 的模式
+
+v0.6.0 起有 `AB_MODE`，默认 `full`——**部署这个版本什么都不变**，直到人切。`subscription` = AutoBangumi 只当订阅的前端：
+它的 RSS 线程（拉 RSS、下载）与改名线程都关掉，WebUI 与订阅照旧；抓取（`grab`，每 30 分钟）与改名全归本项目。为什么、
+改了什么见 `media_agent/abmode.py` 与 `.agents/notes/implemented/architecture/2026-09-27-ab-mode.md`。
+
+### 切换之前
+
+1. 至少跑完一轮 v0.6.0 的 `run`：`ab-adoption` 把 AB 订阅行上的集号偏移迁进各番的 sidecar（生产上只有 AB 37 一条：
+   《超超超超超喜欢你的100个女朋友》第三季，-24，部署后第一轮 `run` 提议一次 `adopt_episode_offset`）；`media-agent health`
+   里没有 `ab_subscription_unmapped` / `ab_subscription_moved`——这两种订阅 AB 一停就没人接。
+2. 抓取任务在跑：`launchctl print gui/$(id -u)/com.zihan.media-agent-grab | grep state`，`media-agent health --grab` 最近一轮
+   不是 critical。
+3. 两边此刻各认什么：`media-agent ab-mode`（= `show`）。预演：`media-agent ab-mode subscription --dry-run`。
+4. （可选）留一份 AB 的配置：`cp <ab-config>/config.json ~/ab-config.json.bak-$(date +%F) && chmod 600 ~/ab-config.json.bak-*`
+   ——里面有密码。切换本身不需要它（逆操作记在审计里）。
+
+### 切换
+
+```sh
+cd ~/media-agent && .venv/bin/media-agent ab-mode subscription
+```
+
+它做的：读 AB 的**整份**配置（`GET /api/v1/config/get`，密码打码）→ 只把 `rss_parser.enable` 与 `bangumi_manage.enable`
+改成 false → **整份**发回（`PATCH /api/v1/config/update`；AB 按整个对象解析，漏掉的段退回默认值——手工改时也绝不要只发这
+两项）→ `GET /api/v1/restart`（程序重启：停掉四个后台任务、按 config.json 重起；WebUI 不停；**不是** `docker restart`，容器
+里 qb_downloader 的补丁不受影响）→ 最多等 6 分钟它回来、读回开关核对 → 写 `state/ab_mode.json`（盖过 `.env` 的 `AB_MODE`），
+并记下核对用的基线（每个 rssitem 的 `last_checked_at`、已有的订阅 id）。拿运行锁：正在跑的 `run` / `grab` 跑完才切，下一轮
+按新模式行事。审计里一条 `set_ab_mode`，批次 ID 印在输出里。
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 切成了（或本来就是） |
+| 1 | 没核对上（unknown：重启之后等不到它回来 / 读回的开关不对）或失败——输出里写着怎么核对、怎么退回；本项目的模式没动 |
+| 2 | 配置错误（`AB_MODE` 写错、`state/ab_mode.json` 坏了） |
+| 3 | AB 接口连不上 / 认不出它的配置：什么都没动（配了 `AB_CONFIG`——AB 的 config.json 在宿主上的路径——就只读它，说一句看到的开关） |
+| 75 | 运行锁被占着 |
+
+### 核对（切换后 15–30 分钟看一次，隔天再看一次）
+
+- `media-agent ab-mode`：两边都是 subscription、「切到 subscription 之后 AB 没再拉过 RSS」、「订阅动作之外 AB 没加过种子」；
+  有问题退出码 1。
+- 每一轮 `run` / `grab` 的健康报告多一行 `AB      subscription（state，自 …） · 拉 RSS 0 · 订阅之外加种 0 · 订阅补集 N`；
+  warn `ab_still_polling` / `ab_added_outside_subscribe` / `ab_mode_unverified`（`run` 的会发信）。
+- 只读看 AB 的日志 `log.txt`：`Program running.` 之后不再有 `[Engine]` 与 ` >> ` 行；qBittorrent 里不再出现订阅之外的新
+  `Bangumi` 种子。
+- **别看 `/api/v1/status`**：不管哪几个线程起了它都说 true。
+- 订一部新番试试：AB 的 WebUI 里订阅 → 它当场把已发布的集加进 qBittorrent（`Bangumi` 分类；新订阅那一刻还没有 id，不带
+  `ab:` 标签）→ 30 分钟之内 `grab` 建目录（需要的话）、登记订阅、把这些种子交接到剧名分类并改名，之后的集由 `grab` 抓；
+  健康报告把这一批计进「订阅补集」，不报警。
+
+**`ab_still_polling`**：`last_checked_at` 又变了 = AB 又拉了一次 RSS（拉了就可能下载）。`media-agent ab-mode` 看它的开关：
+开着（有人在 WebUI 里打开了）→ 再跑 `media-agent ab-mode subscription`；关着却还在拉 = 程序没重启成 → 同一条命令会再重启一次。
+有人在 WebUI 里点了「刷新」也会这样（刷新不看开关、会下载），那一次核对一下 qBittorrent 里多了什么即可。
+**`ab_added_outside_subscribe`**：切换之后 AB 加的种子不是新订阅那一刻补的那一批（启发式：新订阅的保存路径下、第一个种子
+之后 1 小时之内的才算）——RSS 线程、刷新、对老订阅点了「收集」。**`ab_mode_unverified`**：模式来自 `.env` 的 `AB_MODE`、没经
+命令切过（核对不了 AB 关没关），或这一轮读不到 AB 库——用命令切一次（开关已关的只重启、核对、记基线）/ 看 `AB_DB`。
+
+**没核对上（unknown）**：AB 的 config.json 也许已是新开关、线程还是旧的（要到下一次重启才换）；本项目的模式没动。AB 回来之后
+再跑一次同一条命令——开关已对的不再 PATCH，只重启、核对、记录。要退回按下一节。
+
+### 回退
+
+任选其一：
+
+- `media-agent ab-mode full`：两个开关打开、重启、核对，`state/ab_mode.json` 记成 full。
+- `media-agent rollback --run <切换那一次的批次 ID>`：开关改回切换之前的样子、状态文件还原成切换之前的（原来没有就删）。切换
+  之后有人改过开关、或又切过一次，这一步跳过并写明——那时用上一条。
+- AB 的 WebUI 设置里打开「RSS 解析」「番剧管理」、点应用（WebUI 会重启程序）——然后 `media-agent ab-mode full`，让本项目
+  也认 full（或删掉 `state/ab_mode.json` 回到 `.env` 的 `AB_MODE`）。两边不一致时 `media-agent ab-mode` 退出码 1、说出来。
+
+**回退之后会有一波补下载。** AB 的 `torrent` 表按 **URL** 判新：停着期间 feed 里发布的条目全算新的，打开之后第一次拉 RSS
+（15 分钟之内）就一口气下——大多是本项目已经抓过的集。它们落进 `Bangumi` 分类、AB 改名；`full` 下判重对 `Bangumi` 让位，
+`run` 的分类交接之后（一轮之内的下一次迭代）判重清掉重复，输家进隔离区、按判重的处置规则保留期后删。停得越久，这一波越大；
+只是临时切回的话，预计多出"停着那几天 × 在追的番"那么多个种子。**不要**为了少下一些在 AB 里停用订阅：停用把订阅行标成
+`deleted=1`，本项目只读 `deleted=0`，这条订阅的接手、集号偏移、新季登记都跟着没了。
+
+**`AB_MODE` 与状态文件。** `state/ab_mode.json`（命令写的）> `.env` 的 `AB_MODE` > `full`；部署从不碰 `state/`。状态文件坏了，
+所有命令以退出码 2 拒绝启动（「配置错误：…ab_mode.json…」）：删掉它、用 `media-agent ab-mode` 核对两边，再切一次。代码回滚到
+v0.6.0 之前，先切回 full（见「回滚」）。
 
 ## 部署脚本自己的测试
 

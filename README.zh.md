@@ -143,6 +143,37 @@ agent 产出的是**声明式 JSON**，由固定的解释器求值。它只能�
 - **维护暂停。** 有 `state/PAUSE`、或 VPN 救援进行中，`run` / `apply` 以 75 结束、什么都不动；救援脚本与看门狗重建
   qBittorrent 容器前先拿运行锁。
 
+## AutoBangumi 只当订阅的前端
+
+两个下载者抢同一集，一直在制造重复与改名拉锯。订阅之后 AutoBangumi 做的每一样，本项目都接住了——抓取（每 30 分钟，
+任何字幕组）、改名、新一季、按季的集号偏移——于是 AB 可以只留它最擅长的那件事：在那里订阅。
+
+`AB_MODE`（`.env`，默认 `full`）说此刻是哪一种，`media-agent ab-mode` 可逆地切换：
+
+| 模式 | AutoBangumi | media-agent |
+|---|---|---|
+| `full`（默认） | 每 15 分钟拉 RSS、下载，每 60 秒改名 | `Bangumi` 分类归 AB（判重让位）；只为 AB 存在的规则照常 |
+| `subscription` | 只剩 WebUI / 接口的订阅：订阅那一刻把已发布的集补进 `Bangumi`，之后不再动 | 30 分钟之内交接、改名这些集；之后的每一集自己抓；只为 AB 存在的规则停；永远不叫 AB 刷新 |
+
+**现在怎么订阅**——对你来说什么都没变：
+
+- 照旧在 AB 的 WebUI 里订阅（或走 `autobangumi-subscribe-verify` 流程）。下一次 `media-agent grab`（30 分钟之内）需要的话
+  建番目录、把订阅与集号偏移记进这部番的 `.media-agent.json`，然后开始抓；
+- 或者完全不经 AB：`media-agent subscribe --tmdb ID [--season N] [--mikan ID]`；
+- 追着的番开播新一季，提前一周自动登记。
+
+```sh
+uv run media-agent ab-mode                          # 两边各认什么、一不一致
+uv run media-agent ab-mode subscription --dry-run   # 切换会改什么
+uv run media-agent ab-mode subscription             # 关掉 AB 的 RSS 与改名两个线程
+uv run media-agent ab-mode full                     # 切回去
+```
+
+切换读 AB 的整份配置、只改 `rss_parser.enable` 与 `bangumi_manage.enable`、**整份**写回（漏掉的段 AB 会退回默认值）、重启
+它的程序（不是容器）、读回核对之后，才把模式记进 `state/ab_mode.json`（盖过 `AB_MODE`）。这是一个有审计、有逆操作的动作
+（`media-agent rollback`）。此后每一轮的健康报告按切换时记的基线核对 AB 真的不再拉 RSS、订阅之外不再加种子。切回 `full` 会有
+一波补下载：AB 按 URL 判新，停着期间发布的全算新的。步骤见 [deploy/README.md](deploy/README.md#autobangumi-的模式)。
+
 ## 快速开始
 
 ```sh
@@ -164,6 +195,7 @@ uv run media-agent health              # 最近一轮的健康报告
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题（要提交 .agents/acks.json）
 uv run media-agent ledger backfill --dry-run   # 出处覆盖率（每轮 run 会自动补新种子）
 uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID]   # 不经 AutoBangumi 订阅一季
+uv run media-agent ab-mode [show|subscription|full]                # AutoBangumi 只当订阅前端（可逆）
 ```
 
 建议先 `diagnose`，再 `apply --dry-run`。**读清楚它想干什么之后**，
@@ -176,7 +208,7 @@ uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID]   # 不经 Auto
 | 服务 | 必需？ | 缺了会怎样 |
 |---|---|---|
 | qBittorrent WebUI | 是 | — |
-| AutoBangumi | 可选 | 失去 `ab:` 标签相关规则与 AB 订阅的接手；改用 `media-agent subscribe` 订阅 |
+| AutoBangumi | 可选 | 失去 AB 订阅的接手（改用 `media-agent subscribe` 订阅）；`AB_MODE=subscription` 下它只当订阅的前端 |
 | TMDB API key | 可选 | 标题对齐规则跳过（[免费申请](https://www.themoviedb.org/settings/api)） |
 | LLM（OpenAI 兼容） | 可选 | 自演进跳过，其余功能不受影响 |
 
@@ -199,6 +231,7 @@ media_agent/
   converge.py     一轮之内收敛：扫描 → 诊断 → 执行到不动点，不重试、不来回改
   grabmode.py     每 30 分钟的抓取模式：同一套机器，只抓取、接手 AB 订阅、给自己抓的收尾
   subscribe.py    media-agent subscribe：不经 AutoBangumi 订阅一季
+  abmode.py       AutoBangumi 的模式（AB_MODE / media-agent ab-mode）：full，或只当订阅前端
   titles.py       TMDB 标题稳定闸：新标题连看两轮才采用，30 天内不改回去
   evolution.py    残留 → 提议 → 影子验证 → 提升
 .agents/
