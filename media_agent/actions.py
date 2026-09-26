@@ -1188,20 +1188,45 @@ class Executor:
         """
         old = Path(a.args["path"])
         new = old.parent / a.args["new_name"]
-        if new.exists():
-            self._audit("skipped", f, a, {"reason": "目标目录已存在，需人工合并"})
-            return
-        if self.dry_run:
-            self._audit("skipped", f, a, {"reason": "dry-run"})
-            return
 
         # 改动前记下所有受影响种子的原始 save_path，供回退使用
         # 用 under() 而不是 startswith：见 kernel.under 的注释——
         # 这一行曾把兄弟目录的种子圈进来，把库里三个目录名叠成了一团。
+        try:
+            listed = self._claims().torrents()
+        except ClaimsUnknown as e:
+            self._audit("failed", f, a, {
+                "error": f"无法确认目标目录的占用情况，未做任何改动：{e}"})
+            return
         affected = [(t["hash"], t.get("save_path") or "")
-                    for t in self.ctx.qbit.torrents()
+                    for t in listed.values()
                     if under(t.get("content_path") or "/\0", old)
                     or under(t.get("save_path") or "/\0", old)]
+
+        # 目的地此刻归谁（critic N6 的目录形态）。以前只看 `new.exists()`：盘上还没有，
+        # 不等于没人占——按新标题建的订阅、手动加的种子，save_path 可能已经指到它下面
+        # （0%、没元数据的也算），或者一个 save_path 在媒体根、根文件夹就叫这个名字的
+        # Original 布局种子。搬进去两边的文件混在一个目录里，同名集位互相争。
+        # 要搬的那些（affected）不算；只差大小写的同名目录按"已存在"算（claims.check_dir）。
+        chk = self._claims().check_dir(new, movers=[h for h, _ in affected])
+        if chk.unknown:
+            self._audit("failed", f, a, {
+                "error": f"无法确认目标目录的占用情况，未做任何改动：{chk.unknown}",
+                "claims": chk.audit()})
+            return
+        if chk.on_disk:
+            self._audit("skipped", f, a, {"reason": "目标目录已存在，需人工合并",
+                                          "claims": chk.audit()})
+            return
+        if chk.in_qbit:
+            self._audit("skipped", f, a, {
+                "reason": ("目标目录下已有别的种子声明的路径（" + chk.describe()
+                           + "），搬进去会与它们混在一起，需人工合并"),
+                "claims": chk.audit()})
+            return
+        if self.dry_run:
+            self._audit("skipped", f, a, {"reason": "dry-run"})
+            return
 
         bid = a.args.get("bangumi_id")
         prev_savepath = ""
@@ -1740,8 +1765,6 @@ class Executor:
         if op == "rename_show_dir":
             cur = Path(u["path"])
             back = cur.parent / u["new_name"]
-            if back.exists():
-                return False, f"还原目标目录已存在：{back.name}"
 
             # 回退同样由 qBittorrent 搬运（AGENTS.md 第 3 条）。以前这里有两个洞：
             # setLocation 的异常被 `continue` 吞掉，而改名之后才落进新目录的种子
@@ -1763,6 +1786,16 @@ class Executor:
                 return False, (f"{cur.name} 里有 {len(strangers)} 个种子不在当初的改名记录里"
                                f"（改名之后才落进来的，如 {names}）：回退只会搬回记录里的"
                                f"种子，其余种子的文件会被连带搬走、就此失联。交给人处理")
+            # 还原目标此刻归谁：以前只看 `back.exists()`。旧目录盘上没有，但此后可能已有
+            # 种子（按旧标题的订阅）把 save_path 指回了它——搬回去就混在一起（critic N6）。
+            chk = self._claims().check_dir(back, movers=owners)
+            if chk.unknown:
+                return False, f"无法确认还原目标目录的占用情况，未做任何改动：{chk.unknown}"
+            if chk.on_disk:
+                return False, f"还原目标目录已存在：{back.name}"
+            if chk.in_qbit:
+                return False, (f"还原目标目录下已有别的种子（{chk.describe()}），"
+                               f"搬回去会与它们混在一起，交给人处理")
             if self.dry_run:
                 return True, ""
 
