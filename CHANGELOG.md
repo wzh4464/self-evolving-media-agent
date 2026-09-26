@@ -36,7 +36,8 @@
   回退抓取把那一行标成撤销（不删）。账本写不进去不让抓取失败，审计里记 `ledger_error`。
 - **`media-agent ledger backfill [--dry-run]`**：给还没有出处的种子补账本——本项目的抓取审计（集位是抓取器定的）、
   AutoBangumi 库的 `torrent` 表（只读，URL 里就是 infohash）、番组页 feed（按 enclosure 文件名认，7 天内不重复拉），
-  最后是 `ma:` / `manual:` 标签；报覆盖率与仍没有出处的种子。每轮 `run` 扫描之后自动补一次增量（只看新的）。
+  最后是 `ma:` / `manual:` 标签；报覆盖率与仍没有出处的种子（补录的按行数、按最终的来源；早就有的"谁加的不知道"
+  那一行被认出来源另报「认出来源」）。每轮 `run` 扫描之后自动补一次增量（只看新的）。
   `media-agent ledger show <infohash>` 看某个种子那一行。
 - **健康报告带出处覆盖率**：`ledger` 一节（有出处 / 没有 / 其中加进来超过 24 小时的、本轮补录了什么），输出里一行
   「出处」。两条新的 warn：`ledger_unavailable`（账本读不了，这一轮按没有账本认集位与版本）、`provenance_unknown_grew`

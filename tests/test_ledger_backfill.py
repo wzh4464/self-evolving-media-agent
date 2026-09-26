@@ -300,10 +300,7 @@ def test_tags_are_the_last_resort(lib):
     assert [r["hash"] for r in rep.remaining] == [H_FEED]
 
 
-def test_a_409_grab_in_the_audit_does_not_claim_the_torrent(lib):
-    """审计里这个 infohash 只有 409 的抓取（种子早就在）：集位照样是抓取器的，但不冒认是本项目加的——
-    来源记 unknown，AB 库认得出就补成 autobangumi。"""
-    _rezero_ab(lib)
+def _audit_409(lib):
     rec = {"ts": "2026-08-31T13:00:00", "run_id": "20260831T130000", "status": "applied",
            "dry_run": False, "rule": "episode-available", "op": "grab_episode", "summary": "S1E58 可抓取",
            "already_present": True,
@@ -311,12 +308,37 @@ def test_a_409_grab_in_the_audit_does_not_claim_the_torrent(lib):
                     "season": 1, "episode": 58}}
     lib.cfg.audit_log.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
 
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["real", "dry-run"])
+def test_a_409_grab_in_the_audit_does_not_claim_the_torrent(lib, dry_run):
+    """审计里这个 infohash 只有 409 的抓取（种子早就在）：集位照样是抓取器的，但不冒认是本项目加的——
+    来源记 unknown，AB 库认得出就补成 autobangumi。报告里它只算一行、算在 autobangumi 名下：以前先按 unknown 数一次、
+    升级时又按 autobangumi 数一次，生产重放报「unknown 10」而账本里只有 8 行、各来源合计 526 对不上覆盖率 524
+    （2026-09-27 审查）。"""
+    _rezero_ab(lib)
+    _audit_409(lib)
+
+    rep = lb.backfill(lib.context(), dry_run=dry_run)
+
+    assert rep.inserted == {ledger.AUTOBANGUMI: 1} and rep.upgraded == {}
+    assert sum(rep.inserted.values()) == rep.covered - rep.rows_before == 1
+    if not dry_run:
+        row = _rows(lib)[H_AB]
+        assert row.slot == (1, 58) and row.grabbed                   # 抓取器定的集位
+        assert row.source == ledger.AUTOBANGUMI and row.ab_bangumi_id == 9
+
+
+def test_an_existing_row_of_unknown_origin_that_gets_its_source_is_an_upgrade_not_an_insert(lib):
+    """账本里早就有一行（409 时抓取器记的 unknown），这次 AB 库认出是谁加的：报成"认出来源"，不算补录了一行。"""
+    _rezero_ab(lib)
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.record_grab(infohash=H_AB, mikan_title=FYY_MIKAN, season=1, episode=58, added=False)
+
     rep = lb.backfill(lib.context())
 
-    row = _rows(lib)[H_AB]
-    assert row.slot == (1, 58) and row.grabbed                   # 抓取器定的集位
-    assert row.source == ledger.AUTOBANGUMI and row.ab_bangumi_id == 9
-    assert rep.inserted == {ledger.UNKNOWN: 1, ledger.AUTOBANGUMI: 1}
+    assert rep.inserted == {} and rep.upgraded == {ledger.AUTOBANGUMI: 1}
+    assert "认出来源 autobangumi 1" in rep.summary()
+    assert _rows(lib)[H_AB].source == ledger.AUTOBANGUMI
 
 
 def test_a_known_row_of_unknown_origin_does_not_refetch_the_feed(lib):

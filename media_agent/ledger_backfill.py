@@ -35,7 +35,8 @@ from .naming import parse_pin, season_of_dir, title_slot
 class BackfillReport:
     torrents: int = 0
     rows_before: int = 0
-    inserted: dict[str, int] = field(default_factory=dict)       # 来源 → 补了几行（预演 = 会补几行）
+    inserted: dict[str, int] = field(default_factory=dict)       # 来源 → 补了几行（预演 = 会补几行），按最终的来源数
+    upgraded: dict[str, int] = field(default_factory=dict)       # 早就有一行、来源是 unknown，这次认出了是谁加的
     covered: int = 0                                              # 补完之后有出处的种子数
     remaining: list[dict] = field(default_factory=list)           # 仍然没有出处的：{hash, name, show, added_on}
     problems: list[str] = field(default_factory=list)
@@ -47,13 +48,15 @@ class BackfillReport:
 
     def summary(self) -> str:
         ins = "、".join(f"{k} {v}" for k, v in sorted(self.inserted.items())) or "0"
-        return (f"{'预演：会' if self.dry_run else ''}补录 {ins}；有出处 {self.coverage}，"
+        up = "、".join(f"{k} {v}" for k, v in sorted(self.upgraded.items()))
+        return (f"{'预演：会' if self.dry_run else ''}补录 {ins}" + (f"，认出来源 {up}" if up else "")
+                + f"；有出处 {self.coverage}，"
                 f"没有出处 {len(self.remaining)}"
                 + (f"；{len(self.problems)} 处读不了" if self.problems else ""))
 
     def to_dict(self) -> dict:
         return {"torrents": self.torrents, "rows_before": self.rows_before,
-                "inserted": dict(self.inserted), "covered": self.covered,
+                "inserted": dict(self.inserted), "upgraded": dict(self.upgraded), "covered": self.covered,
                 "remaining": len(self.remaining), "problems": list(self.problems),
                 "dry_run": self.dry_run}
 
@@ -181,15 +184,35 @@ def _fill(ctx, rep: BackfillReport, led, rows: dict, misses: set, torrents: list
     done: set[str] = set()                            # 补到了、而且知道是谁加的：后面的来源不用再看
     known: set[str] = set(rows)                       # 有一行（含来源 unknown 的）：知道它"是什么"
 
+    mine_unknown: set[str] = set()                    # 这一次补录插进去的 unknown 行（后面的来源可能把它升级）
+
+    def bump(d: dict, k: str, by: int) -> None:
+        d[k] = d.get(k, 0) + by
+        if not d[k]:
+            del d[k]
+
     def put(h: str, **fields) -> None:
         source = fields["source"]
+        existed = h in known
         if led is not None:
             if not led.upsert_backfill(infohash=h, **fields):
                 return
-        elif h in rows or h in known:                 # 预演：只有 unknown 的行会被升级
+        elif existed:                                 # 预演：只有 unknown 的行会被升级
             if source == ledger.UNKNOWN:
                 return
-        rep.inserted[source] = rep.inserted.get(source, 0) + 1
+        # 报告按行数：一行一个来源。这一次先插成 unknown、后面又被 AB 库认出来的，只算 autobangumi 那一次——以前两边
+        # 各数一次，生产重放报「unknown 10」而账本里只有 8 行，各来源合计对不上覆盖率（2026-09-27 审查）；
+        # 早就有的 unknown 行被认出来源，是"认出来源"，不是补了一行
+        if h in mine_unknown:
+            mine_unknown.discard(h)
+            bump(rep.inserted, ledger.UNKNOWN, -1)
+            bump(rep.inserted, source, 1)
+        elif existed:
+            bump(rep.upgraded, source, 1)
+        else:
+            bump(rep.inserted, source, 1)
+            if source == ledger.UNKNOWN:
+                mine_unknown.add(h)
         known.add(h)
         if source != ledger.UNKNOWN:
             done.add(h)                               # unknown 的留在待补里：AB 库认得出就补上是谁加的
