@@ -413,3 +413,95 @@ def test_duplicates_are_held_when_the_rescan_cannot_see_every_torrent(lib, no_rm
     assert moved.exists() and not rep.deleted
     [c] = [c for c in rep.pool if c.trash_path == moved]
     assert "看不全" in c.why
+
+
+# ------------------------------------------------------------------ 原路径仍被种子声明
+# 旧 purge 的 `.!qB` 检查拿**隔离区里的路径**去比种子的条目——没有任何种子指向 state/trash，
+# 这道检查永远通过。真正该问的是**当初的路径**：还有种子以优先级非 0 声明它，说明隔离没做完
+# （第 1 阶段之前 `qbit.delete` / 设为不下载失败只记一行日志、照样搬文件），或者又有种子要往那写。
+def test_an_expired_extra_whose_origin_is_still_wanted_is_kept(lib, no_rmtree):
+    s1 = lib.show("尼古喵喵").season(1)
+    pack = s1.torrent({"尼古喵喵 S01E01.mkv": GB, "尼古喵喵 NCOP.mkv": 90_000_000},
+                      name="[G] Yani Neko 01+NCOP", layout="nosub")
+    ncop = s1.path / "尼古喵喵 NCOP.mkv"
+    ncop.unlink()                                   # 文件当初被搬走了，种子那一步没做成
+    moved = legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=40)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert not c.eligible and pack.hash[:8] in c.why
+
+
+def test_a_priority_zero_claim_does_not_hold_it(lib, no_rmtree):
+    """对照：file_only 隔离之后种子仍列着那个条目、优先级 0——这正是隔离做完了的样子。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    s1.torrent({"尼古喵喵 S01E01.mkv": GB, "尼古喵喵 NCOP.mkv": 90_000_000},
+               name="[G] Yani Neko 01+NCOP", layout="nosub", priorities={"尼古喵喵 NCOP.mkv": 0})
+    (s1.path / "尼古喵喵 NCOP.mkv").unlink()
+    moved = legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=40)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert [c.trash_path for c in rep.deleted] == [moved]
+
+
+def test_the_survivor_sitting_on_the_origin_name_is_not_a_competing_claim(lib, no_rmtree):
+    """对照：输家当初就叫 `尼古喵喵 S01E05.mkv`，赢家同一批改名到了这个名字上——原路径被
+    替代者自己的种子声明，那正是证明，不是阻碍。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    s1.single("[LoliHouse] Yani Neko - 05 [WebRip 1080p HEVC-10bit AAC ASSx2].mkv",
+              size=GB - 7, probe=CHI)
+    s1.single("尼古喵喵 S01E05.mkv", name="[Raw] Yani Neko - 05 (1080p AVC).mkv",
+              size=GB + 100_000_000, probe=RAW)
+    c = lib.cycle()
+    [rec] = c.applied("trash")
+    assert rec["args"]["path"] == str(s1.path / "尼古喵喵 S01E05.mkv")
+    assert (s1.path / "尼古喵喵 S01E05.mkv").exists()        # 赢家已经坐上了这个名字
+    [moved] = lib.trash_files()
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001", now=_later(31))
+
+    assert [c.trash_path for c in rep.deleted] == [moved]
+
+
+def test_a_duplicate_its_own_pack_still_wants_is_kept(lib, no_rmtree):
+    """第 1 阶段之前：合集里一集判输、`set_file_priority` 失败只记日志，文件照样搬进隔离区——
+    合集仍以优先级 1 声明那个路径，替代者再完整也不能删：删了合集就指着一个不存在的文件。"""
+    s1 = lib.show("尼古喵喵").season(1)
+    pack = s1.torrent({"[G] Yani Neko - 05.mkv": GB, "[G] Yani Neko - 06.mkv": GB},
+                      name="[G] Yani Neko 05-06", layout="nosub", probe=RAW)
+    (s1.path / "[G] Yani Neko - 05.mkv").unlink()
+    s1.single("尼古喵喵 S01E05.mkv", name="[LoliHouse] Yani Neko - 05 [WebRip 1080p].mkv",
+              probe=CHI)
+    moved = legacy(lib, "[G] Yani Neko - 05.mkv", rule="duplicate-episode", kind="duplicate",
+                   days_ago=40, summary="S01E05 重复：保留 尼古喵喵 S01E05.mkv，清理 [G] Yani Neko - 05.mkv",
+                   args={"torrent_hash": pack.hash})
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+    [c] = rep.pool
+    assert c.survivor is not None and pack.hash[:8] in c.why
+
+
+def test_a_dead_partial_whose_name_a_new_download_wants_is_kept(lib, no_rmtree):
+    s1 = lib.show("尼古喵喵").season(1)
+    s1.torrent({"尼古喵喵 S01E11.mkv": GB}, name="[B] Yani Neko - 11.mkv", layout="single",
+               progress=0.0)
+    moved = legacy(lib, "尼古喵喵 S01E11.mkv.!qB", rule="dead-torrent", kind="dead_torrent",
+                   days_ago=40)
+
+    rep = disposal.dispose(lib.context(), mode="run", run_id="p001")
+
+    assert moved.exists() and not rep.deleted
+
+
+def test_nothing_is_eligible_when_qbittorrent_cannot_be_asked(lib):
+    """预演在 qBittorrent 不可用时照样能看，但原路径问不了——一个都不算可删。"""
+    legacy(lib, "尼古喵喵 NCOP.mkv", rule="extras-in-library", kind="extra", days_ago=40)
+
+    [c] = purge.build_pool(lib.context(qbit=None))
+
+    assert not c.eligible and "无法确认" in c.why

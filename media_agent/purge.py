@@ -262,6 +262,14 @@ class _Pool:
         self._shows: dict | None = None
         self.scan_errors: list[str] = []
         self.dur_cache: dict = {}
+        self._claims = None
+
+    def claims(self):
+        """此刻的路径占用索引（`claims.ClaimIndex`）。`qbit=None` 时每一问都是"不知道"。"""
+        if self._claims is None:
+            from .claims import ClaimIndex
+            self._claims = ClaimIndex(self.ctx.qbit)
+        return self._claims
 
     def shows(self) -> dict:
         """此刻的库（`scan.build_state`，不查 TMDB）：`{fold(剧目录): Show}`。只有要证明判重时才扫，
@@ -336,8 +344,41 @@ def _judge(pool: _Pool, c: Candidate) -> None:
     if not c.expired:
         c.why = f"{label}：还在保留期里（隔离 {c.age_days:.1f} 天，保留 {pool.retention:g} 天，还剩 {left:.1f} 天）"
         return
+    why = _origin_problem(pool, c)
+    if why:
+        c.why = why
+        return
     c.eligible = True
     c.why = f"{label}（{c.rule}）已过保留期 {pool.retention:g} 天（隔离 {c.age_days:.0f} 天）"
+
+
+def _origin_problem(pool: _Pool, c: Candidate, survivor=None) -> str:
+    """隔离文件**当初的路径**此刻还被种子以优先级非 0 声明吗？声明着就返回不删的理由。
+
+    旧 purge 的 `.!qB` 检查拿**隔离区里的路径**去比种子的条目——没有任何种子指向 `state/trash`
+    （测绘：生产 539 个种子，0 个条目在隔离区下），那道检查永远通过。真正该问的是原路径：
+
+    - 隔离没做完：第 1 阶段之前 `qbit.delete` / 设为不下载失败只记一行日志，文件照样搬走——种子
+      还要这个文件，删了它，种子就指着一个不存在的文件（qBittorrent 重下或报 missingFiles）；
+    - 又有种子要往那写（换源抓来的新种子、死种半成品的同名新下载）。
+
+    两种都该留着给人看。优先级 0 的声明不算：`file_only` 隔离之后种子照样列着那个条目，那正是
+    隔离做完了的样子。替代者自己的种子声明着原路径也不算（输家当初就叫规范名，赢家同一批改名到了
+    这个名字上）。`.!qB` 按它的正名问（种子声明的是 `X`）。qBittorrent 问不了 → 不删。
+    """
+    if not c.origin:
+        return "原路径不明（审计记录里没有 path），无法确认有没有种子还要它"
+    base = c.origin[: -len(PARTIAL)] if c.origin.endswith(PARTIAL) else c.origin
+    own_hash, own_path = "", None
+    if survivor is not None and survivor.torrent_hash and fold(survivor.path) == fold(base):
+        own_hash, own_path = survivor.torrent_hash, survivor.path
+    chk = pool.claims().check(base, own_hash=own_hash, own_path=own_path, disk=False)
+    if chk.unknown:
+        return f"无法确认原路径此刻有没有种子声明（{chk.unknown}），不删"
+    if chk.claimants:
+        return (f"原路径仍被种子以优先级非 0 声明（{chk.describe()}）：当初的隔离没做完，或又有种子"
+                f"要往那里写——删了它，那个种子就指着一个不存在的文件")
+    return ""
 
 
 def _human_why(c: Candidate) -> str:
@@ -479,5 +520,9 @@ def _prove_duplicate(pool: _Pool, c: Candidate) -> None:
         complete_why = (f"无种子可校验，改以时长自证：{d_surv:.0f}s 与同季中位数 "
                         f"{med:.0f}s 相符，且尾部可解码")
 
+    why = _origin_problem(pool, c, surv)
+    if why:
+        c.why = why
+        return
     c.eligible = True
     c.why = f"S{sn:02d}E{ep:02d} 由 {surv.filename} 占位，{complete_why}"
