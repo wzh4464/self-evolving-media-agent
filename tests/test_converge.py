@@ -362,6 +362,50 @@ def test_undoes_matches_each_recorded_inverse():
     assert not converge.undoes("grab_episode", {"url": url}, trashed)   # 只作废了一个文件，种子还在
 
 
+def test_trashing_an_extra_of_a_just_grabbed_release_does_not_undo_the_grab():
+    """只作废多文件发布里的一个条目（NCOP、PV）不撤销抓取；作废抓的那一集本身才撤销（2026-09-27 审查）。"""
+    grab = {"status": "applied", "op": "grab_episode", "args": {},
+            "undo": {"op": "ungrab_episode", "infohash": "abc123", "season": 1, "episode": 9}}
+    ncop = {"path": "/m/尼古喵喵/Season 1/[LoliHouse] Yani Neko - NCOP [WebRip 1080p].mkv",
+            "torrent_hash": "abc123", "file_only": True}
+    assert not converge.undoes("trash", ncop, grab)
+    own = {"path": "/m/尼古喵喵/Season 1/尼古喵喵 S01E09.mkv", "torrent_hash": "abc123", "file_only": True}
+    assert converge.undoes("trash", own, grab)
+    raw = {"path": "/m/尼古喵喵/Season 1/[LoliHouse] Yani Neko - 09 [WebRip 1080p].mkv",
+           "torrent_hash": "abc123", "file_only": True}
+    assert converge.undoes("trash", raw, grab)                           # 还没改名的那一集
+    assert converge.undoes("trash", {**ncop, "file_only": False}, grab)   # 整个种子一起作废
+
+
+def test_a_grabbed_release_with_an_extra_is_cleaned_without_a_false_oscillation(lib):
+    """抓进来的发布里带着 NCOP：extras-in-library 在第二次迭代提议只作废那个条目——以前被当成"撤销本轮的抓取"拒绝、
+    报 important 的 `oscillation`（"两条规则在打架"），下一轮又照常清掉。"""
+    from harness import make_torrent
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(SHOW)
+    s1 = sh.season(1)
+    for n in range(1, 9):
+        s1.local(f"{SHOW} S01E{n:02d}.mkv")
+    schedule = weekly(12, first_days_ago=60)
+    sh.tmdb(1234, seasons={1: schedule})
+    sh.sidecar(tmdb_id=1234, tmdb_title=SHOW, mikan_id="3500", seasons={"1": {"have": list(range(1, 9))}})
+    title = "[LoliHouse] 尼古喵喵 / Yani Neko - 09 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"
+    blob, ih = make_torrent("[LoliHouse] Yani Neko - 09", files={
+        "[LoliHouse] Yani Neko - 09 [WebRip 1080p].mkv": 600_000_000,
+        "[LoliHouse] Yani Neko - NCOP [WebRip 1080p].mkv": 90_000_000})
+    item = MikanItem(title=title, pub=dict(schedule)[9],
+                     url=f"https://mikanani.me/Download/20260920/{ih}.torrent", torrent=blob, infohash=ih)
+    lib.mikan("3500", [item], search=[SHOW])
+
+    c = lib.loop()
+
+    assert c.applied("grab_episode")
+    assert not c.outcome.oscillations and "oscillation" not in c.kinds()
+    trashes = [r for r in lib.audit(c.run_id) if r["op"] == "trash"]
+    assert [(r["status"], "NCOP" in r["args"]["path"]) for r in trashes] == [("applied", True)]
+    assert all(it.reversed == 0 for it in c.iterations)
+
+
 def test_iteration_line_is_one_compact_line():
     it = converge.Iteration(2, findings=5, actionable=3, attempted=2, memo=1, applied=2, scan_s=1.2)
     line = it.line(3)

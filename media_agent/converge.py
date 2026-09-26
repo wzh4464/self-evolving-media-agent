@@ -133,8 +133,13 @@ def undoes(op: str, args: dict, rec: dict) -> bool:
         return (h == str(u.get("torrent_hash") or "").lower()
                 and pairs(args.get("mapping")) == pairs(u.get("mapping")))
     if op in ("drop_torrent", "trash") and uop == "ungrab_episode":
-        # 刚抓进来的种子又要摘掉 / 又要把它的文件隔离
-        return bool(h) and h == str(u.get("infohash") or "").lower()
+        # 刚抓进来的种子又要摘掉 / 又要把抓的那一集隔离。只作废多文件发布里的**另一个**条目（NCOP、PV：extras-in-library
+        # 的 `file_only`）不撤销抓取——以前一律算，报一条 important 的"两条规则在打架"，下一轮又照常清掉（2026-09-27 审查）
+        if not (h and h == str(u.get("infohash") or "").lower()):
+            return False
+        if op == "drop_torrent" or not args.get("file_only"):
+            return True
+        return _is_grabbed_episode(str(args.get("path") or ""), u)
     if op == "grab_episode":
         # 刚摘掉的种子又要抓回来
         removed = (uop == "readd_torrent"
@@ -142,6 +147,20 @@ def undoes(op: str, args: dict, rec: dict) -> bool:
         rh = str((rec.get("args") or {}).get("torrent_hash") or "").lower()
         return removed and bool(rh) and rh == _grabbed_hash(args)
     return False
+
+
+def _is_grabbed_episode(path: str, u: dict) -> bool:
+    """这个文件是不是抓的那一集（`ungrab_episode` 的逆操作记着季、集）：按文件名认——改好名的 `… S01E09.mkv`、还叫
+    发布名的 `… - 09 […]` 都认得出；认不出集号的（NCOP、PV、菜单）不是。"""
+    from pathlib import PurePath
+    from .naming import parse_episode
+
+    season, ep = parse_episode(PurePath(path).name)
+    try:
+        want = (int(u.get("season")), int(u.get("episode")))
+    except (TypeError, ValueError):
+        return True                                   # 逆操作没记集位（旧记录）：按以前的口径算撤销
+    return ep == want[1] and season in (None, want[0])
 
 
 @dataclass
