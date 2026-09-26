@@ -225,3 +225,44 @@ unknown 的目录改名进 `repair`。tripwire 新种类 `unknown_record`。
 `deploy.sh` 切换前把小体量状态复制到 `state/backups/<时间>-<版本>/` 供手工比对（代码回滚从不回卷审计）。
 `audit.fallback.jsonl` 是审计的一部分（回退、`runs`、隔离区处置一起读它），同样复制；文件不存在就跳过，
 与 `deploy.history` 同一写法。
+
+## 10. 完整的状态契约（给以后读 / 写审计的人）
+
+权威文本在 `media_agent/audit.py` 的模块文档；这里是同一份的展开，带上每种记录的字段。
+
+**执行器的动作记录**（`Executor._audit`，一个 finding 恰好一条）：
+
+| 字段 | 何时有 | 说明 |
+|---|---|---|
+| `ts` `run_id` `status` `dry_run` `rule` `kind` `op` `args` `summary` | 总有 | 与第 2 阶段之前相同。`run_id` 形如 `YYYYMMDDTHHMMSS.mmm-<pid>`（旧的是秒级） |
+| `seq` | 第 3 阶段起总有 | 本批次内从 1 起的序号；回退按它排 LIFO（旧记录没有，按文件顺序） |
+| `undo` | 可逆且生效了 / 也许生效了 | 逆操作的完整描述，`rollback` 按它还原 |
+| `reason` | skipped、unknown | 为什么没动 / 为什么确认不了 |
+| `error` | failed、unknown | 异常（`类型: 文本`），可带动作原来的报错开头 |
+| `effect` | 核实过的 failed | "…出错；按此刻状态核实：没有生效" |
+| `effects_attempted` | unknown | 已经发出的改动，如 `["qbit.add_torrent"]`、`["qbit.set_location", "fs.merge_tree"]` |
+| `confirmed_after_error` | 核实过的 applied | 改动调用报了错、按此刻状态核实确实生效——那个错 |
+| `audit_degraded` | 序列化降级时 | 原记录里有序列化不了的值，按 `str` 写入 |
+
+四种状态：
+
+| `status` | 意思 | 改没改东西 | 带 `undo` | 回退 |
+|---|---|---|---|---|
+| `applied` | 生效了，已确认 | 改了 | 可逆就带 | 尝试 |
+| `skipped` | 没动手 | 没改 | 不带 | 不管 |
+| `failed` | 没生效（异常在任何改动之前，或核实过没生效） | 意图中的改动没发生；已发生的附带改动以字段写明（`torrent_record_lost` / `priority_zeroed` / `stray_copy` / `relocated_from`…） | 一般不带（目录改名半路中止带 `rename_show_dir_partial`，回退明说交给人） | 不管 |
+| `unknown` | 也许生效了、确认不了 | 可能改了、可能改了一部分 | 有"如果生效了该怎么撤"就带 | 尝试（每个逆操作动手前核对此刻状态），结果单独计数、标「当初未确认」 |
+
+**回退**：逐步记录（`run_id` = `rollback-of-<X>`，`rollback_of`、`rollback_id`、`op` = `undo:<逆操作>`、
+`args` = 逆操作、`undoes`、四种状态同上、可带 `notes`，**不带** `undo`）+ 一条汇总（`status` = `rollback`，
+`run_id` = X，`rollback_run_id`、`rollback_id`、各计数、`audit_problems`）。
+
+**文件**：`state/audit.jsonl` 为主；写不进去的原样转写到 stderr 与 `state/audit.fallback.jsonl`。读的一方一律用
+`audit.iter_records`（两个文件、坏行跳过、备用文件里与主文件重复的去掉）。
+
+**读的一方的规矩**：不认识的状态当作"不是已生效"——不计入回退、不计入已隔离、不计入失败模式；新增状态时
+在 `audit.py` 里加常量、在这张表里加一行、在 `tests/test_audit_contract.py` 的合成审计里加一代。
+
+**写的一方的规矩**（新加动作照此办）：动手前 `_intend(逆操作)`；qBittorrent / AB 数据库的写调用自动记进
+`effects_attempted`，文件系统上的改动自己 `_effect("fs.…")`；能按此刻状态核实的改动调用出错时走
+`_settle(probe=…)`，不要直接记 failed。

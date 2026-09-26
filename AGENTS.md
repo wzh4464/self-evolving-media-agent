@@ -118,6 +118,12 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     `MIN_FREE_GB` 只在"已证明可删"的里面提前放，证明不了的不为空间删。搬进 / 搬出隔离区先看目标卷
     放不放得下（跨卷是先拷后删）。见
     [隔离区处置](.agents/notes/implemented/architecture/2026-09-26-quarantine-disposal.md)。
+11. **审计不说谎、不丢记录。** 状态只有四种：`applied`（生效了，已确认）、`skipped`（没动手）、`failed`（没生效）、
+    `unknown`（也许生效了、确认不了）——"异常发生在已经发出的改动之后"不许记成 failed。新加的动作：动手前
+    `_intend(逆操作)`；文件系统改动 `_effect()`（qBittorrent / AB 数据库的写调用自动记）；能按此刻状态核实的
+    改动调用出错时走 `_settle`，核实生效就照常记 applied、带逆操作。写审计永不抛异常（`audit.write`，写不进去
+    转写 stderr 与 `audit.fallback.jsonl`）；读审计一律用 `audit.iter_records`，不认识的状态当作"不是已生效"。见
+    [审计状态契约](.agents/notes/implemented/architecture/2026-09-26-honest-audit.md)。
 
 ## 自演进的闭环
 

@@ -1,4 +1,4 @@
-"""抓取加种后等元数据的时长可配（`GRAB_METADATA_TIMEOUT`，默认 30 秒），等的结局写进审计（B5）。
+"""抓取加种后等元数据的时长可配（`GRAB_METADATA_TIMEOUT`，默认 30 秒），等的结局写进审计。
 
 `grabber.wait_metadata` 的默认值与模块文档一直是 30 秒（磁力 / 连不上 peer 时元数据可能要几分钟，
 超时返回空、交给 `unrenamed-file` 兜底）；而 `_rename_grabbed` 实际写死 `timeout=10.0`，审计里只有

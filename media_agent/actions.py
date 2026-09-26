@@ -236,7 +236,7 @@ class Executor:
     # ---------------- 改动调用出错之后：按此刻状态核实 ----------------
     def _settle(self, f: Finding, a: Action, err: Exception, probe, *, what: str,
                 undo: dict | None = None, extra: dict | None = None, prefix: str = "") -> bool:
-        """一个改动调用抛了异常：问一次此刻的状态，它到底生效没有（B2）。
+        """一个改动调用抛了异常：问一次此刻的状态，它到底生效没有。
 
         `probe()` 返回 True（生效了）、False（没生效：状态与动手前一致）或 None（对不上：部分生效、
         或被别人同时改了）；它自己抛异常 = 读不到此刻状态。
