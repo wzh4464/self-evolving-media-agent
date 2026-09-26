@@ -63,12 +63,15 @@ def _episode_of(title: str) -> int | None:
     return parse_episode(title)[1]
 
 
-def _inflight(ctx: Context, show, by_hash: dict) -> dict[int, set[int]]:
+def _inflight(ctx: Context, show, by_hash: dict, replace_dead: bool = True) -> dict[int, set[int]]:
     """已经有种子在下、只是还没下完的集：`{季号: {集号…}}`。
 
     `have` 只认下完的——这是对的，没下完就还有换源的余地。但**已经在下的
     不该无条件重复抓**：新种子会写向同一个目标路径，两个种子抢同一个文件，
     谁也校验不过（见 `colliding-torrent`，本库已发生三次）。
+
+    `replace_dead=False`（抓取模式，`grabmode`）：死种也算在下、不放行换源——摘死种不在抓取模式里做，放行了就是
+    新旧两个种子抢一个集位；换源留给 6 小时的 `run`（那一轮 dead-torrent 同批摘掉旧种子）。
 
     例外是停滞太久的：Re:Zero 的 E55–E58 卡在 42–92%、全网 seeds=0，
     再等下去也没有意义，这时就该换源。所以用停滞时长（`dead_torrent_hours`）
@@ -107,7 +110,7 @@ def _inflight(ctx: Context, show, by_hash: dict) -> dict[int, set[int]]:
             sd = season_of_dir(f.season_dir or "")
             sn = sd if sd is not None else 1   # Season 0 是 0，不能用 `or 1`
 
-        if t and droppable_dead(ctx, t, now):
+        if replace_dead and t and droppable_dead(ctx, t, now):
             continue        # 死种：本轮 dead-torrent 会摘掉它，放行换源
         out.setdefault(sn, set()).add(ep)
     return out
@@ -310,6 +313,10 @@ class EpisodeAvailableDetector:
     id = "episode-available"
     kind = "episode_grabbable"
 
+    def __init__(self, *, replace_dead: bool = True):
+        # 旧种子死了要不要放行换源（`_inflight`）。`run` 放行（同一批 dead-torrent 摘掉旧种子）；抓取模式不放行
+        self.replace_dead = replace_dead
+
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         if not (ctx.tmdb and ctx.tmdb.enabled):
             return
@@ -395,7 +402,7 @@ class EpisodeAvailableDetector:
                               "tmdb_seasons": sorted(tmdb_sn), "extra": extra},
                 )
                 continue
-            inflight = _inflight(ctx, show, by_hash)
+            inflight = _inflight(ctx, show, by_hash, replace_dead=self.replace_dead)
 
             disk_eps = _disk_episodes(show)
 

@@ -36,8 +36,8 @@ TMDB 身份照常解析（不能像演进重扫那样 `resolve_tmdb=False`：标
 的是 qBittorrent 的种子文件列表（必须是此刻的）与磁盘。所以每次迭代都跑全部检测器，不按迭代挑——生产规模下第二次
 迭代约 2–3 秒（`.agents/notes/implemented/architecture/2026-09-27-converge-within-a-run.md`）。
 
-**给以后的 `media-agent grab` 用。** `run(ctx, reg, ex, scan=…, select=…)` 不认识 `cmd_run`：抓取模式传只有抓取检测器的
-`Registry` 与 `select=only("grab_episode")`，同样得到一轮一个执行器、不重试、反向拒绝、到顶报待做。
+**`media-agent grab` 也用它。** `run(ctx, reg, ex, scan=…, select=…)` 不认识 `cmd_run`：抓取模式（`grabmode.run`）传只有
+抓取相关检测器的 `Registry` 与 `select=only(…, rename=…, trash=…)`，同样得到一轮一个执行器、不重试、反向拒绝、到顶报待做。
 """
 from __future__ import annotations
 
@@ -94,11 +94,18 @@ _TARGET: dict[str, tuple[str, ...]] = {
 }
 
 
-def only(*ops: str) -> Callable[[Finding], bool]:
-    """`run(select=…)` 用：只做这几种动作，别的发现照样诊断出来、不执行。以后的 `media-agent grab`（第 5 阶段）就是
-    `run(ctx, <只有 GRAB_DETECTORS 的 Registry>, ex, select=only("grab_episode"), …)`。"""
-    wanted = frozenset(ops)
-    return lambda f: f.action is not None and f.action.op in wanted
+def only(*ops: str, **guards: Callable[[Finding], bool]) -> Callable[[Finding], bool]:
+    """`run(select=…)` 用：只做这几种动作，别的发现照样诊断出来、不执行。`guards`（动作名 → 判据）：这种动作也做，
+    但只做判据说是的那些——`media-agent grab` 的改名只改本项目抓的种子、判重只判集位里有本项目抓的那一份
+    （`grabmode.Scope`）。"""
+    wanted = frozenset(ops) | frozenset(guards)
+
+    def pick(f: Finding) -> bool:
+        if f.action is None or f.action.op not in wanted:
+            return False
+        guard = guards.get(f.action.op)
+        return guard is None or bool(guard(f))
+    return pick
 
 
 def key_of(op: str, args: dict | None) -> tuple:

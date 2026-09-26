@@ -403,6 +403,18 @@ class LibraryBuilder:
                            scan=lambda n: build_state(ctx, resolve_tmdb=resolve_tmdb))
         return Loop(rid, ctx, out.state, out.findings, ex.report, outcome=out)
 
+    def grab_loop(self, *, max_iterations: int = 3, dry_run: bool = False, run_id: str | None = None) -> Loop:
+        """一轮抓取模式（`media-agent grab`，`grabmode.run`）：同 `loop()`，检测器与挑法是抓取模式的。"""
+        from media_agent import grabmode
+
+        reset_process_caches()
+        ctx = self.context()
+        rid = run_id or self.next_run_id()
+        ex = Executor(ctx, dry_run=dry_run, run_id=rid)
+        out = grabmode.run(ctx, ex, max_iterations=max_iterations,
+                           scan=lambda n: build_state(ctx, resolve_tmdb=True))
+        return Loop(rid, ctx, out.state, out.findings, ex.report, outcome=out)
+
     def converge(self, *, max_rounds: int = 5, **kw) -> list[Cycle]:
         """反复 `cycle()` 直到某一轮什么都没执行。到上限仍在变就判失败——
         每轮都"成功"却原地打转，正是本库最难发现的一类故障（入间同学空转三天）。"""
