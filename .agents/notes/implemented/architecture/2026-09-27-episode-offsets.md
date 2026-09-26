@@ -39,7 +39,8 @@ critic N13：抓取对 AB 带 `episode_offset` 的番无能为力、而且不出
 `episode_offset`，**只对 AB 下载落进的那一季**（`abrow.library_season`：`save_path` 的 `Season N`，没有就是
 `season + season_offset`，不到 1 退回 `season`——AB `downloader/path.py::_gen_save_path`）。判重（`_slot_from`，
 `naming.release_slot` 接受按季取偏移的函数）、出处账本（`ledger_view` → `title_slot`）、`have`（`kernel.episode_of_file`
-同样接受函数）都问它。sidecar 里写坏的项（不是数、季号不是数字、布尔）按没写认，不让判重崩。
+同样接受函数）都问它；出处账本的补录（`ledger_backfill`：AB 库与番组页 feed 两个来源）存下的集位也按同一个规则算
+（sidecar 登记了就按它，没登记才用 AB 行的）。sidecar 里写坏的项（不是数、季号不是数字、布尔）按没写认，不让判重崩。
 
 `media_agent/abrow.py`：AB 订阅行上要读的几样（库内季、番目录名、番组页 id、偏移），只读。
 
@@ -72,6 +73,9 @@ critic N13：抓取对 AB 带 `episode_offset` 的番无能为力、而且不出
 `{"3": 0}` 盖过 AB 的 -24；AB 的偏移只对它那一季（Season 1 的 `- 05` 以前认不出）；AB 的 `season_offset` 把偏移挪到
 `Season <season + season_offset>`；AB 行停用之后 sidecar 照样换算；出处账本按同一个口径从番组页标题重算（以前没有 AB 行
 就算成 (3, 25)、要改名成 S03E25）；写坏的项不崩。`tests/test_episode_offset.py` 原有的 5 条照旧通过。
+
+`tests/test_ledger_backfill.py`：番组页 feed 认出来的 `- 25` 按 sidecar 的 -24 存成 S03E01；sidecar 的 `{"3": 0}` 盖过
+AB 行的 -24（改之前两条红）。
 
 `tests/test_grab_episode_offset.py`：AB 行上的 -24 让 `- 25` 抓成 S03E01；AB 行没了、只有 sidecar 的也行；没有偏移时报
 `episode_numbering_mismatch`（带 `unplaced` 与推测的 -24）；换算出非正数的 `第三季 - 01` 不收、写明为什么；一两周都没有

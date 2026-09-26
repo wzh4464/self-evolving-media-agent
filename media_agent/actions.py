@@ -110,13 +110,7 @@ def _bad_rel(rel, what: str) -> str | None:
     return None
 
 
-# ---------------- 已发出的改动（effect vs bookkeeping）----------------
-#
-# 一个动作抛了异常，它是"没生效"还是"生效了、只是后面的记账没做完"，取决于异常之前有没有发出过改动。
-# 生产 2026-09-16 … 09-26 的 12 次抓取：`add_torrent` 成功之后撞上 `resp` NameError，全记 failed、
-# 没有逆操作；2026-09-14 run 20260914T100214 的 `renameFile` 读超时，qBittorrent 其实改了，同样记 failed。
-# 所以执行器在 `apply()` 期间把 qBittorrent / AutoBangumi 数据库包一层，记下每个动作**发出过**的写调用
-# （发出即记，不管它返回还是抛异常——抛了也可能已经生效）；文件系统上的改动由各动作自己 `_effect()`。
+# ---------------- 往 sidecar 里补人的意图（订阅类动作）----------------
 # 逆操作 `unset_sidecar` 能摘的 sidecar 字段 → 字段的类型（dict 按键摘；其余摘成这个类型的空值）。只列正向动作
 # 会**补**的人的意图与身份（`Executor._set_intent`）：回退绝不能借它摘掉别的东西。
 _UNSETTABLE: dict[str, type] = {"episode_offsets": dict, "subscriptions": dict, "mikan_id": str,
@@ -169,6 +163,14 @@ def _fill_intent(sc, intent: dict) -> list[dict]:
                 wrote.append({"field": "tmdb_source", "value": sc.tmdb_source})
     return wrote
 
+
+# ---------------- 已发出的改动（effect vs bookkeeping）----------------
+#
+# 一个动作抛了异常，它是"没生效"还是"生效了、只是后面的记账没做完"，取决于异常之前有没有发出过改动。
+# 生产 2026-09-16 … 09-26 的 12 次抓取：`add_torrent` 成功之后撞上 `resp` NameError，全记 failed、
+# 没有逆操作；2026-09-14 run 20260914T100214 的 `renameFile` 读超时，qBittorrent 其实改了，同样记 failed。
+# 所以执行器在 `apply()` 期间把 qBittorrent / AutoBangumi 数据库包一层，记下每个动作**发出过**的写调用
+# （发出即记，不管它返回还是抛异常——抛了也可能已经生效）；文件系统上的改动由各动作自己 `_effect()`。
 _QBIT_WRITES = frozenset({
     "add_torrent", "rename_torrent", "rename_file", "set_location", "create_category",
     "set_category", "remove_categories", "add_tags", "remove_tags", "set_file_priority",

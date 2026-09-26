@@ -15,7 +15,8 @@
 3. 最后只剩标签的：`ma:` 钉子（只有本项目的抓取打它，集位就是钉子）、`manual:`（人手加种时自己打的）。
 
 集位按读账本的同一套算（`naming.title_slot`：放在种子所在的季目录里、按 sidecar 的 `season_offsets` 与抓取同一套
-季内换算，AB 的 `episode_offset` 只对它订阅的那一季）；钉着 `ma:` 的按钉子。换算不了（含声明了不止一个季号的）的
+季内换算；集号偏移是 sidecar 的 `episode_offsets`，没登记时才用 AB 的 `episode_offset`、只对它订阅的那一季——
+`builtin.episode_offset_for` 同一个口径）；钉着 `ma:` 的按钉子。换算不了（含声明了不止一个季号的）的
 集位留空，声明的季号与原始集号照记。只补没有的：幂等。
 
 **不拦路**：qBittorrent / AB 库 / 番组页 / 账本任何一样读不了，说一句（`problems`），能补的照补。
@@ -72,7 +73,7 @@ def _where(t: dict, media_root: Path) -> tuple[Path | None, int | None]:
 
 
 class _Shows:
-    """按需读每部番的 sidecar：`season_offsets` 与番组页 id。坏档案按没有处理（说一句）。"""
+    """按需读每部番的 sidecar：`season_offsets`、`episode_offsets` 与番组页 id。坏档案按没有处理（说一句）。"""
 
     def __init__(self, problems: list[str]):
         self._cache: dict[Path, dict] = {}
@@ -80,7 +81,7 @@ class _Shows:
 
     def intent(self, show_dir: Path | None) -> dict:
         if show_dir is None:
-            return {"offsets": {}, "mikan": []}
+            return {"offsets": {}, "episode_offsets": {}, "mikan": []}
         if show_dir not in self._cache:
             from . import sidecar as sc_mod
             sc, problem = sc_mod.load_checked(show_dir)
@@ -91,7 +92,9 @@ class _Shows:
                 m = re.search(r"bangumiId=(\d+)", (s or {}).get("rss_link") or "")
                 if m and m.group(1) not in mikan:
                     mikan.append(m.group(1))
+            from .plugins.builtin import _clean_offsets
             self._cache[show_dir] = {"offsets": dict(sc.season_offsets or {}) if not problem else {},
+                                     "episode_offsets": _clean_offsets(sc.episode_offsets) if not problem else {},
                                      "mikan": mikan}
         return self._cache[show_dir]
 
@@ -257,9 +260,12 @@ def _fill(ctx, rep: BackfillReport, led, rows: dict, misses: set, torrents: list
         title = r.get("name") or ""
         ab_season = int(r.get("season") or 1)
         target = dir_season if dir_season is not None else ab_season
-        slot = pin or title_slot(title, target=target, offsets=shows.intent(show_dir)["offsets"],
-                                 episode_offset=(int(r.get("episode_offset") or 0)
-                                                 if target == ab_season else 0))[0]
+        # 集号偏移与读账本（`builtin.episode_offset_for`）同一个口径：sidecar 登记了这一季就按它，没登记才用 AB 行的
+        # （只对它订阅的那一季）
+        intent = shows.intent(show_dir)
+        shift = intent["episode_offsets"].get(str(target),
+                                              int(r.get("episode_offset") or 0) if target == ab_season else 0)
+        slot = pin or title_slot(title, target=target, offsets=intent["offsets"], episode_offset=shift)[0]
         put(h, source=ledger.MEDIA_AGENT if pin else ledger.AUTOBANGUMI, mikan_title=title,
             mikan_url=r.get("url") or "", show_dir=str(show_dir or ""),
             season=slot[0] if slot else None, episode=slot[1] if slot else None,
@@ -330,6 +336,7 @@ def _from_feeds(ctx, rep: BackfillReport, led, shows: _Shows, todo: dict, misses
                 rep.problems.append(f"拉 {show_dir.name} 的番组页 {mid} 出错（{type(e).__name__}: {e}）")
                 continue
         offsets = shows.intent(show_dir)["offsets"]
+        shifts = shows.intent(show_dir)["episode_offsets"]
         for h in hashes:
             it = items.get(h)
             if it is None:
@@ -339,8 +346,9 @@ def _from_feeds(ctx, rep: BackfillReport, led, shows: _Shows, todo: dict, misses
             _, dir_season = _where(t, media_root)
             pin = parse_pin(t.get("tags") or "")
             title = it.get("title") or ""
-            slot = pin or title_slot(title, target=dir_season if dir_season is not None else 1,
-                                     offsets=offsets)[0]
+            target = dir_season if dir_season is not None else 1
+            slot = pin or title_slot(title, target=target, offsets=offsets,
+                                     episode_offset=shifts.get(str(target), 0))[0]
             put(h, source=ledger.MEDIA_AGENT if pin else ledger.UNKNOWN, mikan_title=title,
                 mikan_url=it.get("url") or "", pub_date=it.get("pub") or "", show_dir=str(show_dir),
                 season=slot[0] if slot else None, episode=slot[1] if slot else None,

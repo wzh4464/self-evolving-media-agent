@@ -425,3 +425,33 @@ def test_a_feed_match_uses_the_shows_season_offsets(lib):
 
     assert _rows(lib)[H_FEED].slot == (1, 58)
 
+
+
+def test_a_feed_match_uses_the_sidecar_episode_offset(lib):
+    """番组页 feed 里认出来的连续编号发布（《100个女朋友》第三季 `- 25`）：集位按 sidecar 的 `episode_offsets`
+    换算成 S03E01——与读账本（`ledger_view`）、判重、抓取同一个口径（`builtin.episode_offset_for`）。"""
+    title = "超超超超超喜欢你的100个女朋友"
+    sh = lib.show(title)
+    sh.sidecar(mikan_id="3417", episode_offsets={"3": -24})
+    sh.season(3).single(f"{title} S03E01.mkv", hash=H_FEED, name="[Nekomoe kissaten] Hyakkano - 25.mkv")
+    lib.mikan("3417", [MikanItem(title="[Nekomoe kissaten] 超超超超超喜欢你的100个女朋友 第三季 - 25 [1080p][简日内嵌]",
+                                 pub="2026-07-10", url=_url(H_FEED))])
+
+    lb.backfill(lib.context())
+
+    assert _rows(lib)[H_FEED].slot == (3, 1)
+
+
+def test_the_sidecar_episode_offset_wins_over_the_ab_rows(lib):
+    """人在 sidecar 里写了这一季的偏移（这里是 0：这一季不换算），盖过 AB 订阅行上的 -24。"""
+    title = "超超超超超喜欢你的100个女朋友"
+    sh = lib.show(title)
+    sh.sidecar(episode_offsets={"3": 0})
+    sh.bangumi(37, title_raw="Hyakkano", season=3, episode_offset=-24)
+    lib.ab_rows("torrent", [{"bangumi_id": 37, "name": "[ANi] 超超超超超喜欢你的100个女朋友 第三季 - 05 [1080P]",
+                             "url": _url(H_AB)}])
+    sh.season(3).single(f"{title} S03E05.mkv", hash=H_AB, name="[ANi] Hyakkano S3 - 05 [1080P].mkv")
+
+    lb.backfill(lib.context())
+
+    assert _rows(lib)[H_AB].slot == (3, 5)
