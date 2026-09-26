@@ -55,6 +55,9 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 
 FAKE_UV = r"""#!/bin/sh
 echo "$PWD uv $*" >> "$SANDBOX/uv.log"
+# 打断之后的那次 sync（即"自动退回"里的）故意放慢：外层若没等退回做完就先返回，
+# 测试就一定看得到停在半路的现场，而不是碰运气赶上退回已经做完。
+[ -f "$SANDBOX/interrupted" ] && sleep 1
 case "$1" in
   sync) mkdir -p .venv/bin && ln -sf "$TOOLS/media-agent" .venv/bin/media-agent ;;
   lock) ;;
@@ -325,10 +328,22 @@ def test_already_deployed_after_a_successful_deploy_is_a_no_op(sandbox):
 # 的短路报「已经是 v1.1.0，无需部署」并返回 0——venv 与 plist 永远不会被补上。
 _IN_PLACE = 'case "$PWD" in *media-agent-stage*) ;; *) {} ;; esac; test -x .venv/bin/media-agent'
 
+# 持锁包装有三种实现（macOS 的 lockf / Linux 的 flock / 都没有时的 Python），信号行为各不相同。
+# 只测平台默认的那一种会漏：v0.2.0 在本机 macOS 全绿，CI 的 Ubuntu 上 flock 分支一收到
+# SIGINT 就先死，退回成了后台孤儿。每个平台把它能跑的实现都跑一遍。
+LOCK_IMPLS = [impl for impl, ok in (("lockf", os.access("/usr/bin/lockf", os.X_OK)),
+                                     ("flock", shutil.which("flock") is not None),
+                                     ("python", True)) if ok]
 
-def test_hangup_during_the_in_place_switch_does_not_kill_it(sandbox):
+
+@pytest.fixture(params=LOCK_IMPLS)
+def lock_impl(request) -> str:
+    return request.param
+
+
+def test_hangup_during_the_in_place_switch_does_not_kill_it(sandbox, lock_impl):
     """ssh 断线：整个进程组收到 SIGHUP。部署要么完整做完，要么完整退回，不能停在半路。"""
-    r = sandbox.deploy("v1.1.0", new_session=True,
+    r = sandbox.deploy("v1.1.0", new_session=True, DEPLOY_LOCK_IMPL=lock_impl,
                        DEPLOY_TEST_CMD=_IN_PLACE.format("kill -HUP 0"))
 
     assert r.returncode == 0, _out(r)
@@ -340,12 +355,14 @@ def test_hangup_during_the_in_place_switch_does_not_kill_it(sandbox):
     assert not list((sandbox.root / "tmp").glob("ma-*"))       # 临时文件照常清理
 
 
-def test_interrupt_during_the_in_place_switch_reverts(sandbox):
+@pytest.mark.parametrize("sig", ["INT", "TERM"])
+def test_interrupt_during_the_in_place_switch_reverts(sandbox, lock_impl, sig):
     """Ctrl-C / SIGTERM 打在原地测试上：自动退回部署前的版本，并记下来。"""
     before = sandbox.fingerprint()
 
-    r = sandbox.deploy("v1.1.0", new_session=True,
-                       DEPLOY_TEST_CMD=_IN_PLACE.format("kill -INT 0"))
+    r = sandbox.deploy("v1.1.0", new_session=True, DEPLOY_LOCK_IMPL=lock_impl,
+                       DEPLOY_TEST_CMD=_IN_PLACE.format(
+                           f'touch "$SANDBOX/interrupted"; kill -{sig} 0'))
 
     assert r.returncode != 0
     assert sandbox.head() == sandbox.tag_sha("v1.0.0")

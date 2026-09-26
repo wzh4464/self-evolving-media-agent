@@ -97,17 +97,39 @@ record() {
 
 # with_lock <锁文件> <最多等几秒> <命令...>
 # 拿不到锁返回 75（EX_TEMPFAIL）。与 media_agent/runlock.py 是同一种锁（flock），
-# 锁文件一律保留（-k）：删掉它会让下一个按路径打开的人拿到另一把锁。
+# 锁文件一律保留：删掉它会让下一个按路径打开的人拿到另一把锁。
+#
+# **持锁的一方必须等命令收尾再退出。** 切换阶段被 Ctrl-C / SIGTERM 打断时要"自动退回"，
+# 而信号是打给整个进程组的：持锁的包装进程若先死，退回就成了后台孤儿，外层脚本已经
+# 返回，看起来像"中断了却没退回"。macOS 的 /usr/bin/lockf 在等子进程时忽略 SIGINT，
+# 天然没事；util-linux 的 `flock 文件 命令` 不处理任何信号，收到就死——2026-09-26 v0.2.0
+# 的 CI 在 Ubuntu 上正是这样挂的（本机 macOS 走 lockf，测不到）。所以 flock 分支改成
+# 在子 shell 里用描述符持锁、命令做前台子进程（bash 等前台子进程结束才处理信号），
+# Python 兜底同样忽略 INT/TERM、等子进程退出。DEPLOY_LOCK_IMPL 只供测试强制走某一分支。
 with_lock() {
-    local file=$1 wait=$2
+    local file=$1 wait=$2 impl=${DEPLOY_LOCK_IMPL:-auto}
     shift 2
-    if [ -x /usr/bin/lockf ]; then
+    if [ "$impl" = auto ]; then
+        if [ -x /usr/bin/lockf ]; then impl=lockf
+        elif command -v flock >/dev/null 2>&1; then impl=flock
+        else impl=python
+        fi
+    fi
+    case $impl in
+    lockf)
         /usr/bin/lockf -k -s -t "$wait" "$file" "$@"
-    elif command -v flock >/dev/null 2>&1; then
-        flock -w "$wait" -E 75 "$file" "$@"
-    else
+        ;;
+    flock)
+        (
+            # >> 而不是 >：锁文件里有持有者的自述，打开时不能截断
+            exec 9>>"$file" || exit 75
+            flock -w "$wait" 9 || exit 75
+            "$@"
+        )
+        ;;
+    python)
         python3 -c '
-import fcntl, os, subprocess, sys, time
+import fcntl, os, signal, subprocess, sys, time
 path, wait, cmd = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
 fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
 end = time.time() + wait
@@ -119,9 +141,19 @@ while True:
         if time.time() >= end:
             sys.exit(75)
         time.sleep(0.5)
-sys.exit(subprocess.call(cmd))
+# 同进程组的子进程自己会收到打给进程组的信号；这里只负责持锁并等它收尾
+for s in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(s, signal.SIG_IGN)
+p = subprocess.Popen(cmd, preexec_fn=lambda: [signal.signal(s, signal.SIG_DFL)
+                                              for s in (signal.SIGINT, signal.SIGTERM)])
+sys.exit(p.wait())
 ' "$file" "$wait" "$@"
-    fi
+        ;;
+    *)
+        echo "DEPLOY_LOCK_IMPL 只能是 auto / lockf / flock / python，收到 $impl" >&2
+        return 2
+        ;;
+    esac
 }
 
 uv_in() {   # uv_in <目录> <uv 参数...>：不让外面的虚拟环境变量把 uv 引到别的 venv
@@ -397,10 +429,16 @@ if [ -z "${_MA_DEPLOY_COPY:-}" ]; then
     # 失败只报一句、照样把日志写完。重新连上来看 state/deploy.log 就知道这次部署的结局。
     printf '\n===== %s deploy.sh %s =====\n' "$(now_iso)" "${ORIG_ARGS[*]}" \
         >> "$APP/state/deploy.log" 2>/dev/null || true
-    exec > >(tee -a "$APP/state/deploy.log") 2>&1
+    # tee 必须挺过 INT/TERM：打给进程组的信号若先杀了它，后面"自动退回"一往终端写就
+    # 吃 SIGPIPE，退回死在半路。bash 只让异步进程自动忽略 INT，TERM 得自己挡。
+    exec > >(trap '' INT TERM; exec tee -a "$APP/state/deploy.log") 2>&1
     copy=$(mktemp "${TMPDIR:-/tmp}/media-agent-deploy.XXXXXX") || die "mktemp 失败"
     cp "$0" "$copy" || die "复制部署脚本失败"
     export _MA_DEPLOY_COPY=$copy
+    # 这一层也要等副本收尾：没有 trap 的 SIGTERM 会让非交互 bash 立刻死掉（SIGINT 才会
+    # 等前台子进程），调用方于是在"退回"还没做完时就拿到了返回码。设了 trap，bash 就会
+    # 等前台命令结束再处理信号，返回码照实是副本的返回码。
+    trap ':' INT TERM
     with_lock "$APP/state/deploy.lock" 0 "${BASH:-/bin/bash}" "$copy" "${ORIG_ARGS[@]}"
     rc=$?
     rm -f "$copy"
