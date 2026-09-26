@@ -728,9 +728,12 @@ def cmd_ab_mode(args, cfg) -> int:
     if config is None:
         seen = f"{where}：{abmode.describe_flags(flags)}" if flags else where
         return _refuse(f"AutoBangumi 的接口不可用，不切换——改配置、重启、读回核对都要接口（{seen}）")
-    if flags == abmode.flags_for(want) and cfg.ab_mode == want and cfg.ab_mode_source == "state":
+    # 两边都已是目标就什么都不做。subscription 还要求模式是命令切的（`state`）：来自 AB_MODE 的没有核对用的基线，
+    # 切一次（开关已关的只重启、核对、记基线）才核对得了；full 没有基线要记，不为记一笔去重启 AB
+    if (flags == abmode.flags_for(want) and cfg.ab_mode == want
+            and (want == abmode.FULL or cfg.ab_mode_source == "state")):
         print(f"已经是 {want}：AB 的开关 {abmode.describe_flags(flags)}，本项目也认 {want}"
-              f"（state/ab_mode.json）。media-agent ab-mode show 看核对")
+              f"（{cfg.ab_mode_source}）。media-agent ab-mode show 看核对")
         return 0
     before = abmode.mode_of(flags) or abmode.describe_flags(flags)
     f = Finding(rule="ab-mode", kind="ab_mode_switch", severity="important",

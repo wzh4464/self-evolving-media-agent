@@ -228,6 +228,13 @@ def test_already_in_the_mode_is_a_no_op(ab_lib, monkeypatch, capsys):
     assert "已经是" in capsys.readouterr().out
 
 
+def test_full_on_a_fresh_deploy_is_a_no_op(ab_lib, monkeypatch, capsys):
+    """刚部署（默认 full、AB 的开关都开着）再说一次 full：没有基线要记、没有东西要切——不为记一笔去重启 AB。"""
+    assert _main(monkeypatch, "ab-mode", "full") == 0
+    assert "restart" not in ab_lib.ab.calls and _state(ab_lib) is None
+    assert "已经是" in capsys.readouterr().out
+
+
 def test_flags_already_off_in_ab_still_restart_and_record(ab_lib, monkeypatch):
     """人在 WebUI 里关过（或 PATCH 之后没重启）：不再 PATCH，但照样重启一次让线程对上配置、核对、记基线。"""
     lib = ab_lib
