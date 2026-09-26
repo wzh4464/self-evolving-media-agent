@@ -54,6 +54,9 @@
   （配了 `AB_CONFIG` 就只读 AB 的 config.json 说一句看到了什么）；重启之后等不到它回来记 unknown、本项目的模式不动、说清怎么
   核对与退回；切回 `full` 提醒补下载（AB 按 URL 判新，停着期间发布的一口气下）。`show` 说两边各认什么、一不一致，切换之后
   AB 还拉没拉 RSS、在订阅之外加没加种子（不一致 / 有问题退出码 1）。`AB_MODE` 写错、状态文件坏了大声失败。
+- **订阅模式下 `Bangumi` 分类不再归 AutoBangumi**：AB 的改名线程停了，`Bangumi` 里只剩订阅那一刻它补的集、名字就是发布名。
+  判重不再为它让位（不报 `pending_ownership`、封存集位里不再 holdback 发布名认不出这一集的）；`media-agent grab` 当场把
+  `Bangumi` / `BangumiCollection` 里的种子交接到剧名分类、改名、判重（以前要等 6 小时的 `run`）。`full` 模式照旧。
 - **第二个 launchd 任务 `com.zihan.media-agent-grab`**（`deploy/com.zihan.media-agent-grab.plist`：每 30 分钟
   `media-agent grab`，加载时不跑，低优先级与主任务相同，日志 `state/grab.log`）。`deploy.sh` 两份都装、各自只在变了时
   重新加载；任何一份装不上两份一起退回；tag 里没有抓取任务（回滚到更早的版本）就卸掉它；装着的任务与 tag 里的对不上时

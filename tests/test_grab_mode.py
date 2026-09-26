@@ -132,3 +132,37 @@ def test_grab_mode_does_no_other_governance(lib):
     """标题对齐、NFO、sidecar 同步都是 `run` 的事：抓取模式的诊断里根本没有这些规则。"""
     names = {getattr(d, "id", "") for d in grabmode.registry().detectors}
     assert names == {"ab-adoption", "episode-available", "duplicate-episode", "unrenamed-file"}
+
+
+# ------------------------------------------------------------------ 订阅模式：AB 订阅那一刻补的集，抓取当场接手
+ANI_04 = "[ANi] Zhuaqu Wu - 04 [1080P][Baha][WEB-DL][CHT].mp4"
+
+
+def test_subscription_mode_grab_hands_over_what_ab_collected_at_subscribe_time(lib):
+    """订阅模式（`AB_MODE=subscription`）下 AB 的改名线程停了：人在 AB 里订阅的那一刻它把已发布的集补进 `Bangumi`
+    分类，之后再没人改名。抓取当场交接（分类改成剧名）、改名、判重——不等 6 小时的 `run`。别的分类碎片、删空分类仍是
+    `run` 的事。"""
+    lib.configure(ab_mode="subscription")
+    sh = _airing(lib, releases=())
+    s1 = sh.season(1)
+    ab = s1.single(ANI_04, category="Bangumi", probe=TWO_SUBS)
+    frag = s1.single("[G] Zhuaqu Wu - 03 [1080p].mkv", category="抓取戊（旧译名）", probe=TWO_SUBS)
+
+    loop = lib.grab_loop()
+
+    assert lib.qbit.torrent(ab.hash)["category"] == SHOW
+    assert [p.name for p in ab.current_paths()] == [f"{SHOW} S01E04.mp4"]
+    assert lib.qbit.torrent(frag.hash)["category"] == "抓取戊（旧译名）"
+    assert not loop.applied("delete_category")
+    assert {r["args"]["torrent_hash"] for r in loop.applied("recategorize")} == {ab.hash}
+
+
+def test_full_mode_grab_leaves_the_bangumi_category_to_ab(lib):
+    sh = _airing(lib, releases=())
+    ab = sh.season(1).single(ANI_04, category="Bangumi", probe=TWO_SUBS)
+
+    loop = lib.grab_loop()
+
+    assert not loop.report.applied
+    assert lib.qbit.torrent(ab.hash)["category"] == "Bangumi"
+    assert "category-consolidation" not in {getattr(d, "id", "") for d in grabmode.registry(lib.cfg).detectors}

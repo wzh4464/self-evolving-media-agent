@@ -10,7 +10,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
-from .. import preferences
+from .. import abmode, preferences
 from ..cache import Cache
 from ..dedup import content_digest
 from ..kernel import (Action, Context, Finding, LibraryState, MediaFile,
@@ -675,6 +675,10 @@ class DuplicateEpisodeDetector:
 
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         cache = Cache(ctx.config.cache_db)
+        # `Bangumi` 分类归不归 AutoBangumi（`abmode`）：`full` 下它的改名线程每 60 秒扫这个分类，文件此刻叫什么只是
+        # "AB 认为的"，判重让位（下面的 `pending_ownership` 与 holdback）。订阅模式（`AB_MODE=subscription`）下改名线程停了，
+        # `Bangumi` 里只有订阅那一刻 AB 补的集、名字就是发布名、没人再改——让位只会让新订阅补来的重复白等一次交接
+        ab_owns = abmode.ab_renames(ctx.config)
         for show in state.shows:
             if show.is_movie:
                 continue
@@ -847,7 +851,7 @@ class DuplicateEpisodeDetector:
                                                    if f.torrent_hash != holder.torrent_hash]},
                     )
 
-                pending = [f for f in files if f.torrent_category == "Bangumi"]
+                pending = [f for f in files if ab_owns and f.torrent_category == "Bangumi"]
                 if pending and not sealed:
                     yield Finding(
                         rule=self.id, kind="pending_ownership", severity="minor",
@@ -884,7 +888,7 @@ class DuplicateEpisodeDetector:
                     # `Bangumi` 下的文件，此刻叫什么只是"AB 认为的"；
                     # 要在本轮就清理它，得让它的**发布名**独立确认集位。
                     holdback = [f for f in losers
-                                if f.torrent_category == "Bangumi"
+                                if ab_owns and f.torrent_category == "Bangumi"
                                 and not _release_agrees(f, show, season, ep)]
                     if holdback:
                         yield Finding(

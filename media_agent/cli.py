@@ -1145,7 +1145,7 @@ def _grab(args, cfg, rh) -> int:
     rh.clients(ctx)
     dry = args.dry_run or not cfg.auto_apply
     ex = Executor(ctx, dry_run=dry, run_id=run_id)
-    scope = grabmode.Scope()
+    scope = grabmode.Scope(cfg)
     prev = health.load_baseline(cfg.state_dir)
 
     def on_scan(n, state) -> None:
@@ -1174,7 +1174,7 @@ def _grab(args, cfg, rh) -> int:
     report = ex.report
     findings = [f for f in out.findings if scope.relevant(f)]
     rh.loop(out)
-    rh.diagnosed(grabmode.registry(), findings, errors=out.detector_errors)
+    rh.diagnosed(grabmode.registry(cfg), findings, errors=out.detector_errors)
     if out.stop == converge.REFUSED:
         n = len(out.iterations)
         why = report.refused

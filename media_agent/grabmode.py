@@ -13,9 +13,15 @@
 | `episode-available`（`replace_dead=False`） | `grab_episode` | 本职。**不换源**：旧种子死了换个发布，要同一批摘掉旧种子（dead-torrent），不在这里做；放行了就是两个种子抢一个集位 |
 | `duplicate-episode` | `trash`，只在集位里有本项目抓的那一份时 | 抓取补上的集位与 AB（还没退役时）的那份重复：判重清走输家、赢家才拿得到集位名——抓取的收尾。删除照样过删除关口（I1–I4）与配额 |
 | `unrenamed-file` | `rename`，只改本项目抓的种子的文件 | 抓取当场的改名（`_rename_grabbed`）等不到元数据、或多视频的发布，要等改名规则；AB 的文件它自己 60 秒就改 |
+| `category-consolidation`（只在订阅模式） | `recategorize`，只把 `Bangumi` / `BangumiCollection` 里的交接到剧名分类 | AB 不再改名：订阅那一刻它补的集当场交接、改名、判重（见下） |
 
 "本项目抓的" = 种子钉着 `ma:SxxEyy`（抓取加种时打的），或出处账本里有这个种子的抓取行（`Row.grabbed`）——按**每次迭代
 的扫描**认（`Scope.observe`），这一轮刚抓的下一次迭代就算。
+
+**订阅模式**（`AB_MODE=subscription`，`abmode`）：AB 的改名线程停了，人在 AB 里订阅的那一刻它把已发布的集补进 `Bangumi`
+分类，之后再没人改名——这些也算"本项目的"：多一条 `category-consolidation`，只做把 `Bangumi` / `BangumiCollection` 里的
+种子交接到剧名分类（`recategorize`；别的分类碎片、删空分类仍是 `run` 的事），这一轮见过在 AB 分类里的种子交接之后照样
+改名、判重（`Scope.handed`）。以前要等 6 小时的 `run`，而 AB 60 秒就改好了。
 
 **不做的**（留给 6 小时的 `run`）：换源与摘死种、标题对齐 / 目录改名、分类交接、NFO、特典、sidecar 同步、新一季登记、
 出处账本的补录、标题稳定闸的计数、隔离区处置、发现历史（抓取每 30 分钟一份会把 `run` 的快照挤出保留窗口，卡住检测只数
@@ -25,7 +31,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from . import converge
+from . import abmode, converge
 from .kernel import Finding, Registry
 from .naming import parse_pin
 
@@ -37,31 +43,51 @@ GRAB_INTERVAL_S = 1800
 ADOPT_OPS = ("create_show_dir", "subscribe_season", "adopt_episode_offset")
 
 
-def registry() -> Registry:
-    """抓取模式的检测器（见模块文档的表）。顺序与 `register_builtins` 相同：接手订阅在前，判重在改名之前。"""
+def _handover(cfg) -> bool:
+    """订阅模式下抓取接手 AB 分类里的种子（模块文档）。"""
+    return cfg is not None and not abmode.ab_renames(cfg)
+
+
+def registry(cfg=None) -> Registry:
+    """抓取模式的检测器（见模块文档的表）。顺序与 `register_builtins` 相同：接手订阅在前，判重在改名之前。
+    订阅模式（`cfg.ab_mode`）多一条分类交接。"""
     from .plugins.adopt import AbAdoptionDetector
-    from .plugins.builtin import DuplicateEpisodeDetector, UnrenamedDetector
+    from .plugins.builtin import CategoryConsolidationDetector, DuplicateEpisodeDetector, UnrenamedDetector
     from .plugins.grab import EpisodeAvailableDetector
 
     reg = Registry()
-    for d in (AbAdoptionDetector(), EpisodeAvailableDetector(replace_dead=False), DuplicateEpisodeDetector(),
-              UnrenamedDetector()):
+    detectors = [AbAdoptionDetector(), EpisodeAvailableDetector(replace_dead=False), DuplicateEpisodeDetector(),
+                 UnrenamedDetector()]
+    if _handover(cfg):
+        detectors.append(CategoryConsolidationDetector())
+    for d in detectors:
         reg.register(d)
     return reg
 
 
 class Scope:
-    """"本项目抓的"种子（见模块文档），每次迭代的扫描之后更新（`observe`）。"""
+    """"本项目抓的"种子（见模块文档），每次迭代的扫描之后更新（`observe`）。`cfg` 给了、而且是订阅模式：AB 分类里的
+    种子也算（`handed`：这一轮见过的，交接到剧名分类之后照样算）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg=None) -> None:
         self.grabbed: set[str] = set()
+        self.handover = _handover(cfg)
+        self.handed: set[str] = set()
 
     def observe(self, state) -> None:
         hashes = {str(t.get("hash") or "").lower() for t in state.torrents or []
                   if parse_pin(t.get("tags") or "")}
         hashes |= {str(h).lower() for h, row in (state.ledger_rows or {}).items()
                    if row.active and row.grabbed}
-        self.grabbed = hashes - {""}
+        if self.handover:
+            self.handed |= {str(t.get("hash") or "").lower() for t in state.torrents or []
+                            if (t.get("category") or "") in abmode.AB_CATEGORIES}
+        self.grabbed = (hashes | self.handed) - {""}
+
+    def recategorize(self, f: Finding) -> bool:
+        """订阅模式下只做 AB 分类的交接：`Bangumi` / `BangumiCollection` → 剧名分类。"""
+        return (self.handover and f.rule == "category-consolidation"
+                and (f.evidence or {}).get("current") in abmode.AB_CATEGORIES)
 
     def rename(self, f: Finding) -> bool:
         """改名只改本项目抓的种子的文件。"""
@@ -77,7 +103,8 @@ class Scope:
 
     @property
     def select(self) -> Callable[[Finding], bool]:
-        return converge.only(*ADOPT_OPS, "grab_episode", rename=self.rename, trash=self.trash)
+        return converge.only(*ADOPT_OPS, "grab_episode", rename=self.rename, trash=self.trash,
+                             recategorize=self.recategorize)
 
     def relevant(self, f: Finding) -> bool:
         """给人看的（输出、健康报告的"发现"）：要做的动作，加上抓取与订阅接手自己的发现（找不到番组页、编号对不上……）。
@@ -88,12 +115,12 @@ class Scope:
 def run(ctx, ex, *, scan, max_iterations: int, scope: Scope | None = None, on_scan=None, on_diagnose=None,
         on_iteration=None, out: converge.Outcome | None = None) -> converge.Outcome:
     """抓取模式的一轮：`converge.run` 配上抓取模式的检测器与挑法。`scope` 给了就用它（调用方要按它筛输出）。"""
-    scope = scope or Scope()
+    scope = scope or Scope(ctx.config)
 
     def observed(n, state) -> None:
         scope.observe(state)
         if on_scan:
             on_scan(n, state)
 
-    return converge.run(ctx, registry(), ex, scan=scan, max_iterations=max_iterations, select=scope.select,
+    return converge.run(ctx, registry(ctx.config), ex, scan=scan, max_iterations=max_iterations, select=scope.select,
                         on_scan=observed, on_diagnose=on_diagnose, on_iteration=on_iteration, out=out)
