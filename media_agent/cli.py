@@ -250,16 +250,22 @@ def cmd_repair(args, cfg) -> int:
     if res.get("refused"):
         return _refuse(res["refused"])
     print(("【预演】" if args.dry_run else "【修复】") + f"分裂目录 {res['pairs']} 对")
+    errors = 0
     for d in res["detail"]:
         if args.dry_run:
             print(f"  {d['old']} → {d['new']}: "
                   f"qBit 搬 {d['would_move_via_qbit']}，文件系统搬 {d['would_move_via_fs']}")
+        elif d.get("error"):
+            errors += 1
+            print(f"  ❌ {d['old']} → {d['new']}: {d['error']}")
         else:
             mark = "✅" if d["old_removed"] else "⚠️ 旧目录未清空"
             print(f"  {mark} {d['old']} → {d['new']}: "
                   f"qBit {d['moved_via_qbit']} + 文件系统 {d['moved_via_fs']}"
-                  + (f"，{d['stranded']} 个同名滞留" if d["stranded"] else ""))
-    return 0
+                  + (f"，{d['stranded']} 个同名滞留" if d["stranded"] else "")
+                  + (f"，{d['left_for_torrents']} 个文件仍归种子、没用文件系统搬"
+                     if d.get("left_for_torrents") else ""))
+    return 1 if errors else 0
 
 
 def cmd_purge(args, cfg) -> int:

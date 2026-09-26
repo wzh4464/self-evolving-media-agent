@@ -358,12 +358,18 @@ class Executor:
     def _is_junk(cls, name: str) -> bool:
         return name in cls._JUNK_NAMES or name.startswith(cls._JUNK_PREFIXES)
 
-    def _merge_tree(self, old: Path, new: Path) -> tuple[int, int]:
+    def _merge_tree(self, old: Path, new: Path,
+                    skip: set[Path] | frozenset = frozenset()) -> tuple[int, int]:
         """把 old 目录树递归合并进 new，逐**文件**移动并保持相对结构。
 
         必须递归：早先的实现只遍历顶层，遇到 `Season 1` 这种子目录时，
         若 new 下已存在同名子目录就整个跳过，导致里面的文件全部滞留在旧目录，
         造成新旧两个目录并存的分裂状态（实测 19 个目录、50 个文件中招）。
+
+        `skip` 里的路径一个都不碰——调用方传入**此刻有种子声明**的路径
+        （见 `_live_claims_under`）。文件系统搬走种子的文件就是 AGENTS.md 第 3 条
+        说的死链；它们要么已由 setLocation 交给 qBittorrent 搬（异步，可能还没搬完），
+        要么根本不该由这里搬。
 
         返回 (已移动文件数, 因目标已存在而滞留的文件数)。
         """
@@ -373,7 +379,7 @@ class Executor:
         new.mkdir(parents=True, exist_ok=True)
 
         for src in sorted(old.rglob("*")):
-            if not src.is_file():
+            if not src.is_file() or src in skip:
                 continue
             rel = src.relative_to(old)
             if self._is_junk(src.name):
@@ -399,6 +405,36 @@ class Executor:
         except OSError:
             pass
         return moved, stranded
+
+    def _live_claims_under(self, root: Path) -> tuple[dict[str, dict], set[Path]]:
+        """此刻 qBittorrent 里谁在 `root` 之下有文件——问活的，不信审计记录。
+
+        返回 `({hash: 种子视图}, {被声明的绝对路径（含 .!qB）})`。一个种子算"在
+        root 之下"：save_path 或 content_path 在 root 下，或者它的某个文件条目落在
+        root 下（save_path 在更上层、Original 布局的根目录恰好就是剧名那种）。
+        save_path 与 root 互不包含的种子，文件不可能落在 root 下，不必问 `files()`。
+        优先级 0 的条目也算：setLocation 会连盘上已有的未勾选文件一起搬。
+
+        `files()` 读失败直接抛——看不全就不能动，调用方此时还什么都没改。
+        """
+        owners: dict[str, dict] = {}
+        claimed: set[Path] = set()
+        for t in self.ctx.qbit.torrents():
+            sp = (t.get("save_path") or "").rstrip("/")
+            cp = (t.get("content_path") or "").rstrip("/")
+            if not sp:
+                continue
+            inside = under(sp, root) or bool(cp and under(cp, root))
+            if not (inside or under(root, sp)):
+                continue
+            for e in self.ctx.qbit.files(t["hash"]):
+                p = Path(sp) / e["name"]
+                if under(p, root):
+                    claimed.update((p, Path(str(p) + ".!qB")))
+                    inside = True
+            if inside:
+                owners[t["hash"]] = t
+        return owners, claimed
 
     def _torrent_rel_path(self, torrent_hash: str, abs_path: Path) -> str | None:
         """qBittorrent 的 renameFile 用的是种子内相对路径，不是绝对路径。"""
@@ -1186,8 +1222,10 @@ class Executor:
         done, skipped, failed, lost = [], [], [], []
 
         # qBittorrent 不在就整批拒绝（critic N3）：逆改名会退化成 `mv`，
-        # 目录改名的逆操作把 setLocation 的异常吞掉后改用文件系统搬，其余逆操作
+        # 目录改名的逆操作无从得知哪些文件归活种子，其余逆操作
         # 各自 AttributeError 记成 failed——半截回退比不回退更难收拾。
+        # （qBit 在线时，目录改名的逆操作另有一道：先问活的种子视图，有不在记录里
+        # 的种子就不动；setLocation 失败记 failed、残留一个不搬。）
         # 也**不写** rollback 汇总记录：写了 `list_runs` 就会把这批标成已回退。
         refused = self.qbit_blocker()
         if refused:
@@ -1361,27 +1399,46 @@ class Executor:
             back = cur.parent / u["new_name"]
             if back.exists():
                 return False, f"还原目标目录已存在：{back.name}"
+
+            # 回退同样由 qBittorrent 搬运（AGENTS.md 第 3 条）。以前这里有两个洞：
+            # setLocation 的异常被 `continue` 吞掉，而改名之后才落进新目录的种子
+            # （此后抓的新集）根本不在 torrent_savepaths 里——接下来按顶层把新目录
+            # 整个 shutil.move 回去，它们的文件就被文件系统搬走、种子失联，
+            # 这条记录还算 reverted。生产上有 78 条已执行的 rename_show_dir，
+            # 回退其中较早的任何一条都会命中后一种，不需要任何故障。
+            # 所以先问 qBittorrent 此刻谁在这个目录里：有不在记录里的，整条不动。
+            listed = dict(u.get("torrent_savepaths") or [])
+            owners, claimed = self._live_claims_under(cur) if cur.exists() else ({}, set())
+            strangers = [h for h in owners if h not in listed]
+            if strangers:
+                names = "、".join(f"{h[:8]}（{owners[h].get('name', '')[:40]}）"
+                                 for h in strangers[:3])
+                return False, (f"{cur.name} 里有 {len(strangers)} 个种子不在当初的改名记录里"
+                               f"（改名之后才落进来的，如 {names}）：回退只会搬回记录里的"
+                               f"种子，其余种子的文件会被连带搬走、就此失联。交给人处理")
             if self.dry_run:
                 return True, ""
 
-            # 回退同样由 qBittorrent 搬运，保持"改动必经 qBit"的不变式
-            for h, sp in u.get("torrent_savepaths", []):
+            moved, failed = 0, []
+            for h, sp in listed.items():
+                if h not in owners:
+                    continue          # 已不在这个目录里（被删了、或此后挪去了别处）：不归这次回退管
                 try:
                     self.ctx.qbit.set_location([h], sp)   # 还原为原始 save_path
-                except Exception:
-                    continue
+                    moved += 1
+                except Exception as e:
+                    failed.append(f"{h[:8]}：{type(e).__name__}: {e}")
+            if failed:
+                # 与正向操作同一口径：有种子没搬成就停手，残留一个都不动——此时是
+                # 半迁移状态，再用文件系统搬只会把没搬成的那个种子的文件也搬走。
+                raise RuntimeError(
+                    f"{len(failed)} 个种子 setLocation 失败（已交给 qBittorrent 搬回 {moved} 个），"
+                    f"残留文件一个没动，需人工核对：{failed[0]}")
 
-            # 残留文件搬回去，再清掉空的新目录
+            # 没有种子声明的残留（NFO、孤儿字幕、`.extras` 里的东西……）逐个文件搬回，
+            # 任何种子声明的路径都不碰：setLocation 是异步的，qBit 可能还没搬完。
             if cur.exists():
-                back.mkdir(parents=True, exist_ok=True)
-                for item in list(cur.iterdir()):
-                    dest = back / item.name
-                    if not dest.exists():
-                        shutil.move(str(item), str(dest))
-                try:
-                    cur.rmdir()
-                except OSError:
-                    pass
+                self._merge_tree(cur, back, skip=claimed)
 
             bid, prev = u.get("bangumi_id"), u.get("prev_savepath")
             if bid and prev and self.ctx.abdb:
@@ -1517,8 +1574,8 @@ class Executor:
         把旧目录残留内容合并进新目录。
 
         对**仍有有效种子**的文件优先走 qBittorrent setLocation；
-        种子已失联的（stale path）只能走文件系统——那些种子本来就已经断了，
-        搬运不会让情况更糟，但会记录下来。
+        没有任何种子声明的残留才走文件系统。任何活种子此刻声明的路径都不用
+        文件系统搬（`_live_claims_under`）；某个种子 setLocation 失败，这一对就不合并。
         """
         # qBit 不在时"哪些文件有活种子"无从得知，_merge_tree 会用文件系统
         # 搬走活种子的文件（critic N3）。拒绝。
@@ -1541,35 +1598,55 @@ class Executor:
 
         results = []
         for old, new in pairs:
-            # 先让还活着的种子自己搬
-            via_qbit = 0
-            if self.ctx.qbit:
-                for t in self.ctx.qbit.torrents():
-                    sp = t.get("save_path") or ""
-                    cp = t.get("content_path") or ""
-                    if not under(sp, old):
-                        continue
-                    if not Path(cp).exists():
-                        continue          # 死链种子，setLocation 搬不动它
-                    try:
-                        self.ctx.qbit.set_location(
-                            [t["hash"]], repath(sp, old, new))
-                        via_qbit += 1
-                    except Exception:
-                        continue
+            # 先问 qBittorrent 此刻谁在旧目录里有文件——不只是 save_path 在旧目录下的：
+            # Original 布局、save_path 在媒体根、根目录恰好叫剧名的种子，content 在
+            # 旧目录下而 save_path 不在，以前它不进 setLocation 名单，文件直接被
+            # _merge_tree 用文件系统搬走。这些被声明的路径一律不许文件系统碰。
+            owners, claimed = self._live_claims_under(old)
+            movable = []
+            for t in owners.values():
+                sp = t.get("save_path") or ""
+                cp = t.get("content_path") or ""
+                if not under(sp, old):
+                    continue          # 根在旧目录之上：setLocation 改不了它的根目录名，留给人
+                if not (cp and Path(cp).exists()):
+                    continue          # 死链 / 没有元数据：setLocation 搬不动它
+                movable.append(t)
 
             if self.dry_run:
+                # 以前 setLocation 在 dry-run 判断之前就发出去了：预演也真的搬了种子。
                 remaining = sum(1 for p in old.rglob("*")
-                                if p.is_file() and not self._is_junk(p.name))
+                                if p.is_file() and p not in claimed
+                                and not self._is_junk(p.name))
                 results.append({"old": old.name, "new": new.name,
-                                "would_move_via_qbit": via_qbit,
+                                "would_move_via_qbit": len(movable),
                                 "would_move_via_fs": remaining})
                 continue
 
-            moved, stranded = self._merge_tree(old, new)
+            via_qbit, failed = 0, []
+            for t in movable:
+                try:
+                    self.ctx.qbit.set_location(
+                        [t["hash"]], repath(t["save_path"], old, new))
+                    via_qbit += 1
+                except Exception as e:
+                    failed.append(f"{t['hash'][:8]}：{type(e).__name__}: {e}")
+            if failed:
+                # 以前吞掉异常接着 _merge_tree：qBit 仍记着旧 save_path，文件却被
+                # 文件系统搬去了新目录——种子失联。这一对停手，交给人。
+                results.append({"old": old.name, "new": new.name,
+                                "moved_via_qbit": via_qbit, "moved_via_fs": 0,
+                                "stranded": 0, "old_removed": False,
+                                "error": (f"{len(failed)} 个种子 setLocation 失败，这一对不做"
+                                          f"文件系统合并：{failed[0]}")})
+                continue
+
+            moved, stranded = self._merge_tree(old, new, skip=claimed)
             results.append({"old": old.name, "new": new.name,
                             "moved_via_qbit": via_qbit, "moved_via_fs": moved,
-                            "stranded": stranded, "old_removed": not old.exists()})
+                            "stranded": stranded,
+                            "left_for_torrents": sum(1 for p in claimed if p.exists()),
+                            "old_removed": not old.exists()})
 
         return {"pairs": len(pairs), "detail": results, "refused": ""}
 

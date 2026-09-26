@@ -195,3 +195,40 @@ finding、照常算"已解释"。人工确认后放行的正式流程留到后�
 **测试**：`tests/test_evolved_actions_gated.py`——规则 JSON 落在 RULES_DIR、经
 `cli.build_registry()` 加载，trash（含自带 path）/ retag / recategorize / rename
 都被跳过、库快照不变；JSON 自称 builtin 也拦得住；无动作规则不受影响。
+
+## 8. 目录级搬运（改名回退、repair）先问活的种子视图，setLocation 失败就停手
+
+**症状（审查复现，未在生产触发）**：第 4 条只在 qBit 不可用时拒绝回退与 repair；
+qBit 在线时，两条目录级搬运仍会用文件系统搬走活种子的文件——正是 AGENTS.md 第 3 条
+说的死链来源。
+
+- `rename_show_dir` 的逆操作：`setLocation` 的异常被 `except Exception: continue`
+  吞掉，随后把新目录**顶层**每一项 `shutil.move` 回旧目录——连同没搬成的那个种子的
+  文件；改名之后才落进新目录的种子（此后抓的新集）根本不在 `torrent_savepaths` 里，
+  文件同样被搬走。这条记录照样算 `reverted`、`failed=0`。后一种不需要任何故障：
+  生产上有 78 条已执行的 rename_show_dir，回退其中较早的任意一条都会命中。
+  顶层搬运还有一个老毛病：qBit 已经建好旧目录下的 `Season 1` 时，新目录 `Season 1`
+  里的无主残留整个被跳过（与 `_merge_tree` 当年修掉的是同一个非递归 bug）。
+- `repair_split_dirs`：同样吞掉 `setLocation` 的异常再 `_merge_tree`；只给 save_path
+  在旧目录下的种子发 setLocation，content 在旧目录下、save_path 在更上层的种子
+  （Original 布局、根目录恰好叫剧名）被 `_merge_tree` 直接搬走。另外 setLocation 在
+  dry-run 判断之前就发出去了，`repair --dry-run` 也会真搬种子。
+
+**修法**：
+- `Executor._live_claims_under(root)`：问活的 `torrents()` + `files()`，返回在 root 下
+  有文件的种子与它们声明的全部路径（含 `.!qB`、含优先级 0 的条目——setLocation 会一起搬）。
+  判"在 root 下"不只看 save_path：content_path 或任一文件条目落在 root 下都算。
+- `_merge_tree(old, new, skip=…)`：`skip` 里的路径一个都不碰。
+- 目录改名的逆操作：活视图里有不在 `torrent_savepaths` 的种子 → 整条跳过并写明是哪几个
+  （dry-run 同样报出来）；记录里、此刻仍在目录里的种子逐个 setLocation，任何一个失败 →
+  抛出，记 `failed`，残留一个不动；都成功才按文件合并无主残留，绕开所有被声明的路径
+  （setLocation 是异步的，qBit 可能还没搬完）。
+- repair：同一个 claim 索引；setLocation 失败的那一对不合并、结果里带 `error`，
+  `media-agent repair` 打 ❌ 并以 1 退出；被声明的路径不合并（`left_for_torrents` 计数，
+  旧目录因此不会被清掉，交给人）；dry-run 不再发任何 setLocation。
+
+**测试**：`tests/test_show_dir_moves.py`——回退用真实正向操作写下的审计记录：
+回退时 setLocation 超时（failed、快照不变）、改名后落进来的种子（skipped、快照不变、
+dry-run 同样报）、异步 setLocation 期间残留合并不碰被声明的文件；repair：setLocation
+失败不合并、根在媒体根的 Original 种子不被合并、dry-run 零调用、同前缀兄弟目录不受牵连、
+CLI 退出码。
