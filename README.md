@@ -115,6 +115,37 @@ name across all their files. The dry run caught it; the fix and the reasoning ar
 Two more self-defects surfaced the same way. **Rules will be wrong — full autonomy
 is only safe because being wrong is recoverable.**
 
+## Knowing when it has quietly stopped
+
+The costliest failures here were never crashes. They were runs where every step
+"succeeded" and nothing moved: one episode grabbed per cycle for three days, ten
+days of grabs failing into the audit log while launchd reported exit code 0. So:
+
+- **Findings history.** Every `run` (and `diagnose`) writes all findings to
+  `state/findings/<run_id>.jsonl` with a stable fingerprint (rule + kind + target,
+  never the summary text, which embeds counts).
+- **Stuck detection.** The same fingerprint in 4 consecutive runs (`STUCK_RUNS`)
+  is reported as *stuck*, with when it started. Known long-standing items are
+  acknowledged with `media-agent ack <fingerprint> --reason …`, which writes the
+  versioned `.agents/acks.json`.
+- **Health report.** Every run ends — normally, refused, or crashed — with
+  `state/health/<run_id>.json` and a short section in the log: client status,
+  torrent count vs. the previous run, action outcomes, grab stats, detector
+  crashes, quarantine size and free space, stuck items, files still release-named
+  after 12 h, and an overall `ok | warn | critical`. Critical runs exit non-zero
+  (1 crash, 3 refused, 4 audit incomplete, 5 disk still full). `media-agent health`
+  prints the latest one.
+- **Fail closed on a partial qBittorrent session.** If the torrent count drops by
+  more than max(20, 10 %) and the audit log doesn't explain it, nothing is changed.
+- **Notifications on change.** Optional SMTP email when the status gets worse or
+  recovers from critical, or a new item gets stuck — at most one per run,
+  secrets redacted.
+- **Readable logs.** Every line of a run carries a timestamp and the run id; the
+  launchd logs rotate at 5 MB.
+- **Maintenance pause.** `state/PAUSE` or an active VPN rescue makes `run` / `apply`
+  exit 75 without touching anything; the rescue and watchdog scripts take the run
+  lock before recreating the qBittorrent container.
+
 ## Quick start
 
 ```sh
@@ -131,6 +162,8 @@ uv run media-agent apply --dry-run     # preview fixes
 uv run media-agent apply               # execute
 uv run media-agent evolve              # draft rules for the blind spots
 uv run media-agent run                 # one full autonomous cycle
+uv run media-agent health              # the last run's health report
+uv run media-agent ack <fp> --reason … # acknowledge a stuck finding (commit .agents/acks.json)
 ```
 
 Start with `diagnose`, then `apply --dry-run`. Only flip `AUTO_APPLY=true` once
@@ -164,14 +197,17 @@ media_agent/
   scan.py         Disk + qBittorrent + AutoBangumi → one LibraryState
   plugins/        The nine built-in detectors
   actions.py      Executor + quarantine + caps + audit log
+  history.py      Findings history, fingerprints, stuck detection, acknowledgements
+  health.py       Per-run health report, torrent-count plausibility
+  notify.py       Change-only email notifications
   evolution.py    Residue → propose → shadow-validate → promote
 .agents/
   notes/          Agent Notes, path-encoded {lifecycle}/{class}/date-title.md
   rules/          Evolved rules (JSON), auto-mounted on the next run
 ```
 
-Read [AGENTS.md](AGENTS.md) before changing anything — it lists six constraints
-that are not up for debate, each one paid for in lost hours.
+Read [AGENTS.md](AGENTS.md) before changing anything — it lists the constraints
+that are not up for debate (all of them, not just the first few), each one paid for in lost hours.
 
 ## Honest limitations
 

@@ -13,6 +13,12 @@
 七成分享率不到 0.1）。一旦可被连入又不暂停，这些会立刻涌向 VPS，
 几小时就能烧穿配额——那才是真正的风险，不是被救的那几个种子的下载量。
 
+**切换时拿着 media-agent 的运行锁**（critic N17）：`start` / `stop` 都会 `docker compose up --force-recreate`，
+qBittorrent 在一轮 `run` 中途消失，扫描读到一半、改名改到一半。所以重建之前先拿 `state/run.lock`（与 media-agent、
+deploy.sh 同一把 flock），最多等 `RESCUE_LOCK_WAIT` 秒（默认 900；一轮 run 约 2 分钟），等不到就不切换、以 75 结束。
+锁只在切换的那几分钟里拿着；`auto` 等下载的那几个小时不拿——那期间 `.rescue-active` 让 media-agent 自己暂停
+（`media_agent/pause.py`）。
+
 用法:
     rescue.py status         看当前模式
     rescue.py start          进入救援模式（暂停做种 + 切到 VPS）
@@ -26,13 +32,19 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 # media-agent 的位置：默认 ~/media-agent，可用 MEDIA_AGENT_HOME 覆盖
-sys.path.insert(0, os.environ.get(
-    "MEDIA_AGENT_HOME", str(Path.home() / "media-agent")))
+MEDIA_AGENT_HOME = Path(os.environ.get("MEDIA_AGENT_HOME", str(Path.home() / "media-agent")))
+sys.path.insert(0, str(MEDIA_AGENT_HOME))
 from media_agent.clients import QBitClient          # noqa: E402
 from media_agent.config import load_config          # noqa: E402
+from media_agent.runlock import LOCK_NAME, RunLock  # noqa: E402
+
+# 重建容器之前等 media-agent 的运行锁最多多少秒；等不到就不切换（退出码 75，与 media-agent 被锁挡住同一个）
+LOCK_WAIT = float(os.environ.get("RESCUE_LOCK_WAIT", "900"))
+EXIT_BUSY = 75
 
 DIR = Path.home() / "gluetun"
 DOCKER = os.environ.get("DOCKER_BIN", "/usr/local/bin/docker")
@@ -131,6 +143,39 @@ def stopped_hashes(q) -> set:
             if t["state"].startswith(("paused", "stopped"))}
 
 
+class MediaAgentBusy(RuntimeError):
+    """media-agent（或部署、手动命令）持有运行锁，等满 LOCK_WAIT 也没放。"""
+
+
+_held: RunLock | None = None
+
+
+@contextmanager
+def media_agent_held(what: str):
+    """期间拿着 media-agent 的运行锁，免得在一轮 run 中途重建 qBittorrent 容器。
+
+    同一个进程里重入直接放行：`start` 失败时在锁里调用 `stop` 回滚，不能自己把自己锁死。"""
+    global _held
+    if _held is not None:
+        yield
+        return
+    lock = RunLock(MEDIA_AGENT_HOME / "state" / LOCK_NAME, label=f"rescue.py {what}（重建 qBittorrent 容器）")
+    print(f"    先拿 media-agent 的运行锁（最多等 {LOCK_WAIT:.0f} 秒），免得在一轮 run 中途重建 qBittorrent")
+    if not lock.acquire(wait=LOCK_WAIT):
+        raise MediaAgentBusy(lock.holder() or "持有者未知")
+    _held = lock
+    try:
+        yield
+    finally:
+        _held = None
+        lock.release()
+
+
+def _busy(what: str, holder: str) -> int:
+    print(f"!! media-agent 正在运行（{holder}），{LOCK_WAIT:.0f} 秒内没等到它结束：这次不{what}，稍后再试")
+    return EXIT_BUSY
+
+
 def load_state() -> dict:
     if STATE.exists():
         try:
@@ -173,7 +218,14 @@ def cmd_start() -> int:
     if st["mode"] == "vps":
         print("已经在救援模式了，无需重复进入")
         return 0
+    try:
+        with media_agent_held("start"):
+            return _start()
+    except MediaAgentBusy as e:
+        return _busy("切换", str(e))
 
+
+def _start() -> int:
     q = qbit()
     pre_stopped = stopped_hashes(q)      # 必须在我们动手暂停之前取
     # 只记录"当前确实在做种"的完成种子。已被用户或分享率上限暂停的不碰，
@@ -214,6 +266,15 @@ def cmd_start() -> int:
 
 
 def cmd_stop() -> int:
+    try:
+        with media_agent_held("stop"):
+            return _stop()
+    except MediaAgentBusy as e:
+        # 救援标记还在：media-agent 继续暂停（安全一侧），人稍后再跑一次 stop
+        return _busy("切回 ExpressVPN（救援模式仍在，稍后再跑 rescue.py stop）", str(e))
+
+
+def _stop() -> int:
     st = load_state()
     print("1/3 切回 ExpressVPN")
     r = compose(vps=False)
@@ -249,8 +310,9 @@ def cmd_stop() -> int:
 
 
 def cmd_auto(hours: float = 6.0) -> int:
-    if cmd_start() != 0:
-        return 1
+    rc = cmd_start()
+    if rc != 0:
+        return rc
     deadline = time.time() + hours * 3600
     print(f"\n进入等待，最长 {hours} 小时。每 60 秒检查一次。")
     while time.time() < deadline:

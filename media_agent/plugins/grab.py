@@ -194,7 +194,7 @@ def _feed_cached(mid: str, cache) -> list[dict]:
     return got.get("items") or []
 
 
-def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None) -> str | None:
+def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None) -> str | None:
     """找这部番在 Mikan 上的番组 id，找到后**写回 sidecar**，省得每轮再搜。
 
     解析顺序是有讲究的：
@@ -230,7 +230,9 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None) -> str | No
         if hit is None:
             try:
                 hit = {"ids": _mikan_search_ids(kw, 3)}
-            except Exception:
+            except Exception as e:
+                if log:
+                    log(f"[episode-available] Mikan 搜索失败 {kw}：{type(e).__name__}: {e}")
                 continue
             cache.put_llm(ck, hit)
         for i in (hit.get("ids") or []):
@@ -247,7 +249,9 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None) -> str | No
     for mid in cands[:4]:
         try:
             fit = _season_fit(_feed_cached(mid, cache), air)
-        except Exception:
+        except Exception as e:
+            if log:
+                log(f"[episode-available] 拉候选番组页 {mid} 的 feed 失败：{type(e).__name__}: {e}")
             continue
         if fit > best_fit:
             best, best_fit = mid, fit
@@ -369,7 +373,9 @@ class EpisodeAvailableDetector:
                 have = set(info.get("have") or []) | disk_eps.get(int(season_key), set())
                 try:
                     eps = ctx.tmdb.season_episodes(show.tmdb_id, int(season_key))
-                except Exception:
+                except Exception as e:
+                    ctx.log(f"[episode-available] TMDB 第 {season_key} 季集表读取失败 {show.dir_name}，"
+                            f"这一季这一轮不抓：{type(e).__name__}: {e}")
                     continue
                 air_of = {e["episode_number"]: e["air_date"] for e in eps
                           if e.get("air_date")}
@@ -399,11 +405,12 @@ class EpisodeAvailableDetector:
                     continue
 
                 mid = _resolve_mikan_id(
-                    sc, show, cache,
+                    sc, show, cache, log=ctx.log,
                     air=[d for d in (air_of.get(n) for n in aired) if d])
                 if not mid:
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="minor",
+                        subject=f"S{int(season_key):02d}",
                         summary=(f"「{show.official_title}」缺 {len(missing)} 集"
                                  f"{missing[:8]}，但找不到 Mikan 番组页，无从抓取"),
                         show=show.dir_name,
@@ -466,6 +473,7 @@ class EpisodeAvailableDetector:
                         if wrong_season:
                             yield Finding(
                                 rule=self.id, kind=self.kind, severity="minor",
+                                subject=f"S{int(season_key):02d}E{ep:02d}",
                                 summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                          f"只搜到 {len(wrong_season)} 个明显属于别季的同集号"
                                          f"发布，全部跳过"),
@@ -485,6 +493,7 @@ class EpisodeAvailableDetector:
                         # 有人发了但没一个合格——报出来，别悄悄跳过
                         yield Finding(
                             rule=self.id, kind=self.kind, severity="minor",
+                            subject=f"S{int(season_key):02d}E{ep:02d}",
                             summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                      f"已有 {len(cands)} 个发布，但都未通过硬门槛"
                                      f"（{'、'.join(sorted({v.blocked_by for _c, v in scored}))}），"
@@ -498,6 +507,7 @@ class EpisodeAvailableDetector:
                     verdict = next(v for c, v in scored if c is best)
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="important",
+                        subject=f"S{int(season_key):02d}E{ep:02d}",
                         summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                  f"可抓取（{len(cands)} 个候选中选 {verdict.why()}）"),
                         show=show.dir_name,

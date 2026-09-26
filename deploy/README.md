@@ -25,9 +25,10 @@
 | `media_agent/`、`tests/`、`pyproject.toml`、`uv.lock` | git（tag） | 代码与锁定的依赖 |
 | `.agents/preferences.json` | git（tag） | 全局择源偏好，**版本化**的行为输入，见下节 |
 | `.agents/rules/`、`.agents/notes/` | git（tag） | 演进规则与 Agent Notes |
+| `.agents/acks.json` | git（tag） | 已确认、先不提醒的"卡住"问题（`media-agent ack` 写），与偏好同理是版本化的用户意图 |
 | `.env` | 只在生产（600） | 凭据与开关；`.env.*`（含 `.env.bak-*`）被忽略 |
 | `.venv/` | 只在生产 | 由部署用 `uv sync --frozen` 维护，运行时不再同步 |
-| `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`deploy.log`、`backups/`、`harvest/` |
+| `state/` | 只在生产 | `audit.jsonl`（回退的依据）、`audit.fallback.jsonl`（审计写不进主文件时的转写，回退一起读）、`purge.jsonl`、`cache.sqlite3`、`trash/`（隔离区）、`run.log`、`run.lock`、`deploy.lock`、`deploy.history`、`deploy.log`、`backups/`、`harvest/` |
 | 各番目录里的 `.media-agent.json` | 媒体根下 | 每部番的用户意图，不归部署管，见下节 |
 
 ## 用户意图放在哪
@@ -40,6 +41,8 @@
   `--harvest` 打包带回开发机，提交、打 tag，再部署那个 tag；不要就
   `git -C ~/media-agent checkout -- .agents/preferences.json`。生产行为必须能从 git 完整复现
   （CHANGELOG「版本与发布约定」）。
+- **卡住问题的确认** `.agents/acks.json` 同样是版本化的：生产上 `media-agent ack …` 改了当轮就生效，下一次部署
+  漂移闸门会拦下它——`--harvest` 带回开发机提交，或在开发机上 `ack` 之后提交、打 tag 再部署。
 - **演进**默认冻结（`.env` 里 `EVOLVE_MODE=off`）：`run` 不再往 `.agents/` 写东西。
   设成 `propose` 会写 `.agents/rules|notes`，同样要提交入库才能再部署。
 
@@ -118,7 +121,7 @@ deploy/deploy.sh v0.2.0
    失败就到此为止。
 4. **切换（持运行锁）。** 等 `state/run.lock`（最多 `DEPLOY_LOCK_WAIT`=900 秒）；
    老代码（v0.1.0）不认锁，所以还要等 launchd 那一轮跑完。然后把小体量状态
-   （`audit.jsonl`、`purge.jsonl`、`cache.sqlite3`、已装的 plist）复制到
+   （`audit.jsonl`、`audit.fallback.jsonl`（有的话）、`purge.jsonl`、`cache.sqlite3`、已装的 plist）复制到
    `state/backups/<时间>-<部署前版本>/`，原地 `git checkout --detach <tag>`、
    `uv sync --frozen`、再跑一遍离线测试。任何一步失败都**自动退回**部署前的版本
    （含 venv 与被接管的文件），`deploy.history` 记 `reverted`。
@@ -186,17 +189,17 @@ CHANGELOG → 打带注释的 tag `vX.Y.Z` → `git push origin main vX.Y.Z` →
 - 进程被 kill 锁自动释放，不会留下要人去删的锁。**不要删 `run.lock` 文件**——
   删了之后持有者锁住的是一个没有名字的 inode，下一个进程会拿到另一把锁。
 - `deploy.sh` 用 `/usr/bin/lockf -k`（Linux 上是 `flock(1)`）拿同一把锁，切换期间一直持有。
-- 手工维护时想让 agent 暂停，就自己拿着锁干活：
+- 手工维护时想让 agent 暂停：`touch ~/media-agent/state/PAUSE`（里面可以写一句为什么），`run` / `apply` 就以 75 结束、健康报告 warn；维护完 `rm` 掉。VPN 救援期间（`~/gluetun/.rescue-active` 在）自动暂停。要在自己干活的那几分钟里连手动命令也挡住，就自己拿着锁：
   `/usr/bin/lockf -k ~/media-agent/state/run.lock zsh`（退出这个 shell 即释放）。
-- 还没覆盖的：`vpn-watchdog.sh` 与 `rescue.py` 重建 qBittorrent 容器时不看这把锁
-  （critic N17）。一轮运行中途 qBittorrent 消失时，qBittorrent 读不全的闸门会让这一轮拒绝改动。
+- `vpn-watchdog.sh` 与 `rescue.py` 重建 qBittorrent 容器之前同样拿这把锁（critic N17）：最多等 900 秒
+  （`RUNLOCK_WAIT` / `RESCUE_LOCK_WAIT`），等不到就这次不重建、退出码 75。见下文「vpn-watchdog.sh / rescue.py」。
 
 ## launchd
 
 `com.zihan.media-agent.plist` 直接执行 `~/media-agent/.venv/bin/media-agent run`，
 **不经 `uv run`**：`uv run` 每轮都会按 `uv.lock` 同步环境，锁文件一变就在凌晨联网装依赖，
 PyPI 不通这一轮就起不来。依赖只在部署时装。周期 21600 秒、`RunAtLoad false`、`Nice 10`、
-`LowPriorityIO`，stdout / stderr 追加到 `state/run.log` / `state/run.err.log`。
+`LowPriorityIO`，stdout / stderr 追加到 `state/run.log` / `state/run.err.log`。每一行带时间与批次 ID，每轮以「run 开始：批次 …」一行开头；两个文件超过 5 MB 时由 `run` 自己先拷贝再截断地轮转成 `.1` … `.5`（`media_agent/runlog.py`：launchd 持有描述符，不能改名；不需要 newsyslog）。
 plist 由 `deploy.sh` 在变化时自动重装；手工重装：
 
 ```sh
@@ -204,6 +207,17 @@ launchctl bootout gui/$(id -u)/com.zihan.media-agent
 cp ~/media-agent/deploy/com.zihan.media-agent.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zihan.media-agent.plist
 ```
+
+`launchctl list | grep media-agent` 的 last exit code（每轮的详情在 `state/health/<批次 ID>.json`，`media-agent health` 看最近一轮）：
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 正常（健康报告 ok 或 warn；warn 的原因见 run.log 末尾的「健康」一节或 `media-agent health`） |
+| 1 | 这一轮崩了（异常冲出）：完整 traceback 在 run.err.log，健康报告照写 |
+| 3 | 降级、整批拒绝改动（qBittorrent 不可用、读不全，或种子数比上一轮骤降而审计解释不了——确认是人为删除的用 `media-agent health --accept-torrent-count`），什么都没改 |
+| 4 | 改动照常做了，但有审计记录没能原样写进 `state/audit.jsonl`：写不进去的（磁盘满、权限……）已转写到 run.err.log 与 `state/audit.fallback.jsonl`，`rollback` / `runs` 会一起读——先腾空间；值序列化不了的已按字符串降级写进 `audit.jsonl` 本身（run.log 末尾写明是哪一种）——多半是代码 bug |
+| 5 | 这一轮跑完了，但健康报告 critical：隔离区处置之后媒体卷剩余仍低于 `MIN_FREE_GB`——要人腾空间 |
+| 75 | 另一个进程持有运行锁，或维护暂停中（VPN 救援进行中 / 有 `state/PAUSE`），这一轮什么都没做 |
 
 ## 部署脚本自己的测试
 
@@ -223,13 +237,47 @@ bash 3.2 会把多字节字符当成变量名的一部分（`$APP，` → `APP\x
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MEDIA_AGENT_HOME` | `~/media-agent` | media-agent 仓库位置 |
-| `DOCKER_BIN` | `/usr/local/bin/docker` | docker 可执行文件 |
+| `MEDIA_AGENT_HOME` | `~/media-agent` | media-agent 仓库位置（运行锁在它的 `state/run.lock`） |
+| `DOCKER_BIN` | `/usr/local/bin/docker` | docker 可执行文件（`vpn-watchdog.sh` 以前写死，现在也读它） |
+| `RUNLOCK_WAIT` | `900` | `vpn-watchdog.sh` 重建前等 media-agent 运行锁的秒数，等不到这一轮不重建（退出码 75） |
+| `WATCHDOG_COMPOSE_TIMEOUT` | `180` | `vpn-watchdog.sh` 的 `docker compose up` 最多等几秒，超时中止、记 `ERROR`、退出码 1（与 `rescue.py` 一致） |
+| `RESCUE_LOCK_WAIT` | `900` | `rescue.py start` / `stop` 切换前等运行锁的秒数，等不到不切换（退出码 75） |
 | `~/gluetun/.env.vps` 里的 `WIREGUARD_ENDPOINT_IP` | — | 救援隧道对端，`rescue.py` 用来核对出口 IP |
 
 `.env` / `.env.vps` 由 `.gitignore` 挡在仓库外——它们装着 WireGuard 密钥和
 服务器地址，不该进版本控制。`rescue.py` 要用 venv 里的解释器跑
 （`~/media-agent/.venv/bin/python deploy/rescue.py …`）：系统的 `/usr/bin/python3` 没有 httpx。
+
+## 重建容器与 media-agent 的协调（critic N17）
+
+两个脚本都会 `docker compose up -d --force-recreate`，qBittorrent（与 gluetun 共用网络命名空间）跟着被拆掉重建。
+
+- **重建之前拿 media-agent 的运行锁**（`state/run.lock`，与 media-agent、`deploy.sh` 同一把 flock）：一轮 `run` 正在跑
+  就等它结束（一轮约 2 分钟），最多等 900 秒；等不到就这次不重建 / 不切换，退出码 75。`vpn-watchdog.sh` 在锁里把自己
+  重跑一遍（等锁期间隧道可能自己好了，重跑会先重新看健康状态），`vpn-watchdog.log` 里记 `WAIT` / `SKIP`。
+  拿着锁时往 `run.lock` 里写一句自述（`pid=… cmd=vpn-watchdog.sh … since=…`，退出时清掉），被挡住的 `run` 与健康报告
+  打印的就是它；docker 的每次调用都有上限（compose 180 秒、inspect / info 30 秒），Docker / OrbStack 卡住时不会无限期
+  拿着锁把每一轮 `run` 挡成 75。`rescue.py` 只在切换的那几分钟里拿锁（`auto` 等下载的几个小时不拿）。
+- **救援期间 media-agent 自己暂停**：`rescue.py start` 写下的 `~/gluetun/.rescue-active` 在，`run` / `apply` 就以 75 结束、
+  健康报告 warn（`media_agent/pause.py`）；`stop` 删掉它之后自动恢复。`stop` 拿不到锁时标记留着——安全一侧，稍后再跑
+  一次 `rescue.py stop`。
+
+### 生产上的副本要手动同步
+
+生产跑的是 **`~/gluetun/` 下的拷贝**（`vpn-watchdog.sh` 由它自己的 launchd 任务每 6 小时跑，`rescue.py` 人手动跑），
+`deploy.sh` 不碰它们。仓库里的这两个文件改了，部署完 media-agent 之后手动同步一次：
+
+```sh
+cd ~/media-agent
+diff -u ~/gluetun/vpn-watchdog.sh deploy/vpn-watchdog.sh    # 先看清楚差在哪（生产上有没有手改过）
+diff -u ~/gluetun/rescue.py deploy/rescue.py
+cp deploy/vpn-watchdog.sh ~/gluetun/vpn-watchdog.sh
+cp deploy/rescue.py ~/gluetun/rescue.py
+/bin/bash -n ~/gluetun/vpn-watchdog.sh && echo ok            # bash 3.2 下能解析
+```
+
+`rescue.py` 需要 media-agent 里有 `media_agent/runlock.py`（v0.2.0 起都有）。先部署 media-agent、再同步脚本：
+反过来的话旧版 media-agent 不认救援标记（不会暂停），但锁照样起作用。
 
 ## rescue.py 的分享率策略
 

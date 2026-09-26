@@ -950,7 +950,9 @@ def test_run_output_warns_loudly_when_space_is_low(offline_cli, monkeypatch, cap
     lib.configure(min_free_gb=50)
     _free(monkeypatch, 12 * 10**9)
 
-    assert cli.cmd_run(_run_args(), lib.cfg) == 0
+    # 能证明可删的都删了仍低于阈值：健康报告 critical，退出码 5（第 3 阶段起；以前是 0，
+    # launchd 上看不出磁盘快满了）
+    assert cli.cmd_run(_run_args(), lib.cfg) == cli.EXIT_CRITICAL
 
     cap = capsys.readouterr()
     assert "MIN_FREE_GB" in cap.out and "⚠️" in cap.out

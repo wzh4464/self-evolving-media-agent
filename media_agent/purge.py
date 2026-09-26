@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import audit as auditlog
 from . import gate
 from .claims import PARTIAL, fold
 from .naming import parse_episode
@@ -84,21 +85,53 @@ class Candidate:
     stat_key: tuple = ()      # 隔离文件的 (inode, 大小, mtime)
     survivor_hash: str = ""
     survivor_size: int | None = None
+    # 这份文件的隔离没成（unknown 的隔离，或 failed 的隔离留下的半份拷贝）：值是原因。
+    # 它不算已隔离，只交给人（`_human_why`）
+    unconfirmed: str = ""
 
 
 def _audit_by_trash_path(audit_log: Path) -> dict:
-    """`trashed_to` -> 审计记录。同一路径若被多次记录，以最后一条为准。"""
-    out: dict[str, dict] = {}
-    if not audit_log.exists():
-        return out
-    for line in audit_log.read_text(encoding="utf-8").splitlines():
-        try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
+    """`trashed_to` -> 审计记录。同一路径若被多次记录，以最后一条为准。
+
+    主审计与 audit.fallback.jsonl 一起读（`audit.iter_records`）：磁盘满的那一轮隔离的文件，
+    记录可能只在备用文件里——没有记录的一律交给人，它就永远到不了期。"""
+    return _trash_records(audit_log)[0]
+
+
+def _trash_records(audit_log: Path) -> tuple[dict, dict]:
+    """`(已隔离, 隔离没成)`：两张 隔离区路径 -> 审计记录 的表，各自以最后一条为准。
+
+    **不算已隔离**、进第二张表的（`build_pool` 据此写明为什么交给人，永不自动删）：
+
+    - `unknown` 的 trash（`trashed_to`）：搬运出错后原位置没了、隔离区那份大小对不上——它可能不完整；
+    - `failed` 的 trash 留下的 `stray_copy`：拷到一半出错，原文件还在库里，隔离区里多出来的那半份。
+
+    进第一张表就会过了保留期按判据被硬删——这两种都不该。"""
+    done: dict[str, dict] = {}
+    unsure: dict[str, dict] = {}
+    for r in auditlog.iter_records(audit_log):
+        if r.get("op") != "trash":
             continue
-        if r.get("op") == "trash" and r.get("status") == "applied" and r.get("trashed_to"):
-            out[r["trashed_to"]] = r
-    return out
+        status = r.get("status")
+        key = r.get("stray_copy") if status == auditlog.FAILED else r.get("trashed_to")
+        if not isinstance(key, str) or not key:
+            continue
+        if status == auditlog.APPLIED:
+            done[key] = r
+            unsure.pop(key, None)
+        elif status in (auditlog.UNKNOWN, auditlog.FAILED):
+            unsure[key] = r
+            done.pop(key, None)
+    return done, unsure
+
+
+def _unsure_why(r: dict) -> str:
+    """隔离没成的那份文件为什么交给人（`_trash_records` 的第二张表）。"""
+    if r.get("status") == auditlog.FAILED:
+        return (f"搬运失败留下的拷贝（审计 failed：原文件仍在 {r.get('path_still_at') or '原位'}），"
+                f"可能不完整")
+    return (f"隔离未确认（审计 unknown：{str(r.get('reason') or r.get('error') or '')[:80]}），"
+            f"这份可能是不完整的拷贝")
 
 
 def _manual_by_trash_path(purge_log: Path, trash_root: Path) -> dict:
@@ -319,7 +352,7 @@ def build_pool(ctx, *, now: datetime | None = None, early: bool = True) -> list[
     `early=False`：保留期内的判重不去证明（记"还在保留期里"、不算可删）。`run` 在空间充足时这样用——
     它们这一轮反正不删，证明要重扫整个库、探测、读头尾摘要，每 6 小时白做一遍。"""
     pool = _Pool(ctx, now or datetime.now(), early)
-    audit = _audit_by_trash_path(Path(pool.cfg.audit_log))
+    audit, unsure = _trash_records(Path(pool.cfg.audit_log))
     manual = _manual_by_trash_path(Path(pool.cfg.state_dir) / "purge.jsonl", pool.trash_root)
 
     from .actions import Executor
@@ -342,6 +375,11 @@ def build_pool(ctx, *, now: datetime | None = None, early: bool = True) -> list[
             c.rule = rec.get("rule") or ""
             c.origin = (rec.get("args") or {}).get("path") or ""
             c.disposition = disposition_of_record(rec)
+        elif str(p) in unsure:
+            u = unsure[str(p)]
+            c.unconfirmed = _unsure_why(u)
+            c.rule = u.get("rule") or ""
+            c.origin = (u.get("args") or {}).get("path") or ""
         else:
             man = manual.get(str(p))
             if man:
@@ -513,6 +551,8 @@ def _new_owner(claims, c: Candidate, cl) -> bool:
 
 
 def _human_why(c: Candidate) -> str:
+    if c.unconfirmed:
+        return f"{c.unconfirmed}，不自动删（需人工处置）"
     if c.disposition == "bundled_version":
         return "合并发布的另一版本：用户口径只留一份，但留哪份由人定，不自动删（需人工处置）"
     if c.disposition == "manual":

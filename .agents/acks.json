@@ -1,0 +1,12 @@
+{
+  "eb4c38d4623e9bbf": {
+    "reason": "库内 Season 2 对 TMDB 单季：抓取已对这部番停手，要人按 TMDB 重排目录或在 sidecar 登记 season_offsets；短期内不会自己好（2026-09-26 生产 run.log 连续出现）",
+    "added": "2026-09-26",
+    "what": "episode-available / season_layout_mismatch / 胆大党"
+  },
+  "fa3591c70b400d12": {
+    "reason": "库内 Season 2、3 对 TMDB 单季：抓取已对这部番停手，要人按 TMDB 重排目录或在 sidecar 登记 season_offsets；短期内不会自己好（2026-09-26 生产 run.log 连续出现）",
+    "added": "2026-09-26",
+    "what": "episode-available / season_layout_mismatch / 超超超超超喜欢你的100个女朋友"
+  }
+}

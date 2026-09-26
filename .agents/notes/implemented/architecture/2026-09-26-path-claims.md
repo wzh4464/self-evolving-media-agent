@@ -89,7 +89,7 @@ save_path 看得到。`download_path`（生产 `temp_path_enabled=False`）不�
 
 `add_and_name`（加种 → 等元数据 30 秒 → 改名 → 无条件改显示名）零调用方：本地两份克隆、
 tests / tools / deploy、生产机上全部 `*.py` / `*.sh` 都查过（grab 调研 §2）。在用的是
-`_op_grab_episode` → `_rename_grabbed`（等 10 秒、只在分季集号与库内不一致时改显示名）。
+`_op_grab_episode` → `_rename_grabbed`（等 `GRAB_METADATA_TIMEOUT` 秒——2026-09-26 前写死 10 秒——、只在分季集号与库内不一致时改显示名）。
 `grabber.py` 的模块文档却说它是"加种子的唯一入口"。两条路径并存，占用闸门只接一条
 等于没接，所以删掉，并把文档改成实情：加种的唯一 HTTP 入口是 `QBitClient.add_torrent`
 （调用方 `_op_grab_episode` 与回退的 `readd_torrent`），`grabber` 只放加种之后的两步。

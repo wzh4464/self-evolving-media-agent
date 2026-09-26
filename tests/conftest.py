@@ -7,7 +7,7 @@
 3. **不起子进程**：`subprocess.run` 只放行测试自己 tmp 目录里的替身脚本
    （docker stub）；`@pytest.mark.ffmpeg` 的测试另外放行 ffprobe / ffmpeg。
 4. **假 ffprobe**：`media_agent.probe._run` → FakeProbe（开发机上真 ffprobe 是存在的）。
-5. **Tripwire**：Executor 的 failed 审计、Registry 吞掉的检测器异常、没路由的 URL、
+5. **Tripwire**：Executor 的 failed / unknown 审计、Registry 吞掉的检测器异常、没路由的 URL、
    假对象没建模的方法……测试结束时未声明的一律判失败。
 
 `@pytest.mark.live` 的测试跳过以上全部——它们本来就是要碰真库的（只读），
@@ -42,7 +42,10 @@ _CONFIG_ENV = ("MEDIA_ROOT", "QBIT_URL", "QBIT_USER", "QBIT_PASS", "AB_URL", "AB
                "TMDB_LANG", "LLM_BASE", "LLM_KEY", "LLM_MODEL", "AUTO_APPLY",
                "TRASH_RETENTION_DAYS", "MAX_DELETE_PER_RUN", "MAX_DELETE_GB_PER_RUN",
                "DEAD_TORRENT_HOURS", "EVOLVE_MODE", "QBIT_ALLOW_EMPTY",
-               "QUARANTINE_MIN_AGE_DAYS", "MIN_FREE_GB")
+               "QUARANTINE_MIN_AGE_DAYS", "MIN_FREE_GB", "GRAB_METADATA_TIMEOUT",
+               "STUCK_RUNS", "TORRENT_DROP_MIN", "TORRENT_DROP_PCT", "UNRENAMED_ALERT_HOURS",
+               "NOTIFY_EMAIL_TO", "NOTIFY_SMTP_HOST", "NOTIFY_SMTP_PORT", "NOTIFY_SMTP_USER",
+               "NOTIFY_SMTP_PASS", "RESCUE_MARKER")
 
 
 def _is_live(request) -> bool:
@@ -117,6 +120,8 @@ def _offline(request, monkeypatch, tmp_path, project_root, tripwire, web, fake_p
     monkeypatch.setattr(config_mod, "_load_dotenv", lambda path: None)
     for k in _CONFIG_ENV:
         monkeypatch.delenv(k, raising=False)
+    # 开发机上可能真有 ~/gluetun/.rescue-active：load_config() 的默认值不能让测试被"维护暂停"
+    monkeypatch.setenv("RESCUE_MARKER", str(tmp_path / "no-rescue-marker"))
     monkeypatch.setattr(evolution_mod, "RULES_DIR", project_root / ".agents" / "rules")
     monkeypatch.setattr(evolution_mod, "NOTES_ROOT", project_root / ".agents" / "notes")
 
@@ -170,10 +175,17 @@ def _offline(request, monkeypatch, tmp_path, project_root, tripwire, web, fake_p
     real_audit = Executor._audit
 
     def audit(self, status, finding, action, extra=None, undo=None):
+        n = len(self.report.audit_problems)
         real_audit(self, status, finding, action, extra, undo)
         if status == "failed":
             tripwire.record("failed_record",
                             f"{action.op} [{finding.rule}] {(extra or {}).get('error', '')}")
+        elif status == "unknown":
+            tripwire.record("unknown_record",
+                            f"{action.op} [{finding.rule}] {(extra or {}).get('error', '')} "
+                            f"{(extra or {}).get('reason', '')}")
+        for p in self.report.audit_problems[n:]:
+            tripwire.record("audit_fallback", p)
 
     monkeypatch.setattr(Executor, "_audit", audit)
 

@@ -124,7 +124,9 @@ with_lock() {
             # >> 而不是 >：锁文件里有持有者的自述，打开时不能截断
             exec 9>>"$file" || exit 75
             flock -w "$wait" 9 || exit 75
-            "$@"
+            # 9>&-：锁只由这一层持有，子孙进程不继承——否则任何残留的孤儿都会在部署结束后
+            # 继续占着锁（vpn-watchdog.sh 在 CI 的 Ubuntu 上就是这么挂的，2026-09-26）
+            "$@" 9>&-
         )
         ;;
     python)
@@ -325,7 +327,7 @@ switch_phase() {
     # audit.jsonl——数据回退仍是 media-agent rollback；这份只供手工比对。
     mkdir -p "$BK" || die "建不了备份目录 $BK"
     local f
-    for f in audit.jsonl purge.jsonl cache.sqlite3 deploy.history; do
+    for f in audit.jsonl audit.fallback.jsonl purge.jsonl cache.sqlite3 deploy.history; do
         [ -f "$APP/state/$f" ] && cp -p "$APP/state/$f" "$BK/"
     done
     [ -f "$AGENTS_DIR/$PLIST_NAME" ] && cp -p "$AGENTS_DIR/$PLIST_NAME" "$BK/"

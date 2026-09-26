@@ -22,8 +22,8 @@
 与 `def _infohash_v1` 之间找 `resp.`）——文件一拆分这个测试就会以 ValueError
 崩掉而不是干净地失败。现在改成真的跑一次抓取：FakeWeb 提供 .torrent，
 FakeQbit 接住加种，断言审计里是 `applied` 且带 `ungrab_episode` 逆操作。
-任何让抓取以异常结束的回归（NameError 也好、别的也好）都会变成 `failed`，
-被 tripwire 直接判红。
+任何让抓取以异常结束的回归（NameError 也好、别的也好）都会变成 `unknown`
+（加种之后抛的，2026-09-26 第 3 阶段起）或 `failed`（加种之前抛的），被 tripwire 直接判红。
 
 跑法：uv run pytest tests/test_grab_bookkeeping.py
 """

@@ -47,6 +47,11 @@ class Finding:
     # 演进器的残留判据要认这个标记，否则同一批文件会被永远重新提议，
     # 产出一串 v2/v3/residual/leftover 变体（实测累积了 28 条同质规则）。
     classified: bool = False
+    # 这条发现说的是这部番里的**哪一集 / 哪一季**（`S01E08` / `S02`），当它不是关于某一个文件时。
+    # 发现历史的指纹按它认（`history.target_of`）：集位级的发现（封存冲突、所有权未交接……）的
+    # `path` 只是桶里第一个文件，谁排第一会变；没有路径的（缺集、可抓取）摘要里嵌着计数，每轮都变
+    # （critic N11）。**只写身份，不写计数。** 不参与 `key()` 去重。
+    subject: str = ""
 
     def key(self) -> tuple:
         """去重键：同一文件同一类问题只报一次。
@@ -325,6 +330,8 @@ class LibraryState:
     # 本次扫描读 qBittorrent 时出的错（不可用 / torrents() / 某个种子的 files()）。
     # 非空 = 种子视图不完整，这份快照只能看、不能拿去改东西（见 Executor.apply）。
     qbit_errors: list[str] = field(default_factory=list)
+    # `torrents()` 这一轮真的成功返回过（`torrents` 为空时分得清"0 个"与"没读到"，健康报告用）
+    qbit_listed: bool = False
 
     def all_files(self) -> Iterable[MediaFile]:
         for s in self.shows:
@@ -362,6 +369,9 @@ class Context:
         # 是同一个列表。放在 Context 上是为了让执行器不依赖调用方记得把 state 传进来：
         # 忘了传，闸门就形同虚设。
         self.qbit_errors: list[str] = []
+        # 构造时各客户端的状况（`cli.build_context` 填）：`ok` / `down: <原因>` / `off（…）`。健康报告用；
+        # 测试里直接构造的 Context 没有它，健康报告按客户端在不在推断。
+        self.client_status: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------
@@ -379,6 +389,12 @@ class Detector(Protocol):
 class Registry:
     """插件注册表：内置检测器 + 演进出的 DSL 规则。"""
     detectors: list[Any] = field(default_factory=list)
+    # 最近一次 `run_all` 里被吞掉的检测器异常：`{rule, error, where}`。单条规则崩溃不拖垮整轮，但必须
+    # 留下来——以前只打一行日志，健康报告说不出"这一轮哪条规则崩了、崩在哪"（critic N9：检测器里一个
+    # "database is locked" 被吞掉，诊断就静默地少了一截）。
+    errors: list[dict] = field(default_factory=list)
+    # 挂载演进规则时读不了 / 格式不对、因此没挂上的规则文件（`load_rule_specs`）。不随 `run_all` 清空。
+    load_errors: list[str] = field(default_factory=list)
 
     def register(self, detector: Any) -> Any:
         self.detectors.append(detector)
@@ -387,6 +403,7 @@ class Registry:
     def run_all(self, ctx: Context, state: LibraryState) -> list[Finding]:
         seen: set[tuple] = set()
         out: list[Finding] = []
+        self.errors = []
         for d in self.detectors:
             try:
                 for f in d.detect(ctx, state):
@@ -394,8 +411,13 @@ class Registry:
                         continue      # 先注册的规则优先，避免重复报同一问题
                     seen.add(f.key())
                     out.append(f)
-            except Exception as e:      # 单个规则崩溃不能拖垮整轮
-                ctx.log(f"[registry] 规则 {getattr(d, 'id', d)} 执行失败: {e}")
+            except Exception as e:      # 单个规则崩溃不能拖垮整轮——但要记下来（`errors`）
+                rule = getattr(d, "id", None) or str(d)
+                where = _where(e)
+                self.errors.append({"rule": rule, "error": f"{type(e).__name__}: {e}",
+                                    "where": where})
+                # 这一行的格式不改：tests 的 tripwire 与读 run.err.log 的人都认它
+                ctx.log(f"[registry] 规则 {rule} 执行失败: {e}（{where}）")
 
         # `unparsable` 的字面意思是"看见了，但归不了类"。要是别的规则**已经**
         # 把它归了类，这句话就不再成立，留着只是把同一个文件报两遍。
@@ -413,6 +435,13 @@ class Registry:
         order = {"critical": 0, "important": 1, "minor": 2}
         out.sort(key=lambda f: (order.get(f.severity, 9), f.kind, f.path))
         return out
+
+
+def _where(e: BaseException, depth: int = 3) -> str:
+    """异常最后几层调用的位置，`文件:行 函数`，由内向外（给健康报告，不是完整 traceback）。"""
+    import traceback
+    frames = traceback.extract_tb(e.__traceback__)[-depth:]
+    return " ← ".join(f"{Path(fr.filename).name}:{fr.lineno} {fr.name}" for fr in reversed(frames))
 
 
 # --------------------------------------------------------------------------
@@ -469,7 +498,7 @@ def _eval_clause(clause: dict, f: MediaFile, s: Show) -> bool:
         return False
     try:
         return op(getter(f, s), clause.get("value"))
-    except Exception:
+    except Exception:       # 坏正则 / 类型不对 = 不命中。每个文件 × 每条规则都求值，逐次报会刷屏；坏规则在加载时报
         return False
 
 
@@ -549,14 +578,19 @@ class RuleSpec:
                 )
 
 
-def load_rule_specs(rules_dir: Path) -> list[RuleSpec]:
-    """从 .agents/rules/*.json 加载演进出的规则。"""
+def load_rule_specs(rules_dir: Path, errors: list | None = None) -> list[RuleSpec]:
+    """从 .agents/rules/*.json 加载演进出的规则。
+
+    读不了 / 格式不对的文件跳过（一条坏规则不该让其余的都挂不上），原因追加进 `errors`。以前一声不吭地跳过：
+    规则文件写坏了，这条规则就此消失，没有任何地方看得出来（evolution 调研 §10b）。"""
     specs: list[RuleSpec] = []
     if not rules_dir.exists():
         return specs
     for p in sorted(rules_dir.glob("*.json")):
         try:
             specs.append(RuleSpec.from_json(json.loads(p.read_text(encoding="utf-8"))))
-        except Exception:
+        except Exception as e:
+            if errors is not None:
+                errors.append(f"{p.name}：{type(e).__name__}: {e}")
             continue
     return specs

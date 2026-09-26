@@ -126,6 +126,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
             state.qbit_errors.append(msg)
             ctx.log(f"[scan] qBittorrent 数据不完整——{msg}")
     state.torrents = torrents
+    state.qbit_listed = listed
     torrent_by_hash = {t["hash"]: t for t in torrents}
     by_path: dict[str, dict] = {}
     for t in torrents:
@@ -290,7 +291,7 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
     # qBittorrent 5.x 只在会话恢复完之后才起 WebUI（application.cpp 里 WebUI 建在
     # Session::restored 的回调里），"启动中返回空列表"不会发生；真正的触发是一个
     # 端着空会话的 qBit——比如容器重建时没挂上 config / BT_backup 卷。这个判据不需要
-    # 跨轮状态。部分缺失（比上一轮少了一半）要和上一轮比，留给每轮健康摘要。
+    # 跨轮状态。部分缺失（比上一轮少了一截）要和上一轮比：见下面的种子数合理性。
     if listed and not torrents and not cfg.qbit_allow_empty:
         videos = sum(1 for s in state.shows for f in (*s.files, *s.extras_files)
                      if f.ext in VIDEO_EXTS)
@@ -298,6 +299,15 @@ def build_state(ctx: Context, resolve_tmdb: bool = True) -> LibraryState:
             msg = (f"qBittorrent 报告 0 个种子，而媒体库里有 {videos} 个视频文件——"
                    f"多半是 qBit 的会话没恢复（容器重建丢了 BT_backup 等）；"
                    f"库里确实不用种子的话设 QBIT_ALLOW_EMPTY=1")
+            state.qbit_errors.append(msg)
+            ctx.log(f"[scan] qBittorrent 数据不可信——{msg}")
+
+    # --- 合理性：比上一轮被采信的计数少了一截，审计里又没有对应的摘除（`health` 模块文档）---
+    # 只恢复了一部分会话的 qBit 照样成功返回，接口上没有任何报错；后果与上面一样。
+    if listed and torrents and not state.qbit_errors:
+        from .health import torrent_count_problem
+        msg = torrent_count_problem(cfg, len(torrents))
+        if msg:
             state.qbit_errors.append(msg)
             ctx.log(f"[scan] qBittorrent 数据不可信——{msg}")
 
@@ -351,7 +361,9 @@ def _resolve_tmdb(ctx: Context, state: LibraryState) -> None:
         try:
             title, _ = ctx.tmdb.official_title(hit["id"])
             seasons = ctx.tmdb.seasons(hit["id"])
-        except Exception:
+        except Exception as e:
+            ctx.log(f"[scan] TMDB 取标题 / 季信息失败 {show.dir_name}（id {hit['id']}），这一轮按没匹配处理："
+                    f"{type(e).__name__}: {e}")
             continue
         show.tmdb_id = hit["id"]
         show.tmdb_title = title

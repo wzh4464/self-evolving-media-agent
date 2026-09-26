@@ -19,13 +19,20 @@ media_agent/
   clients.py      capability 的 provider 实现（qBit/AutoBangumi/TMDB/AniList/LLM）
   plugins/        内置检测器
   actions.py      执行器 + 隔离区 + 配额上限 + 审计日志
+  audit.py        audit.jsonl 的读写：写永不抛（降级 / 转写 audit.fallback.jsonl），读两个文件一起读
   purge.py        隔离区里每一份能不能真删（按处置类别的判据）
   disposal.py     硬删除的唯一出口：预写 purge.jsonl、容量闸、run / purge 的处置
+  history.py      发现历史：每轮全部发现落 state/findings/，指纹 = 规则 + 类型 + 目标（不含摘要）
+  health.py       运行健康：种子数基线（骤降且审计解释不了 → 整轮拒绝）、每轮健康报告
+  notify.py       通知邮件：健康报告有变化才发（一轮最多一封），去重在 state/notify.json，永不带密钥
+  runlog.py       run 的输出每行带时间与批次 ID；run.log / run.err.log 先拷贝再截断地轮转（launchd 持有描述符）
+  pause.py        维护暂停：VPN 救援标记或 state/PAUSE 在时 run / apply 以 75 结束（diagnose 照常）
   evolution.py    自演进：残留检测 → 提议 → 影子验证 → 提升
   cli.py          命令行入口
 .agents/
   notes/          Agent Notes，路径编码 {lifecycle}/{class}/日期-标题.md
   rules/          演进出来的声明式规则（JSON），下轮自动挂载
+  acks.json       已确认、先不提醒的"卡住"问题（指纹 → 理由 / 期限），版本化的用户意图
 tests/
   harness/        离线测试基座：FakeQbit/FakeWeb/FakeProbe/… + LibraryBuilder
   conftest.py     自动隔离（断网、state/ 进临时目录）+ tripwire
@@ -43,6 +50,8 @@ uv run media-agent apply              # 执行修复
 uv run media-agent evolve             # 为规则盲区提议新规则（需 EVOLVE_MODE=propose）
 uv run media-agent run                # 完整自治轮次（演进默认冻结），末尾处置隔离区
 uv run media-agent purge --verbose    # 隔离区处置预演：每一份删不删、为什么（--apply 真删）
+uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题、先不提醒（写 .agents/acks.json，要提交）
+uv run media-agent health               # 最近一轮的健康报告（--run ID 指定一轮，--json 原样）
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```
 
@@ -117,6 +126,18 @@ uv run pytest                         # 离线测试（不联网、不碰真库�
     `MIN_FREE_GB` 只在"已证明可删"的里面提前放，证明不了的不为空间删。搬进 / 搬出隔离区先看目标卷
     放不放得下（跨卷是先拷后删）。见
     [隔离区处置](.agents/notes/implemented/architecture/2026-09-26-quarantine-disposal.md)。
+11. **审计不说谎、不丢记录。** 状态只有四种：`applied`（生效了，已确认）、`skipped`（没动手）、`failed`（没生效）、
+    `unknown`（也许生效了、确认不了）——"异常发生在已经发出的改动之后"不许记成 failed。新加的动作：动手前
+    `_intend(逆操作)`；文件系统改动 `_effect()`（qBittorrent / AB 数据库的写调用自动记）；能按此刻状态核实的
+    改动调用出错时走 `_settle`，核实生效就照常记 applied、带逆操作。写审计永不抛异常（`audit.write`，写不进去
+    转写 stderr 与 `audit.fallback.jsonl`）；读审计一律用 `audit.iter_records`，不认识的状态当作"不是已生效"。见
+    [审计状态契约](.agents/notes/implemented/architecture/2026-09-26-honest-audit.md)。
+
+12. **"悄悄停摆"必须被看见。** 宽 `except` 要么说出来（`ctx.log` 带上下文、审计、往上抛、交给调用方），要么在那一行
+    注释为什么不说（`tests/test_silent_excepts.py` 按语法检查）。新的健康信号接进 `health.RunHealth`（`run` 收尾不管
+    成败都写报告），critical 的要让退出码非零；有状态的新检测器给集位 / 季级发现填 `Finding.subject`，指纹里**永远
+    不放摘要**。要人处理、短期不会动的卡住问题用 `media-agent ack` 确认（`.agents/acks.json` 是版本化的用户意图）。见
+    [运行健康](.agents/notes/implemented/architecture/2026-09-26-run-health.md)。
 
 ## 自演进的闭环
 

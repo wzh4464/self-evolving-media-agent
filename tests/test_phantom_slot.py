@@ -62,6 +62,21 @@ def test_phantom_loser_record_is_dropped_and_keeper_takes_the_slot(lib):
     assert lib.trash_files() == []                         # 什么文件都没进隔离区
 
 
+def test_phantom_drop_whose_delete_timed_out_after_dropping_is_applied_with_readd(lib):
+    """摘幻影的种子记录超时、qBittorrent 其实摘了：按"种子已不在"核实，照常记已执行、带重加的逆操作
+    （复审变异 B2r17：把这里的核实换成"说不清"全套照绿）。"""
+    s1 = _akane(lib)
+    p = s1.single(SLOT, size=508_000_000, on_disk=False)
+    s1.single(K_RAW, size=508_100_000)
+    lib.qbit.fail("delete", hash=p.hash, after=True)
+
+    c = lib.cycle()
+
+    [drop] = [r for r in c.applied("trash") if r["args"].get("phantom")]
+    assert drop["undo"]["op"] == "readd_torrent" and "ReadTimeout" in drop["confirmed_after_error"]
+    assert not lib.qbit.has(p.hash)
+
+
 def test_phantom_never_wins_the_duplicate_even_with_a_better_name(lib):
     """幻影声明得更大、发布名更好：以前它赢，唯一的真文件被移进隔离区。"""
     s1 = _akane(lib)

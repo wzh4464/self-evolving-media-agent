@@ -31,6 +31,8 @@ KINDS = {
     "tmdb_unknown":    "FakeTMDB 被问到未登记的 id",
     "llm_unexpected":  "测试没开启 FakeLLM，代码却调用了它",
     "failed_record":   "Executor 写了一条 status=failed 的审计",
+    "unknown_record":  "Executor 写了一条 status=unknown 的审计（改动也许生效了、确认不了）",
+    "audit_fallback":  "Executor 的一条审计没能原样写进 audit.jsonl（降级序列化 / 转写 stderr 与备用文件）",
     "detector_error":  "Registry 吞掉了某个检测器的异常",
     "log_failure":     "ctx.log 打出了含「失败」的行（被吞掉的错误）",
 }

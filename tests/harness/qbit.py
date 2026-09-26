@@ -13,8 +13,8 @@
 - 没有元数据（metaDL，`files()` 为空）时 `content_path` 与 `root_path` 都是空串，
   不回落到 save_path（release-5.2.3 torrentimpl.cpp:556-578 的 `hasMetadata()` 分支）。
 - `tags` 排序后用 `", "` 连接；`progress` 完成时是 1。
-- `files()` 对未知 hash 抛 `QBitError("torrents/files -> HTTP 404: Not Found")`，
-  与真客户端的报错类型、文本一致（B2 就是这个 404）。
+- `files()` 对未知 hash 抛 `QBitError("torrents/files -> HTTP 404: Not Found", status=404)`，
+  与真客户端的报错类型、文本、状态码一致（B2 就是这个 404；判断按 `clients.is_not_found`）。
 - `set_file_priority(…, 0)` 只改优先级，文件留在盘上（`use_unwanted_folder=False`）。
 - `delete(delete_files=False)` 只摘记录；未知 hash 静默忽略（真 API 也是 200）。
 
@@ -40,8 +40,9 @@ _BTIH = re.compile(r"xt=urn:btih:([0-9A-Za-z]+)")
 
 class _Fault:
     def __init__(self, method: str, torrent_hash: str | None, exc: BaseException,
-                 times: int | None):
+                 times: int | None, after: bool = False):
         self.method, self.hash, self.exc, self.times = method, torrent_hash, exc, times
+        self.after = after
 
 
 def _qb_path_ok(rel: str) -> bool:
@@ -57,9 +58,16 @@ class FakeQbit:
       **未经生产实测**，所以每次覆盖都记 `qbit_overwrite`）或 `"raise"`（报 409）。
     - `async_moves`：True 时 `set_location` 只登记，`drain()` 才真正搬文件——
       近似 qBittorrent 的异步 moveStorage，用来暴露"setLocation 后立刻 _merge_tree"的竞态。
+      搬完之前种子的 `state` 是 `moving`、`save_path` 不变（qBittorrent 5.2.3：`m_storageIsMoving`
+      在处理请求时就置上，`save_path` 搬完才变），`drain()` 之后恢复原来的状态。
     - `async_deletes`：True 时 `delete` 只登记，种子（连同它的条目）照样出现在 `torrents()` /
       `files()` 里，`drain()` 才真正删——qBittorrent 的删除同样是异步的，刚删完的种子还会在
       列表里出现一会儿（`claims.ClaimIndex` 按引用拿执行器的 `_removed_torrents` 正是为此）。
+    - `rename_lag`（属性，默认 0）：> 0 时 `rename_file` 受理后只登记，之后第 `rename_lag + 1` 次
+      `files()` 才看得到新名字（`drain()` 立刻完成）。qBittorrent 5.2.3 的 `renameFile` 只是
+      `doRenameFile` → libtorrent `rename_file` 排进磁盘队列，`torrents/files` 的名字要等
+      `file_renamed` 告警回来（`handleFileRenamed`）才变——磁盘队列积压时，刚受理的改名在列表里
+      还是原名（2026-09-26 复审：以前这里同步改名，"原名还在 = 没生效"的误判测不出来）。
     """
 
     def __init__(self, tripwire=None, *, default_save_path: str | Path = "",
@@ -76,6 +84,8 @@ class FakeQbit:
         self._catalog: dict[str, dict] = {}     # hash → {"name", "files", "multi"}：磁力重加时恢复元数据
         self._faults: list[_Fault] = []
         self._pending_moves: list[tuple[str, str]] = []
+        self.rename_lag = 0
+        self._pending_renames: list[list] = []      # [hash, 条目, 新名, 还要几次 files() 才落地]
         self.categories: set[str] = set()
         self.calls: list[tuple] = []            # 所有 API 调用的有序记录
         self.overwrites: list[tuple[str, str]] = []
@@ -86,14 +96,16 @@ class FakeQbit:
             self.tripwire.record(kind, detail)
 
     def _err(self, status: int, path: str, text: str) -> QBitError:
-        """与 `QBitClient._get/_post` 同一格式的错误，并记 tripwire。"""
-        e = QBitError(f"{path} -> HTTP {status}: {text}")
+        """与 `QBitClient._get/_post` 同一格式、同一状态码（`QBitError.status`）的错误，并记 tripwire。"""
+        e = QBitError(f"{path} -> HTTP {status}: {text}", status=status)
         self._trip("qbit_error", str(e))
         return e
 
-    def _maybe_fail(self, method: str, torrent_hash: str | None = None) -> None:
+    def _maybe_fail(self, method: str, torrent_hash: str | None = None, *,
+                    after: bool = False) -> None:
         for f in list(self._faults):
-            if f.method != method or (f.hash is not None and f.hash != torrent_hash):
+            if (f.method != method or f.after != after
+                    or (f.hash is not None and f.hash != torrent_hash)):
                 continue
             if f.times is not None:
                 f.times -= 1
@@ -312,24 +324,49 @@ class FakeQbit:
         self._set_progress(t, 1.0)
 
     def fail(self, method: str, *, hash: str | None = None,
-             exc: BaseException | None = None, times: int | None = 1) -> None:
+             exc: BaseException | None = None, times: int | None = 1,
+             after: bool = False) -> None:
         """故障注入：下 `times` 次（None = 一直）调用 `method`（可限定某个 hash）时抛 `exc`。
 
         默认异常是 `httpx.ReadTimeout`——生产上 qBit WebUI 超时就是这个形态
         （2026-09-19/20 三次登录超时，run.err.log）。
+
+        `after=True`：**改动照常生效之后**再抛——qBittorrent 已经处理了请求、响应却没回来
+        （2026-09-14 run 20260914T100214 的 `renameFile` 读超时就是这样：qBit 其实改了名）。
+        只对写方法有意义。
         """
         self._faults.append(_Fault(method, hash.lower() if hash else None,
-                                   exc or httpx.ReadTimeout("timed out (injected)"), times))
+                                   exc or httpx.ReadTimeout("timed out (injected)"), times, after))
 
     def drain(self) -> None:
         """完成所有挂起的 setLocation（`async_moves`）与删除（`async_deletes`）。"""
         pending, self._pending_moves = self._pending_moves, []
         for h, loc in pending:
             if h in self._t:
-                self._do_move(self._t[h], loc)
+                t = self._t[h]
+                self._do_move(t, loc)
+                if t["state"] == "moving":
+                    t["state"] = t.pop("_state_before_move", None) or "stalledUP"
         deletes, self._pending_deletes = self._pending_deletes, []
         for h, delete_files in deletes:
             self._do_delete(h, delete_files)
+        renames, self._pending_renames = self._pending_renames, []
+        for h, entry, new_path, _left in renames:
+            if h in self._t:
+                self._do_rename(self._t[h], entry, new_path)
+
+    def _tick_renames(self) -> None:
+        """一次 `files()`：挂起的改名各走一步，到点的落地（`rename_lag`）。"""
+        keep = []
+        for p in self._pending_renames:
+            h, entry, new_path, left = p
+            if left <= 0:
+                if h in self._t:
+                    self._do_rename(self._t[h], entry, new_path)
+                continue
+            p[3] = left - 1
+            keep.append(p)
+        self._pending_renames = keep
 
     def snapshot(self) -> dict:
         """规范化的全量状态，便于 `assert before == after`。"""
@@ -351,6 +388,7 @@ class FakeQbit:
         h = (torrent_hash or "").lower()
         self.calls.append(("files", h))
         self._maybe_fail("files", h)
+        self._tick_renames()
         return copy.deepcopy(self._files_view(self._get(h, "torrents/files")))
 
     def add_torrent(self, source: bytes | str, *, save_path: str = "",
@@ -392,6 +430,7 @@ class FakeQbit:
                       magnet_uri=f"magnet:?xt=urn:btih:{h}&dn={name}")
         # libtorrent 加种时会检查已存在的文件（没有 resume data 就查盘）
         self._set_progress(t, self._disk_progress(t) if files else 0.0, paused=paused)
+        self._maybe_fail("add_torrent", after=True)
         return True
 
     def rename_torrent(self, torrent_hash: str, name: str) -> None:
@@ -399,6 +438,7 @@ class FakeQbit:
         self.calls.append(("rename_torrent", h, name))
         self._maybe_fail("rename_torrent", h)
         self._get(h, "torrents/rename")["name"] = name
+        self._maybe_fail("rename_torrent", h, after=True)
 
     def rename_file(self, torrent_hash: str, old_path: str, new_path: str) -> None:
         h = torrent_hash.lower()
@@ -410,8 +450,15 @@ class FakeQbit:
                 or any(f["name"] == new_path and f is not entry for f in t["_files"])):
             raise self._err(409, "torrents/renameFile",
                             "Invalid newPath or oldPath, or newPath already in use")
+        if self.rename_lag > 0:
+            self._pending_renames.append([h, entry, new_path, self.rename_lag])
+        else:
+            self._do_rename(t, entry, new_path)
+        self._maybe_fail("rename_file", h, after=True)
+
+    def _do_rename(self, t: dict, entry: dict, new_path: str) -> None:
         sp = Path(t["save_path"])
-        src, dst = sp / old_path, sp / new_path
+        src, dst = sp / entry["name"], sp / new_path
         self._move(src, dst)
         self._move(Path(str(src) + ".!qB"), Path(str(dst) + ".!qB"))
         entry["name"] = new_path                   # 注意：t["name"] 不变
@@ -436,8 +483,12 @@ class FakeQbit:
                 continue                            # 真 API 忽略未知 hash
             if self.async_moves:
                 self._pending_moves.append((h, location))
+                if t["state"] != "moving":
+                    t["_state_before_move"] = t["state"]
+                t["state"] = "moving"
             else:
                 self._do_move(t, location)
+            self._maybe_fail("set_location", h, after=True)
 
     def set_category(self, hashes: list[str], category: str) -> None:
         hs = [h.lower() for h in hashes]
@@ -449,6 +500,8 @@ class FakeQbit:
         for h in hs:
             if h in self._t:
                 self._t[h]["category"] = category
+        for h in hs:
+            self._maybe_fail("set_category", h, after=True)
 
     def remove_categories(self, categories: list[str]) -> None:
         self.calls.append(("remove_categories", tuple(categories)))
@@ -457,6 +510,7 @@ class FakeQbit:
             if t["category"] in categories:
                 t["category"] = ""                  # 分类没了，种子变"无分类"而非被删
         self.categories -= set(categories)
+        self._maybe_fail("remove_categories", after=True)
 
     def add_tags(self, hashes: list[str], tags: str) -> None:
         hs = [h.lower() for h in hashes]
@@ -465,6 +519,7 @@ class FakeQbit:
             self._maybe_fail("add_tags", h)
             if h in self._t:
                 self._t[h]["tags"] |= self._norm_tags(tags)
+            self._maybe_fail("add_tags", h, after=True)
 
     def remove_tags(self, hashes: list[str], tags: str) -> None:
         hs = [h.lower() for h in hashes]
@@ -473,6 +528,7 @@ class FakeQbit:
             self._maybe_fail("remove_tags", h)
             if h in self._t:
                 self._t[h]["tags"] -= self._norm_tags(tags)
+            self._maybe_fail("remove_tags", h, after=True)
 
     def set_file_priority(self, torrent_hash: str, ids: list[int], priority: int) -> None:
         h = torrent_hash.lower()
@@ -484,6 +540,7 @@ class FakeQbit:
             raise self._err(409, "torrents/filePrio", "File IDs are not valid")
         for i in ids:
             idx[i]["priority"] = int(priority)     # use_unwanted_folder=False：文件留在原地
+        self._maybe_fail("set_file_priority", h, after=True)
 
     def recheck(self, hashes: list[str]) -> None:
         hs = [h.lower() for h in hashes]
@@ -493,6 +550,7 @@ class FakeQbit:
             t = self._t.get(h)
             if t is not None:
                 self._set_progress(t, self._disk_progress(t))
+            self._maybe_fail("recheck", h, after=True)
 
     def delete(self, hashes: list[str], delete_files: bool) -> None:
         hs = [h.lower() for h in hashes]
@@ -501,8 +559,9 @@ class FakeQbit:
             self._maybe_fail("delete", h)
             if self.async_deletes:
                 self._pending_deletes.append((h, bool(delete_files)))
-                continue
-            self._do_delete(h, delete_files)
+            else:
+                self._do_delete(h, delete_files)
+            self._maybe_fail("delete", h, after=True)
 
     def _do_delete(self, h: str, delete_files: bool) -> None:
         t = self._t.pop(h, None)

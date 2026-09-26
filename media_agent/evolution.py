@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from . import audit as auditlog
 from .kernel import (
     Context, Finding, LibraryState, MediaFile, Registry, RuleSpec, Show,
     _FIELD_GETTERS, _OPS, load_rule_specs,
@@ -135,26 +136,28 @@ def find_failure_patterns(audit_log: Path, min_runs: int = 2,
     **按批次计数，不按条目。** 同一轮里 30 个文件因为同一个原因失败，是**一次**
     事件，不是 30 次；而同一个原因在 5 个不同批次里反复出现，才是"这条规则
     有问题"。计数单位必须是批次，否则一次大规模的一次性故障永远压过真正的顽疾。
+
+    **`unknown` 单独成类。** 改动也许生效了、执行器确认不了（改名请求超时之类，见 `audit` 模块文档）。
+    同一个原因在几个批次里反复记 unknown，同样说明哪里不对（qBittorrent 老是超时、某步老是在改动之后
+    出错），但它不是"没生效"——与 failed 分开计数，`status` 字段标明。
     """
-    if not audit_log.exists():
-        return []
     cutoff = (datetime.now() - timedelta(days=within_days)).isoformat()
     runs: dict[tuple, set] = defaultdict(set)
     hits: Counter = Counter()
     detail: dict[tuple, dict] = {}
-    for line in audit_log.read_text(encoding="utf-8").splitlines():
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
+    # 主审计与 audit.fallback.jsonl 一起读（`audit.iter_records`），坏行跳过；别的状态（applied /
+    # skipped / 回退汇总 / 将来的新状态）都不算
+    for rec in auditlog.iter_records(audit_log):
+        status = rec.get("status")
+        if status not in (auditlog.FAILED, auditlog.UNKNOWN) or str(rec.get("ts") or "") < cutoff:
             continue
-        if rec.get("status") != "failed" or (rec.get("ts") or "") < cutoff:
-            continue
-        key = (rec.get("rule"), rec.get("op"), (rec.get("error") or "")[:60])
-        runs[key].add(rec.get("run_id") or rec.get("ts"))
+        key = (status, str(rec.get("rule") or ""), str(rec.get("op") or ""),
+               str(rec.get("error") or "")[:60])
+        runs[key].add(str(rec.get("run_id") or rec.get("ts")))
         hits[key] += 1
         detail[key] = rec
     out = [
-        {"rule": k[0], "op": k[1], "error": k[2],
+        {"status": k[0], "rule": k[1], "op": k[2], "error": k[3],
          "runs": len(v), "count": hits[k], "sample": detail[k]}
         for k, v in runs.items() if len(v) >= min_runs
     ]
@@ -389,7 +392,10 @@ class Evolver:
             try:
                 covered = {f.path for f in d.detect(self.ctx, state)
                            if f.path and (f.action is not None or f.classified)}
-            except Exception:
+            except Exception as e:
+                # 影子验证里别的规则崩了：当作与它不重叠（与 Registry 对崩溃检测器的处理一致），但要说出来
+                self.ctx.log(f"[evolve] 影子验证时规则 {getattr(d, 'id', d)} 执行失败，按不重叠处理："
+                             f"{type(e).__name__}: {e}")
                 continue
             if covered and set(hits) & covered:
                 return getattr(d, "id", "?")
@@ -478,7 +484,7 @@ class Evolver:
 
 def load_evolved(registry: Registry) -> int:
     """把 .agents/rules/ 里已提升的规则挂载进注册表。"""
-    specs = load_rule_specs(RULES_DIR)
+    specs = load_rule_specs(RULES_DIR, errors=registry.load_errors)
     for s in specs:
         registry.register(s)
     return len(specs)

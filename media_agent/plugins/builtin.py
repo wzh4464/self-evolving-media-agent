@@ -189,7 +189,7 @@ def _season_offsets(show: Show) -> dict:
         from .. import sidecar as sc_mod
         try:
             _OFFSET_CACHE[key] = dict(sc_mod.load(show.dir_path).season_offsets or {})
-        except Exception:
+        except Exception:   # 坏 JSON / 读不了 sidecar.load 自己兜了；到这里是格式怪异：没有偏移 = 声明季对不上就不认（安全一侧）
             _OFFSET_CACHE[key] = {}
     return _OFFSET_CACHE[key]
 
@@ -305,6 +305,60 @@ def _playable(f: MediaFile) -> bool:
     return size > 0 and not (f.torrent_hash and size < f.size)
 
 
+def _seal_candidates(files: list, season: int, ep: int) -> list:
+    """这一集的封存候选：钉着 `ma:SxxEyy` 的就是这一集、不是幻影、复核通过（`meets_requirements`），
+    按偏好从高到低（`_prefer_score`）。`files` 是这一集的桶（已按路径去重）。
+
+    判重的封存与 `seal_conflicts` 共用这一处——两边对"谁封存着这一集"必须是同一个结论。"""
+    out = []
+    for f in sorted((f for f in files if _pinned(f) == (season, ep) and not is_phantom(f)),
+                    key=_prefer_score, reverse=True):
+        if meets_requirements(f)[0]:
+            out.append(f)
+    return out
+
+
+def _episode_buckets(show: Show) -> dict[tuple[int, int], list[MediaFile]]:
+    """判重的分桶：下完了的正片视频（不含特典）按 `_resolve` 的集位归拢，同一路径只留一份。"""
+    buckets: dict[tuple[int, int], list[MediaFile]] = defaultdict(list)
+    seen: set[str] = set()
+    for f in show.files:
+        if not _is_video(f) or f.is_incomplete or _is_extra(f, show):
+            continue
+        r = _resolve(f, show)
+        if r and str(f.path) not in seen:
+            seen.add(str(f.path))
+            buckets[r].append(f)
+    return buckets
+
+
+def seal_conflicts(show: Show) -> dict[tuple[int, int], list[MediaFile]]:
+    """集位 → 在那里互相冲突的封存候选（来自**不止一个**种子），按偏好从高到低。
+    与 `DuplicateEpisodeDetector` 报 `seal_conflict` 同一判据；电影没有集位，返回空。"""
+    if show.is_movie:
+        return {}
+    out = {}
+    for (season, ep), files in _episode_buckets(show).items():
+        if not any(_pinned(f) == (season, ep) for f in files):
+            continue                                  # 没有钉子就没有封存：不必探测
+        seals = _seal_candidates(files, season, ep)
+        if len({f.torrent_hash for f in seals}) > 1:
+            out[(season, ep)] = seals
+    return out
+
+
+def slot_holder(show: Show, slot: tuple[int, int], seals: list) -> MediaFile:
+    """封存冲突里集位名归谁：**已经叫这个名字**的那份，没有就归偏好分最高的那份（`seals[0]`）。
+
+    已经叫这个名字的不挪：偏好分先看文件名（`_prefer_score`），改完名它的分数会变，拿分数重新挑就会
+    今天归 A、明天归 B——两边轮流改名，比每轮一条「集位被占」更糟。"""
+    title = show.official_title
+    for f in seals:
+        if is_normalized(f.filename, title) and parse_episode(f.filename) == slot:
+            return f
+    return seals[0]
+
+
 # ---------------------------------------------------------------------------
 class OrphanTorrentDetector:
     """在 Media 目录里但没有 `ab:<id>` 标签的种子。
@@ -375,6 +429,7 @@ class UnrenamedDetector:
                 # 还把真正需要人看的条目淹在里面。
                 continue
             title = show.official_title
+            held = None                  # 封存冲突里不该拿集位名的种子：{集位: {hash}}，按需算
             for f in show.files:
                 # 下载中的也要改名 —— 拿到种子就改好，不等下载完。
                 # 走 qBittorrent renameFile 是安全的：它会同步处理 `.!qB` 临时文件
@@ -426,6 +481,17 @@ class UnrenamedDetector:
                     continue
 
                 season, ep = resolved
+                if _pinned(f) == resolved and f.torrent_hash:
+                    # 封存冲突（两个不同的种子都封存着这一集，判重报 `seal_conflict`、等人挑）：集位名
+                    # 只归一份（`slot_holder`），其余种子的文件不提改名。以前两份都提，一份改成了，另一份
+                    # 此后每一轮都被执行器以「集位被占」跳过——一轮一条、没有结论（runloop §8a：这类跳过
+                    # 连着 28 轮）。冲突由判重报一次，连着几轮都在交给卡住检测。
+                    if held is None:
+                        held = {slot: {x.torrent_hash for x in seals}
+                                - {slot_holder(show, slot, seals).torrent_hash}
+                                for slot, seals in seal_conflicts(show).items()}
+                    if f.torrent_hash in held.get(resolved, ()):
+                        continue
                 if real_ext in SUB_EXTS:
                     lang = subtitle_lang_tag(stem)
                     new = (target_subtitle_filename(title, season, ep, lang, real_ext)
@@ -464,33 +530,17 @@ class DuplicateEpisodeDetector:
         for show in state.shows:
             if show.is_movie:
                 continue
-            buckets: dict[tuple[int, int], list[MediaFile]] = defaultdict(list)
-            for f in show.files:
-                if not _is_video(f) or f.is_incomplete or _is_extra(f, show):
-                    continue
-                r = _resolve(f, show)
-                if r:
-                    buckets[r].append(f)
+            # 同一磁盘路径只能算一份（`_episode_buckets` 按路径去重）。上游 `scan` 已经按路径收敛过，
+            # 这里是兜底：**删除是不可逆的，不能指望上游永远不出错。**
+            #
+            # 2026-09-06 尼古喵喵 S01E08 的教训——两个种子宣称同一路径，
+            # 桶里进了两条实为同一文件的条目，排序后"清理输的那个"
+            # 删掉的正是唯一的真文件，审计里留下 `保留 X，清理 X`。
+            # 只要 keeper 和 loser 可能指向同一个路径，这条规则就有能力
+            # 把一集彻底抹掉，所以护栏必须在产出删除动作之前。
+            buckets = _episode_buckets(show)
 
             for (season, ep), files in sorted(buckets.items()):
-                # 同一磁盘路径只能算一份。上游 `scan` 已经按路径收敛过，
-                # 这里是兜底：**删除是不可逆的，不能指望上游永远不出错。**
-                #
-                # 2026-09-06 尼古喵喵 S01E08 的教训——两个种子宣称同一路径，
-                # 桶里进了两条实为同一文件的条目，排序后"清理输的那个"
-                # 删掉的正是唯一的真文件，审计里留下 `保留 X，清理 X`。
-                # 只要 keeper 和 loser 可能指向同一个路径，这条规则就有能力
-                # 把一集彻底抹掉，所以护栏必须在产出删除动作之前。
-                seen: set[str] = set()
-                deduped = []
-                for f in files:
-                    key = str(f.path)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    deduped.append(f)
-                files = deduped
-
                 if len(files) < 2:
                     continue
 
@@ -527,6 +577,7 @@ class DuplicateEpisodeDetector:
                 if len(phantoms) == len(files):
                     yield Finding(
                         rule=self.id, kind="phantom_only", severity="minor",
+                        subject=f"S{season:02d}E{ep:02d}",
                         classified=True,
                         summary=(f"S{season:02d}E{ep:02d} 的 {len(files)} 个候选都是种子声明了、"
                                  f"盘上却没有的幻影，没有可保留的真文件，本轮不做取舍"),
@@ -547,11 +598,12 @@ class DuplicateEpisodeDetector:
                 #   报 `seal_unknown` 给人看。探得到而且确实不合格的，照旧 `seal_failed`。
                 seals: list = []
                 protected: set[int] = set()
+                passed = {id(f) for f in _seal_candidates(files, season, ep)}
                 for f in sorted((f for f in files
                                  if _pinned(f) == (season, ep) and id(f) not in phantoms),
                                 key=_prefer_score, reverse=True):
                     ok, why = meets_requirements(f)
-                    if ok:
+                    if id(f) in passed:
                         seals.append((f, why))
                         continue
                     if probe(f.path) is None:
@@ -582,21 +634,32 @@ class DuplicateEpisodeDetector:
                 if len(seal_torrents) > 1:
                     top = sealed[0].torrent_hash
                     protected |= {id(f) for f, _ in seals if f.torrent_hash != top}
+                    # 集位名只归一份（`slot_holder`），其余种子的文件 unrenamed-file 不再提改名
+                    holder = slot_holder(show, (season, ep), [f for f, _ in seals])
+                    has_name = holder.filename == target_filename(
+                        show.official_title, season, ep, holder.ext)
                     yield Finding(
                         rule=self.id, kind="seal_conflict", severity="important",
+                        subject=f"S{season:02d}E{ep:02d}",
                         classified=True,
                         summary=(f"S{season:02d}E{ep:02d} 有 {len(seal_torrents)} 个不同的种子都钉着"
-                                 f"这一集且复核通过，封存不替择源二选一：都不删，需人工挑一个"),
+                                 f"这一集且复核通过，封存不替择源二选一：都不删，需人工挑一个；"
+                                 f"集位名{'留在' if has_name else '给'} {holder.filename}，其余的先不改名"),
                         show=show.dir_name, path=str(sealed[0].path),
                         evidence={"files": [f.filename for f, _ in seals],
                                   "torrents": seal_torrents,
-                                  "reasons": [why for _, why in seals]},
+                                  "reasons": [why for _, why in seals],
+                                  "slot_name_held_by": holder.filename if has_name else None,
+                                  "slot_name_goes_to": holder.filename,
+                                  "renames_held": [f.filename for f, _ in seals
+                                                   if f.torrent_hash != holder.torrent_hash]},
                     )
 
                 pending = [f for f in files if f.torrent_category == "Bangumi"]
                 if pending and not sealed:
                     yield Finding(
                         rule=self.id, kind="pending_ownership", severity="minor",
+                        subject=f"S{season:02d}E{ep:02d}",
                         classified=True,
                         summary=(f"S{season:02d}E{ep:02d} 有 {len(files)} 个候选，但其中 "
                                  f"{len(pending)} 个仍在 AutoBangumi 的分类下"
@@ -613,6 +676,7 @@ class DuplicateEpisodeDetector:
                 if len(files) > 3:
                     yield Finding(
                         rule=self.id, kind="suspicious_episode_parse", severity="minor",
+                        subject=f"S{season:02d}E{ep:02d}",
                         summary=(f"S{season:02d}E{ep:02d} 竟有 {len(files)} 个文件声称是同一集，"
                                  f"判定为集号解析异常而非重复，已跳过删除"),
                         show=show.dir_name, path=str(files[0].path),
@@ -633,6 +697,7 @@ class DuplicateEpisodeDetector:
                     if holdback:
                         yield Finding(
                             rule=self.id, kind="pending_ownership", severity="minor",
+                            subject=f"S{season:02d}E{ep:02d}",
                             classified=True,
                             summary=(f"S{season:02d}E{ep:02d} 已封存 {keeper.filename}，"
                                      f"但另 {len(holdback)} 个候选的发布名认不出这个集位，"
@@ -748,6 +813,7 @@ class RenameCollisionDetector:
     def detect(self, ctx: Context, state: LibraryState) -> Iterable[Finding]:
         for show in state.shows:
             targets: dict[str, list[MediaFile]] = defaultdict(list)
+            slot_of: dict[str, tuple[int, int]] = {}
             for f in show.files:
                 if not _is_video(f) or _is_extra(f, show):
                     continue
@@ -755,7 +821,10 @@ class RenameCollisionDetector:
                 if not r:
                     continue
                 season, ep = r
-                targets[target_filename(show.official_title, season, ep, f.ext)].append(f)
+                t = target_filename(show.official_title, season, ep, f.ext)
+                targets[t].append(f)
+                slot_of[t] = r
+            conflicts = None             # 封存冲突（按需算：要探测）
 
             for target, files in targets.items():
                 if len(files) < 2:
@@ -763,9 +832,24 @@ class RenameCollisionDetector:
                 hashes = [f.torrent_hash for f in files if f.torrent_hash]
                 if len(set(hashes)) < 2:
                     continue      # 同一个种子的多个文件，不是碰撞
+                if any(_pinned(f) for f in files):
+                    # 争这个名字的恰好就是一组封存冲突（都钉着这一集、都复核通过）：判重已经报了
+                    # `seal_conflict`，集位名只给一份、其余不提改名（`slot_holder`）。它们都是本项目抓的、
+                    # 在剧名分类下，AutoBangumi 查不到，谈不上"改名死循环"——再报一条 critical，同一个
+                    # 冲突每轮两条，卡住检测里也是两条。有没钉的第三份一起争，照报（判重这一轮会清掉它）。
+                    if conflicts is None:
+                        conflicts = seal_conflicts(show)
+                    sealed = {x.torrent_hash for x in conflicts.get(slot_of[target], [])}
+                    if sealed and set(hashes) <= sealed and len(hashes) == len(files):
+                        continue
+                season, ep = slot_of[target]
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="critical",
                     summary=f"{len(files)} 个种子争抢同一目标名 {target}，会导致改名死循环",
+                    # 身份按集位：`path` 只是桶里第一个文件，有种子的按 torrents() 的顺序排——qBit 5.x 的
+                    # /torrents/info 不排序（遍历 QHash），容器重建、加了种子就换第一名，指纹跟着变
+                    # （卡住检测的连续段断掉、确认悄悄失效；2026-09-26 复审）
+                    subject=f"S{season:02d}E{ep:02d}",
                     show=show.dir_name, path=str(files[0].path),
                     evidence={"target": target,
                               "competitors": [
@@ -821,7 +905,9 @@ def _entries_or_none(ctx: Context, torrent_hash: str) -> list[dict] | None:
     """种子的文件列表；读不到返回 None（= 不知道）。"""
     try:
         return ctx.qbit.files(torrent_hash) if ctx.qbit else None
-    except Exception:
+    except Exception as e:
+        ctx.log(f"[dead-torrent] files({torrent_hash[:8]}) 读取失败，这个种子这一轮不下结论："
+                f"{type(e).__name__}: {e}")
         return None
 
 
@@ -1267,6 +1353,7 @@ class CategoryConsolidationDetector:
                 continue          # 还有种子留在这个分类里，不能删
             yield Finding(
                 rule=self.id, kind="empty_category", severity="minor",
+                subject=f"分类:{cat}",
                 summary=f"分类 `{cat}` 合并后已无种子，可删除",
                 evidence={"had_torrents": len(members)},
                 action=Action(op="delete_category", args={"category": cat},
@@ -1335,7 +1422,9 @@ class StaleTorrentPathDetector:
             try:
                 entries = [e for e in ctx.qbit.files(t["hash"])
                            if e.get("priority", 1) != 0]
-            except Exception:
+            except Exception as e:
+                ctx.log(f"[stale-torrent-path] files({t['hash'][:8]}) 读取失败，这个种子这一轮不重新关联："
+                        f"{type(e).__name__}: {e}")
                 entries = []
 
             for e in entries:

@@ -32,7 +32,7 @@ from .naming import VIDEO_EXTS
 
 
 def wait_metadata(qbit, torrent_hash: str, timeout: float = 30.0,
-                  interval: float = 1.0) -> list[dict]:
+                  interval: float = 1.0, errors: list[str] | None = None) -> list[dict]:
     """等到 `torrents/files` 有内容为止，返回参与下载的文件列表。
 
     磁力链刚加进来时处于 `metaDL`——还在从 DHT/peer 拉元数据，此时
@@ -40,14 +40,19 @@ def wait_metadata(qbit, torrent_hash: str, timeout: float = 30.0,
     常见原因是连不上任何 peer（无端口转发时尤其常见），那可能要几分钟，
     所以超时返回空列表是正常结果，不是错误：交给后续的 `unrenamed-file`
     规则兜底即可。
+
+    `errors`：给了就把每次读 `files()` 的报错追加进去——超时的时候分得清是"真没元数据"
+    还是"qBittorrent 一直报错"（抓取审计的 `metadata.last_error`）。
     """
     deadline = time.time() + timeout
     while True:
         try:
             files = [f for f in (qbit.files(torrent_hash) or [])
                      if f.get("priority", 1) != 0]
-        except Exception:
+        except Exception as e:
             files = []
+            if errors is not None:
+                errors.append(f"{type(e).__name__}: {e}")
         if files:
             return files
         if time.time() >= deadline:

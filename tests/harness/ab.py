@@ -41,11 +41,16 @@ CREATE TABLE torrent (id INTEGER PRIMARY KEY, bangumi_id INTEGER REFERENCES bang
 
 
 def make_docker_stub(root: Path) -> tuple[Path, Path]:
-    """返回 (stub 可执行文件, 日志文件)。stub 把每次调用的参数追加进日志。"""
+    """返回 (stub 可执行文件, 日志文件)。stub 把每次调用的参数追加进日志。
+
+    同目录下有 `fail-<子命令>` 文件时，那个子命令记完日志后以 1 退出（`LibraryBuilder.docker_fail`）：
+    `docker start` 失败就是"库已改好、容器没起来"的现场。"""
     root.mkdir(parents=True, exist_ok=True)
     log = root / "docker.log"
     stub = root / "docker"
-    stub.write_text('#!/bin/sh\necho "$@" >> "%s"\n' % log, encoding="utf-8")
+    stub.write_text('#!/bin/sh\necho "$@" >> "%s"\n'
+                    'if [ -e "%s/fail-$1" ]; then echo "injected docker $1 failure" >&2; exit 1; fi\n'
+                    % (log, root), encoding="utf-8")
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return stub, log
 

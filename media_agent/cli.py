@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import traceback
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
-from . import __version__, disposal, runlock
+from . import __version__, disposal, health, history, notify, pause, runlock, runlog
 from .actions import Executor, new_run_id
 from .cache import Cache
 from .clients import (
@@ -42,6 +45,38 @@ EXIT_DEGRADED = 3
 # 另一个进程持有运行锁、本次什么都没做时的退出码。取 sysexits 的 EX_TEMPFAIL，
 # 与 /usr/bin/lockf 等锁超时的退出码一致：launchd 的 last exit code 75 = "被挡住了，下轮再来"。
 EXIT_LOCKED = 75
+
+# 异常冲出了这一轮：与 Python 未捕获异常的退出码相同，只是健康报告照写（`cmd_run`）。
+EXIT_CRASH = health.EXIT_CRASH
+
+# 这一轮跑完了，但健康报告是 critical 且不属于上面几种：处置之后媒体卷剩余仍低于 MIN_FREE_GB
+# （`health.exit_code_for`）。launchd 只记下退出码、照常 6 小时后再起下一轮——非零不会让它停掉任务。
+EXIT_CRITICAL = health.EXIT_CRITICAL
+
+# 改动照常做了、整轮也跑完了，但有审计记录没能原样写进 audit.jsonl（磁盘满、权限、序列化不了）时的
+# 退出码。记录已转写到 stderr（run.err.log）与 state/audit.fallback.jsonl，回退照样读得到；但这种
+# 事必须被看见——以前写审计的异常直接冲出执行器、整轮中止（critic N8 的余项），launchd 上只剩一个
+# traceback。与 EXIT_DEGRADED（整批拒绝、什么都没改）分开，看退出码就知道是哪一种。
+EXIT_AUDIT_INCOMPLETE = 4
+
+
+def _report_audit_problems(problems: list, state_dir) -> bool:
+    """审计没能原样写进 audit.jsonl：stdout（run.log）与 stderr（run.err.log）各说一遍，按种类说落在了哪
+    （`audit.where`：序列化降级的在 audit.jsonl 里；转写的在 stderr 与 `state_dir` 下的备用文件里）。返回是否有问题。"""
+    if not problems:
+        return False
+    from .audit import FALLBACK, FALLBACK_NAME, kinds, where
+    counts = kinds(problems)
+    msg = f"⚠️  {len(problems)} 条审计没能原样写进 audit.jsonl——{where(counts)}"
+    if counts.get(FALLBACK):
+        msg += f"（备用文件 {Path(state_dir) / FALLBACK_NAME}）"
+    print(f"\n═══ {msg} ═══")
+    for p in problems[:10]:
+        print(f"  ⚠️  {p}")
+    if len(problems) > 10:
+        print(f"  …另 {len(problems) - 10} 条")
+    _log(msg)
+    return True
 
 
 def _needs_lock(args) -> bool:
@@ -77,30 +112,43 @@ def _warn_degraded(state) -> None:
 
 
 def build_context(cfg, need_llm: bool = False) -> Context:
+    # 各客户端此刻的状况，健康报告用（`ok` / `down: 原因` / `off（为什么）`）
+    status: dict[str, str] = {}
     qbit = None
     try:
         qbit = QBitClient(cfg.qbit_url, cfg.qbit_user, cfg.qbit_pass)
+        status["qbit"] = "ok"
     except Exception as e:
         _log(f"⚠️  qBittorrent 连接失败：{e}")
+        status["qbit"] = f"down: {type(e).__name__}: {e}"[:200]
 
     ab = None
     try:
         if cfg.ab_user:
             ab = AutoBangumiClient(cfg.ab_url, cfg.ab_user, cfg.ab_pass)
+            status["ab"] = "ok"
+        else:
+            status["ab"] = "off（未配置 AB_USER）"
     except Exception as e:
         _log(f"⚠️  AutoBangumi API 连接失败（不影响只读诊断）：{e}")
+        status["ab"] = f"down: {type(e).__name__}: {e}"[:200]
 
     abdb = AutoBangumiDB(cfg.ab_db, cfg.ab_container, cfg.docker_bin) if cfg.ab_db else None
+    status["abdb"] = "ok" if abdb else "off（未配置 AB_DB）"
     tmdb = TMDBClient(cfg.tmdb_api_key, cfg.tmdb_lang)
+    status["tmdb"] = "ok" if tmdb.enabled else "off（未配置 TMDB_API_KEY）"
     if not tmdb.enabled:
         _log("⚠️  未配置 TMDB_API_KEY，标题对齐相关规则将跳过")
 
     llm = LLMClient(cfg.llm_base, cfg.llm_key, cfg.llm_model)
+    status["llm"] = "ok" if llm.enabled else "off（未配置 LLM_KEY）"
     if need_llm and not llm.enabled:
         _log("⚠️  未配置 LLM_KEY，自演进与模糊匹配将跳过")
 
-    return Context(cfg, qbit=qbit, ab=ab, abdb=abdb, tmdb=tmdb,
-                   anilist=AniListClient(), llm=llm, logger=_log)
+    ctx = Context(cfg, qbit=qbit, ab=ab, abdb=abdb, tmdb=tmdb,
+                  anilist=AniListClient(), llm=llm, logger=_log)
+    ctx.client_status = status
+    return ctx
 
 
 def build_registry() -> Registry:
@@ -109,6 +157,8 @@ def build_registry() -> Registry:
     n = load_evolved(reg)          # 演进出的规则挂在内置之后（内置优先）
     if n:
         _log(f"已挂载 {n} 条演进规则")
+    for e in reg.load_errors:      # 坏规则文件：以前一声不吭地少挂一条
+        _log(f"⚠️  [rules] 演进规则加载失败，没挂上：{e}")
     return reg
 
 
@@ -150,10 +200,20 @@ def cmd_scan(args, cfg) -> int:
     return 0
 
 
+def _record_findings(cfg, run_id: str, findings, state, cmd: str, dry_run: bool = False) -> None:
+    """这一轮的全部发现写进发现历史（`history`，critic N11）。写不进去只在 stderr 说一句：观测不拦正事。
+    `dry_run`：预演的一轮——卡住检测不拿它给带动作的发现算连续（`history.find_stuck`）。"""
+    _, problems = history.write_snapshot(cfg.state_dir, run_id, findings, cmd=cmd,
+                                         degraded=bool(state.qbit_errors), dry_run=dry_run)
+    for p in problems:
+        _log(f"⚠️  发现历史：{p}")
+
+
 def cmd_diagnose(args, cfg) -> int:
     ctx = build_context(cfg)
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
     findings = build_registry().run_all(ctx, state)
+    _record_findings(cfg, new_run_id(), findings, state, "diagnose")
     if not args.json:
         _warn_degraded(state)
     _print_findings(findings, args.json)
@@ -193,7 +253,19 @@ def cmd_apply(args, cfg) -> int:
         print(f"  ⏭️  [{rec['op']}] {rec['summary']} —— {rec.get('reason','')}")
     for rec in report.failed:
         print(f"  ❌ [{rec['op']}] {rec['summary']} —— {rec.get('error','')}")
+    _print_unknown(report.unknown)
+    if _report_audit_problems(report.audit_problems, cfg.state_dir):
+        return EXIT_AUDIT_INCOMPLETE
     return 0
+
+
+def _print_unknown(recs: list[dict], limit: int = 20) -> None:
+    """记 unknown 的动作（改动也许生效了、确认不了）逐条列出：它们要人按此刻状态核对。"""
+    for rec in recs[:limit]:
+        print(f"  ❓ [{rec['op']}] {rec['summary']} —— 未确认：{rec.get('reason') or rec.get('error', '')}"
+              + ("（带逆操作，rollback 会按此刻状态尝试还原）" if rec.get("undo") else ""))
+    if len(recs) > limit:
+        print(f"  ❓ …另 {len(recs) - limit} 条未确认（media-agent runs / audit.jsonl）")
 
 
 def cmd_runs(args, cfg) -> int:
@@ -206,6 +278,12 @@ def cmd_runs(args, cfg) -> int:
     print(f"{'批次 ID':<26} {'时间':<20} {'已执行':>6} {'可回退':>6}  类型")
     for r in runs:
         mark = " ↩已回退" if r.get("rolled_back") else ""
+        if r.get("rollback_of"):
+            # 回退的逐步记录（每一步还原 / 跳过 / 出错各一条）；它本身不能再回退
+            mark += f" ↩回退 {r['rollback_of']} 的记录"
+        if r.get("unconfirmed"):
+            # 当初记 unknown 的：改动也许生效了。带逆操作的已算进"可回退"，回退时按此刻状态核对
+            mark += f" ❓未确认 {r['unconfirmed']}"
         print(f"{r['run_id']:<26} {r['ts']:<20} {r['applied']:>6} {r['undoable']:>6}  "
               f"{','.join(r['kinds'][:3])}{mark}")
     print(f"\n回退最近一次： media-agent rollback --last")
@@ -218,7 +296,8 @@ def cmd_rollback(args, cfg) -> int:
 
     run_id = args.run
     if args.last or not run_id:
-        runs = [r for r in ex.list_runs() if not r.get("rolled_back") and r["undoable"]]
+        runs = [r for r in ex.list_runs()
+                if not r.get("rolled_back") and not r.get("rollback_of") and r["undoable"]]
         if not runs:
             print("没有可回退的批次")
             return 1
@@ -228,6 +307,8 @@ def cmd_rollback(args, cfg) -> int:
     res = ex.rollback(run_id)
     if res.get("refused"):
         return _refuse(res["refused"])
+    if not args.dry_run:
+        print(f"  逐步记录：批次 rollback-of-{run_id}（每一步还原 / 跳过 / 出错各一条，media-agent runs 可见）")
     print(f"  已还原: {res['reverted']}")
     print(f"  跳过:   {res['skipped']}")
     print(f"  失败:   {res['failed']}")
@@ -236,15 +317,24 @@ def cmd_rollback(args, cfg) -> int:
     if res["torrent_records_lost"]:
         print(f"  ⚠️  种子记录已丢失: {res['torrent_records_lost']} 项"
               f"（文件可还原，但需重新添加种子才能继续做种）")
+    if res.get("unconfirmed"):
+        print(f"  ❓ 当初未确认是否生效（unknown）: {res['unconfirmed']} 项——其中 "
+              f"{res.get('unconfirmed_reverted', 0)} 项按此刻状态核对后已还原（计入上面的已还原）"
+              + (f"，{res['unconfirmed_no_undo']} 项没有逆操作、需人工核对"
+                 if res.get("unconfirmed_no_undo") else ""))
     if res.get("priority_not_restored"):
         print(f"  ⚠️  文件已搬回、合集条目的下载没恢复: {res['priority_not_restored']} 项"
               f"（它此刻没有种子做种）")
         for n in res.get("notes") or []:
             print(f"    ⚠️  {n}")
     for d in res["skipped_detail"]:
-        print(f"    ⏭️  {d.get('skip_reason','')}")
+        tag = "（当初未确认）" if d.get("status") == "unknown" else ""
+        print(f"    ⏭️  {tag}{d.get('skip_reason','')}")
     for d in res["failed_detail"]:
-        print(f"    ❌ {d.get('error','')}")
+        tag = "（当初未确认）" if d.get("status") == "unknown" else ""
+        print(f"    ❌ {tag}{d.get('error','')}")
+    if _report_audit_problems(res.get("audit_problems") or [], cfg.state_dir):
+        return EXIT_AUDIT_INCOMPLETE
     return 0
 
 
@@ -271,6 +361,13 @@ def cmd_repair(args, cfg) -> int:
                   + (f"，{d['stranded']} 个同名滞留" if d["stranded"] else "")
                   + (f"，{d['left_for_torrents']} 个文件仍归种子、没用文件系统搬"
                      if d.get("left_for_torrents") else ""))
+            ab = d.get("ab_savepath") or ""
+            if ab.startswith("❌"):
+                errors += 1
+                print(f"    {ab}")
+            elif ab:
+                # 半路中止的目录改名没走到的最后一步（`Executor._repair_ab_savepath`）
+                print(f"    AutoBangumi 的 save_path 已改到 {ab}")
     return 1 if errors else 0
 
 
@@ -405,6 +502,154 @@ def cmd_purge(args, cfg) -> int:
     return 0
 
 
+def _stuck(cfg, run_id: str) -> list:
+    """本轮之前连续 STUCK_RUNS 轮都在的问题（`history.find_stuck`），确认文件读不了就在 stderr 说一句。"""
+    acks, problems = history.load_acks()
+    for p in problems:
+        _log(f"⚠️  确认文件：{p}")
+    return history.find_stuck(cfg.state_dir, run_id, min_runs=cfg.stuck_runs, acks=acks)
+
+
+def _print_stuck(cfg, stuck: list, limit: int = 20) -> None:
+    """卡住的问题：同一个指纹连续 STUCK_RUNS 轮 run 都在。确认过的只计数（`.agents/acks.json`）。"""
+    open_ = [s for s in stuck if not s.ack]
+    acked = len(stuck) - len(open_)
+    if not open_:
+        if acked:
+            print(f"\n═══ 卡住：没有未确认的（{acked} 个已确认、不再提醒，见 .agents/acks.json） ═══")
+        return
+    tail = f"（另有 {acked} 个已确认、不再提醒）" if acked else ""
+    print(f"\n═══ 卡住：{len(open_)} 个问题连续 ≥{cfg.stuck_runs} 轮都在{tail} ═══")
+    root = str(cfg.media_root).rstrip("/") + "/"
+    for s in open_[:limit]:
+        where = "" if s.target == s.show else f" {s.target.removeprefix(root)}"
+        print(f"  ⏳ 连续 {s.runs} 轮（自 {s.first_seen}）[{s.rule}] {s.kind}【{s.show or '-'}】{where}")
+        print(f"      {s.summary[:160]}")
+        print(f"      指纹 {s.fp}——要人处理、先不提醒：media-agent ack {s.fp} --reason \"…\"")
+    if len(open_) > limit:
+        print(f"  …另 {len(open_) - limit} 个（media-agent health 看全部）")
+
+
+_FP = re.compile(r"[0-9a-f]{6,16}")
+
+
+def cmd_ack(args, cfg) -> int:
+    """确认一个卡住的问题：写进 `.agents/acks.json`（版本化的用户意图，要提交入库）。"""
+    path = history.acks_path()
+    acks, problems = history.load_acks(path)
+    if problems:
+        # 读不了就不写：覆盖一个坏掉的文件会丢掉里面别的确认
+        print(f"❌ {problems[0]}——先修好它再确认")
+        return 2
+    if args.list:
+        if not acks:
+            print("还没有任何确认（.agents/acks.json）")
+        today = datetime.now().date()
+        for fp, a in sorted(acks.items()):
+            state = "有效" if history.active_ack(acks, fp, today) else "已过期"
+            print(f"  {fp}  [{state}] {a.get('what', '')}")
+            print(f"      {a.get('reason', '')}" + (f"（至 {a['until']}）" if a.get("until") else ""))
+        return 0
+    fp = (args.fingerprint or "").strip().lower()
+    if not _FP.fullmatch(fp):
+        print(f"❌ 指纹要写成 6–16 位十六进制（media-agent health / run 输出里的「指纹 …」），收到 {fp!r}")
+        return 2
+    if args.remove:
+        hit = [k for k in acks if k.startswith(fp)]
+        if len(hit) != 1:
+            print(f"❌ .agents/acks.json 里{'没有' if not hit else '有不止一个'}以 {fp} 开头的确认")
+            return 1
+        acks.pop(hit[0])
+        history.save_acks(acks, path)
+        print(f"已撤销确认 {hit[0]}")
+        _remind_commit(path)
+        return 0
+    if not (args.reason or "").strip():
+        print("❌ 要写 --reason：为什么先不管它（半年后读到的人要看得懂）")
+        return 2
+    if args.until:
+        try:
+            datetime.strptime(args.until, "%Y-%m-%d")
+        except ValueError:
+            print(f"❌ --until 要写成 YYYY-MM-DD，收到 {args.until!r}")
+            return 2
+    seen = history.seen_fingerprints(cfg.state_dir)
+    hits = [k for k in seen if k.startswith(fp)]
+    if len(hits) > 1:
+        print(f"❌ 以 {fp} 开头的指纹不止一个：{', '.join(sorted(hits)[:5])}——多写几位")
+        return 2
+    if hits:
+        fp = hits[0]
+        r = seen[fp]
+        what = f"{r.get('rule')} / {r.get('kind')} / {r.get('target')}"
+    elif args.force and len(fp) == 16:
+        what = "（确认时发现历史里还没有）"
+    else:
+        print(f"❌ 最近的发现历史里没有指纹 {fp}（state/findings/）——打错了？"
+              "要预先确认一个还没出现的问题，写全 16 位并加 --force")
+        return 1
+    entry = {"reason": args.reason.strip(), "added": datetime.now().date().isoformat(),
+             "what": what}
+    if args.until:
+        entry["until"] = args.until
+    acks[fp] = entry
+    history.save_acks(acks, path)
+    print(f"已确认 {fp}：{what}" + (f"，至 {args.until}" if args.until else ""))
+    _remind_commit(path)
+    return 0
+
+
+def _remind_commit(path) -> None:
+    print(f"\n⚠️  {path} 是版本化的用户意图，要提交入库：\n"
+          f"    git add .agents/acks.json && git commit -m \"chore: 确认 …\"\n"
+          "  在生产机上改的：下一次部署时漂移闸门会拦下它——用 deploy.sh --harvest 带回开发机提交、打 tag"
+          "（deploy/README.md「用户意图放在哪」）")
+
+
+def cmd_health(args, cfg) -> int:
+    """最近一轮（或 `--run` 指定那一轮）的健康报告；`--json` 原样输出。
+
+    `--accept-torrent-count`：把此刻 qBittorrent 的种子数认作新基线（人为批量删除之后）。"""
+    if getattr(args, "accept_torrent_count", False):
+        return _accept_torrent_count(cfg)
+    rep = health.load_report(cfg.state_dir, getattr(args, "run", None))
+    if rep is None:
+        which = f"批次 {args.run} 的" if getattr(args, "run", None) else "任何"
+        print(f"还没有{which}健康报告（state/health/，每轮 run 结束时写）")
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+        return 0
+    for line in health.render(rep, health.health_dir(cfg.state_dir) / f"{rep.get('run_id')}.json"):
+        print(line)
+    base = health.load_baseline(cfg.state_dir)
+    if base:
+        print(f"  种子数基线 {base['count']}（{base.get('source')}，批次 {base.get('run_id')}，"
+              f"{base.get('ts')}）")
+    return 0
+
+
+def _accept_torrent_count(cfg) -> int:
+    ctx = build_context(cfg)
+    if ctx.qbit is None:
+        return _refuse("qBittorrent 不可用：读不到此刻的种子数，基线不动")
+    try:
+        n = len(ctx.qbit.torrents())
+    except Exception as e:                           # noqa: BLE001 —— 读不到就不动基线，照实说
+        return _refuse(f"读不到种子列表（{type(e).__name__}: {e}），基线不动")
+    prev = health.load_baseline(cfg.state_dir)
+    problem = health.save_baseline(cfg.state_dir, count=n, run_id=new_run_id(),
+                                   ts=datetime.now().isoformat(timespec="seconds"),
+                                   source="accepted")
+    if problem:
+        print(f"❌ {problem}")
+        return 1
+    print(f"已把此刻的 {n} 个种子认作新的基线"
+          + (f"（原来是 {prev['count']} 个，批次 {prev.get('run_id')}）" if prev else "")
+          + "；下一轮 run 按它比")
+    return 0
+
+
 def cmd_evolve(args, cfg) -> int:
     if cfg.evolve_mode != "propose":
         # 手动 evolve 同样往 .agents/ 写规则和笔记——冻结期间工作区要与部署的 tag 一致
@@ -444,36 +689,100 @@ def cmd_evolve(args, cfg) -> int:
 
     failures = find_failure_patterns(cfg.audit_log)
     if failures:
-        print("\n⚠️  反复失败的动作（可能是规则本身有问题）：")
+        print("\n⚠️  反复失败 / 反复未确认的动作（可能是规则本身有问题）：")
         for f in failures:
-            print(f"  {f['runs']} 个批次 / 共 {f['count']} 次 "
+            tag = "未确认" if f.get("status") == "unknown" else "失败"
+            print(f"  {f['runs']} 个批次 / 共 {f['count']} 次 {tag} "
                   f"[{f['rule']}] {f['op']}: {f['error']}")
     return 0
 
 
 def cmd_run(args, cfg) -> int:
-    """一轮完整自治。"""
+    """一轮完整自治。收尾——正常结束、整批拒绝、异常冲出都一样——写健康报告（`health` 模块文档）。
+
+    以前 `run` 只在"整批拒绝"与"审计没写全"时退出码非零；异常冲出就是一段 traceback，其余一切（抓取连着十天
+    NameError、检测器崩了、磁盘快满）launchd 上都是 0。现在每轮都有一份 `state/health/<批次 ID>.json` 与输出末尾
+    一小节，critical 时退出码非零（1 / 3 / 4 / 5，见 `health.exit_code_for`）。
+    """
+    # 批次 ID 先定下来：发现历史、审计、隔离区处置、健康报告、日志前缀都用这一个，彼此对得上
+    # （经 `main` 起的由它先定好，日志前缀从拿锁之前就带上）
+    rh = health.RunHealth(cfg, run_id=getattr(args, "run_id", None) or new_run_id(), cmd="run",
+                          dry_run=args.dry_run or not cfg.auto_apply)
+    try:
+        rc = _run(args, cfg, rh)
+    except Exception as e:
+        # 冲出来的异常：完整 traceback 进 stderr（run.err.log），摘要进健康报告，退出码与未捕获异常同为 1
+        rh.crashed(e)
+        traceback.print_exc()
+        rc = EXIT_CRASH
+    except BaseException as e:
+        # Ctrl-C / 被 kill 的 SystemExit：报告照写，异常照常往外抛
+        rh.crashed(e)
+        _finish_run(cfg, rh, EXIT_CRASH)
+        raise
+    return _finish_run(cfg, rh, rc)
+
+
+def _finish_run(cfg, rh, rc: int) -> int:
+    """定状态、写报告、打印一小节；返回最终退出码。这一步自己出错不改变这一轮的退出码。"""
+    try:
+        # 报告里可能混进带凭据的报错（httpx 的异常会带上整个请求 URL，TMDB 的 api_key 就在里面）
+        rep = notify.redact_obj(cfg, rh.finish(rc))
+        # 有变化才发通知，一轮最多一封；发不出去只在 stderr 说、记进报告，不改退出码
+        rep["notify"] = notify.maybe_send(cfg, rep)
+        path, problems = health.write_report(cfg.state_dir, rep)
+        for line in health.render(rep, path):
+            print(line)
+        for p in problems:
+            _log(f"⚠️  健康报告：{p}")
+        return rep["exit_code"]
+    except Exception as e:                           # noqa: BLE001 —— 观测出错不能吞掉这一轮的结论
+        _log(f"⚠️  健康报告出错（{type(e).__name__}: {e}），本轮退出码按原样 {rc}")
+        traceback.print_exc()
+        return rc
+
+
+def _run(args, cfg, rh) -> int:
+    run_id = rh.data["run_id"]
     ctx = build_context(cfg, need_llm=True)
+    ctx.log = rh.tap(ctx.log)
+    rh.clients(ctx)
+    prev = health.load_baseline(cfg.state_dir)
+    scanned_at = datetime.now().isoformat(timespec="seconds")
     state = build_state(ctx, resolve_tmdb=not args.no_tmdb)
+    rh.scanned(state, prev)
+    if not state.qbit_errors:
+        # 这一轮的种子数被采信了：下一轮拿它比（`health.torrent_count_problem`）。时间取扫描之前——
+        # 这一轮自己摘掉的种子也算进下一轮"解释得通"的那部分。被拒绝的一轮不挪基线。
+        problem = health.save_baseline(cfg.state_dir, count=len(state.torrents), run_id=run_id,
+                                       ts=scanned_at, source="run")
+        if problem:
+            _log(f"⚠️  {problem}")
     reg = build_registry()
 
     findings = reg.run_all(ctx, state)
+    rh.diagnosed(reg, findings)
+    dry = args.dry_run or not cfg.auto_apply
+    _record_findings(cfg, run_id, findings, state, "run", dry_run=dry)
     print(f"═══ 诊断：{len(findings)} 个问题 ═══")
     _warn_degraded(state)
     _print_findings(findings, False)
 
-    dry = args.dry_run or not cfg.auto_apply
-    ex = Executor(ctx, dry_run=dry)
+    ex = Executor(ctx, dry_run=dry, run_id=run_id)
     report = ex.apply(findings)
     if report.refused:
         # fail closed：不修、不演进（演进器会拿这份残缺快照去立规则）、
         # 也不处置隔离区——降级的一轮不改动任何东西。
+        rh.refused(report.refused)
         return _refuse(report.refused)
+    rh.applied(report, findings, state)
     print(f"\n═══ 修复：{report.summary()} ═══")
+    _print_unknown(report.unknown)
 
     rc = 0
     if cfg.evolve_mode != "propose":
         # 冻结：不重扫、不调 LLM、不构造 Evolver（它的 __init__ 就会建 .agents/rules）
+        rh.evolve("frozen")
         print(f"\n═══ 演进：已冻结（EVOLVE_MODE={cfg.evolve_mode}） ═══")
     elif ctx.llm.enabled and not args.no_evolve:
         # 修复后重新扫描，残留才是真盲区
@@ -481,6 +790,8 @@ def cmd_run(args, cfg) -> int:
         if state2.qbit_errors:
             # 种子视图残缺时，有种子的文件全变成"无主文件"，演进器会拿它们当
             # 盲区去立规则——规则一旦上线就是永久的。宁可这轮不演进。
+            rh.rescan_degraded(state2.qbit_errors[0])
+            rh.evolve("skipped")
             print(f"\n═══ 演进：跳过——重扫时 qBittorrent 数据不完整："
                   f"{state2.qbit_errors[0]} ═══")
             rc = EXIT_DEGRADED
@@ -489,14 +800,25 @@ def cmd_run(args, cfg) -> int:
             results = Evolver(ctx, reg).evolve(state2, findings2,
                                                max_proposals=args.max_proposals)
             promoted = [r for r in results if r["outcome"] == "promoted"]
+            rh.evolve(f"proposed {len(results)}, promoted {len(promoted)}")
             print(f"\n═══ 演进：提议 {len(results)} 条，上线 {len(promoted)} 条 ═══")
             for r in promoted:
                 print(f"  🎉 {r['rule_id']}")
+    else:
+        rh.evolve("off")
 
     # 隔离区处置（disposal 模块文档）：以前这里按日期 rmtree 整个日目录、一行记录都不写
     # （Executor.purge_trash，生产上删掉过 6 个文件 4.7GB，说不出是哪几个）。现在按处置类别
     # 逐个判、逐个预写日志后删；要人定的过了保留期只报不删。
-    _print_disposal(cfg, disposal.dispose(ctx, mode="run", run_id=ex.run_id, dry_run=dry))
+    rep = disposal.dispose(ctx, mode="run", run_id=ex.run_id, dry_run=dry)
+    rh.disposed(rep)
+    _print_disposal(cfg, rep)
+    stuck = _stuck(cfg, run_id)
+    rh.stuck(stuck)
+    _print_stuck(cfg, stuck)
+    # 审计写不进去不中止这一轮（上面的处置照跑——磁盘满时它是唯一腾空间的一步），但在最后大声说
+    if _report_audit_problems(report.audit_problems, cfg.state_dir):
+        return EXIT_AUDIT_INCOMPLETE
     return rc
 
 
@@ -520,7 +842,7 @@ def main() -> int:
     s.add_argument("--kind", nargs="*", help="只处理指定类型的问题")
     s.add_argument("--show", nargs="*", help="只处理指定番剧（目录名）")
     s.add_argument("--limit", type=int, help="最多处理多少条（受控试跑用）")
-    s.set_defaults(func=cmd_apply, lock=True)
+    s.set_defaults(func=cmd_apply, lock=True, pause=True)
 
     s = sub.add_parser("runs", help="列出历史批次（回退用）")
     s.set_defaults(func=cmd_runs)
@@ -547,12 +869,29 @@ def main() -> int:
     # 会写 .agents/，影子验证还会跑全部检测器（含写 sidecar 的抓取规则）
     s.set_defaults(func=cmd_evolve, lock=True)
 
+    s = sub.add_parser("ack", help="确认一个卡住的问题：先不提醒（写 .agents/acks.json，要提交入库）")
+    s.add_argument("fingerprint", nargs="?", help="指纹（run / health 输出里的「指纹 …」，可写前 6 位以上）")
+    s.add_argument("--reason", help="为什么先不管它")
+    s.add_argument("--until", help="到哪天（YYYY-MM-DD，含当天）为止，过了重新提醒")
+    s.add_argument("--remove", action="store_true", help="撤销这个确认")
+    s.add_argument("--force", action="store_true", help="发现历史里还没有这个指纹也确认（要写全 16 位）")
+    s.add_argument("--list", action="store_true", help="列出全部确认")
+    s.set_defaults(func=cmd_ack)
+
+    s = sub.add_parser("health", help="最近一轮（或指定一轮）的健康报告")
+    s.add_argument("--run", help="批次 ID，省略则看最近一轮")
+    s.add_argument("--json", action="store_true", help="原样输出 JSON")
+    s.add_argument("--accept-torrent-count", action="store_true",
+                   help="把此刻 qBittorrent 的种子数认作新基线（在 qBit 里手动批量删除之后）")
+    s.set_defaults(func=cmd_health)
+
     s = sub.add_parser("run", help="完整自治轮次")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-evolve", action="store_true",
                    help="本轮不演进（EVOLVE_MODE=propose 时才有意义，默认 off 本来就不跑）")
     s.add_argument("--max-proposals", type=int, default=3)
-    s.set_defaults(func=cmd_run, lock=True)
+    # 维护暂停（`pause` 模块文档）：run / apply 与以后的抓取模式声明 pause=True
+    s.set_defaults(func=cmd_run, lock=True, pause=True)
 
     args = p.parse_args()
     try:
@@ -560,12 +899,66 @@ def main() -> int:
     except ValueError as e:
         _log(f"配置错误：{e}")
         return 2
+    paused = pause.reason(cfg) if getattr(args, "pause", False) else ""
+    if args.cmd == "run":
+        # launchd 把这些输出追加进 state/run.log / run.err.log：每一行带时间与批次 ID（`runlog`）
+        args.run_id = new_run_id()
+        with runlog.stamped(args.run_id):
+            if paused:
+                return _paused_run(args, cfg, paused)
+            return _locked(args, cfg, before=_run_banner,
+                           locked_out=lambda holder: _locked_out_run(args, cfg, holder))
+    if paused:
+        return _paused(paused)
+    return _locked(args, cfg)
+
+
+def _paused(why: str) -> int:
+    """维护暂停（`pause`）：不拿锁、什么都不做，stdout 与 stderr 各说一遍，退出码 75。"""
+    msg = f"⏸️  维护暂停，本次不执行任何操作：{why}"
+    print(f"\n═══ {msg} ═══")
+    _log(msg)
+    return EXIT_LOCKED
+
+
+def _paused_run(args, cfg, why: str) -> int:
+    """暂停的 `run` 也写健康报告（warn）：忘了删的 state/PAUSE 不能让 agent 悄悄停摆。"""
+    rh = health.RunHealth(cfg, run_id=args.run_id, cmd="run",
+                          dry_run=args.dry_run or not cfg.auto_apply)
+    rh.paused(why)
+    return _finish_run(cfg, rh, _paused(why))
+
+
+def _locked_out_run(args, cfg, holder: str) -> int:
+    """被运行锁挡住的 `run` 也写健康报告（warn）：锁要是被一个卡死的进程一直拿着，每一轮都这样悄悄结束。"""
+    rh = health.RunHealth(cfg, run_id=args.run_id, cmd="run",
+                          dry_run=args.dry_run or not cfg.auto_apply)
+    rh.locked(holder or "持有者未知，可能是部署脚本")
+    return _finish_run(cfg, rh, _locked_out(holder))
+
+
+def _run_banner(args, cfg) -> None:
+    """`run` 拿到锁之后、做任何事之前：轮转日志（锁保证没有别的 media-agent 同时在写），打一行轮次分隔。"""
+    rotated = runlog.rotate(cfg.state_dir)
+    print(f"═══ media-agent {__version__} run 开始：批次 {args.run_id}"
+          f"{'（预演）' if args.dry_run or not cfg.auto_apply else ''} ═══")
+    for m in rotated:
+        _log(m)
+
+
+def _locked(args, cfg, before=None, locked_out=None) -> int:
+    """需要运行锁的子命令先拿锁（见 runlock.py），拿不到以 75 结束（`locked_out(持有者)` 给了就交给它）。
+    `before` 在拿到锁之后、执行之前调用。"""
     if not _needs_lock(args):
+        if before:
+            before(args, cfg)
         return args.func(args, cfg)
     lock = RunLock(cfg.state_dir / LOCK_NAME, label=" ".join(["media-agent", *sys.argv[1:]]))
     if not lock.acquire(wait=runlock.DEFAULT_WAIT):
-        return _locked_out(lock.holder())
+        return (locked_out or _locked_out)(lock.holder())
     try:
+        if before:
+            before(args, cfg)
         return args.func(args, cfg)
     finally:
         lock.release()
