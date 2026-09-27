@@ -412,31 +412,7 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
     if (wanted or remembered or stored) and not air:
         return (wanted[0] if wanted else "") or remembered or stored
 
-    cands: list[str] = []
-    for c in (*wanted, remembered, stored):
-        if c and c not in cands:
-            cands.append(c)
-    for s in sc.sources:
-        m = re.search(r"bangumiId=(\d+)", s.get("rss_link") or "")
-        if m and m.group(1) not in cands:
-            cands.append(m.group(1))
-    for kw in [sc.canonical_title, show.official_title, *sc.aliases]:
-        kw = (kw or "").strip()
-        if not kw:
-            continue
-        ck = f"mikansearch:{kw}"
-        hit = cache.get_llm(ck, ttl=LOOKUP_TTL)
-        if hit is None:
-            try:
-                hit = {"ids": _mikan_search_ids(kw, 3)}
-            except Exception as e:
-                if log:
-                    log(f"[episode-available] Mikan 搜索失败 {kw}：{type(e).__name__}: {e}")
-                continue
-            cache.put_llm(ck, hit)
-        for i in (hit.get("ids") or []):
-            if i not in cands:
-                cands.append(i)
+    cands = _mikan_candidates(sc, show, cache, log=log, season=season, preferred=wanted)
     if not cands:
         return None
 
@@ -465,6 +441,65 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
     if best != remembered:
         cache.put_llm(key, {"id": str(best), "fit": round(best_fit, 3)})
     return str(best)
+
+
+def _mikan_candidates(sc, show, cache, log=None, season: int | None = None, preferred=()) -> list[str]:
+    """这部番可能对应的全部 Mikan 番组页，顺序即可信度：这一季的订阅指定的（`preferred`）、上轮为这一季选中的、
+    sidecar 记着的、rss_link 里的、按标题搜到的（搜索结果走缓存）。`_resolve_mikan_id` 从中按播出日期挑一页；
+    缺的集在那一页上没有候选时，抓取再按这一集的播出日期到其余页里找。"""
+    stored = str(getattr(sc, "mikan_id", "") or "")
+    remembered = str((cache.get_llm(_pick_key(show, season), ttl=PICK_TTL) or {}).get("id") or "")
+    cands: list[str] = []
+    for c in (*(str(p or "") for p in preferred), remembered, stored):
+        if c and c not in cands:
+            cands.append(c)
+    for s in sc.sources:
+        m = re.search(r"bangumiId=(\d+)", s.get("rss_link") or "")
+        if m and m.group(1) not in cands:
+            cands.append(m.group(1))
+    for kw in [sc.canonical_title, show.official_title, *sc.aliases]:
+        kw = (kw or "").strip()
+        if not kw:
+            continue
+        ck = f"mikansearch:{kw}"
+        hit = cache.get_llm(ck, ttl=LOOKUP_TTL)
+        if hit is None:
+            try:
+                hit = {"ids": _mikan_search_ids(kw, 3)}
+            except Exception as e:
+                if log:
+                    log(f"[episode-available] Mikan 搜索失败 {kw}：{type(e).__name__}: {e}")
+                continue
+            cache.put_llm(ck, hit)
+        for i in (hit.get("ids") or []):
+            if i not in cands:
+                cands.append(i)
+    return cands
+
+
+# 番组页"覆盖"某一集：页上发布的时间跨度把这集的播出日期包进来。页上最早的发布可以比播出晚到 30 天（迟到的搬运组、
+# 合集），最晚的发布可以比播出早到 `PREAIR_SLACK_DAYS`（抢先党）。v0.5.1 把两头的松弛写反了：第一集播出 20 天后
+# 才有合集的页，覆盖不到它自己的第一集。
+LATE_SLACK_DAYS = 30
+
+
+def _pub_span(items: list[dict]):
+    pubs = []
+    for it in items:
+        try:
+            pubs.append(date.fromisoformat(it.get("pub") or ""))
+        except ValueError:
+            pass
+    return (min(pubs), max(pubs)) if pubs else None
+
+
+def _span_covers(span, air: str) -> bool:
+    try:
+        a = date.fromisoformat(air)
+    except (TypeError, ValueError):
+        return False
+    lo, hi = span
+    return lo - timedelta(days=LATE_SLACK_DAYS) <= a <= hi + timedelta(days=PREAIR_SLACK_DAYS)
 
 
 class EpisodeAvailableDetector:
@@ -680,10 +715,11 @@ class EpisodeAvailableDetector:
                             grace_cut=grace_cut) -> bool:
                     return sub and season > 0 and ep > newest and bool(air_of.get(ep)) and air_of[ep] <= grace_cut
 
+                preferred = _pages_for(subs, rows, int(season_key))
                 mid = _resolve_mikan_id(
                     sc, show, cache, log=ctx.log, season=int(season_key),
                     air=[d for d in (air_of.get(n) for n in aired) if d],
-                    preferred=_pages_for(subs, rows, int(season_key)),
+                    preferred=preferred,
                     recent=[d for d in (air_of.get(n) for n in missing) if d])
                 if not mid:
                     late = [ep for ep in missing if stalled(ep)]
@@ -732,13 +768,18 @@ class EpisodeAvailableDetector:
                 # 这部番就无声地停了。偏移与判重 / 改名 / 出处账本同一个口径（`episode_offset_for`、`offset_episode`：
                 # 换算出非正数的不收，理由记进 `off_season`，照样报出来）
                 ep_off = offset_for(int(season_key)) if int(season_key) else 0
-                by_ep: dict[int, list[dict]] = {}
-                off_season: dict[int, list[tuple[dict, str]]] = {}
-                for it in items:
+
+                def place(it, span, tmdb_season=tmdb_season, ep_off=ep_off, off_by_season=off_by_season,
+                          air_of=air_of):
+                    """一条发布的（原始集号, 落在这一库内季的第几集, 不收的理由）：按 TMDB 那一季的编号认（压平的季里
+                    `S01E30` 就是 TMDB 第 1 季第 30 集），再按这一库内季的集号偏移换算。主番组页与兜底的别的页同一个口径。
+
+                    **没写季号的集号只在它所在的页覆盖这集的播出日期时才算数**（`span`：这一页的发布时间跨度）。平手时选页
+                    会挑发布最新的那一页（Re:Zero 的新一档），压平的季里缺的是好几年前的老集时，那一页上没写季号的 `- 06`
+                    是它自己那一档的第 6 集，不是第 6 集（合并 v0.5.1 时它的测试抓出来的）。"""
                     n = _episode_of(it["title"])
                     if n is None:
-                        continue
-                    # 按 TMDB 那一季的编号认（压平的季里 `S01E30` 就是 TMDB 第 1 季第 30 集），再按这一库内季的集号偏移换算
+                        return None, None, ""
                     ep_here, why = _slot_in_season(it["title"], n, tmdb_season, off_by_season)
                     if ep_here is not None and ep_off:
                         shifted = offset_episode(ep_here, ep_off)
@@ -746,18 +787,62 @@ class EpisodeAvailableDetector:
                             why = (f"按集号偏移 {ep_off:+d} 换算出非正数（{ep_here} → {ep_here + ep_off}），"
                                    f"说不清是哪一集")
                         ep_here = shifted
+                    aired_on = air_of.get(ep_here) if ep_here is not None else None
+                    if (aired_on and span and not _declared_seasons(it["title"])
+                            and not _span_covers(span, aired_on)):
+                        return n, None, (f"没写季号，所在番组页的发布（{span[0]}–{span[1]}）对不上这一集的播出日期"
+                                         f"（{aired_on}）")
+                    return n, ep_here, why
+
+                by_ep: dict[int, list[dict]] = {}
+                off_season: dict[int, list[tuple[dict, str]]] = {}
+                span = _pub_span(items)
+                for it in items:
+                    n, ep_here, why = place(it, span)
+                    if n is None:
+                        continue
                     if ep_here is None:
                         off_season.setdefault(n, []).append((it, why))
                     else:
                         by_ep.setdefault(ep_here, []).append(it)
 
-                silent: list[int] = []           # 归拢表里什么都没有的集：循环之后统一说
                 # 订阅着的季：先给每一集找候选，再在有候选的集里数 `MAX_PER_SHOW`（抓的、没抓成要报的各数各的）。以前
                 # `missing[:6]` 先截断：新订阅常常是"缺的全是已播的"，页上没有前几集（半路订的、Mikan 把两档分成两个页而
                 # TMDB 是一季）时每次都只看同样的前 6 集，后面还在播的永远轮不到（2026-09-27 回放：AB 6 的 E24、E25）。
                 # 没人订的季照旧只看缺的前 6 集：回放里没人订的【我推的孩子】（库里只有第一档 11 集、TMDB 压平成 35 集）
                 # 放开之后要越过第二档整档的空缺，把第三档 E25–E35 抓进来——补不补老档是人的决定，不是抓取的
                 window = missing if season_key in subscribed else missing[:MAX_PER_SHOW]
+
+                # TMDB 把多季压成一季、Mikan 却每季一页：主页面上某集一个候选都没有时，去别的候选页里
+                # **发布时间覆盖这集播出日期**的那些页找（2026-09-27 超百：按全季日期选中了第二季那页 3524，
+                # 第 30、31 集在第三季的 3997 上，检测器静默跳过、从没报过）。按日期选页，不拿别季同集号凑数。
+                # 这一季有订阅指定的页（`preferred`）时只在那几页里找：订阅指定页是人的意图，别的页"日期对得上"只是猜；
+                # 订阅的页上真没有，由 `episode_not_released` 报出来（订阅着的季停下来是 important）
+                need = [ep for ep in window if not by_ep.get(ep) and not off_season.get(ep)]
+                looked = [mid]
+                if need:
+                    for pid in (preferred or _mikan_candidates(sc, show, cache, log=ctx.log, season=int(season_key))):
+                        if pid in looked or len(looked) >= max(4, len(preferred)):
+                            continue
+                        try:
+                            pitems = _feed_cached(pid, cache)
+                        except Exception as e:
+                            ctx.log(f"[episode-available] 拉候选番组页 {pid} 的 feed 失败：{type(e).__name__}: {e}")
+                            continue
+                        looked.append(pid)
+                        span = _pub_span(pitems)
+                        covered = {ep for ep in need if span and _span_covers(span, air_of.get(ep, ""))}
+                        for it in (pitems if covered else ()):
+                            n, ep_here, why = place(it, span)
+                            if n is None:
+                                continue
+                            it = {**it, "page": pid}     # 抓到的记进出处账本的是它真正所在的页
+                            if ep_here in covered:
+                                by_ep.setdefault(ep_here, []).append(it)
+                            elif ep_here is None and n in covered:
+                                off_season.setdefault(n, []).append((it, why))
+
+                silent: list[int] = []           # 哪一页的归拢表里都什么都没有的集：循环之后统一说
                 grabs = noted = 0
                 for ep in window:
                     raw = by_ep.get(ep) or []
@@ -832,7 +917,7 @@ class EpisodeAvailableDetector:
                                  f"可抓取（{len(cands)} 个候选中选 {verdict.why()}）"),
                         show=show.dir_name,
                         evidence={"season": season_key, "episode": ep,
-                                  "air_date": air_of.get(ep, ""), "mikan_id": mid,
+                                  "air_date": air_of.get(ep, ""), "mikan_id": best.get("page") or mid,
                                   "chosen": best["title"][:140],
                                   "chosen_pub": best.get("pub", ""),
                                   "rejected_by_date": len(wrong_season),
@@ -860,7 +945,7 @@ class EpisodeAvailableDetector:
                         ),
                     )
                 if silent:
-                    yield from self._silent(show, int(season_key), silent, by_ep, eps, air_of, mid,
+                    yield from self._silent(show, int(season_key), silent, by_ep, eps, air_of, looked,
                                             ep_off, today, ranged=ranged, stalled=stalled)
 
     def _unidentified(self, ctx: Context, show, rows) -> Iterable[Finding]:
@@ -893,9 +978,10 @@ class EpisodeAvailableDetector:
                       "bangumi_ids": [r.get("id") for r in rows if abrow.library_season(r) == season]})
 
     def _silent(self, show, season: int, silent: list[int], by_ep: dict, eps: list[dict],
-                air_of: dict, mid: str, ep_off: int, today: str, *, ranged: bool = False,
+                air_of: dict, pages: list[str], ep_off: int, today: str, *, ranged: bool = False,
                 stalled=lambda ep: False) -> Iterable[Finding]:
-        """要找的集在归拢表里什么都没有（N13 以前的 bare `continue`）：说出来。
+        """要找的集在归拢表里什么都没有（N13 以前的 bare `continue`；主番组页 `pages[0]` 与按播出日期兜底查过的别的页
+        都算上）：说出来。
 
         - 番组页上有编号落在这一季**之外**（比 TMDB 这一季最后一集还大）：多半是按连续集号发布、又没登记集号偏移——
           这一季一集都抓不到，报 `episode_numbering_mismatch`（important），带上按最小编号推测的偏移供人核对；
@@ -916,7 +1002,7 @@ class EpisodeAvailableDetector:
                 show=show.dir_name,
                 evidence={"season": season, "missing": silent, "unplaced": unplaced[:24],
                           "season_episodes": last, "episode_offset": ep_off,
-                          "suggested_offset": guess, "mikan_id": mid},
+                          "suggested_offset": guess, "mikan_id": pages[0], "mikan_pages": pages},
             )
             return
         cutoff = (date.fromisoformat(today) - timedelta(days=NO_RELEASE_GRACE_DAYS)).isoformat()
@@ -928,12 +1014,13 @@ class EpisodeAvailableDetector:
             rule=self.id, kind="episode_not_released", severity="important" if late else "minor",
             subject=f"S{season:02d}",
             summary=(f"「{show.official_title}」S{season} 的 {overdue} 播出已超过 {NO_RELEASE_GRACE_DAYS} 天，"
-                     f"番组页 {mid} 上还没有这几集的任何发布（字幕组断更、番组页选错了，或发布标题认不出集号）"),
+                     f"番组页（查过 {len(pages)} 个：{', '.join(pages)}）上还没有这几集的任何发布"
+                     f"（字幕组断更、番组页选错了，或发布标题认不出集号）"),
             show=show.dir_name,
             evidence={"season": season, "episodes": overdue, "stalled": late,
                       "waiting": [ep for ep in silent if ep not in overdue],
                       "air_dates": {str(ep): air_of.get(ep, "") for ep in overdue},
-                      "grace_days": NO_RELEASE_GRACE_DAYS, "mikan_id": mid},
+                      "grace_days": NO_RELEASE_GRACE_DAYS, "mikan_id": pages[0], "mikan_pages": pages},
         )
 
 
