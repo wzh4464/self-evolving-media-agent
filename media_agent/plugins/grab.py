@@ -23,8 +23,9 @@ import re
 from datetime import date, timedelta
 from typing import Iterable
 
-from .. import preferences
+from .. import abrow, preferences
 from ..cache import Cache, FEED_TTL, LOOKUP_TTL, season_episodes
+from ..claims import fold
 from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
                       tmdb_groups)
 from ..naming import (SPECIAL_RE, declared_seasons, offset_episode, parse_episode, parse_pin,
@@ -219,23 +220,54 @@ def _feed_cached(mid: str, cache) -> list[dict]:
     return got.get("items") or []
 
 
+def _ab_rows_by_dir(rows, media_root) -> dict[str, list[dict]]:
+    """AB 的有效订阅行按番目录分组（`claims.fold` 过的目录名 → 按 id 排的行）。`show.bangumi` 只挂一行（同一个目录的
+    第一行），可一部番可以有好几季的订阅。"""
+    out: dict[str, list[dict]] = {}
+    for row in sorted(rows or [], key=lambda r: int(r.get("id") or 0)):
+        name = abrow.show_dir_name(row, media_root)
+        if name:
+            out.setdefault(fold(name), []).append(row)
+    return out
+
+
+def _pages_for(subs: dict, rows, season: int) -> list[str]:
+    """库内第 `season` 季的订阅指定的番组页：sidecar 订阅的 `mikan_id`，再是 AB 里落进这一季的每条有效订阅的
+    bangumiId（与 `episode_offset_for` 同一个口径：AB 行只对它落进的那一季，`abrow.library_season`）。"""
+    pages = [str((subs.get(str(season)) or {}).get("mikan_id") or "")]
+    pages += [abrow.mikan_id_of(r.get("rss_link")) for r in rows if abrow.library_season(r) == season]
+    return [p for p in dict.fromkeys(pages) if p]
+
+
 def _pick_key(show, season: int | None) -> str:
     """选中的番组页在缓存里的键：按 TMDB id（目录改名不丢）+ 季——同一部番的不同季常在不同的番组页。"""
     return f"mikanpick:{show.tmdb_id or show.dir_name}:{'' if season is None else season}"
 
 
+def _latest_pub(items: list[dict]) -> str:
+    """番组页上最新一条发布的日期（ISO 字符串，没有返回空串）。"""
+    return max((str(it.get("pub") or "") for it in items), default="")
+
+
 def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
-                      season: int | None = None, preferred: str = "") -> str | None:
+                      season: int | None = None, preferred=(), recent: list[str] | None = None) -> str | None:
     """找这部番（这一季）在 Mikan 上的番组 id。
 
     候选的来源是有讲究的：
-    0. 这一季的订阅里记着的番组页（`preferred`：AB 订阅的 bangumiId、`subscribe --mikan`）——人为这一季选的，最先试
+    0. 这一季的订阅指定的番组页（`preferred`：sidecar 订阅的 `mikan_id`、AB 里对这一季的有效订阅的 bangumiId、
+       `subscribe --mikan`）——人为这一季选的，最先试
     1. 上一轮为这一季选中的（`state/` 缓存里的 `mikanpick:`）与 sidecar 里的 `mikan_id` —— 先试
     2. 从已有的 rss_link 里抠 —— 番组式链接里就带着 bangumiId，
        这是**已被验证过的**映射（订阅确实从它拿到过内容）
     3. 才轮到按标题搜 —— 最不可靠：Mikan 的番组命名常年错位
        （《入间同学入魔了！》标"第三季"的页面装的是第一季），
        按标题搜到的 id 只能算猜测
+
+    **打分与平手**：按这一季已播集的播出日期（`air`）给每个候选打分（`_season_fit`），取最高的。TMDB 把几年的几档压平成
+    一季时（Re:Zero：2016 → 2026 共 85 集），窗口框得住每一个页、全都是 1.0——以前严格的 `>` 让排在前面的赢（上一轮记住的、
+    sidecar 里人很久以前填的「第二季」页 2259），这一档的 E83、E84 在 AB 订阅的 3951 上早就有了，一直没抓（2026-09-27 回放）。
+    现在平手时依次比：是不是订阅指定的页 → 离缺的那几集近不近（`recent`：按缺的集的播出日期开窗打分）→ 最新一条发布的
+    日期 → 候选的先后。
 
     **选中的记进缓存，不写 sidecar。** 以前在这里 `save_sidecar`——那是检测期：`diagnose`、
     `apply --dry-run`、演进器的影子验证都会改写媒体库里的 `.media-agent.json`，改动没有审计、回退不了
@@ -246,14 +278,16 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
     key = _pick_key(show, season)
     remembered = str((cache.get_llm(key, ttl=PICK_TTL) or {}).get("id") or "")
 
-    preferred = str(preferred or "")
+    if isinstance(preferred, str):
+        preferred = (preferred,)
+    wanted = [str(p) for p in dict.fromkeys(str(p or "") for p in preferred) if p]
 
     # 没有播出日期可比时，只能沿用存下来的（老番、TMDB 查不到的情况）
-    if (preferred or remembered or stored) and not air:
-        return preferred or remembered or stored
+    if (wanted or remembered or stored) and not air:
+        return (wanted[0] if wanted else "") or remembered or stored
 
     cands: list[str] = []
-    for c in (preferred, remembered, stored):
+    for c in (*wanted, remembered, stored):
         if c and c not in cands:
             cands.append(c)
     for s in sc.sources:
@@ -284,16 +318,19 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
     # 这一步是必要的：入间同学的 rss_link 是搜索式链接（没有 bangumiId），
     # 于是只能按标题搜，搜到的 2839 是**第三季**的页面——它每一集都齐、
     # 每个集号都对得上，唯独年份差了三年。不比时间就发现不了。
-    best, best_fit = None, 0.0
-    for mid in cands[:4]:
+    # 只比前四个候选；订阅指定的页多于四个时（同一季好几条 AB 订阅）全都比
+    best, best_fit, best_rank = None, 0.0, None
+    for i, mid in enumerate(cands[:max(4, len(wanted))]):
         try:
-            fit = _season_fit(_feed_cached(mid, cache), air)
+            items = _feed_cached(mid, cache)
         except Exception as e:
             if log:
                 log(f"[episode-available] 拉候选番组页 {mid} 的 feed 失败：{type(e).__name__}: {e}")
             continue
-        if fit > best_fit:
-            best, best_fit = mid, fit
+        fit = _season_fit(items, air)
+        rank = (fit, mid in wanted, _season_fit(items, recent or []), _latest_pub(items), -i)
+        if fit > 0 and (best_rank is None or rank > best_rank):
+            best, best_fit, best_rank = mid, fit, rank
     if best is None or best_fit < 0.15:
         # 一个都对不上：宁可不抓，也不要从错的季里抓。
         # 返回 None 会让上层报"找不到 Mikan 番组页"，那是准确的描述。
@@ -341,6 +378,7 @@ class EpisodeAvailableDetector:
         groups = tmdb_groups(state.shows)
         by_hash = {t["hash"]: t for t in state.torrents}
         dup_reported: set[int] = set()
+        ab_rows = _ab_rows_by_dir(state.bangumi_rows, ctx.config.media_root)
 
         for show in state.shows:
             if not show.tmdb_id or show.naming_hold:
@@ -457,7 +495,8 @@ class EpisodeAvailableDetector:
                 mid = _resolve_mikan_id(
                     sc, show, cache, log=ctx.log, season=int(season_key),
                     air=[d for d in (air_of.get(n) for n in aired) if d],
-                    preferred=str((subs.get(season_key) or {}).get("mikan_id") or ""))
+                    preferred=_pages_for(subs, ab_rows.get(fold(show.dir_name), ()), int(season_key)),
+                    recent=[d for d in (air_of.get(n) for n in missing) if d])
                 if not mid:
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="minor",
