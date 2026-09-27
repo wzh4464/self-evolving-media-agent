@@ -82,6 +82,21 @@ def test_offset_that_would_give_a_non_positive_episode_is_unparsable(lib):
     assert not [x for x in found if x.action]
 
 
+def test_an_offset_that_lands_exactly_on_zero_is_unparsable(lib):
+    """换算出正好 0（`- 24` 配上 -24）也是认不出：不能落进第 0 集——那是特典位，判重 / 改名会把它塞进 Season 0 的
+    集位。以前只测过 -23（`- 01`），`m > 0` 改成 `m >= 0` 全套测试照样过（审查的变异 T1-06）。"""
+    from media_agent.naming import offset_episode
+    assert offset_episode(24, -24) is None and offset_episode(25, -24) == 1 and offset_episode(1, 0) == 1
+    _, s3 = _season3(lib)
+    s3.single("[Nekomoe kissaten] Hyakkano - 24 [1080p][JPSC].mkv")
+
+    show, files = _files(lib)
+    [f] = files.values()
+    assert _resolve(f, show) is None
+    assert episode_of_file(f, episode_offset=-24) is None
+    assert not [x for x in lib.diagnose(detectors=[UnrenamedDetector]) if x.action]
+
+
 def test_release_name_still_gets_the_offset(lib):
     """对照：发布名照旧换算（`- 25` → S03E01），这是偏移存在的理由。"""
     _, s3 = _season3(lib)
