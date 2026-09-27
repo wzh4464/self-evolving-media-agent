@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from harness import MikanItem, video, weekly
 
 from media_agent import sidecar as sc_mod
@@ -368,3 +369,86 @@ def test_a_new_row_for_a_deleted_show_still_gets_its_dir(lib):
     [made] = [f for f in fs if f.action]
     assert made.action.op == "create_show_dir" and made.action.args["seasons"] == [2]
     assert [f.kind for f in fs if not f.action] == ["ab_subscription_dir_gone"]
+
+
+# ------------------------------------------------------------------ 写的那一刻再核一次（人的意图只补不改）
+def _existing_show_with_s2_row(lib):
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(NEW)
+    sh.season(1).local(f"{NEW} S01E01.mkv")
+    sh.sidecar(seasons={"1": {"have": [1]}})
+    _row(lib, season=2)
+    return sh
+
+
+def test_a_subscription_a_human_wrote_after_diagnose_is_not_overwritten(lib):
+    """诊断时第 2 季还没有订阅、sidecar 也没有番组页 id；执行之前人写上了自己的订阅与 `mikan_id`：执行按此刻的文件，
+    一个字都不改（AGENTS.md 第 16 条）。审查的变异 T2-17（删掉 `_op_subscribe_season` 里"这一季已经订阅"的检查）以前
+    全套测试照样过。"""
+    sh = _existing_show_with_s2_row(lib)
+    findings = [f for f in _findings(lib) if f.action and f.action.op == "subscribe_season"]
+    assert findings and findings[0].action.args["intent"] == {"mikan_id": MID}
+    human = {"source": "cli", "mikan_id": "1111", "since": "2026-09-27"}
+    sh.sidecar(subscriptions={"2": human}, mikan_id="1111")
+
+    rep = lib.apply(findings)
+
+    [rec] = rep.skipped
+    assert "已经订阅" in rec["reason"]
+    sc = lib.sidecar(NEW)
+    assert sc.subscriptions == {"2": human} and sc.mikan_id == "1111"
+
+
+def test_intent_riding_along_never_replaces_what_the_sidecar_has(lib):
+    """`subscribe_season` 顺带补的意图（番组页 id、版本要求、TMDB 身份）只在 sidecar 还没有时填：已有的不同的值原样留着，
+    只写下这一季的订阅。审查的变异 T2-16（`_fill_intent` 的"还是空的才填"改成一律填）以前全套测试照样过。"""
+    from media_agent.kernel import Action, Finding
+
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(NEW)
+    sh.season(1).local(f"{NEW} S01E01.mkv")
+    sh.sidecar(seasons={"1": {"have": [1]}}, mikan_id="1111", require_any=["邪竜解放版"], tmdb_id=3401,
+               tmdb_source="human")
+    f = Finding(rule="subscribe", kind="subscribe", severity="important", summary="订阅第 2 季", show=NEW,
+                action=Action(op="subscribe_season", args={
+                    "show_dir": str(sh.path), "season": 2, "subscription": {"source": "cli"},
+                    "intent": {"mikan_id": "2222", "require_any": ["TV 版"], "tmdb_id": 9999}}))
+
+    rep = lib.apply([f])
+
+    [rec] = rep.applied
+    assert rec["undo"]["entries"] == [{"field": "subscriptions", "key": "2", "value": {"source": "cli"}}]
+    sc = lib.sidecar(NEW)
+    assert (sc.mikan_id, sc.require_any, sc.tmdb_id, sc.tmdb_source) == ("1111", ["邪竜解放版"], 3401, "human")
+    assert sc.subscriptions == {"2": {"source": "cli"}}
+
+
+@pytest.mark.allow("failed_record", match="create_show_dir")
+def test_creating_a_dir_is_refused_when_qbittorrent_cannot_be_read(lib):
+    """占用看不全（qBittorrent 的种子列表读失败）就拒绝：盘上看不到不等于没人占（AGENTS.md 第 8 条）。审查的变异 T2-13
+    （`if chk.unknown:` → `if False:`）以前全套测试照样过。"""
+    _row(lib)
+    findings = _findings(lib)
+    lib.qbit.fail("torrents", times=None)
+
+    rep = lib.apply(findings)
+
+    [rec] = rep.failed
+    assert rec["op"] == "create_show_dir" and "无法确认" in rec["error"]
+    assert not lib.path(NEW).exists()
+
+
+def test_rollback_keeps_a_dir_a_torrent_now_saves_into(lib):
+    """建目录之后 AB 加了一个种子（0%，盘上什么都没有）保存进 `Season 1`：目录归它了，回退不删、写明是哪个种子。审查的
+    变异 T2-15（`_remove_show_dir` 的 `if owners:` → `if False:`）以前全套测试照样过——只测过盘上有东西的那一种。"""
+    _row(lib, season=1)
+    c = lib.cycle(detectors=[AbAdoptionDetector])
+    lib.qbit.seed("f" * 40, name="[LoliHouse] Shinban Otsu - 01", save_path=lib.path(NEW) / "Season 1",
+                  files={"[LoliHouse] Shinban Otsu - 01.mkv": 600_000_000}, progress=0.0,
+                  category="Bangumi", tags="ab:51")
+
+    res = lib.rollback(c.run_id)
+
+    assert res["reverted"] == 0 and res["skipped"] == 1
+    assert "ffffffff" in res["skipped_detail"][0]["skip_reason"]
+    assert lib.path(NEW).is_dir()
