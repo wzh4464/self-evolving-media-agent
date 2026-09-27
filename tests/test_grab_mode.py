@@ -66,6 +66,38 @@ def test_grab_mode_grabs_and_renames_only_what_media_agent_grabbed(lib):
     assert any(f.action and f.action.op == "rename" and f.torrent_hash == ab.hash for f in loop.findings)
 
 
+def test_grab_mode_renames_a_torrent_the_ledger_says_it_grabbed(lib):
+    """"本项目抓的" = `ma:` 钉子**或**出处账本里的抓取行：钉子没了（人改过标签）的，账本照样认，照样收尾改名。以前每个
+    抓取模式的测试都靠 `ma:` 认（审查的变异 T4-05 删掉账本那一半，全套测试照样过）。"""
+    from media_agent import ledger
+
+    sh = _airing(lib, have=(1, 2, 4))
+    ours = sh.season(1).single("[LoliHouse] Zhuaqu Wu - 03 [WebRip 1080p].mkv", probe=TWO_SUBS)
+    with ledger.Ledger.open(lib.cfg.state_dir) as led:
+        led.record_grab(infohash=ours.hash, mikan_title=TPL.format(3), season=1, episode=3, run_id="g0")
+
+    loop = lib.grab_loop()
+
+    assert {r["args"]["torrent_hash"] for r in loop.applied("rename")} == {ours.hash}
+    assert [p.name for p in ours.current_paths()] == [f"{SHOW} S01E03.mkv"]
+
+
+def test_the_scope_keeps_torrents_it_handed_over_in_earlier_iterations(lib):
+    """订阅模式：这一轮见过在 AB 分类里的种子，交接到剧名分类之后照样算"本项目的"（下一次迭代改名、判重还认它）。
+    审查的变异 W2-21（`handed |=` 写成 `handed =`）全套测试照样过——交接的测试在同一次迭代里就改完了名。"""
+    from types import SimpleNamespace
+
+    lib.configure(ab_mode="subscription")
+    scope = grabmode.Scope(lib.cfg)
+    h = "a" * 40
+
+    scope.observe(SimpleNamespace(torrents=[{"hash": h.upper(), "category": "Bangumi", "tags": ""}], ledger_rows={}))
+    assert h in scope.grabbed
+    scope.observe(SimpleNamespace(torrents=[{"hash": h, "category": SHOW, "tags": ""}], ledger_rows={}))
+    assert h in scope.grabbed
+    assert "b" * 40 not in scope.grabbed
+
+
 def test_grab_mode_dedupes_a_slot_that_holds_its_own_grab(lib):
     """AB 的 ABEMA 生肉占着 E04 的集位名；本项目抓的 LoliHouse 那份下完了：判重清走生肉、赢家改名——同一次抓取里收尾。"""
     sh = _airing(lib, releases=())

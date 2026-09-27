@@ -92,6 +92,23 @@ def test_grab_prints_only_findings_that_concern_it(offline_cli, monkeypatch, cap
     assert rep["findings"]["total"] == 0          # 收尾诊断里只剩 AB 那一份的改名：不是抓取的事，不算
 
 
+def test_grab_refuses_loudly_when_qbittorrent_is_down(offline_cli, monkeypatch, capsys):
+    """qBittorrent 不可用：整批拒绝，大声说（stdout 进 grab.log、stderr 进 grab.err.log），退出码 3、健康报告 critical（与
+    `run` 同一个口径）。审查的变异 T4-19（拒绝时 `return 0`）全套测试照样过：退出码由健康报告的 critical 原因兜住了，
+    少的是那一行拒绝的横幅——没有测试看它。"""
+    lib = offline_cli
+    _scene(lib)
+    lib.qbit_down()
+
+    assert _main(monkeypatch, "grab") == cli.EXIT_DEGRADED
+
+    captured = capsys.readouterr()
+    assert "⛔ 拒绝执行任何改动" in captured.out and "⛔ 拒绝执行任何改动" in captured.err
+    [rep] = _grab_reports(lib)
+    assert rep["status"] == "critical"
+    assert not [r for r in lib.audit() if r["op"] == "grab_episode"]
+
+
 def test_health_shows_the_last_grab_with_a_flag(offline_cli, monkeypatch, capsys):
     lib = offline_cli
     _scene(lib)
