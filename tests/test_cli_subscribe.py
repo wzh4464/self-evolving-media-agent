@@ -153,6 +153,23 @@ def test_two_dirs_for_one_show_ask_for_dir(offline_cli, capsys):
     assert "--dir" in capsys.readouterr().out
 
 
+def test_a_dir_other_than_the_one_that_owns_the_show_is_refused(offline_cli, capsys):
+    """这部番已经有目录（它的 sidecar 记着这个 tmdb_id），`--dir` 却指向另一个：拒绝、什么都不写——两个目录抓同一部番，
+    抓取只认文件多的那个（审查的变异 T3-07 以前全套测试照样过）。"""
+    lib = offline_cli
+    lib.configure(qbit_allow_empty=True)
+    _airing(lib)
+    sh = lib.show(TITLE)
+    sh.season(1).local(f"{TITLE} S01E01.mkv")
+    sh.sidecar(tmdb_id=TMDB, tmdb_source="human")
+
+    assert cli.cmd_subscribe(_args(season=1, dir="别的目录"), lib.cfg) == 2
+
+    assert TITLE in capsys.readouterr().out
+    assert not lib.path("别的目录").exists()
+    assert not [r for r in lib.audit() if r.get("op") in ("create_show_dir", "subscribe_season")]
+
+
 @pytest.mark.allow("tmdb_unknown")                       # 这里就是要问一个不存在的 id
 def test_an_unknown_tmdb_id_is_refused(offline_cli, capsys):
     lib = offline_cli

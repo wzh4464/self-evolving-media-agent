@@ -156,6 +156,44 @@ def test_an_unmappable_save_path_is_reported_not_acted_on(lib):
     assert not lib.path(NEW).exists()
 
 
+def test_a_save_path_that_is_a_season_dir_right_under_the_root_is_unmapped(lib):
+    """`save_path` 是 `<媒体根>/Season 1`：媒体根下那一段是季目录名，不是番目录——报 `ab_subscription_unmapped`，不在媒体根下
+    建一个叫 `Season 1` 的"番"（`safe_dir_name` 拒季目录名；审查的变异 T2-11 以前全套测试照样过）。"""
+    lib.bangumi(id=54, official_title=NEW, title_raw="Shinban Otsu", season=1, rss_link=RSS,
+                save_path=str(lib.media_root / "Season 1"))
+
+    [f] = _findings(lib)
+
+    assert f.kind == "ab_subscription_unmapped" and not f.action
+    assert not (lib.media_root / "Season 1").exists()
+
+
+def test_the_season_dir_in_save_path_decides_the_library_season(lib):
+    """AB 行上 `season=2`、`season_offset=0`，可 `save_path` 是 `…/Season 3`：AB 的下载落进 Season 3，订阅也登记第 3 季
+    （`abrow.library_season`：`save_path` 的 `Season N` 优先；以前每个现场两者都一致，审查的变异 T2-20 照样过）。"""
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(NEW)
+    sh.season(1).local(f"{NEW} S01E01.mkv")
+    sh.sidecar(seasons={"1": {"have": [1]}})
+    lib.bangumi(id=55, official_title=NEW, title_raw="Shinban Otsu", season=2, rss_link=RSS,
+                save_path=str(lib.path(NEW) / "Season 3"))
+
+    [f] = [f for f in _findings(lib) if f.action]
+
+    assert f.action.op == "subscribe_season" and f.action.args["season"] == 3 and f.subject == "S03"
+
+
+def test_a_corrupt_sidecar_gets_no_subscription_proposed(lib):
+    """番目录的档案坏了：不提议订阅（执行时也会拒，但诊断里就不该出一个做不成的动作——坏档案由 sidecar-sync 报）。"""
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(NEW)
+    sh.season(1).local(f"{NEW} S01E01.mkv")
+    sc_mod.path_for(sh.path).write_text("{ broken", encoding="utf-8")
+    _row(lib, season=2)
+
+    assert not [f for f in _findings(lib) if f.action]
+
+
 def test_a_stale_save_path_does_not_make_an_empty_twin(lib):
     """AB 的保存路径还指着改名之前的目录名（人手改了目录、没同步到 AB），而现在的目录的档案记着这条订阅：
     不建一个只有档案的空壳（抓取会把它当重复目录跳过，标题对齐还要往已有的目录上改），报出来。"""
@@ -173,12 +211,13 @@ def test_a_stale_save_path_does_not_make_an_empty_twin(lib):
 
 
 def test_a_case_variant_of_an_existing_dir_is_not_created_again(lib):
-    """生产卷是大小写不敏感的 APFS：`re zero` 与 `Re Zero` 是同一个目录。"""
+    """生产卷是大小写不敏感的 APFS：`RE ZERO` 与 `Re Zero` 是同一个目录。AB 这一边的名字也要折叠——以前的现场用的是
+    `re zero`，它折叠前后一样，查的那一侧不折叠也照样过（审查的变异 T2-29）。"""
     lib.configure(qbit_allow_empty=True)
     sh = lib.show("Re Zero")
     sh.season(1).local("Re Zero S01E01.mkv")
     sh.sidecar(seasons={"1": {"have": [1]}})
-    _row(lib, name="re zero", season=1)
+    _row(lib, name="RE ZERO", season=1)
 
     assert not [f for f in _findings(lib) if f.action and f.action.op == "create_show_dir"]
 
