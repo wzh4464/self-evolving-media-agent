@@ -728,13 +728,18 @@ def cmd_ab_mode(args, cfg) -> int:
     if config is None:
         seen = f"{where}：{abmode.describe_flags(flags)}" if flags else where
         return _refuse(f"AutoBangumi 的接口不可用，不切换——改配置、重启、读回核对都要接口（{seen}）")
-    # 两边都已是目标就什么都不做。subscription 还要求模式是命令切的（`state`）：来自 AB_MODE 的没有核对用的基线，
-    # 切一次（开关已关的只重启、核对、记基线）才核对得了；full 没有基线要记，不为记一笔去重启 AB
+    # 两边都已是目标就什么都不做。subscription 还要求模式是命令切的（`state`）、而且切换之后的核对没有问题：来自 AB_MODE
+    # 的没有核对用的基线；切换时没记下基线、之后 AB 拉过 RSS（有人点了一次刷新、重启没生效）的，基线永远停在切换那一刻，
+    # warn 永远在——README 与警告都说"再跑同一条命令"，它就得真的重启、核对、重新记基线（2026-09-27 审查：以前这里一律
+    # "已经是"、什么都不做）。full 没有基线要记，不为记一笔去重启 AB
     if (flags == abmode.flags_for(want) and cfg.ab_mode == want
             and (want == abmode.FULL or cfg.ab_mode_source == "state")):
-        print(f"已经是 {want}：AB 的开关 {abmode.describe_flags(flags)}，本项目也认 {want}"
-              f"（{cfg.ab_mode_source}）。media-agent ab-mode show 看核对")
-        return 0
+        problems = [] if want == abmode.FULL else _ab_mode_problems(ctx, cfg)
+        if not problems:
+            print(f"已经是 {want}：AB 的开关 {abmode.describe_flags(flags)}，本项目也认 {want}"
+                  f"（{cfg.ab_mode_source}）。media-agent ab-mode show 看核对")
+            return 0
+        print(f"已经是 {want}，但切换之后的核对有问题（{'；'.join(problems)}）：重启一次 AB、核对、重新记基线")
     before = abmode.mode_of(flags) or abmode.describe_flags(flags)
     f = Finding(rule="ab-mode", kind="ab_mode_switch", severity="important",
                 summary=(f"AutoBangumi 切到 {want}：{abmode.describe_flags(flags)} → "
@@ -830,20 +835,39 @@ def _ab_mode_show(ctx, cfg) -> int:
             print(f"AutoBangumi 程序：问不到（{type(e).__name__}: {e}）")
     if cfg.ab_mode != abmode.SUBSCRIPTION:
         return rc
+    act, read_error = _ab_activity(ctx, cfg, rec)
+    if read_error:
+        print(f"  ⚠️  {read_error}，下面的核对不全")
+        rc = 1
+    for line in abmode.activity_lines(act):
+        print(line)
+    return 1 if abmode.activity_problems(act) else rc
+
+
+def _ab_activity(ctx, cfg, rec) -> tuple[dict, str]:
+    """切到 subscription 之后 AB 做了什么（`abmode.activity`）与读不全的原因（空串 = 读全了）。"""
+    from . import abmode
+
     rss_rows = bangumi_rows = torrents = []
+    why = ""
     try:
         if ctx.abdb is not None:
             rss_rows, bangumi_rows = ctx.abdb.rss_items(), ctx.abdb.bangumi()
         if ctx.qbit is not None:
             torrents = ctx.qbit.torrents()
-    except Exception as e:                           # noqa: BLE001 —— 只是看一眼，照实说
-        print(f"  ⚠️  读 AB 库 / qBittorrent 出错（{type(e).__name__}: {e}），下面的核对不全")
-        rc = 1
-    act = abmode.activity(rec, rss_rows=rss_rows, bangumi_rows=bangumi_rows, torrents=torrents,
-                          media_root=cfg.media_root)
-    for line in abmode.activity_lines(act):
-        print(line)
-    return 1 if abmode.activity_problems(act) else rc
+    except Exception as e:                           # noqa: BLE001 —— 只是看一眼：原因交给调用方说
+        why = f"读 AB 库 / qBittorrent 出错（{type(e).__name__}: {e}）"
+    return abmode.activity(rec, rss_rows=rss_rows, bangumi_rows=bangumi_rows, torrents=torrents,
+                           media_root=cfg.media_root), why
+
+
+def _ab_mode_problems(ctx, cfg) -> list[str]:
+    """已经是 subscription 时，切换之后的核对还有什么问题（没有基线、AB 拉过 RSS、在订阅之外加了种子、读不全）。"""
+    from . import abmode
+
+    act, why = _ab_activity(ctx, cfg, abmode.read_state(cfg.state_dir))
+    out = [p["code"] for p in abmode.activity_problems(act)]
+    return out + ([why] if why else [])
 
 
 def cmd_health(args, cfg) -> int:

@@ -260,6 +260,47 @@ def test_already_in_the_mode_is_a_no_op(ab_lib, monkeypatch, capsys):
     assert "已经是" in capsys.readouterr().out
 
 
+def test_rerunning_after_a_one_off_poll_restarts_and_takes_a_fresh_baseline(ab_lib, monkeypatch, capsys):
+    """切换之后有人在 WebUI 里点了一次「刷新」（或重启没生效、线程还在拉）：`ab_still_polling`。README 与警告都说"再跑
+    同一条命令"——以前它看两边都是 subscription 就说"已经是"、什么都不做，基线永远停在切换那一刻，这条 warn 永远在
+    （2026-09-27 审查复现）。现在核对有问题就照样重启、核对、重新记基线。"""
+    lib = ab_lib
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    lib.configure(ab_mode="subscription", ab_mode_source="state")
+    first = _state(lib)
+    lib.ab.running["rss"] = True                         # 一次性的拉取
+    lib.ab.poll_rss("2026-09-27T09:00:00+00:00")
+    lib.ab.running["rss"] = False
+    assert _main(monkeypatch, "ab-mode", "show") == 1
+    lib.ab.calls.clear()
+    capsys.readouterr()
+
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+
+    assert "restart" in lib.ab.calls and "update_config" not in lib.ab.calls
+    rec = _state(lib)
+    assert rec["run_id"] != first["run_id"]
+    assert rec["baseline"]["rss_last_checked"] == {"1": "2026-09-27T09:00:00+00:00", "2": "2026-09-27T09:00:00+00:00"}
+    assert "核对有问题" in capsys.readouterr().out
+    assert _main(monkeypatch, "ab-mode", "show") == 0
+
+
+def test_rerunning_records_the_baseline_a_switch_without_ab_db_missed(ab_lib, monkeypatch):
+    """切换那一刻 AB 库读不了（基线为 None → `ab_mode_unverified`）：修好之后再跑一次同一条命令就补上基线。"""
+    lib = ab_lib
+    lib.over["abdb"] = None
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    assert _state(lib)["baseline"] is None
+    lib.configure(ab_mode="subscription", ab_mode_source="state")
+    del lib.over["abdb"]
+    lib.ab.calls.clear()
+
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+
+    assert "restart" in lib.ab.calls
+    assert _state(lib)["baseline"]["bangumi_ids"] == [1, 2]
+
+
 def test_full_on_a_fresh_deploy_is_a_no_op(ab_lib, monkeypatch, capsys):
     """刚部署（默认 full、AB 的开关都开着）再说一次 full：没有基线要记、没有东西要切——不为记一笔去重启 AB。"""
     assert _main(monkeypatch, "ab-mode", "full") == 0

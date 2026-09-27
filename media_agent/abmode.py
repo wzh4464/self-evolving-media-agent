@@ -348,13 +348,15 @@ def activity_problems(act: dict) -> list[dict]:
         out.append({"code": "ab_still_polling",
                     "text": f"切到 subscription（{act.get('since')}）之后 AB 拉过 RSS：{len(polled)} 个 rssitem 的 "
                             f"last_checked_at 变了（{names}{' 等' if len(polled) > 3 else ''}）——RSS 线程还在跑（没重启 / "
-                            f"开关被改回？）或有人点了刷新（刷新也会让它下载）；media-agent ab-mode show 核对"})
+                            f"开关被改回？）或有人点了刷新（刷新也会让它下载）；media-agent ab-mode show 核对，之后再跑一次 "
+                            f"media-agent ab-mode subscription（重启、核对、重新记基线）"})
     outside = (act.get("adds") or {}).get("outside") or []
     if outside:
         names = "、".join(f"{x['hash']} {x['name'][:40]}" for x in outside[:3])
         out.append({"code": "ab_added_outside_subscribe",
                     "text": f"AB 在订阅动作之外加了 {len(outside)} 个种子（{names}{' 等' if len(outside) > 3 else ''}）："
-                            f"RSS 线程 / 刷新 / 对老订阅点了「收集」——订阅模式下订阅之外它不该再下载"})
+                            f"RSS 线程 / 刷新 / 对老订阅点了「收集」——订阅模式下订阅之外它不该再下载；核对过之后再跑一次 "
+                            f"media-agent ab-mode subscription（重启、核对、重新记基线）"})
     return out
 
 

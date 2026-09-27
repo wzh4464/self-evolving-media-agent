@@ -304,10 +304,14 @@ cd ~/media-agent && .venv/bin/media-agent ab-mode subscription
 
 **`ab_still_polling`**：`last_checked_at` 又变了 = AB 又拉了一次 RSS（拉了就可能下载）。`media-agent ab-mode` 看它的开关：
 开着（有人在 WebUI 里打开了）→ 再跑 `media-agent ab-mode subscription`；关着却还在拉 = 程序没重启成 → 同一条命令会再重启一次。
-有人在 WebUI 里点了「刷新」也会这样（刷新不看开关、会下载），那一次核对一下 qBittorrent 里多了什么即可。
+有人在 WebUI 里点了「刷新」也会这样（刷新不看开关、会下载），那一次核对一下 qBittorrent 里多了什么，然后同样再跑一次
+`media-agent ab-mode subscription`。核对是按切换时记的基线比的：**不再跑这一次，这条 warn 就一直在**，之后真的又拉了也分不出来。
+两边都已是 subscription 时，这条命令只在核对有问题（没有基线、拉过 RSS、订阅之外加过种子、读不全）时动手：不再 PATCH，
+重启一次、核对、重新记基线；核对没问题就说「已经是」、什么都不做。
 **`ab_added_outside_subscribe`**：切换之后 AB 加的种子不是新订阅那一刻补的那一批（启发式：新订阅的保存路径下、第一个种子
-之后 1 小时之内的才算）——RSS 线程、刷新、对老订阅点了「收集」。**`ab_mode_unverified`**：模式来自 `.env` 的 `AB_MODE`、没经
-命令切过（核对不了 AB 关没关），或这一轮读不到 AB 库——用命令切一次（开关已关的只重启、核对、记基线）/ 看 `AB_DB`。
+之后 1 小时之内的才算）——RSS 线程、刷新、对老订阅点了「收集」；核对过之后同样再跑一次 `media-agent ab-mode subscription`
+重新记基线。**`ab_mode_unverified`**：模式来自 `.env` 的 `AB_MODE`、没经命令切过，或切换那一刻 AB 库读不了（核对不了 AB 关没
+关），或这一轮读不到 AB 库——用命令切一次（开关已关的只重启、核对、记基线）/ 看 `AB_DB`。
 
 **没核对上（unknown）**：AB 的 config.json 也许已是新开关、线程还是旧的（要到下一次重启才换）；本项目的模式没动。AB 回来之后
 再跑一次同一条命令——开关已对的不再 PATCH，只重启、核对、记录。要退回按下一节。
