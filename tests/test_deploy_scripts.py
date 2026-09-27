@@ -656,6 +656,21 @@ def test_redeploying_the_same_tag_installs_a_missing_job(sandbox):
     assert sandbox.history()[-1][4] == "ok"
 
 
+def test_redeploying_a_tag_without_the_grab_job_removes_a_leftover_one(sandbox):
+    """装着的抓取任务是 tag 里没有的（回滚到更早的版本时没卸成、或人手放进去的）：同一个 tag 再部署不能被"已经是这个
+    版本"短路——它每 30 分钟调一个这个版本没有的子命令。审查的变异 D-05（`plists_current` 的"多了附属任务"那一支改成
+    `elif false`）以前全套测试照样过。"""
+    assert sandbox.deploy("v1.7.0").returncode == 0
+    (sandbox.agents_dir / f"{GRAB}.plist").write_text(GRAB_PLIST.format(prog="/app/.venv/bin/media-agent"),
+                                                     encoding="utf-8")
+
+    r = sandbox.deploy("v1.7.0")
+
+    assert r.returncode == 0, _out(r)
+    assert "无需部署" not in r.stdout
+    assert not sandbox.installed(GRAB)
+
+
 def test_redeploying_with_both_jobs_current_is_a_no_op(sandbox):
     assert sandbox.deploy("v1.4.0").returncode == 0
     n = len(sandbox.history())

@@ -264,3 +264,48 @@ def test_repair_ignores_records_with_bogus_paths(lib, operator_cwd):
 
     assert res["pairs"] == 0
     assert _tree(operator_cwd) == before_cwd
+
+
+# ------------------------------------------------------------------ 第 5 阶段的两种逆操作：只摘白名单里的、开关只认两个布尔
+@pytest.mark.parametrize("entry", [
+    {"field": "canonical_title", "value": "被伪造的标题"},                   # 不在白名单：回退不能借它摘别的
+    {"field": "episode_offsets", "value": -24},                            # 按键摘的字段缺 key
+    "episode_offsets",                                                     # 不是对象
+])
+def test_a_forged_unset_sidecar_record_is_refused(lib, entry):
+    """`unset_sidecar` 只摘正向动作会补的那几项（`actions._UNSETTABLE`）：审计是历史数据、可能被手改。以前删掉白名单
+    检查（审查的变异 T1-22），伪造的 `canonical_title` 条目在摘的时候 KeyError，不是干净的拒绝。"""
+    sh = lib.show("回退甲")
+    sh.sidecar(canonical_title="回退甲", episode_offsets={"3": -24})
+    before = lib.sidecar("回退甲")
+    _write_audit(lib, "forged-unset", {"op": "unset_sidecar", "show_dir": str(sh.path), "entries": [entry]},
+                 op="adopt_episode_offset")
+
+    res = lib.rollback("forged-unset")
+
+    assert res["reverted"] == 0 and res["failed"] == 0 and res["skipped"] == 1
+    assert "entries" in res["skipped_detail"][0]["skip_reason"]
+    after = lib.sidecar("回退甲")
+    assert (after.canonical_title, after.episode_offsets) == (before.canonical_title, before.episode_offsets)
+
+
+ON = {"rss_parser.enable": True, "bangumi_manage.enable": True}
+
+
+@pytest.mark.parametrize("undo", [
+    {"op": "set_ab_mode", "flags": {"rss_parser.enable": "false", "bangumi_manage.enable": False},
+     "set": ON, "prev_state": None},
+    {"op": "set_ab_mode", "flags": {"rss_parser.enable": False}, "set": ON, "prev_state": None},
+    {"op": "set_ab_mode", "flags": {"rss_parser.enable": False, "bangumi_manage.enable": False},
+     "set": ON, "prev_state": {"mode": "half"}},
+])
+def test_a_forged_set_ab_mode_record_is_refused(lib, undo):
+    """`set_ab_mode` 的逆操作只认两个开关各一个布尔、`prev_state` 是合法的模式记录：否则不 PATCH、不重启 AB。`set` 就是
+    AB 此刻的开关（后面那道"有人改过"的检查拦不住它）。审查的变异 W1-20 把这道校验关掉，全套测试照样过——字符串
+    "false" 会被当成真值发给 AB。"""
+    _write_audit(lib, "forged-ab", undo, op="set_ab_mode")
+
+    res = lib.rollback("forged-ab")
+
+    assert res["reverted"] == 0 and res["skipped"] == 1
+    assert not [c for c in lib.ab.calls if c in ("update_config", "restart")]
