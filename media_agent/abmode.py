@@ -187,30 +187,41 @@ def restart_and_wait(ab, want: dict, *, timeout: float | None = None, poll: floa
                      clock=time.monotonic, sleep=time.sleep) -> tuple[bool, str]:
     """`GET /api/v1/restart`，然后等 AB 回来（`status` 为真）并读回开关 == `want`。返回 `(核对上了, 说明)`。
 
-    重启请求超时是常态（`Program.start()` 先等下载器），接着问；请求根本没发出去 / 被拒（连不上、5xx）就不等了：AB 也许没
-    重启，config.json 里的新开关要到下一次重启才生效——说不清。"""
+    重启请求**读超时**是常态（`Program.start()` 先等下载器）：请求到了，接着问——但要先看到 AB 在重启（`status` 为假）
+    再认它回来。读回的开关证明不了重启过：PATCH 那一步 AB 已经重载了设置（`config/update` 里的 `settings.load()`），
+    旧程序也还在跑、`status` 照样为真。连接 / 连接池 / 写请求超时、连不上、5xx：请求多半没到 AB，不等了——AB 也许没
+    重启，config.json 里的新开关要到下一次重启才生效，说不清（2026-09-27 审查：以前一切超时都当"在重启"，连接超时之后
+    记 applied、写了状态文件，AB 的两个线程照旧在跑）。"""
     import httpx
 
     timeout = RESTART_TIMEOUT_S if timeout is None else timeout
     poll = POLL_S if poll is None else poll
     note = ""
+    # 重启请求正常返回 = `Program.restart()` 做完了（先停后起）；读超时 = 还在里面，要看到它停过
+    seen_down = True
     try:
         ab.restart(timeout=RESTART_REQUEST_TIMEOUT_S)
-    except httpx.TimeoutException:
-        note = "重启请求超时（AB 在等下载器？），接着等它回来；"
+    except httpx.ReadTimeout:
+        note = "重启请求读超时（AB 在等下载器？），接着等它回来；"
+        seen_down = False
     except Exception as e:                          # noqa: BLE001 —— 不知道重启了没有：交给调用方记 unknown
-        return False, (f"重启请求出错（{type(e).__name__}: {e}）：AB 也许没有重启，config.json 里的新开关要到下一次重启"
-                       f"才生效")
+        return False, (f"重启请求出错（{type(e).__name__}: {e}）：请求多半没到 AB，AB 也许没有重启，config.json 里的"
+                       f"新开关要到下一次重启才生效")
     deadline = clock() + timeout
     last = ""
     while True:
         try:
-            if bool((ab.status() or {}).get("status")):
+            up = bool((ab.status() or {}).get("status"))
+            if up and not seen_down:
+                last = "AB 一直在运行（status=true），没看到它重启过——重启请求也许没被处理"
+            elif up:
                 seen = flags_of(ab.get_config())
                 if seen == want:
                     return True, note + "AB 回来了，读回的开关对得上"
                 return False, note + f"AB 回来了，但读回的开关是 {describe_flags(seen)}（有别人同时改了配置？）"
-            last = "AB 程序还没起来（status=false）"
+            else:
+                seen_down = True
+                last = "AB 程序还没起来（status=false）"
         except Exception as e:                      # noqa: BLE001 —— 还没起来 / 接口抖：到时限之前接着问
             last = f"问 AB 出错（{type(e).__name__}: {e}）"
         if clock() >= deadline:

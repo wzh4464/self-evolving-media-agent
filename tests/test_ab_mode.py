@@ -172,6 +172,38 @@ def test_a_restart_request_that_never_reached_ab_is_unknown(ab_lib, monkeypatch)
     assert _state(ab_lib) is None
 
 
+@pytest.mark.allow("unknown_record", match="set_ab_mode")
+@pytest.mark.parametrize("exc", [httpx.ConnectTimeout("connect timed out"), httpx.PoolTimeout("pool timed out"),
+                                 httpx.WriteTimeout("write timed out")], ids=lambda e: type(e).__name__)
+def test_a_restart_request_that_timed_out_before_reaching_ab_is_unknown(ab_lib, monkeypatch, exc):
+    """连接 / 连接池 / 写请求超时：请求多半没到 AB。PATCH 已经让 AB 重载了设置（读回的开关是新的），旧程序也还在跑
+    （status 为真）——读回核对什么都证明不了。以前一律当"在重启、接着等"，记 applied、写状态文件，AB 的两个线程其实
+    照旧在拉 RSS、改名（2026-09-27 审查复现）。"""
+    ab_lib.ab.fail("restart", exc=exc)
+    monkeypatch.setattr(abmode, "RESTART_TIMEOUT_S", 0.0)
+
+    assert _main(monkeypatch, "ab-mode", "subscription") == 1
+
+    [a] = _set_audit(ab_lib)
+    assert a["status"] == "unknown"
+    assert ab_lib.ab.running == {"rss": True, "renamer": True}
+    assert _state(ab_lib) is None
+
+
+@pytest.mark.allow("unknown_record", match="set_ab_mode")
+def test_a_read_timeout_is_accepted_only_after_ab_was_seen_restarting(ab_lib, monkeypatch):
+    """读超时 = 请求到了、AB 在等下载器。可 AB 真在重启的话 status 会先是 false：一直是真（旧程序还在跑）就没法说它
+    重启过，等到时限记 unknown。"""
+    ab_lib.ab.fail("restart", exc=httpx.ReadTimeout("timed out"))       # 请求报超时、AB 那边什么都没发生
+    monkeypatch.setattr(abmode, "RESTART_TIMEOUT_S", 0.0)
+
+    assert _main(monkeypatch, "ab-mode", "subscription") == 1
+
+    assert _set_audit(ab_lib)[0]["status"] == "unknown"
+    assert ab_lib.ab.running == {"rss": True, "renamer": True}
+    assert _state(ab_lib) is None
+
+
 @pytest.mark.allow("failed_record", match="set_ab_mode")
 def test_a_failed_update_that_did_not_land_is_failed_and_does_not_restart(ab_lib, monkeypatch):
     ab_lib.ab.fail("update_config", exc=httpx.ReadTimeout("timed out"))
