@@ -151,6 +151,8 @@
 - **复用审计（`tools/audit_duplication.py`）查出的重复实现收成一处**，行为不变：
   - Mikan RSS 的条目切分与标题提取只剩 `subscription.rss_items`；抓取的 `_feed_items` 以前自己再写一遍同样的正则。
   - RSS 链接里的 bangumiId 只由 `abrow.mikan_id_of` 认：抓取的候选页与出处账本补录以前各抠一遍（第 4 阶段新写的补录没复用）。
+  - 种子条目按完整路径认（`save_path + 条目名`）只剩 `claims.entry_at`：执行器与删除关口（第 3 阶段）各有一份一模一样的；
+    蓝光源的判断只剩 `naming.BDRIP_RE`：出处账本（第 4 阶段）以前抄了一遍画质解析里的正则。
 
 ## [0.5.1] - 2026-09-27
 

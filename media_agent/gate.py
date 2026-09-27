@@ -73,6 +73,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .claims import PARTIAL, ClaimsUnknown, fold
+from .claims import entry_at as _entry_at
 from .kernel import DSL_ORIGIN, Finding
 from .naming import (VIDEO_EXTS, explicit_slot, is_extra_of, parse_episode, parse_pin,
                      season_of_dir)
@@ -200,11 +201,6 @@ def _slot_arg(v) -> tuple[int, int] | None:
 def _removed(ex) -> set[str]:
     """本批次已摘掉的种子（小写 hash；qBittorrent 给的本来就是小写，这里只是不信任调用方）。"""
     return {h.lower() for h in ex._removed_torrents}
-
-
-def _entry_at(t: dict, entries: list[dict], abs_path: Path) -> dict | None:
-    sp = Path((t.get("save_path") or "").rstrip("/") or "/")
-    return next((e for e in entries if sp / e["name"] == abs_path), None)
 
 
 # ------------------------------------------------------------------ trash

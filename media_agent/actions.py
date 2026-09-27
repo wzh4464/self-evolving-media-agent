@@ -23,7 +23,7 @@ from pathlib import Path
 from . import abmode
 from . import audit as auditlog
 from . import disposal
-from .claims import PARTIAL, ClaimCheck, ClaimIndex, ClaimsUnknown, fold
+from .claims import PARTIAL, ClaimCheck, ClaimIndex, ClaimsUnknown, entry_at, fold
 from .clients import is_not_found
 from .kernel import DSL_ORIGIN, Action, Context, Finding, repath, under
 from .naming import parse_episode
@@ -857,16 +857,7 @@ class Executor:
                              "若它也判不了（画质无法比较等），需要人工介入")
         return extra
 
-    @staticmethod
-    def _entry_at(t: dict, entries: list[dict], abs_path: Path) -> dict | None:
-        """种子 `t` 的条目里，`save_path + 条目名` 恰好是 `abs_path` 的那一条。
-
-        按完整路径认，**不按文件名**：合集里不同子目录下同名的文件（`a/E05.mkv`、
-        `b/E05.mkv`）按文件名会认到第一个。scan 给 MediaFile 的路径就是
-        `save_path.rstrip("/") + "/" + 条目名`，逆改名记下的路径也由它推出，逐字相等。
-        """
-        sp = Path((t.get("save_path") or "").rstrip("/") or "/")
-        return next((e for e in entries if sp / e["name"] == abs_path), None)
+    _entry_at = staticmethod(entry_at)      # 种子条目按完整路径认（`claims.entry_at`，与删除关口同一处）
 
     def _torrent_rel_path(self, torrent_hash: str, abs_path: Path) -> str | None:
         """qBittorrent 的 renameFile 用的是种子内相对路径，不是绝对路径。

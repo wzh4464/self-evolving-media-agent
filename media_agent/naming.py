@@ -386,6 +386,8 @@ _SIMPLIFIED_RE = re.compile(
 _TRADITIONAL_RE = re.compile(
     r"繁|BIG5|CHT|TC\b|JPTC|tcjp|\btc\.|繁日|Cht|hant|traditional", re.IGNORECASE)
 _CHINESE_RE = re.compile(r"\bchi\b|\bzho\b|中文|中字", re.IGNORECASE)
+# 蓝光源：文件名的画质判断（`parse_quality`）与出处账本记版本词（`ledger.versions_of`）共用
+BDRIP_RE = re.compile(r"BDRip|Blu-?Ray|BDBOX", re.IGNORECASE)
 
 
 def looks_simplified(s: str) -> bool:
@@ -442,7 +444,7 @@ def parse_quality(filename: str, size: int = 0) -> Quality:
 
     simplified = looks_simplified(f)
     traditional = looks_traditional(f)
-    is_bdrip = bool(re.search(r"BDRip|Blu-?Ray|BDBOX", f, re.IGNORECASE))
+    is_bdrip = bool(BDRIP_RE.search(f))
     return Quality(height, simplified, traditional, is_bdrip, size)
 
 

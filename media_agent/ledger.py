@@ -136,12 +136,13 @@ def versions_of(title: str, rules: dict | None = None) -> set[str]:
     """标题里命中的版本词：偏好规则（`preferences`）里 prefer / avoid 的关键词，外加 BDRip。
     内部名常常一个都没有（LoliHouse 的 `ASSx2`、合并发布的 `【邪龙解放版】` 只在番组页标题里）。"""
     from . import preferences
+    from .naming import BDRIP_RE
 
     r = rules or preferences.load_rules()
     t = title or ""
     out = {w for group in ("prefer", "avoid") for rule in r.get(group, [])
            for w in rule.get("any", []) if w and w in t}
-    if re.search(r"BDRip|Blu-?Ray|BDBOX", t, re.IGNORECASE):
+    if BDRIP_RE.search(t):
         out.add("BDRip")
     return out
 

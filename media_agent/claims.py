@@ -53,6 +53,18 @@ def fold(p: str | Path) -> str:
     return unicodedata.normalize("NFC", str(p)).casefold()
 
 
+def entry_at(t: dict, entries: list[dict], abs_path: Path) -> dict | None:
+    """种子 `t` 的条目里，`save_path + 条目名` 恰好是 `abs_path` 的那一条。
+
+    按完整路径认，**不按文件名**：合集里不同子目录下同名的文件（`a/E05.mkv`、
+    `b/E05.mkv`）按文件名会认到第一个。scan 给 MediaFile 的路径就是
+    `save_path.rstrip("/") + "/" + 条目名`，逆改名记下的路径也由它推出，逐字相等。
+    执行器（改名、摘条目）与删除关口（`gate`）共用这一处。
+    """
+    sp = Path((t.get("save_path") or "").rstrip("/") or "/")
+    return next((e for e in entries if sp / e["name"] == abs_path), None)
+
+
 @dataclass(frozen=True)
 class Claimant:
     """一个占用者。`kind` 是 `"disk"`（盘上已有）或 `"qbit"`（种子声明着）。"""
