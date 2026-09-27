@@ -262,6 +262,9 @@ v0.6.0 起有 `AB_MODE`，默认 `full`——**部署这个版本什么都不变
 1. 至少跑完一轮 v0.6.0 的 `run`：`ab-adoption` 把 AB 订阅行上的集号偏移迁进各番的 sidecar（生产上只有 AB 37 一条：
    《超超超超超喜欢你的100个女朋友》第三季，-24，部署后第一轮 `run` 提议一次 `adopt_episode_offset`）；`media-agent health`
    里没有 `ab_subscription_unmapped` / `ab_subscription_moved`——这两种订阅 AB 一停就没人接。
+   AB 订阅着的番要是报 `season_layout_mismatch`（TMDB 把几季压平成一季、库里分着季，多出来的季没登记集号偏移），那几季
+   抓取不抓：登记了偏移的季照样抓（证据里的 `mapped`），别的季按建议在 sidecar 的 `episode_offsets` 里登记之后才抓。
+   2026-09-27 回放：《100个女朋友》第三季（-24）照样抓，Season 1、2 不抓（都已播完、集都齐）。
 2. 抓取任务在跑：`launchctl print gui/$(id -u)/com.zihan.media-agent-grab | grep state`，`media-agent health --grab` 最近一轮
    不是 critical。
 3. 两边此刻各认什么：`media-agent ab-mode`（= `show`）。预演：`media-agent ab-mode subscription --dry-run`。

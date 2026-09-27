@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from datetime import date, timedelta
 from typing import Iterable
@@ -240,6 +241,91 @@ def _pages_for(subs: dict, rows, season: int) -> list[str]:
     return [p for p in dict.fromkeys(pages) if p]
 
 
+def _season_layout(ctx, cache, show, sc, keys, offset_for) -> tuple[dict[int, tuple[int, int, int | None]], dict | None]:
+    """库内每一季落在 TMDB 哪一季的哪一段：`{库内季: (TMDB 季, 基数, 上界)}`——库内第 e 集 = TMDB 那一季的第 base + e 集，
+    上界 None = 到那一季的最后一集。这一轮没法确定范围、不抓的季不在里面；第二项是它们的 `season_layout_mismatch` 证据
+    （都确定得了为 None）。
+
+    - TMDB 有这一季：就是它，整季。TMDB 的季列表是扫描按条目缓存 30 天的（`show.tmdb_seasons`），列表里没有的先问分集表
+      （`season_episodes`，6 小时）：新一季刚上 TMDB 时列表还是旧的，以前抓到第二季的头几集、sidecar-sync 记下
+      `seasons["2"]` 之后整部番停抓到缓存过期（2026-09-27 审查）。
+    - TMDB 没有、登记了负的集号偏移 `-B`（`offset_for`：sidecar 的 `episode_offsets`，没登记时 AB 落进这一季的订阅行上的）：
+      是 TMDB 上它之前最后一季（压平的那一季）从第 B+1 集起的一段，到下一个这样登记了的库内季为止；那一季自己的库内季只到
+      第一个基数。《超超超超超喜欢你的100个女朋友》TMDB 一季 36 集、库里三季：`{"2": -12, "3": -24}` 让三季各是 12 集的一段。
+      同一季里几个库内季的基数重复、或顺序与季号不一致：当成没登记。
+    - TMDB 没有、没登记、盘上有集：多出来的季。它与 TMDB 那一季本身各是哪一段说不清——两套编号一比会把已有的判成缺失
+      （2026-08-31 药屋 E25–E30 就是这么重下的），所以**除了登记了偏移的季，这部番这一轮都不抓**（与以前整部番停抓相同，
+      只是登记了的照样抓：以前连 AB 37 的第三季也一起停了，订阅模式下就没人抓它）。
+    订阅了、盘上还没有、TMDB 也没有的季照常交给后面（分集表取不到 / 是空的，由那里说）。"""
+    listed = {int(x["season_number"]) for x in (show.tmdb_seasons or []) if x.get("season_number")}
+    ints = sorted({int(k) for k in keys})
+    if not listed:
+        return {n: (n, 0, None) for n in ints}, None
+    have_of = {int(k): (v or {}).get("have") or [] for k, v in (sc.seasons or {}).items() if str(k).isdigit()}
+    tmdb = set(listed)
+    for n in ints:
+        if n > 0 and n not in tmdb:
+            eps, _why = season_episodes(ctx, cache, show.tmdb_id, n)
+            if eps:
+                tmdb.add(n)
+    views: dict[int, tuple[int, int, int | None]] = {}
+    mapped: dict[int, tuple[int, int]] = {}
+    extra: list[int] = []
+    for n in ints:
+        if n <= 0 or n in tmdb:
+            views[n] = (n, 0, None)
+            continue
+        off = offset_for(n)
+        host = max((t for t in tmdb if 0 < t < n), default=None)
+        if off < 0 and host is not None:
+            mapped[n] = (host, -off)
+        elif have_of.get(n):
+            extra.append(n)
+        else:
+            views[n] = (n, 0, None)
+    by_host: dict[int, list[tuple[int, int]]] = {}
+    for n, (h, b) in mapped.items():
+        by_host.setdefault(h, []).append((b, n))
+    for h, lst in by_host.items():
+        lst.sort()
+        bases = [b for b, _n in lst]
+        if len(set(bases)) != len(bases) or [n for _b, n in lst] != sorted(n for _b, n in lst):
+            for _b, n in lst:
+                mapped.pop(n)
+                if have_of.get(n):
+                    extra.append(n)
+                else:
+                    views[n] = (n, 0, None)
+            continue
+        for i, (b, n) in enumerate(lst):
+            views[n] = (h, b, lst[i + 1][0] if i + 1 < len(lst) else None)
+        if h in views:
+            views[h] = (h, 0, lst[0][0])
+    if not extra:
+        return views, None
+    extra.sort()
+    suggested: dict[str, int] = {}
+    for n in extra:
+        host = max((t for t in tmdb if 0 < t < n), default=None)
+        base, ok = 0, host is not None
+        for s in range(host or n, n):
+            if s in mapped and mapped[s][0] == host:
+                base = mapped[s][1]
+            elif str(s) in suggested:
+                base = -suggested[str(s)]
+            if not have_of.get(s):
+                ok = False
+                break
+            base += max(have_of[s])
+        if ok:
+            suggested[str(n)] = -base
+    evidence = {"library_seasons": sorted(n for n, h in have_of.items() if n > 0 and h),
+                "tmdb_seasons": sorted(tmdb), "extra": extra,
+                "mapped": {str(n): [h, b] for n, (h, b) in sorted(mapped.items())},
+                "suggested_offsets": suggested}
+    return {n: v for n, v in views.items() if n in mapped}, evidence
+
+
 def _pick_key(show, season: int | None) -> str:
     """选中的番组页在缓存里的键：按 TMDB id（目录改名不丢）+ 季——同一部番的不同季常在不同的番组页。"""
     return f"mikanpick:{show.tmdb_id or show.dir_name}:{'' if season is None else season}"
@@ -423,32 +509,39 @@ class EpisodeAvailableDetector:
             # 1..24，于是 E25-E30 被判成缺失并抓了下来——它们就是磁盘上的
             # S02E01-E06。《超超超超超喜欢你的100个女朋友》同样被重复抓了 6 集。
             #
-            # 换算需要 sidecar 的 `season_offsets`（发布方季号 → 之前累计集数），
-            # 那是人或演进器该决定的事。在配好之前宁可不抓。
-            tmdb_sn = {int(x["season_number"]) for x in (show.tmdb_seasons or [])
-                       if x.get("season_number")}
-            lib_sn = {int(k) for k, v in sc.seasons.items()
-                      if k.isdigit() and int(k) > 0 and v.get("have")}
-            extra = sorted(lib_sn - tmdb_sn) if tmdb_sn else []
-            if extra:
+            # 换算靠集号偏移（`episode_offsets`：库内这一季是压平的那一季从第几集起的一段），那是人（或 AB 订阅行）
+            # 该决定的事：没登记的多出来的季，在配好之前宁可不抓（`_season_layout`）。2026-09-27 回放之前这里是
+            # "库里有 TMDB 没有的季就整部番停抓"，建议写的是改变不了这一点的 `season_offsets`——AB 37 的第三季登记了
+            # -24 也一样停着，订阅模式下就没人抓它
+            views, layout = _season_layout(ctx, cache, show, sc, season_keys,
+                                           lambda n: episode_offset_for(show, n))
+            if layout:
+                sugg = layout["suggested_offsets"]
                 yield Finding(
                     rule=self.id, kind="season_layout_mismatch", severity="important",
                     classified=True,
-                    summary=(f"库内有 Season {extra} 而 TMDB 只有 "
-                             f"Season {sorted(tmdb_sn)}——两套集号口径不一致，"
-                             f"已停止对这部番自动抓取，以免把已有的集数重下一遍。"
-                             f"按 TMDB 重编排目录，或在 sidecar 的 season_offsets "
-                             f"里登记换算关系"),
-                    show=show.dir_name,
-                    evidence={"library_seasons": sorted(lib_sn),
-                              "tmdb_seasons": sorted(tmdb_sn), "extra": extra},
+                    summary=(f"库内有 Season {layout['extra']} 而 TMDB 只有 Season {layout['tmdb_seasons']}，"
+                             f"这几季没登记集号偏移——两套集号口径不一致，"
+                             + (f"除了登记了偏移的 Season {sorted(int(k) for k in layout['mapped'])}，"
+                                if layout["mapped"] else "")
+                             + "已停止对这部番自动抓取，以免把已有的集数重下一遍。在 sidecar 的 episode_offsets 里"
+                             "登记多出来的每个库内季的偏移（它在 TMDB 那一季里之前有几集就是负几"
+                             + (f"；按库内各季的集数推测：{json.dumps(sugg, ensure_ascii=False)}，核对后再写"
+                                if sugg else "") + "），或按 TMDB 重编排目录"),
+                    show=show.dir_name, evidence=layout,
                 )
-                continue
+                if not views:
+                    continue
             inflight = _inflight(ctx, show, by_hash, replace_dead=self.replace_dead)
 
             disk_eps = _disk_episodes(show)
 
             for season_key in season_keys:
+                view = views.get(int(season_key))
+                if view is None:
+                    continue                     # 季的编排对不上（上面报过）
+                tmdb_season, base, upper = view
+                ranged = bool(base or upper is not None)
                 info = sc.seasons.get(season_key) or {}
                 # `have` 要并上磁盘实况，不能只信 sidecar。
                 #
@@ -464,11 +557,16 @@ class EpisodeAvailableDetector:
                 # 分集表走缓存（`cache.season_episodes`：在播 6 小时、播完 7 天、取不到 6 小时内不再问）。以前这里
                 # 每一遍都不带缓存地问：生产 129 个 sidecar、159 个季键，一次 diagnose 43.98 秒里 31.9 秒是它
                 # （runloop 调研 2026-09-26）——`run` 迭代到不动点时每次迭代都要再付一遍
-                eps, why = season_episodes(ctx, cache, show.tmdb_id, int(season_key))
+                eps, why = season_episodes(ctx, cache, show.tmdb_id, tmdb_season)
                 if eps is None:
-                    ctx.log(f"[episode-available] TMDB 第 {season_key} 季集表读取失败 {show.dir_name}，"
+                    ctx.log(f"[episode-available] TMDB 第 {tmdb_season} 季集表读取失败 {show.dir_name}，"
                             f"这一季这一轮不抓：{why}")
                     continue
+                if ranged:
+                    # 压平的那一季里属于这个库内季的一段，按库内编号（第 base + e 集 = 库内第 e 集）
+                    top = upper if upper is not None else float("inf")
+                    eps = [{**e, "episode_number": int(e["episode_number"]) - base} for e in eps
+                           if isinstance(e.get("episode_number"), int) and base < e["episode_number"] <= top]
                 air_of = {e["episode_number"]: e["air_date"] for e in eps
                           if e.get("air_date")}
 
@@ -552,7 +650,8 @@ class EpisodeAvailableDetector:
                     n = _episode_of(it["title"])
                     if n is None:
                         continue
-                    ep_here, why = _slot_in_season(it["title"], n, int(season_key), off_by_season)
+                    # 按 TMDB 那一季的编号认（压平的季里 `S01E30` 就是 TMDB 第 1 季第 30 集），再按这一库内季的集号偏移换算
+                    ep_here, why = _slot_in_season(it["title"], n, tmdb_season, off_by_season)
                     if ep_here is not None and ep_off:
                         shifted = offset_episode(ep_here, ep_off)
                         if shifted is None:
@@ -674,10 +773,10 @@ class EpisodeAvailableDetector:
                     )
                 if silent:
                     yield from self._silent(show, int(season_key), silent, by_ep, eps, air_of, mid,
-                                            ep_off, today)
+                                            ep_off, today, ranged=ranged)
 
     def _silent(self, show, season: int, silent: list[int], by_ep: dict, eps: list[dict],
-                air_of: dict, mid: str, ep_off: int, today: str) -> Iterable[Finding]:
+                air_of: dict, mid: str, ep_off: int, today: str, *, ranged: bool = False) -> Iterable[Finding]:
         """要找的集在归拢表里什么都没有（N13 以前的 bare `continue`）：说出来。
 
         - 番组页上有编号落在这一季**之外**（比 TMDB 这一季最后一集还大）：多半是按连续集号发布、又没登记集号偏移——
@@ -685,7 +784,8 @@ class EpisodeAvailableDetector:
         - 否则是真的还没人发：播出超过 `NO_RELEASE_GRACE_DAYS` 天的才报 `episode_not_released`（minor），刚播的是
           正常的等待。"""
         last = max((int(e["episode_number"]) for e in eps if e.get("episode_number")), default=0)
-        unplaced = sorted(n for n in by_ep if n > last)
+        # 压平的季里的一段（`_season_layout`）：落在这一段之外的是同一季别的库内季的，不是编号对不上
+        unplaced = [] if ranged else sorted(n for n in by_ep if n > last)
         if unplaced:
             guess = 1 - unplaced[0] + (ep_off or 0)
             yield Finding(
