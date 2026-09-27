@@ -354,6 +354,31 @@ def test_rollback_restores_the_flags_and_the_previous_state(ab_lib, monkeypatch)
     assert _state(lib) is None                        # 切之前没有状态文件：回退后也没有
 
 
+def test_rolling_back_a_switch_to_full_takes_a_fresh_baseline(ab_lib, monkeypatch):
+    """subscription → full → 回退 full 那一步：状态文件回到 subscription。以前原样写回切到 subscription 那一刻的记录，
+    可 full 那段时间 AB 的 RSS 线程每 15 分钟都推一遍 `last_checked_at`、带 `ab:` 地加了种子——回退一落地
+    `ab_still_polling`（与 `ab_added_outside_subscribe`）就报出来，而且再也清不掉（2026-09-27 审查复现）。
+    现在按回退的那一刻重新记基线；批次 ID 还是当初那一步的（再回退它照样认得出）。"""
+    lib = ab_lib
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    first = _state(lib)
+    lib.configure(ab_mode="subscription", ab_mode_source="state")
+    assert _main(monkeypatch, "ab-mode", "full") == 0
+    lib.configure(ab_mode="full", ab_mode_source="state")
+    full_run = _set_audit(lib)[-1]["run_id"]
+    lib.ab.poll_rss("2026-09-28T09:00:00+00:00")          # full 期间 AB 照常拉 RSS
+
+    res = lib.rollback(full_run)
+
+    assert res["reverted"] == 1, res
+    rec = _state(lib)
+    assert rec["mode"] == "subscription" and rec["run_id"] == first["run_id"]
+    assert rec["baseline"]["rss_last_checked"] == {"1": "2026-09-28T09:00:00+00:00", "2": "2026-09-28T09:00:00+00:00"}
+    assert rec["switched_at_epoch"] > first["switched_at_epoch"]
+    lib.configure(ab_mode="subscription", ab_mode_source="state")
+    assert _main(monkeypatch, "ab-mode", "show") == 0
+
+
 def test_rollback_does_not_touch_flags_a_human_changed_since(ab_lib, monkeypatch):
     lib = ab_lib
     assert _main(monkeypatch, "ab-mode", "subscription") == 0

@@ -3250,8 +3250,23 @@ class Executor:
         if u.get("prev_state") is None:
             abmode.remove_state(self.cfg.state_dir)
         else:
-            abmode.write_state(self.cfg.state_dir, u["prev_state"])
+            abmode.write_state(self.cfg.state_dir, self._restored_ab_state(u["prev_state"]))
         return True, ""
+
+    def _restored_ab_state(self, prev: dict) -> dict:
+        """回退写回的状态文件。回到 subscription 的要按**此刻**重新记核对用的基线：原样写回切换那一刻的记录，被回退的那一步
+        （切到 full）期间 AB 的 RSS 线程每 15 分钟推一遍 `last_checked_at`、带 `ab:` 地加种子，回退一落地 `ab_still_polling` /
+        `ab_added_outside_subscribe` 就报、再也清不掉（2026-09-27 审查复现）。批次 ID 留原来的：那一步照样能回退。"""
+        rec = dict(prev)
+        if rec.get("mode") != abmode.SUBSCRIPTION:
+            return rec
+        base, why = abmode.baseline(self.ctx.abdb)
+        now = datetime.now()
+        rec.update(baseline=base, since=now.isoformat(timespec="seconds"),
+                   switched_at_epoch=round(now.timestamp(), 3), restored_by=self.run_id)
+        if why:
+            self.ctx.log(f"[rollback] 回到 subscription，但没能重新记下核对用的基线：{why}")
+        return rec
 
     def _unset_sidecar(self, u: dict) -> tuple[bool, str]:
         """逆操作 `unset_sidecar`：摘掉正向动作往 sidecar 里**补**的那几项（`_set_intent`）。

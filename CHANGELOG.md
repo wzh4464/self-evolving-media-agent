@@ -93,6 +93,9 @@
   可 README 与 `ab_still_polling` / `ab_mode_unverified` 的说明都让人"再跑同一条命令"——切换之后有人点了一次刷新、切换那一刻
   AB 库读不了，基线就永远停在那里，warn 每轮都在，之后真的又拉了也分不出来。现在核对有问题（没有基线、拉过 RSS、订阅之外
   加过种子、读不全）就不 PATCH、重启一次、核对、重新记基线；没问题才说「已经是」。
+- **回退一次"切回 full"重新记核对用的基线**：subscription → full → `rollback` 那一步，以前原样写回切到 subscription 那一刻的
+  状态文件；full 期间 AB 照常拉 RSS、加种子，回退一落地 `ab_still_polling` / `ab_added_outside_subscribe` 就报、清不掉。现在
+  按回退那一刻记基线（批次 ID 留原来的，那一步照样能回退）。
 
 ## [0.5.0] - 2026-09-27
 
