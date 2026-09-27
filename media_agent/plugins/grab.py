@@ -227,6 +227,34 @@ def _feed_cached(mid: str, cache) -> list[dict]:
     return got.get("items") or []
 
 
+def _folded(groups: dict, ab_rows: dict) -> dict[int, dict[str, tuple[dict, object]]]:
+    """重复目录（`tmdb_groups` 的 duplicate）上订阅的季，按宿主归拢：`{id(宿主): {季键: (订阅, 重复目录)}}`。订阅 = 它 sidecar
+    里的 `subscriptions`，加上挂在它上面、落进那一季的 AB 有效订阅（没登记进 sidecar 之前）。宿主自己订阅的季以宿主的为准。"""
+    from .adopt import subscription_of
+    out: dict[int, dict[str, tuple[dict, object]]] = {}
+    for g in groups.values():
+        if g.get("kind") != "duplicate":
+            continue
+        box = out.setdefault(id(g["host"]), {})
+        for d in g.get("duplicates", []):
+            sc, problem = load_sidecar_checked(d.dir_path)
+            subs = {} if problem else {str(k): (v if isinstance(v, dict) else {})
+                                       for k, v in (sc.subscriptions or {}).items() if str(k).isdigit()}
+            for r in ab_rows.get(fold(d.dir_name), []):
+                subs.setdefault(str(abrow.library_season(r)), subscription_of(r))
+            for k, sub in subs.items():
+                box.setdefault(k, (sub, d))
+    return out
+
+
+def _offset_registered(show, season: int) -> bool:
+    """宿主自己有没有这一季的集号偏移：sidecar 登记了（`0` 也算），或它的 AB 行落进这一季。"""
+    from .builtin import _show_intent
+    if str(season) in _show_intent(show)["episode_offsets"]:
+        return True
+    return bool(show.bangumi) and abrow.library_season(show.bangumi) == season
+
+
 def _tmdb_said_no(why: str) -> bool:
     """分集表取不到的原因是 TMDB 答了"没有这一季"（HTTP 4xx，限流的 429 除外），不是连不上。"""
     m = re.search(r"HTTP (4\d\d)", why or "")
@@ -477,6 +505,10 @@ class EpisodeAvailableDetector:
         by_hash = {t["hash"]: t for t in state.torrents}
         dup_reported: set[int] = set()
         ab_rows = _ab_rows_by_dir(state.bangumi_rows, ctx.config.media_root)
+        # 重复目录上的订阅并进宿主（`_folded`）：AB 按自己的标题建续作的保存路径（`旧番庚 第二季/Season 2`），与本项目按
+        # TMDB 改过名的番目录（`旧番庚`）对不上；订阅那一刻 AB 一集都没补时，`create_show_dir` 建出的只是个只有档案的空壳——
+        # 它被归成重复目录、抓取跳过，宿主又没有这一季的订阅，第二季永远不来（2026-09-27 审查复现）
+        folds = _folded(groups, ab_rows)
 
         for show in state.shows:
             if show.naming_hold:
@@ -490,15 +522,20 @@ class EpisodeAvailableDetector:
                 if show.tmdb_id not in dup_reported:
                     dup_reported.add(show.tmdb_id)
                     sibs = [s.dir_name for s in g["shows"]]
+                    folded = {k: d.dir_name for k, (_sub, d) in sorted(folds.get(id(host), {}).items(),
+                                                                         key=lambda kv: int(kv[0]))}
                     yield Finding(
                         rule=self.id, kind="duplicate_show_dir", severity="important",
                         summary=(f"{len(sibs)} 个目录装着同一批内容（TMDB "
                                  f"{show.tmdb_id}），抓取只认文件最多的"
-                                 f"「{host.dir_name}」，其余会被跳过"),
+                                 f"「{host.dir_name}」，其余会被跳过"
+                                 + (f"；它们上面订阅的第 {sorted(int(k) for k in folded)} 季抓进「{host.dir_name}」"
+                                    if folded else "")),
                         show=host.dir_name,
                         evidence={"tmdb_id": show.tmdb_id, "dirs": sibs,
                                   "host": host.dir_name,
                                   "duplicates": [d.dir_name for d in g["duplicates"]],
+                                  "folded": folded,
                                   "hint": "多半是历史遗留的分季目录或繁简两版，应合并"},
                     )
                 continue
@@ -507,7 +544,11 @@ class EpisodeAvailableDetector:
             # 也抓——新番、新一季以前要等 AutoBangumi 放进第一个文件）
             subs = {str(k): (v if isinstance(v, dict) else {})
                     for k, v in (sc.subscriptions or {}).items() if str(k).isdigit()}
-            rows = ab_rows.get(fold(show.dir_name), [])
+            folded = {k: v for k, v in folds.get(id(show), {}).items() if k not in subs}
+            subs = {**{k: sub for k, (sub, _d) in folded.items()}, **subs}
+            rows = ab_rows.get(fold(show.dir_name), []) + [r for _sub, d in folded.values()
+                                                           for r in ab_rows.get(fold(d.dir_name), [])
+                                                           if str(abrow.library_season(r)) in folded]
             # 人明说要抓的季：sidecar 的订阅，或 AB 里落进这一库内季的有效订阅（`abrow.library_season`）
             subscribed = set(subs) | {str(abrow.library_season(r)) for r in rows}
             season_keys = sorted({k for k in sc.seasons if str(k).isdigit()} | set(subs), key=int)
@@ -527,8 +568,14 @@ class EpisodeAvailableDetector:
             # 该决定的事：没登记的多出来的季，在配好之前宁可不抓（`_season_layout`）。2026-09-27 回放之前这里是
             # "库里有 TMDB 没有的季就整部番停抓"，建议写的是改变不了这一点的 `season_offsets`——AB 37 的第三季登记了
             # -24 也一样停着，订阅模式下就没人抓它
-            views, layout = _season_layout(ctx, cache, show, sc, season_keys,
-                                           lambda n: episode_offset_for(show, n))
+            def offset_for(n: int, show=show, folded=folded) -> int:
+                # 并进来的季：宿主自己没登记（sidecar、落进这一季的 AB 行）时按那个重复目录的（它的 sidecar、它的 AB 行）
+                owner = folded.get(str(n), (None, None))[1]
+                if owner is not None and not _offset_registered(show, n):
+                    return episode_offset_for(owner, n)
+                return episode_offset_for(show, n)
+
+            views, layout = _season_layout(ctx, cache, show, sc, season_keys, offset_for)
             if layout:
                 sugg = layout["suggested_offsets"]
                 yield Finding(
@@ -683,7 +730,7 @@ class EpisodeAvailableDetector:
                 # 只认原始集号：`by_ep[25]` 有、要找的 `by_ep[1]` 空着，下面一句 `continue`——既不抓也不报，AB 一退役
                 # 这部番就无声地停了。偏移与判重 / 改名 / 出处账本同一个口径（`episode_offset_for`、`offset_episode`：
                 # 换算出非正数的不收，理由记进 `off_season`，照样报出来）
-                ep_off = episode_offset_for(show, int(season_key)) if int(season_key) else 0
+                ep_off = offset_for(int(season_key)) if int(season_key) else 0
                 by_ep: dict[int, list[dict]] = {}
                 off_season: dict[int, list[tuple[dict, str]]] = {}
                 for it in items:

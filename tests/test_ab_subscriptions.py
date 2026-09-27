@@ -242,3 +242,34 @@ def test_rollback_of_a_subscribed_season_only_unsets_it(lib):
     assert res["reverted"] == 1
     sc = lib.sidecar(NEW)
     assert sc.subscriptions == {} and sc.mikan_id == "" and sc.notes == ["之后人写的"]
+
+
+# ------------------------------------------------------------------ 续作的保存路径与已有的番目录名不同
+def test_a_sequel_whose_save_path_names_another_folder_is_grabbed_into_the_host(lib):
+    """AB 按自己的标题建保存路径（`旧番庚 第二季/Season 2`），本项目的番目录叫 TMDB 的标题（`旧番庚`）。订阅那一刻 AB 一集都
+    没补（开播前订的、或全被过滤）：`create_show_dir` 建出一个只有档案的空壳，扫描认出它与 `旧番庚` 是同一个 TMDB 条目、归为
+    重复目录——抓取跳过它，宿主又没有第 2 季的订阅，第二季永远不来（2026-09-27 审查复现：grab → run → grab… 零个
+    `grab_episode`，只有一条"抓取只认文件最多的「旧番庚」"）。现在重复目录上的订阅并进宿主：第二季抓进 `旧番庚/Season 2`。"""
+    lib.configure(qbit_allow_empty=True, ab_mode="subscription")
+    s2 = weekly(12, first_days_ago=10)
+    lib.tmdb.add_show(3801, "旧番庚", seasons={1: weekly(12, first_days_ago=400), 2: s2},
+                      queries=["旧番庚 第二季"])
+    host = lib.show("旧番庚")
+    for n in range(1, 13):
+        host.season(1).local(f"旧番庚 S01E{n:02d}.mkv")
+    host.sidecar(tmdb_id=3801, tmdb_source="human", tmdb_title="旧番庚", seasons={"1": {"have": list(range(1, 13))}})
+    lib.bangumi(id=81, official_title="旧番庚 第二季", title_raw="Jiufan Geng S2", season=2,
+                rss_link="https://mikanani.me/RSS/Bangumi?bangumiId=5081&subgroupid=1",
+                save_path=str(lib.media_root / "旧番庚 第二季" / "Season 2"))
+    tpl = "[LoliHouse] 旧番庚 第二季 / Jiufan Geng S2 - {:02d} [WebRip 1080p][简繁内封字幕]"
+    lib.mikan("5081", [MikanItem(title=tpl.format(n), pub=dict(s2)[n]) for n in (1, 2)],
+              search=["旧番庚", "旧番庚 第二季"])
+
+    loop = lib.grab_loop()
+
+    assert loop.applied("create_show_dir")                            # 空壳照建（名字认不出它是谁，交给扫描）
+    grabs = loop.applied("grab_episode")
+    assert sorted(r["args"]["episode"] for r in grabs) == [1, 2]
+    assert {r["save_path"] for r in grabs} == {str(lib.path("旧番庚") / "Season 2")}
+    [dup] = [f for f in loop.findings if f.kind == "duplicate_show_dir"]
+    assert dup.evidence["folded"] == {"2": "旧番庚 第二季"}
