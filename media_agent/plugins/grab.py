@@ -24,7 +24,7 @@ import re
 from datetime import date, timedelta
 from typing import Iterable
 
-from .. import abrow, preferences
+from .. import abmode, abrow, preferences
 from ..cache import Cache, FEED_TTL, LOOKUP_TTL, season_episodes
 from ..claims import fold
 from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
@@ -32,6 +32,7 @@ from ..kernel import (Action, Context, Finding, LibraryState, episode_of_file,
 from ..naming import (SPECIAL_RE, declared_seasons, offset_episode, parse_episode, parse_pin,
                       season_of_dir, slot_in_season)
 from ..sidecar import load as load_sidecar
+from ..sidecar import load_checked as load_sidecar_checked
 from .subscription import (MIKAN, _disk_episodes, _http_get,
                            _mikan_search_ids, is_seasonal)
 
@@ -42,6 +43,10 @@ MAX_PER_SHOW = 6
 # 一集播出多少天之后，番组页上还一个发布都没有才报（`episode_not_released`）。字幕组一般一两天内出；
 # 在这之前是正常的等待，每轮都报只会把真问题淹掉。
 NO_RELEASE_GRACE_DAYS = 3
+
+# 订阅着的季不是季度番时（`is_seasonal`：上百集的连载、一档连播超过 300 天）只看最近这么多天里播的集——AB 的口径是订阅
+# 之后发布的它都下；以前这种季订阅着也一集不抓、一声不吭（2026-09-27 审查）。补老集是人的事
+SUBSCRIBED_RECENT_DAYS = 30
 
 # 上一次为（这部番, 这一季）选中的番组页记多久。它只是下一轮候选里排第一的那个、每轮照样按播出日期
 # 重新打分，所以放得久一点无妨；过期了也只是回到"按 rss_link / 标题重新搜"。
@@ -220,6 +225,12 @@ def _feed_cached(mid: str, cache) -> list[dict]:
         got = {"items": _feed_items(mid)}
         cache.put_llm(ck, got)
     return got.get("items") or []
+
+
+def _tmdb_said_no(why: str) -> bool:
+    """分集表取不到的原因是 TMDB 答了"没有这一季"（HTTP 4xx，限流的 429 除外），不是连不上。"""
+    m = re.search(r"HTTP (4\d\d)", why or "")
+    return bool(m) and m.group(1) != "429"
 
 
 def _ab_rows_by_dir(rows, media_root) -> dict[str, list[dict]]:
@@ -468,8 +479,11 @@ class EpisodeAvailableDetector:
         ab_rows = _ab_rows_by_dir(state.bangumi_rows, ctx.config.media_root)
 
         for show in state.shows:
-            if not show.tmdb_id or show.naming_hold:
-                continue                 # 标题认不准：抓来的会按退回的名字改名、落进那个分类
+            if show.naming_hold:
+                continue                 # 标题认不准：抓来的会按退回的名字改名、落进那个分类（naming_held 另报）
+            if not show.tmdb_id:
+                yield from self._unidentified(ctx, show, ab_rows.get(fold(show.dir_name), []))
+                continue
             g = groups.get(show.tmdb_id) or {}
             if g.get("kind") == "duplicate" and show in g.get("duplicates", []):
                 host = g["host"]
@@ -558,9 +572,16 @@ class EpisodeAvailableDetector:
                 # 每一遍都不带缓存地问：生产 129 个 sidecar、159 个季键，一次 diagnose 43.98 秒里 31.9 秒是它
                 # （runloop 调研 2026-09-26）——`run` 迭代到不动点时每次迭代都要再付一遍
                 eps, why = season_episodes(ctx, cache, show.tmdb_id, tmdb_season)
+                sub = season_key in subscribed
                 if eps is None:
-                    ctx.log(f"[episode-available] TMDB 第 {tmdb_season} 季集表读取失败 {show.dir_name}，"
-                            f"这一季这一轮不抓：{why}")
+                    if not _tmdb_said_no(why):
+                        ctx.log(f"[episode-available] TMDB 第 {tmdb_season} 季集表读取失败 {show.dir_name}，"
+                                f"这一季这一轮不抓：{why}")
+                    elif sub:
+                        yield self._unserved(ctx, show, int(season_key), rows, "tmdb_no_season",
+                                             f"TMDB 上没有第 {tmdb_season} 季（{why}）")
+                    else:
+                        ctx.log(f"[episode-available] TMDB 上没有第 {tmdb_season} 季（{why}）：{show.dir_name} 的这一季不抓")
                     continue
                 if ranged:
                     # 压平的那一季里属于这个库内季的一段，按库内编号（第 base + e 集 = 库内第 e 集）
@@ -585,14 +606,31 @@ class EpisodeAvailableDetector:
                             dates.append(date.fromisoformat(e["air_date"]))
                         except ValueError:
                             pass
+                recent_from = ""
                 if not is_seasonal(dates, len(eps), date.today()):
+                    if not sub:
+                        continue
+                    # 订阅着的长篇 / 连播的季：只看最近播的（上面的常量）。一集都没有就是播完了，没什么可抓，不报
+                    recent_from = (date.today() - timedelta(days=SUBSCRIBED_RECENT_DAYS)).isoformat()
+                aired = {n for n, d in air_of.items() if recent_from <= d <= today}
+                if not aired and not eps and sub:
+                    yield self._unserved(ctx, show, int(season_key), rows, "tmdb_no_episodes",
+                                         f"TMDB 第 {tmdb_season} 季还没有分集表", severity="minor")
                     continue
-                aired = {n for n, d in air_of.items() if d <= today}
                 # 已经在下的不重复抓（除非停滞太久，见 _inflight 的注释）
                 busy = inflight.get(int(season_key), set())
                 missing = sorted(aired - have - busy)
                 if not missing:
                     continue
+                # 订阅着的季"停下来了"：播出超过宽限期、又比库里（含在下的）最新一集还新的缺集——不是订阅之前就缺着的
+                # 老空缺。这些发现要进卡住检测与通知（important；`history.qualifies` 不数 minor）：订阅模式下抓取是唯一的
+                # 下载者，找不到番组页 / 候选全被拒 / 没发布以前都是 minor，Re:Zero 就停在这里没人收到（2026-09-27 审查）
+                grace_cut = (date.fromisoformat(today) - timedelta(days=NO_RELEASE_GRACE_DAYS)).isoformat()
+                newest = max(have | busy, default=0)
+
+                def stalled(ep: int) -> bool:
+                    return sub and int(season_key) > 0 and ep > newest and bool(air_of.get(ep)) \
+                        and air_of[ep] <= grace_cut
 
                 mid = _resolve_mikan_id(
                     sc, show, cache, log=ctx.log, season=int(season_key),
@@ -600,13 +638,15 @@ class EpisodeAvailableDetector:
                     preferred=_pages_for(subs, rows, int(season_key)),
                     recent=[d for d in (air_of.get(n) for n in missing) if d])
                 if not mid:
+                    late = [ep for ep in missing if stalled(ep)]
                     yield Finding(
-                        rule=self.id, kind=self.kind, severity="minor",
+                        rule=self.id, kind=self.kind, severity="important" if late else "minor",
                         subject=f"S{int(season_key):02d}",
                         summary=(f"「{show.official_title}」缺 {len(missing)} 集"
-                                 f"{missing[:8]}，但找不到 Mikan 番组页，无从抓取"),
+                                 f"{missing[:8]}，但找不到 Mikan 番组页，无从抓取"
+                                 + (f"（订阅着，{late[:8]} 播出已超过 {NO_RELEASE_GRACE_DAYS} 天）" if late else "")),
                         show=show.dir_name,
-                        evidence={"missing": missing, "season": season_key},
+                        evidence={"missing": missing, "season": season_key, "stalled": late},
                     )
                     continue
 
@@ -695,7 +735,7 @@ class EpisodeAvailableDetector:
                         if (wrong_season or elsewhere) and noted < MAX_PER_SHOW:
                             noted += 1
                             yield Finding(
-                                rule=self.id, kind=self.kind, severity="minor",
+                                rule=self.id, kind=self.kind, severity="important" if stalled(ep) else "minor",
                                 subject=f"S{int(season_key):02d}E{ep:02d}",
                                 summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                          f"只搜到 {len(wrong_season) + len(elsewhere)} 个明显属于别季的同集号"
@@ -720,7 +760,7 @@ class EpisodeAvailableDetector:
                             continue
                         noted += 1
                         yield Finding(
-                            rule=self.id, kind=self.kind, severity="minor",
+                            rule=self.id, kind=self.kind, severity="important" if stalled(ep) else "minor",
                             subject=f"S{int(season_key):02d}E{ep:02d}",
                             summary=(f"「{show.official_title}」S{season_key}E{ep:02d} "
                                      f"已有 {len(cands)} 个发布，但都未通过硬门槛"
@@ -773,16 +813,42 @@ class EpisodeAvailableDetector:
                     )
                 if silent:
                     yield from self._silent(show, int(season_key), silent, by_ep, eps, air_of, mid,
-                                            ep_off, today, ranged=ranged)
+                                            ep_off, today, ranged=ranged, stalled=stalled)
+
+    def _unidentified(self, ctx: Context, show, rows) -> Iterable[Finding]:
+        """TMDB 认不出的番目录（`create_show_dir` / `media-agent subscribe` 建的、按目录名搜不到）：订阅着的季抓不了，说出来。
+        以前一句 `continue`——`grab` 与 `run` 都没有任何发现（2026-09-27 审查）。没人订的照旧不报（身份由 tmdb-identity 管）。"""
+        sc, problem = load_sidecar_checked(show.dir_path)
+        subs = set() if problem else {str(k) for k in (sc.subscriptions or {}) if str(k).isdigit()}
+        for season in sorted(subs | {str(abrow.library_season(r)) for r in rows}, key=int):
+            yield self._unserved(ctx, show, int(season), rows, "no_tmdb",
+                                 "TMDB 认不出这部番（按目录名 / AB 标题都没搜到，sidecar 也没有 tmdb_id）")
+
+    def _unserved(self, ctx: Context, show, season: int, rows, reason: str, why: str, *,
+                  severity: str | None = None) -> Finding:
+        """订阅着的季抓不了（`subscription_unserved`）。`full` 模式下 AB 照着它的订阅下，只有 AB 订阅着的季报 minor；
+        订阅模式下、或只有 sidecar 订阅（`media-agent subscribe`、新季登记）的季没有别人下，important。"""
+        by_ab = any(abrow.library_season(r) == season for r in rows)
+        if severity is None:
+            severity = "minor" if (by_ab and abmode.ab_downloads(ctx.config)) else "important"
+        return Finding(
+            rule=self.id, kind="subscription_unserved", severity=severity, subject=f"S{season:02d}",
+            summary=(f"「{show.official_title or show.dir_name}」第 {season} 季订阅着，但抓取抓不了：{why}"
+                     + ("——AB 还在按它的订阅下" if severity == "minor" and by_ab else
+                        "——订阅模式下没有别人下，在 sidecar 里写 tmdb_id / 登记集号偏移，或改订阅")),
+            show=show.dir_name,
+            evidence={"season": season, "reason": reason, "detail": why,
+                      "bangumi_ids": [r.get("id") for r in rows if abrow.library_season(r) == season]})
 
     def _silent(self, show, season: int, silent: list[int], by_ep: dict, eps: list[dict],
-                air_of: dict, mid: str, ep_off: int, today: str, *, ranged: bool = False) -> Iterable[Finding]:
+                air_of: dict, mid: str, ep_off: int, today: str, *, ranged: bool = False,
+                stalled=lambda ep: False) -> Iterable[Finding]:
         """要找的集在归拢表里什么都没有（N13 以前的 bare `continue`）：说出来。
 
         - 番组页上有编号落在这一季**之外**（比 TMDB 这一季最后一集还大）：多半是按连续集号发布、又没登记集号偏移——
           这一季一集都抓不到，报 `episode_numbering_mismatch`（important），带上按最小编号推测的偏移供人核对；
-        - 否则是真的还没人发：播出超过 `NO_RELEASE_GRACE_DAYS` 天的才报 `episode_not_released`（minor），刚播的是
-          正常的等待。"""
+        - 否则是真的还没人发：播出超过 `NO_RELEASE_GRACE_DAYS` 天的才报 `episode_not_released`（minor；订阅着的季里比库里
+          最新一集还新的——这部番停下来了——important，`stalled`），刚播的是正常的等待。"""
         last = max((int(e["episode_number"]) for e in eps if e.get("episode_number")), default=0)
         # 压平的季里的一段（`_season_layout`）：落在这一段之外的是同一季别的库内季的，不是编号对不上
         unplaced = [] if ranged else sorted(n for n in by_ep if n > last)
@@ -805,12 +871,14 @@ class EpisodeAvailableDetector:
         overdue = [ep for ep in silent if (air_of.get(ep) or today) <= cutoff]
         if not overdue:
             return
+        late = [ep for ep in overdue if stalled(ep)]
         yield Finding(
-            rule=self.id, kind="episode_not_released", severity="minor", subject=f"S{season:02d}",
+            rule=self.id, kind="episode_not_released", severity="important" if late else "minor",
+            subject=f"S{season:02d}",
             summary=(f"「{show.official_title}」S{season} 的 {overdue} 播出已超过 {NO_RELEASE_GRACE_DAYS} 天，"
                      f"番组页 {mid} 上还没有这几集的任何发布（字幕组断更、番组页选错了，或发布标题认不出集号）"),
             show=show.dir_name,
-            evidence={"season": season, "episodes": overdue,
+            evidence={"season": season, "episodes": overdue, "stalled": late,
                       "waiting": [ep for ep in silent if ep not in overdue],
                       "air_dates": {str(ep): air_of.get(ep, "") for ep in overdue},
                       "grace_days": NO_RELEASE_GRACE_DAYS, "mikan_id": mid},

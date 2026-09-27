@@ -222,3 +222,18 @@ def test_the_subcommand_is_wired_and_takes_the_run_lock(offline_cli, monkeypatch
     finally:
         holder.release()
     assert not lib.path(TITLE).exists()
+
+
+def test_a_long_running_season_says_only_recent_episodes_are_grabbed(offline_cli, capsys):
+    """上百集、每周一集的季（`is_seasonal` 说是连载）：订阅着的只抓最近播的，预览照实说、照样列出要抓的。"""
+    lib = offline_cli
+    sched = weekly(160, first_days_ago=7 * 159 + 2)
+    lib.tmdb.add_show(TMDB, TITLE, seasons={1: sched})
+    lib.mikan(MID, [MikanItem(title=f"[G] 新番丁 / Shinban Tei - {n:03d} [1080p][简日内嵌]", pub=dict(sched)[n])
+                    for n in (159, 160)], search=[TITLE])
+
+    assert cli.cmd_subscribe(_args(season=1, mikan=MID), lib.cfg) == 0
+
+    out = capsys.readouterr().out
+    assert "不是季度番" in out and "最近" in out and "不会抓" not in out
+    assert "S01E160" in out and "可抓取" in out

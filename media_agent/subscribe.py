@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from . import sidecar as sc_mod
@@ -156,7 +156,7 @@ def plan(ctx, *, tmdb_id: int, season: int | None = None, mikan: str = "", dir_n
 def preview(ctx, show_dir: Path, season: int) -> list[str]:
     """下一次抓取会对这部番的这一季做什么：扫描一遍、抓取检测器照原样跑一遍（只读），逐条说；不在播的季说清楚不会抓。"""
     from .cache import Cache, season_episodes
-    from .plugins.grab import EpisodeAvailableDetector
+    from .plugins.grab import SUBSCRIBED_RECENT_DAYS, EpisodeAvailableDetector
     from .plugins.subscription import SEASONAL_WINDOW_DAYS, cour_start, is_seasonal
     from .scan import build_state
 
@@ -184,9 +184,15 @@ def preview(ctx, show_dir: Path, season: int) -> list[str]:
     aired = [d for d in dates if d <= today]
     if not is_seasonal(dates, len(eps), today):
         start = cour_start(dates).isoformat() if dates else "未定档"
-        return lines + [f"第 {season} 季不在播（这一档开播于 {start}，超过 {SEASONAL_WINDOW_DAYS} 天，或是上百集的连载）："
-                        f"抓取只补在播 / 刚播完的季，下一次抓取不会抓它——老番请手动加种"]
-    lines.append(f"第 {season} 季在播：TMDB 上已播 {len(aired)}/{len(eps)} 集")
+        recent = [d for d in aired if d >= today - timedelta(days=SUBSCRIBED_RECENT_DAYS)]
+        if not recent:
+            return lines + [f"第 {season} 季不在播（这一档开播于 {start}，超过 {SEASONAL_WINDOW_DAYS} 天，或是上百集的连载），"
+                            f"最近 {SUBSCRIBED_RECENT_DAYS} 天也没播过：下一次抓取不会抓它——老番请手动加种"]
+        # 订阅着的长篇 / 连播的季：抓取只看最近播的（`grab.SUBSCRIBED_RECENT_DAYS`）
+        lines.append(f"第 {season} 季不是季度番（这一档开播于 {start}，或是上百集的连载）：订阅着的只抓最近 "
+                     f"{SUBSCRIBED_RECENT_DAYS} 天播出的 {len(recent)} 集，更早的请手动加种")
+    else:
+        lines.append(f"第 {season} 季在播：TMDB 上已播 {len(aired)}/{len(eps)} 集")
     related = [s for s in state.shows if s is show or s.tmdb_id == show.tmdb_id]
     try:
         found = [f for f in EpisodeAvailableDetector().detect(ctx, dataclasses.replace(state, shows=related))

@@ -39,6 +39,24 @@
 `is_seasonal`（只补在播 / 刚播完的季）、`season_layout_mismatch`、偏好、日期闸、`MAX_PER_SHOW`。抓下来的第一集由抓取
 自己写进 `seasons[N].have`，之后 sidecar-sync 按盘上接着记。
 
+**订阅着的季抓不了要说出来、停了要让人收到**（2026-09-27 审查）。"订阅着的季" = sidecar 订阅，或 AB 里落进这一库内季的有效
+订阅（`full` 下 AB 照着 RSS 下，抓取出不出力都无所谓；订阅模式下抓取是唯一的下载者）。以前：
+
+- 抓不了却一声不吭：TMDB 认不出这部番（`create_show_dir` 建的目录搜不到）一句 `continue`；这一季不是季度番（`is_seasonal`：
+  上百集的连载、一档连播超过 300 天）一句 `continue`；TMDB 上没有订阅的这一季只记一行日志。`grab` 与 `run` 都没有发现。
+- 停了没人收到：找不到番组页、候选全被拒、`episode_not_released` 都是 minor，`history.qualifies` 只数 critical / important
+  （或带动作的），永远不算卡住、不发信——Re:Zero（AB 9）就停在这里。
+
+现在：
+- `subscription_unserved`（subject `Sxx`，证据 `reason`：`no_tmdb` / `tmdb_no_season` / `tmdb_no_episodes`）：订阅着却抓不了。
+  `full` 下只有 AB 订阅着的季是 minor（AB 在下），其余 important；TMDB 上这一季还没有分集表（多半是还没定档）一律 minor。
+  TMDB 连不上（不是 4xx）照旧只记日志——那不是这一季的问题。
+- 订阅着的季不是季度番：只看最近 `SUBSCRIBED_RECENT_DAYS`（30）天里播的集（AB 的口径：订阅之后发布的它都下），照样抓；
+  一集都没有就是播完了，不报（AB 里挂着的老订阅不因此天天报）。没人订的照旧不碰。`media-agent subscribe` 的预览照实说。
+- 订阅着的季里"停下来了"的缺集——播出超过 `NO_RELEASE_GRACE_DAYS` 天、又比库里（含在下的）最新一集还新（订阅之前就缺着的
+  老空缺不算）——找不到番组页、候选全被拒、`episode_not_released` 报 important（证据 `stalled`），进卡住检测、`run` 的通知。
+  特典位（Season 0）不算。
+
 **`MAX_PER_SHOW` 在哪些集里数**：订阅着的季（sidecar 订阅，或 AB 里落进这一季的有效订阅）先给每一集找候选，再在有候选的集里
 按集号从小到大取前 6 集（没抓成要报的另数 6 条）。以前 `missing[:6]` 先截断：新订阅常常是"缺的全是已播的"，页上没有前几集
 （半路订的、Mikan 把两档分成两个页而 TMDB 是一季）时每次都只看同样的前 6 集，还在播的永远轮不到——AB 6《正相反的你与我》
@@ -73,7 +91,7 @@ E25–E35 抓进来——补不补老档是人的决定。
     不写（退出码 2），要改就直接编辑 sidecar。这一季已经订阅 → 什么都不写，照样给预览。
   - 然后说出下一次抓取会做什么（`subscribe.preview`：扫描一遍、抓取检测器对这部番原样跑一遍，只读）：可抓的集、为什么不抓
     （找不到番组页、编号对不上、都没过硬门槛……）；**不在播的季说清楚不会抓**——抓取只补在播 / 刚播完的季（`is_seasonal`），
-    老番的整季补档不在这一步。
+    老番的整季补档不在这一步（上百集的连载、连播的季订阅着只抓最近 30 天播的，预览照实说）。
   - 预演（`--dry-run` / `AUTO_APPLY=false`，与 `apply` 同一个口径）不写，也不给预览（订阅还没写，抓取看不到它）。
   - 拿运行锁（与 `run` / `grab` 排队），不看维护暂停（人手的命令，与 `rollback` / `repair` 一样）。
 
@@ -82,6 +100,8 @@ E25–E35 抓进来——补不补老档是人的决定。
 `tests/test_subscriptions.py`：只有订阅档案的目录被扫描登记（不是电影、TMDB 按 sidecar 认）；没有订阅的空目录、坏档案的
 空目录照旧不登记；订阅的季盘上一集都没有也抓；订阅的季与盘上的季一起看；订阅里的番组页先于搜索（搜到的别的页日期
 对不上）；端到端（迭代）种子加进 `<番目录>/Season 1`、`have` 记上。改之前 5 条红（另两条是"照旧不登记"的对照）。
+
+`tests/test_grab_subscribed_visible.py`：TMDB 认不出的订阅目录报 `subscription_unserved`（important）；只有 AB 订阅着、`full` 下 minor、订阅模式下 important；TMDB 没有订阅的季报出来；200 集的连载订阅着只抓最近播的、没人订的不碰；播完的老订阅不报；订阅着的季找不到番组页 / 最新一集之后没发布 / 候选全被拒是 important（`history.qualifies` 数它），订阅之前的老空缺照旧 minor。改之前全红（"播完的老订阅不报"是对照）。`tests/test_cli_subscribe.py` 多一条：连载的季预览说只抓最近的。
 
 `tests/test_grab_missing_cap.py`（AB 6 形态：两档压平成一季、订的是第二档的页）：页上有的集越过前面的空缺照抓；只在有候选的
 集里数上限；没人订的季照旧只看前 6 集；AB 里的订阅同样算订阅着。改之前前两条红。
