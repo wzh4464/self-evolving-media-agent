@@ -491,3 +491,13 @@ def test_rollback_keeps_a_dir_a_torrent_now_saves_into(lib):
     assert res["reverted"] == 0 and res["skipped"] == 1
     assert "ffffffff" in res["skipped_detail"][0]["skip_reason"]
     assert lib.path(NEW).is_dir()
+
+
+def test_intent_with_a_malformed_page_id_does_not_reach_the_sidecar(lib):
+    """订阅类动作带进 sidecar 的番组页 id 只收纯数字（`actions._clean_intent`）：动作参数来自检测器或人的命令行、也可能来自
+    一份旧的诊断快照，sidecar 里不该出现 `abc` 这样的页（审查的变异 T2-28 以前全套测试照样过——命令行那边先查过了）。"""
+    from media_agent.actions import _clean_intent
+
+    assert _clean_intent({"mikan_id": "4601"}) == {"mikan_id": "4601"}
+    assert _clean_intent({"mikan_id": "abc"}) == {}
+    assert _clean_intent({"mikan_id": 4601}) == {}

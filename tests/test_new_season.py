@@ -115,3 +115,15 @@ def test_the_new_season_is_grabbed_in_the_same_run(lib):
     assert [r["args"]["season"] for r in loop.applied("subscribe_season")] == [2]
     assert sorted(r["args"]["episode"] for r in loop.applied("grab_episode")) == [1, 2]
     assert lib.sidecar(SHOW).subscriptions["2"]["source"] == "new-season"
+
+
+def test_a_show_whose_identity_is_on_hold_gets_no_new_season(lib):
+    """TMDB 身份这一轮认不准（`naming_hold`：旧版记下的 tmdb_id 没有佐证、坏档案……）：不按它登记下一季——登记了的"下一季"
+    可能是另一部番的（审查的变异 T2-26 去掉这一条，全套测试照样过）。"""
+    _show(lib)
+    ctx = lib.context()
+    state = lib.scan(ctx=ctx)
+    [show] = state.shows
+    show.naming_hold = "sidecar 的 tmdb_id 是旧版记下的，这一轮不认"
+
+    assert not list(NewSeasonDetector().detect(ctx, state))

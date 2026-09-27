@@ -87,6 +87,17 @@ def test_without_an_offset_the_numbering_mismatch_is_reported_not_skipped(lib):
     assert set(f.evidence["missing"]) == {1, 2, 4, 5, 6}
 
 
+def test_a_registered_but_wrong_offset_gets_a_corrected_suggestion(lib):
+    """登记了偏移、可登记错了（-12，发布其实从 25 起）：换算后 13–18 还是落在 12 集的一季之外，推测的偏移要把已登记的算进去
+    ——是 -24，不是在 -12 之上再减的 -12（审查的变异 T1-15 忽略已登记的偏移，全套测试照样过）。"""
+    _hyakkano(lib, sidecar_offset=-12, releases={k: NEKO for k in range(1, 7)})
+
+    [f] = [f for f in lib.diagnose(detectors=[EpisodeAvailableDetector]) if f.kind == "episode_numbering_mismatch"]
+
+    assert f.evidence["episode_offset"] == -12 and f.evidence["unplaced"][0] == 13
+    assert f.evidence["suggested_offset"] == -24
+
+
 def test_a_release_the_offset_pushes_below_one_is_reported(lib):
     """配着 -24 的一季里按季内编号发的 `第三季 - 01`：换算出 -23，说不清是哪一集——不收，报出来、写明为什么。"""
     _hyakkano(lib, ab_offset=-24, releases={1: LOLI_S3, 2: NEKO, 4: NEKO, 5: NEKO, 6: NEKO})
@@ -111,6 +122,17 @@ def test_an_episode_with_no_release_at_all_is_reported_after_a_grace(lib):
     assert f.evidence["episodes"] == [4, 5] and f.evidence["waiting"] == [6]
     assert f.evidence["mikan_id"] == MID and f.evidence["grace_days"] == NO_RELEASE_GRACE_DAYS
     assert not [f for f in fs if f.kind == "episode_numbering_mismatch"]
+
+
+def test_the_grace_ends_on_the_day(lib):
+    """播出正好 `NO_RELEASE_GRACE_DAYS` 天、还没有发布：宽限到头了，报（边界是"超过或等于"；审查的变异 T1-16 把 `<=`
+    写成 `<`，全套测试照样过）。"""
+    _hyakkano(lib, sidecar_offset=-24, releases={k: NEKO for k in range(1, 5)}, have=(1, 2, 3, 4),
+              first_days_ago=7 * 4 + NO_RELEASE_GRACE_DAYS)
+
+    [f] = [f for f in lib.diagnose(detectors=[EpisodeAvailableDetector]) if f.kind == "episode_not_released"]
+
+    assert f.evidence["episodes"] == [5] and f.evidence["waiting"] == []
 
 
 def test_a_just_aired_episode_without_a_release_is_quiet(lib):

@@ -127,3 +127,15 @@ def test_an_ab_row_for_another_season_does_not_steer_this_one(lib):
     g = _grabs(lib.diagnose(detectors=[EpisodeAvailableDetector]))
 
     assert {f.evidence["mikan_id"] for f in g.values()} == {NEW}
+
+
+def test_a_page_the_subscription_names_beats_a_nearer_one(lib):
+    """人（或 AB 的订阅）为这一季指定了页：播出日期打分平手时它赢，哪怕别的页离缺的集更近——订阅指定的页是人的意图，
+    "近不近"只是猜；它真停了由 `episode_not_released` 报出来（订阅着的季停下来是 important）。"""
+    _rezero(lib, ab_page=None, subscription={"source": "cli", "mikan_id": OLD})
+
+    fs = lib.diagnose(detectors=[EpisodeAvailableDetector])
+
+    [f] = [f for f in fs if f.kind == "episode_not_released"]
+    assert f.evidence["mikan_id"] == OLD and f.severity == "important"
+    assert not [f for f in fs if f.action]
