@@ -336,6 +336,10 @@ cd ~/media-agent && .venv/bin/media-agent ab-mode subscription
 只是临时切回的话，预计多出"停着那几天 × 在追的番"那么多个种子。**不要**为了少下一些在 AB 里停用订阅：停用把订阅行标成
 `deleted=1`，本项目只读 `deleted=0`，这条订阅的接手、集号偏移、新季登记都跟着没了。
 
+**不追一部番了：在 AB 里停用它的订阅。** 光删番目录不够——AB 的订阅还挂着，只是本项目不再把它建回来（`ab-adoption` 认得出
+"在过"的目录，报一条 minor 的 `ab_subscription_dir_gone`）；删错了就手动建回目录（或 `media-agent subscribe`），下一次抓取接着
+登记。停用的订阅本项目看不见（`deleted=1`），它的集号偏移已经迁进 sidecar 的照旧。
+
 **`AB_MODE` 与状态文件。** `state/ab_mode.json`（命令写的）> `.env` 的 `AB_MODE` > `full`；部署从不碰 `state/`。状态文件坏了，
 所有命令以退出码 2 拒绝启动（「配置错误：…ab_mode.json…」）：删掉它、用 `media-agent ab-mode` 核对两边，再切一次。代码回滚到
 v0.6.0 之前，先切回 full（见「回滚」）。

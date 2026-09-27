@@ -302,3 +302,69 @@ def test_a_new_season_whose_burst_already_landed_is_registered_in_the_same_grab(
     assert sub["args"]["season"] == 2
     assert [r["args"]["episode"] for r in loop.applied("grab_episode")] == [2]
     assert lib.sidecar("旧番庚").subscriptions["2"]["mikan_id"] == "5081"
+
+
+# ------------------------------------------------------------------ 人删掉的番目录不重建
+def test_a_show_dir_the_user_deleted_is_not_recreated(lib):
+    """AB 里还挂着订阅（播完的番大多如此），人把番目录删了：以前每 30 分钟的抓取都 `create_show_dir` 建回来、接着把整季
+    重下一遍（2026-09-27 审查：删掉《杀手青春》之后同一次抓取就提了 6 个 `grab_episode`；35 条有效订阅里 30 条的季还在
+    `is_seasonal` 的窗口里）。见过这个目录的订阅（它在过）目录没了就只说一句，不重建。"""
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(NEW)
+    sh.season(1).local(f"{NEW} S01E01.mkv")
+    sh.sidecar(seasons={"1": {"have": [1]}})
+    _row(lib, season=1)
+    assert not [f for f in _findings(lib) if f.action]                 # 目录在：见过了
+    import shutil
+    shutil.rmtree(lib.path(NEW))
+
+    fs = _findings(lib)
+
+    assert not [f for f in fs if f.action]
+    [f] = fs
+    assert f.kind == "ab_subscription_dir_gone" and f.severity == "minor" and f.evidence["bangumi_id"] == 51
+    assert "停用" in f.summary
+
+
+def test_a_row_ab_already_downloaded_for_counts_as_seen(lib):
+    """部署之前就删了的目录（这个版本从没见过它）：AB 的 torrent 表里有这条订阅下过的种子，说明目录在过——同样不重建。"""
+    _row(lib, id=14)
+    lib.ab_rows("torrent", [{"id": 1, "bangumi_id": 14, "name": "[G] Shinban Otsu - 01", "url": "magnet:?x",
+                             "downloaded": 1}])
+
+    [f] = _findings(lib)
+
+    assert f.kind == "ab_subscription_dir_gone" and not f.action
+    assert not lib.path(NEW).exists()
+
+
+def test_a_rolled_back_dir_is_not_recreated_by_the_next_grab(lib):
+    """回退了 `create_show_dir`：下一次诊断不能又把它建回来（那是撤销本轮动作的反向，只是隔了一轮）。"""
+    _row(lib, season=1)
+    c = lib.cycle(detectors=[AbAdoptionDetector])
+    assert c.applied("create_show_dir")
+    lib.diagnose(detectors=[AbAdoptionDetector])                      # 下一次抓取看到它在
+    assert lib.rollback(c.run_id)["reverted"] == 1
+
+    fs = _findings(lib)
+
+    assert [f.kind for f in fs] == ["ab_subscription_dir_gone"] and not lib.path(NEW).exists()
+
+
+def test_a_new_row_for_a_deleted_show_still_gets_its_dir(lib):
+    """删掉的番又在 AB 里订了新的一季（新的订阅行）：人又要了，照建。"""
+    lib.configure(qbit_allow_empty=True)
+    sh = lib.show(NEW)
+    sh.season(1).local(f"{NEW} S01E01.mkv")
+    sh.sidecar(seasons={"1": {"have": [1]}})
+    _row(lib, id=51, season=1)
+    _findings(lib)
+    import shutil
+    shutil.rmtree(lib.path(NEW))
+    _row(lib, id=52, season=2, rss="https://mikanani.me/RSS/Bangumi?bangumiId=4602&subgroupid=1")
+
+    fs = _findings(lib)
+
+    [made] = [f for f in fs if f.action]
+    assert made.action.op == "create_show_dir" and made.action.args["seasons"] == [2]
+    assert [f.kind for f in fs if not f.action] == ["ab_subscription_dir_gone"]

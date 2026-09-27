@@ -97,6 +97,10 @@
   `season_layout_mismatch` 的建议改成写 `episode_offsets`（带按库内各季集数推测的值；以前说的 `season_offsets` 改变不了
   什么）。TMDB 的季列表（按条目缓存 30 天）里没有、分集表里有的季不再算多出来的：以前新一季刚抓了头几集、记进 `seasons`
   之后整部番停抓到缓存过期。
+- **人删掉的番目录不再被建回来、整季重下**：AB 里还挂着订阅（播完的番大多如此）时，`ab-adoption` 以前只要番目录不在就
+  `create_show_dir`，下一次迭代就把整季（还在 `is_seasonal` 窗口里的）重新抓——删目录不再是删掉；回退 `create_show_dir`
+  之后下一次抓取也会建回来。现在"在过"的目录（本项目见过它，或 AB 的 torrent 表里有这条订阅下过的种子）没了只报一条 minor 的
+  `ab_subscription_dir_gone`；同一个目录上新的订阅行照建。不追一部番要在 AB 里停用它的订阅（`deploy/README.md`）。
 - **AB 订阅那一刻补进来的新一季，同一次抓取里就登记、接着抓**：`ab-adoption` 以前看到"盘上已有这一季"（订阅那一刻 AB 补的
   第一集名字里就带季号，`S2 - 01`）就不登记订阅，以为 sidecar-sync 马上会记进 `seasons`——可抓取模式里没有 sidecar-sync，
   6 小时的 `run` 记上之前抓取看不见这一季，第二集晚半天。现在 sidecar 的 `seasons` 与 `subscriptions` 都还没有这一季就登记

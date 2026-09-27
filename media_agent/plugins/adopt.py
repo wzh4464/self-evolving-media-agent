@@ -20,11 +20,13 @@ sidecar 的 `seasons` 里已经有的季不写订阅：抓取本来就看它（s
 """
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
 from .. import abrow
 from .. import sidecar as sc_mod
+from ..cache import Cache
 from ..claims import fold
 from ..kernel import Action, Context, Finding, LibraryState
 from ..naming import season_of_dir
@@ -46,6 +48,39 @@ def _dirs_by_bangumi_id(shows) -> dict:
         if bid is not None:
             out.setdefault(bid, s.dir_path)
     return out
+
+
+# 见过的订阅目录记多久（`_remember`）：够长就行——过期了只是回到"AB 的 torrent 表里有没有它下过的种子"那一条证据
+SEEN_TTL = 10 * 365 * 86400
+
+
+def _seen_key(row: dict) -> str:
+    return f"abseen:{row.get('id')}"
+
+
+def _remember(cache, row: dict, name: str) -> None:
+    """这条订阅的番目录此刻在：记下来（`state/` 的缓存，检测只写 `state/`，不碰媒体根）。已记着同一个目录就不再写。"""
+    if row.get("id") is None:
+        return
+    got = cache.get_llm(_seen_key(row), ttl=SEEN_TTL) or {}
+    if got.get("dir") != fold(name):
+        cache.put_llm(_seen_key(row), {"dir": fold(name), "first_seen": date.today().isoformat()})
+
+
+def _seen_before(ctx, cache, row: dict, name: str) -> bool:
+    """这条订阅的番目录在过吗（人删了 / 回退了，不是还没建）：本项目见过它（`_remember`），或 AB 的 torrent 表里有这条订阅
+    下过的种子（AB 的 RSS 线程加种时记 `bangumi_id`——部署之前就删了的也认得出；订阅那一刻补的那一批不记，新订阅不会因此被
+    当成"在过"）。AB 库读不了就只按前一条。"""
+    got = cache.get_llm(_seen_key(row), ttl=SEEN_TTL) or {}
+    if got.get("dir") == fold(name):
+        return True
+    if ctx.abdb is None or row.get("id") is None:
+        return False
+    try:
+        return bool(ctx.abdb.query("SELECT 1 FROM torrent WHERE bangumi_id=? LIMIT 1", (row.get("id"),)))
+    except Exception as e:                          # noqa: BLE001 —— 只少一条证据：照实记一行，按"没见过"走
+        ctx.log(f"[ab-adoption] 读 AB 的 torrent 表出错（{type(e).__name__}: {e}），订阅 {row.get('id')} 按没见过处理")
+        return False
 
 
 def subscription_of(row: dict) -> dict:
@@ -72,7 +107,7 @@ class AbAdoptionDetector:
         except OSError as e:
             ctx.log(f"[ab-adoption] 列不出媒体根 {media_root}（{type(e).__name__}: {e}），这一轮不接手订阅")
             return
-        shows = {fold(s.dir_name): s for s in state.shows}
+        cache = Cache(ctx.config.cache_db)
         missing: dict[str, list[dict]] = {}
         for row in state.bangumi_rows:
             name = abrow.show_dir_name(row, media_root)
@@ -83,6 +118,7 @@ class AbAdoptionDetector:
             if d is None:
                 missing.setdefault(name, []).append(row)
                 continue
+            _remember(cache, row, name)
             yield from self._existing(d, row)
         known = _dirs_by_bangumi_id(state.shows) if missing else {}
         for name, rows in missing.items():
@@ -90,7 +126,23 @@ class AbAdoptionDetector:
             if elsewhere:
                 yield from (self._moved(r, name, d) for r, d in elsewhere)
                 continue
-            yield self._create(media_root / name, rows)
+            gone = [r for r in rows if _seen_before(ctx, cache, r, name)]
+            yield from (self._gone(r, name) for r in gone)
+            new = [r for r in rows if r not in gone]
+            if new:
+                yield self._create(media_root / name, new)
+
+    def _gone(self, row: dict, name: str) -> Finding:
+        """番目录在过、现在没了，AB 的订阅还挂着：人删的（或回退了 `create_show_dir`）。**不重建**——以前每 30 分钟的抓取
+        都建回来、接着把整季重下一遍：删掉《杀手青春》之后同一次抓取就提了 6 个 `grab_episode`，35 条有效订阅里 30 条的季还在
+        `is_seasonal` 的窗口里（2026-09-27 审查）。v0.5 下删掉就是删掉了：AB 只下 RSS 里新出的，播完的番没有新的。"""
+        return Finding(
+            rule=self.id, kind="ab_subscription_dir_gone", severity="minor", subject=f"AB{row.get('id')}",
+            summary=(f"AutoBangumi 订阅 {row.get('id')}「{row.get('official_title')}」的番目录「{name}」在过、现在没了："
+                     f"不重建（当作人删的）。不追了就在 AB 里停用这条订阅；还要就手动建回这个目录（或 "
+                     f"media-agent subscribe），下一次抓取接着登记"),
+            show=name,
+            evidence={"bangumi_id": row.get("id"), "save_path": row.get("save_path"), "dir_name": name})
 
     def _moved(self, row: dict, name: str, show_dir: Path) -> Finding:
         """AB 的 save_path 指向一个不存在的目录，而另一个番目录的 sidecar 记着这条订阅（sidecar-sync 按 save_path 写下的
