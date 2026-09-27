@@ -34,7 +34,8 @@ from ..sidecar import load as load_sidecar
 from .subscription import (MIKAN, _disk_episodes, _http_get,
                            _mikan_search_ids, is_seasonal)
 
-# 单轮为一部番最多提议抓几集，防止新订阅时一次刷屏
+# 单轮为一部番（每一季）最多提议抓几集，防止新订阅时一次刷屏。在**番组页上有候选**的集里数（没抓成要报的另数一份），
+# 不在全部缺的集里数——页上没有的前几集不能把后面有的挡住
 MAX_PER_SHOW = 6
 
 # 一集播出多少天之后，番组页上还一个发布都没有才报（`episode_not_released`）。字幕组一般一两天内出；
@@ -406,6 +407,9 @@ class EpisodeAvailableDetector:
             # 也抓——新番、新一季以前要等 AutoBangumi 放进第一个文件）
             subs = {str(k): (v if isinstance(v, dict) else {})
                     for k, v in (sc.subscriptions or {}).items() if str(k).isdigit()}
+            rows = ab_rows.get(fold(show.dir_name), [])
+            # 人明说要抓的季：sidecar 的订阅，或 AB 里落进这一库内季的有效订阅（`abrow.library_season`）
+            subscribed = set(subs) | {str(abrow.library_season(r)) for r in rows}
             season_keys = sorted({k for k in sc.seasons if str(k).isdigit()} | set(subs), key=int)
             if not season_keys:
                 continue
@@ -495,7 +499,7 @@ class EpisodeAvailableDetector:
                 mid = _resolve_mikan_id(
                     sc, show, cache, log=ctx.log, season=int(season_key),
                     air=[d for d in (air_of.get(n) for n in aired) if d],
-                    preferred=_pages_for(subs, ab_rows.get(fold(show.dir_name), ()), int(season_key)),
+                    preferred=_pages_for(subs, rows, int(season_key)),
                     recent=[d for d in (air_of.get(n) for n in missing) if d])
                 if not mid:
                     yield Finding(
@@ -561,11 +565,20 @@ class EpisodeAvailableDetector:
                         by_ep.setdefault(ep_here, []).append(it)
 
                 silent: list[int] = []           # 归拢表里什么都没有的集：循环之后统一说
-                for ep in missing[:MAX_PER_SHOW]:
+                # 订阅着的季：先给每一集找候选，再在有候选的集里数 `MAX_PER_SHOW`（抓的、没抓成要报的各数各的）。以前
+                # `missing[:6]` 先截断：新订阅常常是"缺的全是已播的"，页上没有前几集（半路订的、Mikan 把两档分成两个页而
+                # TMDB 是一季）时每次都只看同样的前 6 集，后面还在播的永远轮不到（2026-09-27 回放：AB 6 的 E24、E25）。
+                # 没人订的季照旧只看缺的前 6 集：回放里没人订的【我推的孩子】（库里只有第一档 11 集、TMDB 压平成 35 集）
+                # 放开之后要越过第二档整档的空缺，把第三档 E25–E35 抓进来——补不补老档是人的决定，不是抓取的
+                window = missing if season_key in subscribed else missing[:MAX_PER_SHOW]
+                grabs = noted = 0
+                for ep in window:
                     raw = by_ep.get(ep) or []
                     elsewhere = off_season.get(ep) or []
                     if not raw and not elsewhere:
                         silent.append(ep)
+                        continue
+                    if grabs >= MAX_PER_SHOW and noted >= MAX_PER_SHOW:
                         continue
 
                     # 先按播出日期把明显错季的剔掉，再交给偏好打分。
@@ -580,7 +593,8 @@ class EpisodeAvailableDetector:
                     cands = ok + unknown
                     by_season = [f"{why} | {c['title'][:90]}" for c, why in elsewhere][:6]
                     if not cands:
-                        if wrong_season or elsewhere:
+                        if (wrong_season or elsewhere) and noted < MAX_PER_SHOW:
+                            noted += 1
                             yield Finding(
                                 rule=self.id, kind=self.kind, severity="minor",
                                 subject=f"S{int(season_key):02d}E{ep:02d}",
@@ -603,6 +617,9 @@ class EpisodeAvailableDetector:
                             name="只保留" + "/".join(sc.require_any)))
                     if best is None:
                         # 有人发了但没一个合格——报出来，别悄悄跳过
+                        if noted >= MAX_PER_SHOW:
+                            continue
+                        noted += 1
                         yield Finding(
                             rule=self.id, kind=self.kind, severity="minor",
                             subject=f"S{int(season_key):02d}E{ep:02d}",
@@ -617,6 +634,9 @@ class EpisodeAvailableDetector:
                                       "rejected_by_season": by_season},
                         )
                         continue
+                    if grabs >= MAX_PER_SHOW:
+                        continue
+                    grabs += 1
                     verdict = next(v for c, v in scored if c is best)
                     yield Finding(
                         rule=self.id, kind=self.kind, severity="important",
