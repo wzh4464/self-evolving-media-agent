@@ -66,7 +66,7 @@ uv run media-agent ledger backfill      # 补录出处账本（--dry-run 只报�
 uv run media-agent ledger show <hash>   # 账本里某个种子是什么
 uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID] [--dir 名] [--require-any 词 …] [--offset N]
                                         # 不经 AutoBangumi 订阅一季：建目录 + sidecar（有审计、能回退），说出下一次抓取会做什么
-uv run media-agent ab-mode [show|subscription|full] [--dry-run]
+uv run media-agent ab-mode [show|subscription|full] [--dry-run] [--force]
                                         # AutoBangumi 的模式：看两边各认什么 / 可逆地切 AB 的下载与改名（有审计、能回退）
 uv run pytest                         # 离线测试（不联网、不碰真库）
 ```

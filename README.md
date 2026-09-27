@@ -240,7 +240,7 @@ uv run media-agent health              # the last run's health report
 uv run media-agent ack <fp> --reason … # acknowledge a stuck finding (commit .agents/acks.json)
 uv run media-agent ledger backfill --dry-run   # provenance coverage (every run backfills new torrents)
 uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID]   # subscribe without AutoBangumi
-uv run media-agent ab-mode [show|subscription|full]                # AutoBangumi as a subscription front-end, reversibly
+uv run media-agent ab-mode [show|subscription|full]                # AutoBangumi as a subscription front-end, reversibly (--dry-run, --force)
 ```
 
 Start with `diagnose`, then `apply --dry-run`. Only flip `AUTO_APPLY=true` once

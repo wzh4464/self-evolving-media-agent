@@ -45,7 +45,7 @@
   两个任务每 6 小时同一秒起来）；认维护暂停；健康报告写 `state/health/grab/`（`media-agent health --grab`），通知只为抓取
   相关的事发（崩溃、整批拒绝、审计、抓取动作失败），去重状态单独一份；不写发现历史；日志 `state/grab.log`，与 run.log
   一样轮转。番组页 feed 的缓存从 1 小时改成 20 分钟，比抓取的节奏短。
-- **`media-agent ab-mode [show|subscription|full] [--dry-run]`：可逆地关掉 AutoBangumi 的下载与改名，只留它当订阅的前端**
+- **`media-agent ab-mode [show|subscription|full] [--dry-run] [--force]`：可逆地关掉 AutoBangumi 的下载与改名，只留它当订阅的前端**
   （新配置 `AB_MODE`，默认 `full`——部署这个版本什么都不变，直到人切）。`subscription`：AB 的 `rss_parser.enable` 与
   `bangumi_manage.enable` 都关（不拉 RSS、不改名），WebUI 里的订阅照旧。切换读 AB 的整份配置、只改这两个开关、整份发回
   （漏掉的段 AB 会退回默认值）、重启它的程序（不是容器）、等它回来读回核对，然后把模式记进 `state/ab_mode.json`（盖过
@@ -124,6 +124,9 @@
   本来就是新的、旧程序也还在跑（`status` 为真）——连接超时之后照样记 applied、写状态文件，AB 的两个线程其实照旧在拉 RSS、
   改名。现在只有读超时（请求到了）接着等，而且要先看到 AB 停过（`status=false`）才认它回来；连接 / 连接池 / 写请求超时记
   unknown、模式不动。回退（`rollback`）用的是同一处。
+- **`ab-mode subscription` 切之前把 AB 的每条订阅对一遍**：本项目的抓取接不住的（认不出番目录、保存路径过期、季的编排对不上、
+  TMDB 认不出、编号对不上、订阅着却已经停下来了）AB 一停就不再来——列出来、不切（退出码 1），新选项 `--force` 照样切，
+  `--dry-run` 只列。确认过、不再提醒的发现照样算。以前的切换清单只查认不出目录的两种，生产回放里 AB 37、AB 9 都没拦下。
 - **已经是 subscription 时再跑 `ab-mode subscription` 真的会重新核对**：以前两边都是 subscription 就说「已经是」、什么都不做，
   可 README 与 `ab_still_polling` / `ab_mode_unverified` 的说明都让人"再跑同一条命令"——切换之后有人点了一次刷新、切换那一刻
   AB 库读不了，基线就永远停在那里，warn 每轮都在，之后真的又拉了也分不出来。现在核对有问题（没有基线、拉过 RSS、订阅之外

@@ -43,7 +43,8 @@ def _args(**kw):
 
 
 def _switch(lib, monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["media-agent", "ab-mode", "subscription"])
+    # 甲番没有 TMDB 身份（这里测的是切换之后的核对）：切之前的覆盖检查会列出它、拦下切换，`--force` 照样切
+    monkeypatch.setattr(sys, "argv", ["media-agent", "ab-mode", "subscription", "--force"])
     assert cli.main() == 0
     lib.configure(ab_mode="subscription", ab_mode_source="state")
 

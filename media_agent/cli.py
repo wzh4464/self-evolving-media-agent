@@ -740,13 +740,25 @@ def cmd_ab_mode(args, cfg) -> int:
                   f"（{cfg.ab_mode_source}）。media-agent ab-mode show 看核对")
             return 0
         print(f"已经是 {want}，但切换之后的核对有问题（{'；'.join(problems)}）：重启一次 AB、核对、重新记基线")
+    dry = args.dry_run or not cfg.auto_apply
+    if want == abmode.SUBSCRIPTION and abmode.mode_of(flags) != abmode.SUBSCRIPTION:
+        # 切之前把每条有效的 AB 订阅对一遍（`abmode.coverage`）：抓取接不住的，AB 一停就不再来
+        gaps = _ab_coverage(ctx, cfg)
+        if gaps:
+            print(f"⚠️  订阅模式下这 {len(gaps)} 条 AB 订阅本项目的抓取接不住（AB 一停，它们就不再来）：")
+            for g in gaps:
+                print(f"  · AB {g['bangumi_id']}「{g['title']}」第 {g['season']} 季（{g['dir'] or '认不出目录'}）："
+                      f"{g['why']}")
+            if not dry and not getattr(args, "force", False):
+                print("没有切：先按上面处理（登记集号偏移 / 在 sidecar 里写 tmdb_id / 改订阅……），再跑一次；确认要切就加 "
+                      "--force")
+                return 1
     before = abmode.mode_of(flags) or abmode.describe_flags(flags)
     f = Finding(rule="ab-mode", kind="ab_mode_switch", severity="important",
                 summary=(f"AutoBangumi 切到 {want}：{abmode.describe_flags(flags)} → "
                          f"{abmode.describe_flags(abmode.flags_for(want))}"),
                 evidence={"before": flags, "media_agent_mode": cfg.ab_mode, "source": cfg.ab_mode_source},
                 action=Action(op="set_ab_mode", args={"mode": want}))
-    dry = args.dry_run or not cfg.auto_apply
     ex = Executor(ctx, dry_run=dry)
     report = ex.apply([f], need_qbit=False)
     if _report_audit_problems(report.audit_problems, cfg.state_dir):
@@ -842,6 +854,26 @@ def _ab_mode_show(ctx, cfg) -> int:
     for line in abmode.activity_lines(act):
         print(line)
     return 1 if abmode.activity_problems(act) else rc
+
+
+def _ab_coverage(ctx, cfg) -> list[dict]:
+    """切到 subscription 之前的覆盖检查：扫描一遍、订阅接手与抓取两个检测器照原样诊断一遍（只读），交给
+    `abmode.coverage`。诊断出错就算一条接不住（核对不了不当作接得住）。"""
+    from . import abmode
+    from .plugins.adopt import AbAdoptionDetector
+    from .plugins.grab import EpisodeAvailableDetector
+    from .scan import build_state
+
+    try:
+        state = build_state(ctx)
+        _warn_degraded(state)
+        findings = []
+        for d in (AbAdoptionDetector(), EpisodeAvailableDetector(replace_dead=False)):
+            findings += list(d.detect(ctx, state))
+    except Exception as e:                           # noqa: BLE001 —— 核对不了：当作一条接不住交给调用方说
+        return [{"bangumi_id": "?", "title": "", "season": "?", "dir": "",
+                 "why": f"覆盖检查出错（{type(e).__name__}: {e}），核对不了"}]
+    return abmode.coverage(findings, state.bangumi_rows, cfg.media_root)
 
 
 def _ab_activity(ctx, cfg, rec) -> tuple[dict, str]:
@@ -1334,6 +1366,8 @@ def main() -> int:
                                        "不改名）；full = 切回 AB 下载、改名。可逆，有审计、能 rollback")
     s.add_argument("mode", nargs="?", default="show", choices=("show", "subscription", "full"))
     s.add_argument("--dry-run", action="store_true", help="只说会改什么，不改")
+    s.add_argument("--force", action="store_true",
+                   help="切到 subscription 时，有 AB 订阅本项目的抓取接不住也照样切（默认列出来、不切）")
     # 切换改的是 AB 与 state/ab_mode.json（下一轮 run / grab 按它行事）：与 run 排队。人手的命令，不看维护暂停
     s.set_defaults(func=cmd_ab_mode, lock=lambda a: a.mode != "show" and not a.dry_run)
 

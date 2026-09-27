@@ -369,6 +369,69 @@ def test_mixed_flags_are_switched_both_ways(ab_lib, monkeypatch):
     assert _state(ab_lib)["previous_flags"] == {"rss_parser.enable": True, "bangumi_manage.enable": False}
 
 
+# ================================================================ 切之前：AB 的每条订阅抓取都接得住吗
+def _uncovered_row(lib):
+    """丙番：TMDB 把两档压平成一季 24 集，库里 Season 1、2 各 12 集、没登记集号偏移；AB 订阅 3 是它的第 2 季——
+    抓取的季的编排闸让这部番一集都不抓（生产上《100个女朋友》的形态，那条发现还是确认过、不再提醒的）。"""
+    from harness import weekly
+
+    lib.configure(qbit_allow_empty=True)
+    lib.tmdb.add_show(3903, "丙番", seasons={1: weekly(24, first_days_ago=200)})
+    sh = lib.show("丙番")
+    for sn in (1, 2):
+        for n in range(1, 13):
+            sh.season(sn).local(f"丙番 S{sn:02d}E{n:02d}.mkv")
+    sh.sidecar(tmdb_id=3903, tmdb_source="human", tmdb_title="丙番",
+               seasons={"1": {"have": list(range(1, 13))}, "2": {"have": list(range(1, 13))}})
+    sh.bangumi(3, title_raw="Bing", season=2)
+
+
+def test_switching_is_refused_while_an_ab_subscription_would_go_uncovered(ab_lib, monkeypatch, capsys):
+    """切之前把每条有效的 AB 订阅对一遍：抓取接不住的（季的编排对不上、TMDB 认不出、找不到番组页而且停下来了……），
+    AB 一停就不再来——列出来、不切（2026-09-27 回放：AB 37 与 AB 9 都是这样，切换清单只查了认不出目录的两种）。
+    确认过、不再提醒的发现照样算：那只是不发信，不是接得住。"""
+    lib = ab_lib
+    _uncovered_row(lib)
+
+    assert _main(monkeypatch, "ab-mode", "subscription") == 1
+
+    out = capsys.readouterr().out
+    assert "接不住" in out and "丙番" in out and "--force" in out
+    assert "update_config" not in lib.ab.calls and "restart" not in lib.ab.calls
+    assert not _set_audit(lib) and _state(lib) is None
+
+
+def test_force_switches_despite_uncovered_subscriptions(ab_lib, monkeypatch, capsys):
+    lib = ab_lib
+    _uncovered_row(lib)
+
+    assert _main(monkeypatch, "ab-mode", "subscription", "--force") == 0
+
+    assert "丙番" in capsys.readouterr().out                    # 照样列出来
+    assert _state(lib)["mode"] == "subscription"
+
+
+def test_dry_run_lists_uncovered_subscriptions_without_refusing(ab_lib, monkeypatch, capsys):
+    lib = ab_lib
+    _uncovered_row(lib)
+
+    assert _main(monkeypatch, "ab-mode", "subscription", "--dry-run") == 0
+
+    out = capsys.readouterr().out
+    assert "丙番" in out and "预演" in out
+    assert "update_config" not in lib.ab.calls
+
+
+def test_a_registered_offset_makes_the_row_covered(ab_lib, monkeypatch):
+    """登记了集号偏移（`{"2": -12}`）：第 2 季对到压平那一季的 E13–E24，抓取接得住，照常切。"""
+    lib = ab_lib
+    _uncovered_row(lib)
+    lib.show("丙番").sidecar(episode_offsets={"2": -12})
+
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    assert _state(lib)["mode"] == "subscription"
+
+
 # ================================================================ 切回 full
 def test_switching_back_to_full_turns_both_on_and_warns_about_the_catch_up(ab_lib, monkeypatch, capsys):
     lib = ab_lib

@@ -195,7 +195,7 @@ uv run media-agent health              # 最近一轮的健康报告
 uv run media-agent ack <指纹> --reason …  # 确认一个卡住的问题（要提交 .agents/acks.json）
 uv run media-agent ledger backfill --dry-run   # 出处覆盖率（每轮 run 会自动补新种子）
 uv run media-agent subscribe --tmdb ID [--season N] [--mikan ID]   # 不经 AutoBangumi 订阅一季
-uv run media-agent ab-mode [show|subscription|full]                # AutoBangumi 只当订阅前端（可逆）
+uv run media-agent ab-mode [show|subscription|full]                # AutoBangumi 只当订阅前端（可逆；--dry-run、--force）
 ```
 
 建议先 `diagnose`，再 `apply --dry-run`。**读清楚它想干什么之后**，

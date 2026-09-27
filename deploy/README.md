@@ -267,7 +267,7 @@ v0.6.0 起有 `AB_MODE`，默认 `full`——**部署这个版本什么都不变
    2026-09-27 回放：《100个女朋友》第三季（-24）照样抓，Season 1、2 不抓（都已播完、集都齐）。
 2. 抓取任务在跑：`launchctl print gui/$(id -u)/com.zihan.media-agent-grab | grep state`，`media-agent health --grab` 最近一轮
    不是 critical。
-3. 两边此刻各认什么：`media-agent ab-mode`（= `show`）。预演：`media-agent ab-mode subscription --dry-run`。
+3. 两边此刻各认什么：`media-agent ab-mode`（= `show`）。预演：`media-agent ab-mode subscription --dry-run`——它同时列出本项目的抓取接不住的 AB 订阅（下一节），切之前处理掉。
 4. （可选）留一份 AB 的配置：`cp <ab-config>/config.json ~/ab-config.json.bak-$(date +%F) && chmod 600 ~/ab-config.json.bak-*`
    ——里面有密码。切换本身不需要它（逆操作记在审计里）。
 
@@ -277,7 +277,13 @@ v0.6.0 起有 `AB_MODE`，默认 `full`——**部署这个版本什么都不变
 cd ~/media-agent && .venv/bin/media-agent ab-mode subscription
 ```
 
-它做的：读 AB 的**整份**配置（`GET /api/v1/config/get`，密码打码）→ 只把 `rss_parser.enable` 与 `bangumi_manage.enable`
+它先把 AB 的每条有效订阅对一遍（扫描一遍、订阅接手与抓取两个检测器只读地诊断一遍，`abmode.coverage`）：本项目的抓取接不住
+的——认不出番目录、保存路径过期、季的编排对不上而这一季不在照样抓的里面、TMDB 认不出、编号对不上、订阅着却已经停下来了——
+AB 一停就不再来，**列出来、不切**（退出码 1）；按列出来的处理（登记集号偏移、在 sidecar 里写 tmdb_id、改订阅……）之后再跑，
+确认要切就加 `--force`。确认过、不再提醒的发现照样算（确认只是不发信）。`--dry-run` 只列出来。2026-09-27 回放：修过抓取之后
+35 条订阅全接得住。
+
+然后：读 AB 的**整份**配置（`GET /api/v1/config/get`，密码打码）→ 只把 `rss_parser.enable` 与 `bangumi_manage.enable`
 改成 false → **整份**发回（`PATCH /api/v1/config/update`；AB 按整个对象解析，漏掉的段退回默认值——手工改时也绝不要只发这
 两项）→ `GET /api/v1/restart`（程序重启：停掉四个后台任务、按 config.json 重起；WebUI 不停；**不是** `docker restart`，容器
 里 qb_downloader 的补丁不受影响）→ 最多等 6 分钟它回来、读回开关核对 → 写 `state/ab_mode.json`（盖过 `.env` 的 `AB_MODE`），
@@ -287,7 +293,7 @@ cd ~/media-agent && .venv/bin/media-agent ab-mode subscription
 | 退出码 | 含义 |
 |---|---|
 | 0 | 切成了（或本来就是） |
-| 1 | 没核对上（unknown：重启之后等不到它回来 / 读回的开关不对）或失败——输出里写着怎么核对、怎么退回；本项目的模式没动 |
+| 1 | 有 AB 订阅本项目的抓取接不住（列出来了，什么都没动；`--force` 照样切）；或没核对上（unknown：重启之后等不到它回来 / 读回的开关不对）或失败——输出里写着怎么核对、怎么退回；本项目的模式没动 |
 | 2 | 配置错误（`AB_MODE` 写错、`state/ab_mode.json` 坏了） |
 | 3 | AB 接口连不上 / 认不出它的配置：什么都没动（配了 `AB_CONFIG`——AB 的 config.json 在宿主上的路径——就只读它，说一句看到的开关） |
 | 75 | 运行锁被占着 |

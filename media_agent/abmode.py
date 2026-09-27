@@ -360,6 +360,51 @@ def activity_problems(act: dict) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- 切之前：AB 的每条订阅抓取都接得住吗
+# 抓取检测器（`episode-available`）说"这一季这样下去不会来"的发现：订阅着却抓不了、编号对不上一集都抓不到；另有找不到番组页 /
+# 候选全被拒 / 没发布、而且已经停下来了的（important、不带动作——它们在订阅着的季里停住时才是 important）
+_GAP_KINDS = ("subscription_unserved", "episode_numbering_mismatch")
+
+
+def coverage(findings, rows, media_root) -> list[dict]:
+    """切到 `subscription` 之前：每条有效的 AB 订阅，本项目的抓取接不接得住（`findings` 是 `ab-adoption` 与
+    `episode-available` 这一刻的诊断，**不看确认**——确认只是不发信）。接不住的每条 `{bangumi_id, title, season, dir, why}`：
+
+    - 认不出番目录、保存路径过期（`ab_subscription_unmapped` / `…_moved`）；
+    - 这部番季的编排对不上（`season_layout_mismatch`），而这一季不在照样抓的（`mapped`）里；
+    - 这一季订阅着却抓不了（`subscription_unserved`）、编号对不上（`episode_numbering_mismatch`）、停下来了（抓取的
+      important 发现不带动作）。
+
+    2026-09-27 回放：AB 37（压平成一季、季的编排闸挡着）与 AB 9（选错番组页、只有一条 minor）都接不住，切换清单只查了
+    前两种，两条都没拦下。人删掉的番目录（`ab_subscription_dir_gone`）不算：那是人不要了。"""
+    from .abrow import library_season, show_dir_name
+    from .claims import fold
+
+    out = []
+    for row in sorted(rows or [], key=lambda r: int(r.get("id") or 0)):
+        rid, season = row.get("id"), library_season(row)
+        name = fold(show_dir_name(row, media_root))
+        why = ""
+        for f in findings:
+            ev = f.evidence or {}
+            if f.kind in ("ab_subscription_unmapped", "ab_subscription_moved"):
+                if ev.get("bangumi_id") == rid:
+                    why = why or f.summary
+                continue
+            if f.rule != "episode-available" or not name or fold(f.show or "") != name:
+                continue
+            if f.kind == "season_layout_mismatch":
+                if str(season) not in (ev.get("mapped") or {}):
+                    why = why or f.summary
+            elif str(f.subject or "").startswith(f"S{season:02d}") and (
+                    f.kind in _GAP_KINDS or (f.severity in ("critical", "important") and not f.action)):
+                why = why or f.summary
+        if why:
+            out.append({"bangumi_id": rid, "title": str(row.get("official_title") or ""), "season": season,
+                        "dir": show_dir_name(row, media_root), "why": why})
+    return out
+
+
 def activity_lines(act: dict) -> list[str]:
     """`ab-mode show` 的几行。"""
     problems = activity_problems(act)
