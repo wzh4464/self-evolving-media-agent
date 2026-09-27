@@ -119,6 +119,27 @@ def test_grab_gives_up_quickly_when_the_run_holds_the_lock(offline_cli, monkeypa
     assert "media-agent run" in rep["reasons"][0]["text"]
 
 
+@pytest.mark.parametrize("cmd, wait", [("grab", "DEFAULT_WAIT"), ("run", "RUN_WAIT")])
+def test_each_command_waits_for_the_lock_as_long_as_it_should(offline_cli, monkeypatch, cmd, wait):
+    """抓取拿锁只短等（`DEFAULT_WAIT`），`run` 等得久（`RUN_WAIT`）。上一条测试只看退出码 75：抓取要是按 `RUN_WAIT` 等，
+    照样 75、只是晚几十秒——审查的变异 T4-10b 全套测试照样过。这里直接看传给 `acquire` 的等待时长。"""
+    waits = []
+    real = RunLock.acquire
+    monkeypatch.setattr(RunLock, "acquire", lambda self, wait=runlock.DEFAULT_WAIT: waits.append(wait) or real(self, 0))
+    monkeypatch.setattr(cli, f"cmd_{cmd}", lambda args, cfg: 0)
+
+    assert _main(monkeypatch, cmd) == 0
+
+    assert waits == [getattr(runlock, wait)]
+
+
+def test_run_waits_much_longer_than_a_grab_takes():
+    """两个任务按同一个起点计时、每 6 小时撞一次：`run` 要等得过一轮抓取（一般一两分钟），抓取绝不为 `run` 等几分钟。
+    审查的变异 T4-17（`RUN_WAIT = 10.0`，与抓取一样短）全套测试照样过——每个测试都把它改小了。"""
+    assert runlock.RUN_WAIT >= 10 * runlock.DEFAULT_WAIT
+    assert runlock.RUN_WAIT >= 180
+
+
 def test_run_waits_out_a_grab_that_holds_the_lock(offline_cli, monkeypatch):
     lib = offline_cli
     monkeypatch.setattr(runlock, "DEFAULT_WAIT", 0.1)
@@ -162,6 +183,27 @@ def test_grab_rotates_its_own_logs_not_the_runs(offline_cli, monkeypatch):
 
 
 # ------------------------------------------------------------------ 通知
+def test_a_locked_out_grab_does_not_mail_and_keeps_its_own_notify_state(offline_cli, monkeypatch):
+    """抓取的通知要经 `_finish_run` 按 `scope=grab` 发：锁被 `run` 占着是抓取的日常，不发信；去重状态写
+    `notify-grab.json`、不碰 `run` 的 `notify.json`。只直接调 `notify.maybe_send(scope="grab")` 的测试拦不住调用处退回默认的
+    `run` 口径（审查的变异 T4-16，全套测试照样过）——那样每 6 小时撞锁一次就发一封，两边的去重状态互相覆盖。"""
+    lib = offline_cli
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda cfg, msg: sent.append(msg))
+    lib.configure(notify_email_to="you@example.com", notify_smtp_host="smtp.example.com")
+    monkeypatch.setattr(runlock, "DEFAULT_WAIT", 0.1)
+    held = RunLock(lib.cfg.state_dir / LOCK_NAME, "media-agent run")
+    assert held.acquire(wait=0)
+    try:
+        assert _main(monkeypatch, "grab") == cli.EXIT_LOCKED
+    finally:
+        held.release()
+
+    assert sent == []
+    assert (lib.cfg.state_dir / "notify-grab.json").exists()
+    assert not (lib.cfg.state_dir / "notify.json").exists()
+
+
 @pytest.mark.parametrize("reasons, mailed", [
     ([{"level": "warn", "code": "locked", "text": "运行锁被占着"}], False),
     ([{"level": "warn", "code": "paused", "text": "维护暂停"}], False),
