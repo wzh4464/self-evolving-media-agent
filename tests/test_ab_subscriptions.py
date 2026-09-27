@@ -8,7 +8,8 @@ AB 仍是订阅的前端（用户在 AB 的 WebUI 里订，`autobangumi-subscrib
 - 番目录还没有：`create_show_dir`——建 `<媒体根>/<番名>/`、各订阅季的 `Season N/`、一份只有人的意图的 sidecar
   （`subscriptions`、订阅 `rss_link` 里的番组页 id、AB 的集号偏移）。**这是这一步唯一的媒体根写入**，有逆操作
   （`remove_show_dir`：目录里只剩它自己建的东西时才删）。TMDB 身份照旧由扫描搜、sidecar-sync / `pin_tmdb` 钉。
-- 番目录在、这一季盘上还没有（sidecar 的 `seasons` 与 `subscriptions` 都没有它）：`subscribe_season`。盘上已经有这一季的
+- 番目录在、sidecar 的 `seasons` 与 `subscriptions` 都还没有这一季（盘上有了、还没记进 `seasons` 的也算）：`subscribe_season`。
+  `seasons` 里已经有这一季的
   订阅不写——抓取本来就看它，生产上 35 条订阅不因此多出 35 次写。
 - 订阅行认不出番目录（`save_path` 不在媒体根下）：报出来，不动手。
 AB 库用真的 sqlite（`lib.bangumi`）；只读。
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 import json
 
-from harness import MikanItem, weekly
+from harness import MikanItem, video, weekly
 
 from media_agent import sidecar as sc_mod
 from media_agent.plugins.adopt import AbAdoptionDetector
@@ -273,3 +274,31 @@ def test_a_sequel_whose_save_path_names_another_folder_is_grabbed_into_the_host(
     assert {r["save_path"] for r in grabs} == {str(lib.path("旧番庚") / "Season 2")}
     [dup] = [f for f in loop.findings if f.kind == "duplicate_show_dir"]
     assert dup.evidence["folded"] == {"2": "旧番庚 第二季"}
+
+
+def test_a_new_season_whose_burst_already_landed_is_registered_in_the_same_grab(lib):
+    """AB 订阅那一刻补进来的第一集名字里就带着季（`Jiufan Geng S2 - 01`）：以前 `ab-adoption` 认它"盘上已有这一季"、不登记
+    订阅，可抓取模式里没有 sidecar-sync——`seasons` 要等 6 小时的 `run` 才记上第 2 季，这之间抓取看不见它，第二集晚半天
+    （2026-09-27 审查复现：grab #1 只交接改名，grab #2 什么都不做，run 才抓 S02E02）。sidecar 的 `seasons` 与 `subscriptions`
+    都还没有这一季就登记订阅，同一次抓取里就抓。"""
+    lib.configure(qbit_allow_empty=True, ab_mode="subscription")
+    s2 = weekly(12, first_days_ago=10)
+    lib.tmdb.add_show(3801, "旧番庚", seasons={1: weekly(12, first_days_ago=400), 2: s2})
+    sh = lib.show("旧番庚")
+    for n in range(1, 13):
+        sh.season(1).local(f"旧番庚 S01E{n:02d}.mkv")
+    sh.sidecar(tmdb_id=3801, tmdb_source="human", tmdb_title="旧番庚", seasons={"1": {"have": list(range(1, 13))}})
+    lib.bangumi(id=81, official_title="旧番庚", title_raw="Jiufan Geng", season=2,
+                rss_link="https://mikanani.me/RSS/Bangumi?bangumiId=5081&subgroupid=1",
+                save_path=str(lib.media_root / "旧番庚" / "Season 2"))
+    sh.season(2).single("[LoliHouse] Jiufan Geng S2 - 01 [WebRip 1080p HEVC-10bit AAC][简繁内封字幕].mkv",
+                        category="Bangumi", probe=video("hevc", subs=["chi 简体中文", "chi 繁體中文"]))
+    tpl = "[LoliHouse] 旧番庚 第二季 / Jiufan Geng S2 - {:02d} [WebRip 1080p][简繁内封字幕]"
+    lib.mikan("5081", [MikanItem(title=tpl.format(n), pub=dict(s2)[n]) for n in (1, 2)], search=["旧番庚"])
+
+    loop = lib.grab_loop()
+
+    [sub] = loop.applied("subscribe_season")
+    assert sub["args"]["season"] == 2
+    assert [r["args"]["episode"] for r in loop.applied("grab_episode")] == [2]
+    assert lib.sidecar("旧番庚").subscriptions["2"]["mikan_id"] == "5081"

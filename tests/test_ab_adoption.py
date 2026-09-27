@@ -19,12 +19,11 @@ RAW_25 = "[Nekomoe kissaten] Hyakkano - 25 [1080p][JPSC].mkv"
 
 
 def _scene(lib, *, sidecar: dict | None = None, **row):
-    """库里有第三季（一个本地文件）；AB 订阅 37 带着 -24。"""
+    """库里有第三季（一个本地文件，sidecar-sync 记进了 `seasons`）；AB 订阅 37 带着 -24。"""
     lib.configure(qbit_allow_empty=True)
     sh = lib.show(TITLE)
     sh.season(3).local(f"{TITLE} S03E02.mkv")
-    if sidecar is not None:
-        sh.sidecar(**sidecar)
+    sh.sidecar(**{"seasons": {"3": {"have": [2]}}, **(sidecar or {})})
     row.setdefault("season", 3)
     row.setdefault("episode_offset", -24)
     sh.bangumi(37, title_raw="Hyakkano", **row)
@@ -96,6 +95,7 @@ def test_rows_without_an_offset_or_disabled_are_left_alone(lib):
 def test_the_season_offset_decides_which_library_season_gets_it(lib):
     sh = lib.show(TITLE)
     sh.season(3).local(f"{TITLE} S03E02.mkv")
+    sh.sidecar(seasons={"3": {"have": [2]}})
     lib.configure(qbit_allow_empty=True)
     lib.bangumi(id=37, official_title=TITLE, title_raw="Hyakkano", season=2, season_offset=1,
                 episode_offset=-24, save_path=str(sh.path / "Season 3"))

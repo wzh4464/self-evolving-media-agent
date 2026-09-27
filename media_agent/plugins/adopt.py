@@ -5,14 +5,15 @@
 
 - **订阅本身**：AB 在的时候，是 AB 把第一个文件放进番目录，media-agent 的扫描与抓取才看得见这部番 / 这一季。现在对每条
   有效订阅：番目录还没有 → `create_show_dir`（建目录、订阅季的 `Season N`、一份只有人的意图的 sidecar，这一步唯一的媒体根
-  写入）；番目录在、这一季盘上还一集都没有（`seasons` 与 `subscriptions` 都没有它）→ `subscribe_season`。订阅记着
+  写入）；番目录在、sidecar 的 `seasons` 与 `subscriptions` 都还没有这一季 → `subscribe_season`。订阅记着
   `rss_link` 里的番组页 id（`mikan_id`），抓取先试它。TMDB 身份不在这里写：扫描按目录名 / AB 标题搜，sidecar-sync 填、
   模型选的走 `pin_tmdb`（原有的一套）。
 - **集号偏移**（`episode_offset`，AB 37《超超超超超喜欢你的100个女朋友》第三季的 -24）：迁进 sidecar 的
   `episode_offsets`（`adopt_episode_offset`；目录还没有的随 `create_show_dir` 一起写）。迁之前规则退回 AB 行
   （`builtin.episode_offset_for`），行为不变。
 
-盘上已经有的季不写订阅：抓取本来就看它（sidecar-sync 按盘上记进 `seasons`），生产上 35 条订阅不因此多出 35 次写。
+sidecar 的 `seasons` 里已经有的季不写订阅：抓取本来就看它（sidecar-sync 按盘上记进 `seasons`），生产上 35 条订阅不因此
+多出 35 次写。盘上有了、`seasons` 还没记的照样写：抓取模式里没有 sidecar-sync，等 6 小时的 `run` 记上之前抓取看不见它。
 
 检测只读（AGENTS.md 第 13 条）：读 AB 库（只读连接）、媒体根的目录列表与 sidecar，要写的变成动作，经执行器写、有审计、
 能回退。AB 库一个字节都不改。
@@ -35,16 +36,6 @@ def safe_dir_name(name: str) -> bool:
     return bool(name) and name.strip() == name and "/" not in name and "\0" not in name \
         and name not in (".", "..") and not name.startswith(".") and name not in SKIP_DIRS \
         and season_of_dir(name) is None
-
-
-def _seasons_on_disk(show) -> set[int]:
-    """这部番盘上已经下完、认得出集位的季——与 sidecar-sync 记 `seasons` 的口径相同（`have_episodes`，只认规范名与
-    记下来的集位）。sidecar-sync 还没记进档案的（档案还没写过、这一轮刚下完的）也算：它这一轮就会记进去，抓取从那以后
-    看它，不必再登记订阅。只有下载中 / 发布名文件的季不算——多登记一次订阅无害，漏登记就要等下一次。"""
-    if show is None:
-        return set()
-    from ..kernel import have_episodes
-    return set(have_episodes(show, allow_release_names=False))
 
 
 def _dirs_by_bangumi_id(shows) -> dict:
@@ -92,7 +83,7 @@ class AbAdoptionDetector:
             if d is None:
                 missing.setdefault(name, []).append(row)
                 continue
-            yield from self._existing(d, row, shows.get(fold(d.name)))
+            yield from self._existing(d, row)
         known = _dirs_by_bangumi_id(state.shows) if missing else {}
         for name, rows in missing.items():
             elsewhere = [(r, known[r.get("id")]) for r in rows if r.get("id") in known]
@@ -152,14 +143,16 @@ class AbAdoptionDetector:
                           note="只建一个新目录与订阅季的 Season N、写一份只有人的意图的 sidecar；目录名被占就不建"),
         )
 
-    def _existing(self, show_dir: Path, row: dict, show) -> Iterable[Finding]:
+    def _existing(self, show_dir: Path, row: dict) -> Iterable[Finding]:
         sc, problem = sc_mod.load_checked(show_dir)
         if problem:
             return                        # 坏档案由 sidecar-sync 报（`sidecar_corrupt`），修好之前不写
         season = abrow.library_season(row)
         key = str(season)
-        if key not in (sc.seasons or {}) and key not in (sc.subscriptions or {}) \
-                and season not in _seasons_on_disk(show):
+        if key not in (sc.seasons or {}) and key not in (sc.subscriptions or {}):
+            # 盘上已经有这一季、sidecar-sync 还没记进 `seasons` 的也登记：抓取模式（`grabmode`）里没有 sidecar-sync，以前
+            # 等 6 小时的 `run` 记上之前抓取看不见这一季——订阅那一刻 AB 补的第一集名字里就带季号（`S2 - 01`），第二集
+            # 晚半天（2026-09-27 审查复现）。多登记一次无害：这一季本来就要抓，订阅还记着 AB 的番组页
             sub = subscription_of(row)
             intent = {"mikan_id": sub["mikan_id"]} if sub.get("mikan_id") and not sc.mikan_id else {}
             yield Finding(

@@ -34,10 +34,12 @@ biggest gap"）。现在对每一条有效订阅（`subscriptions` 的语义见 
   bangumiId，搜索式 RSS 没有）、AB 的集号偏移（`episode_offsets`，不再单独迁）。**这是订阅接手里唯一的媒体根写入。**
   TMDB 身份不在这里写：下一次迭代扫描按目录名 / AB 标题搜（原有的一套），sidecar-sync 填、模型选的走 `pin_tmdb`；抓取用
   扫描搜到的身份，同一轮 `run` 里就能开始抓。
-- **番目录在、这一季盘上还一集都没有**（sidecar 的 `seasons`、`subscriptions` 都没有它，盘上也没有下完、认得出集位的——
-  与 sidecar-sync 记 `seasons` 同一个口径）→ `subscribe_season`（`ab_subscription`，subject `Sxx`）。番组页 id 只在 sidecar
-  还没有 `mikan_id` 时补。**盘上已经有的季不写**：抓取本来就看它，生产上 35 条订阅不因此多出 35 次写（部署后第一轮什么都不
-  提议，ab 调研 §0：35 条都对得上有档案、有这一季的目录）。
+- **番目录在、sidecar 的 `seasons` 与 `subscriptions` 都还没有这一季** → `subscribe_season`（`ab_subscription`，subject
+  `Sxx`）。番组页 id 只在 sidecar 还没有 `mikan_id` 时补。**`seasons` 里已经有的季不写**：抓取本来就看它，生产上 35 条订阅
+  不因此多出 35 次写（部署后第一轮什么都不提议，ab 调研 §0：35 条都对得上有档案、有这一季的目录；2026-09-27 回放照旧）。
+  以前还要"盘上也没有下完、认得出集位的"才写（`_seasons_on_disk`，以为 sidecar-sync 这一轮就会记进 `seasons`）：可抓取模式
+  里没有 sidecar-sync，订阅那一刻 AB 补的第一集名字里就带季号（`Jiufan Geng S2 - 01`），盘上"有了"、`seasons` 要等 6 小时
+  的 `run` 才记上，这之间抓取看不见这一季，第二集晚半天（2026-09-27 审查复现）。
 - **认不出番目录**（`save_path` 里没有媒体根目录名、名字是隐藏 / 季目录）→ `ab_subscription_unmapped`（important，不动手）：
   media-agent 接不住这条订阅，AB 退役之后它就停了。
 - **保存路径过期**：`save_path` 指向不存在的目录，而另一个番目录的档案记着这条订阅（sidecar-sync 写下的 `bangumi_id`）→

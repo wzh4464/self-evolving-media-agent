@@ -67,7 +67,8 @@ E25–E35 抓进来——补不补老档是人的决定。
 ## 谁登记订阅
 
 - AutoBangumi 的有效订阅（`ab-adoption`：`create_show_dir` / `subscribe_season`，见 `architecture/2026-09-27-ab-adoption.md`）；
-  盘上已经有的季不登记（抓取本来就看它）。
+  sidecar 的 `seasons` 里已经有的季不登记（抓取本来就看它）；盘上有了、`seasons` 还没记的照样登记（抓取模式里没有
+  sidecar-sync）。
 - **开播的新一季**（`new-season`，`plugins/new_season.py` → `subscribe_season`，source `new-season`）：AB 的订阅一季一行，新
   一季要人在 AB 里再订一次；AB 退役之后没有这一步，老番的新一季就不会来。规则：
   - 这部番是**订阅着的**：sidecar 有 `subscriptions`，或 AB 里有它的有效订阅（`show.bangumi`）。档案里留着的旧 `bangumi_id`
