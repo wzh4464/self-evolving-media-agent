@@ -13,6 +13,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-27
+
 ### 修复
 - TMDB 把多季压成一季、Mikan 却每季一个番组页时，缺的集抓不到而且一声不吭：抓取为一季只解析一个番组页
   （按全季播出日期打分），缺的集在那一页上没有候选就直接跳过。2026-09-27《超超超超超喜欢你的100个女朋友》
@@ -615,7 +617,8 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.3.0...v0.4.0

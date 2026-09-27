@@ -1,6 +1,6 @@
 [project]
 name = "media-agent"
-version = "0.5.0"
+version = "0.5.1"
 description = "自治的番剧媒体库管理 agent：查重、改名、TMDB 对齐、死种清理"
 requires-python = ">=3.11"
 dependencies = [
