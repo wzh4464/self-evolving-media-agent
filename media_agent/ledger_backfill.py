@@ -23,11 +23,10 @@
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ledger
+from . import abrow, ledger
 from .kernel import under
 from .naming import parse_pin, season_of_dir, title_slot
 
@@ -89,9 +88,9 @@ class _Shows:
                 self.problems.append(f"{show_dir.name} 的 sidecar 解析不了（{problem}），按没有换算关系算")
             mikan = [str(sc.mikan_id)] if (sc.mikan_id and not problem) else []
             for s in (sc.sources if not problem else []):
-                m = re.search(r"bangumiId=(\d+)", (s or {}).get("rss_link") or "")
-                if m and m.group(1) not in mikan:
-                    mikan.append(m.group(1))
+                i = abrow.mikan_id_of((s or {}).get("rss_link"))
+                if i and i not in mikan:
+                    mikan.append(i)
             from .plugins.builtin import _clean_offsets
             self._cache[show_dir] = {"offsets": dict(sc.season_offsets or {}) if not problem else {},
                                      "episode_offsets": _clean_offsets(sc.episode_offsets) if not problem else {},

@@ -453,9 +453,9 @@ def _mikan_candidates(sc, show, cache, log=None, season: int | None = None, pref
         if c and c not in cands:
             cands.append(c)
     for s in sc.sources:
-        m = re.search(r"bangumiId=(\d+)", s.get("rss_link") or "")
-        if m and m.group(1) not in cands:
-            cands.append(m.group(1))
+        i = abrow.mikan_id_of(s.get("rss_link"))
+        if i and i not in cands:
+            cands.append(i)
     for kw in [sc.canonical_title, show.official_title, *sc.aliases]:
         kw = (kw or "").strip()
         if not kw:

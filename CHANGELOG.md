@@ -150,6 +150,7 @@
 ### 变更
 - **复用审计（`tools/audit_duplication.py`）查出的重复实现收成一处**，行为不变：
   - Mikan RSS 的条目切分与标题提取只剩 `subscription.rss_items`；抓取的 `_feed_items` 以前自己再写一遍同样的正则。
+  - RSS 链接里的 bangumiId 只由 `abrow.mikan_id_of` 认：抓取的候选页与出处账本补录以前各抠一遍（第 4 阶段新写的补录没复用）。
 
 ## [0.5.1] - 2026-09-27
 
