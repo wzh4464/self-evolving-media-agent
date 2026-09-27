@@ -34,7 +34,7 @@ from ..naming import (SPECIAL_RE, declared_seasons, offset_episode, parse_episod
 from ..sidecar import load as load_sidecar
 from ..sidecar import load_checked as load_sidecar_checked
 from .subscription import (MIKAN, _disk_episodes, _http_get,
-                           _mikan_search_ids, is_seasonal)
+                           _mikan_search_ids, is_seasonal, rss_items)
 
 # 单轮为一部番（每一季）最多提议抓几集，防止新订阅时一次刷屏。在**番组页上有候选**的集里数（没抓成要报的另数一份），
 # 不在全部缺的集里数——页上没有的前几集不能把后面有的挡住
@@ -133,13 +133,12 @@ def _feed_items(bangumi_id: str) -> list[dict]:
     """
     body = _http_get(f"{MIKAN}/RSS/Bangumi?bangumiId={bangumi_id}")
     out: list[dict] = []
-    for it in re.findall(r"<item>(.*?)</item>", body, re.S):
-        m = re.search(r"<title>(.*?)</title>", it, re.S)
+    for title, it in rss_items(body):
         u = re.search(r'<enclosure[^>]*url="([^"]+)"', it)
-        if not (m and u):
+        if not u:
             continue
         d = re.search(r"<pubDate>\s*(\d{4}-\d{2}-\d{2})", it)
-        out.append({"title": html.unescape(m.group(1)).strip(),
+        out.append({"title": title,
                     "url": html.unescape(u.group(1)).strip(),
                     "pub": d.group(1) if d else ""})
     return out

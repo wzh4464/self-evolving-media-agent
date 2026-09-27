@@ -104,20 +104,25 @@ def _fetch_rss_titles(url: str) -> list[str]:
     return rss_item_titles(_fetch(safe, timeout=25))
 
 
-def rss_item_titles(body: str) -> list[str]:
-    """RSS 正文 → 各 `<item>` 的标题。**RSS 标题提取的唯一实现。**
+def rss_items(body: str) -> list[tuple[str, str]]:
+    """RSS 正文 → 各 `<item>` 的（标题, 条目原文）。**RSS 条目切分与标题提取的唯一实现**：
+    订阅这边只要标题（`rss_item_titles`），抓取（`grab._feed_items`）再从条目原文里取 enclosure 与 pubDate。
 
     原先这里写的是 `re.findall(r"<title>…", body)[1:]`——靠"第一个 title
     一定是 channel 标题"这个位置假设跳过它。频道少一个 title 就会吞掉一条
-    真条目，多一个就会混进非条目文本。按 `<item>` 分块没有这个脆点，
-    也和 `grab._feed_items` 的做法一致（那边还要顺带取 enclosure 和 pubDate）。
+    真条目，多一个就会混进非条目文本。按 `<item>` 分块没有这个脆点。
     """
     out = []
     for it in re.findall(r"<item>(.*?)</item>", body, re.S):
         m = re.search(r"<title>(.*?)</title>", it, re.S)
         if m:
-            out.append(html.unescape(m.group(1)).strip())
+            out.append((html.unescape(m.group(1)).strip(), it))
     return out
+
+
+def rss_item_titles(body: str) -> list[str]:
+    """RSS 正文 → 各 `<item>` 的标题（`rss_items`）。"""
+    return [title for title, _it in rss_items(body)]
 
 
 def _longest_common(a: str, b: str) -> str:
