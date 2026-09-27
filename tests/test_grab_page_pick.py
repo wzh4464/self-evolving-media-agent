@@ -22,7 +22,7 @@ from harness import MikanItem
 from media_agent.plugins.grab import EpisodeAvailableDetector
 
 SHOW = "Re:从零开始的异世界生活"
-TMDB = 3951_0
+TMDB = 3913
 OLD, NEW = "2259", "3951"
 TPL = "[Nix-Raws] Re:Zero kara Hajimeru Isekai Seikatsu - {:02d} [CR WEB-DL 1080p][简繁内封]"
 

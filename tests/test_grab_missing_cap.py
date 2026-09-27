@@ -16,7 +16,7 @@ from harness import MikanItem
 from media_agent.plugins.grab import MAX_PER_SHOW, EpisodeAvailableDetector
 
 SHOW = "正相反的你与我"
-TMDB = 2780_43
+TMDB = 3912
 MID = "4037"
 TPL = "[SweetSub] 相反的你和我 / Seihantai na Kimi to Boku - {:02d} [WebRip 1080p][简日内嵌]"
 

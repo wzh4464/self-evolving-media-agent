@@ -25,7 +25,7 @@ from harness import MikanItem, weekly
 from media_agent.plugins.grab import EpisodeAvailableDetector
 
 HYAKKANO = "超超超超超喜欢你的100个女朋友"
-TMDB = 2235_64
+TMDB = 3910
 MID = "3417"
 NIX = ("[Nix-Raws] Kimi no Koto ga Dai Dai Dai Dai Daisuki na 100-nin no Kanojo S01E{:02d} "
        "[CR WEB-DL 1080p AVC AAC][简繁内封]")
@@ -100,12 +100,12 @@ def test_without_offsets_the_advice_is_episode_offsets_with_a_guess(lib):
     建议写的是 episode_offsets（按 Season 1 的 12 集推测 -12），不是改变不了什么的 season_offsets。"""
     lib.configure(qbit_allow_empty=True)
     sched = weekly(24, first_days_ago=200)
-    lib.tmdb.add_show(2404_11, "胆大党", seasons={1: sched})
+    lib.tmdb.add_show(3911, "胆大党", seasons={1: sched})
     sh = lib.show("胆大党")
     for sn in (1, 2):
         for n in range(1, 13):
             sh.season(sn).local(f"胆大党 S{sn:02d}E{n:02d}.mkv")
-    sh.sidecar(tmdb_id=2404_11, tmdb_source="human", tmdb_title="胆大党",
+    sh.sidecar(tmdb_id=3911, tmdb_source="human", tmdb_title="胆大党",
                seasons={"1": {"have": list(range(1, 13))}, "2": {"have": list(range(1, 13))}})
 
     fs = lib.diagnose(detectors=[EpisodeAvailableDetector])
