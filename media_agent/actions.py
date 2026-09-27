@@ -3233,7 +3233,11 @@ class Executor:
             state = abmode.read_state(self.cfg.state_dir)
         except ValueError as e:
             return False, f"{e}；先修好状态文件再回退"
-        if state is not None and (rec is None or state.get("run_id") != rec.get("run_id")):
+        # 这一步从没写过状态文件（没核对上记了 unknown、或写不进去带 `state_error`）：此刻的就是切之前的那一份。命令为
+        # unknown 印的正是「rollback --run 这一步」——以前看到别的批次写的状态文件一律拒绝、说"此后又切过"，第二次起的每一次
+        # 切换都退不了（2026-09-27 审查复现）
+        never_wrote = state is not None and state == u.get("prev_state")
+        if state is not None and not never_wrote and (rec is None or state.get("run_id") != rec.get("run_id")):
             return False, (f"state/ab_mode.json 已不是这一步写的（此后又切过，现在是 {state.get('mode')}，批次 "
                            f"{state.get('run_id')}）：只回退这一步会让两边对不上——回退最近那一次，或直接用 "
                            f"media-agent ab-mode")

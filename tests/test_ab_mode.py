@@ -379,6 +379,54 @@ def test_rolling_back_a_switch_to_full_takes_a_fresh_baseline(ab_lib, monkeypatc
     assert _main(monkeypatch, "ab-mode", "show") == 0
 
 
+@pytest.mark.allow("unknown_record", match="set_ab_mode")
+def test_the_printed_rollback_of_an_unknown_switch_works_after_an_earlier_switch(ab_lib, monkeypatch, capsys):
+    """subscription（A，applied）之后切 full 卡在重启（B，unknown）：B 没写状态文件，命令印出「rollback --run B」。以前
+    回退看到状态文件是 A 写的就拒绝——"此后又切过"，说的不是实情，开关也留在 B 发出去的样子（2026-09-27 审查复现）。
+    状态文件就是 B 之前的那一份：这一步从没写过它，开关改回去、重启核对，状态文件不动。"""
+    lib = ab_lib
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    first = _state(lib)
+    lib.configure(ab_mode="subscription", ab_mode_source="state")
+    lib.ab.hang_restart()
+    monkeypatch.setattr(abmode, "RESTART_TIMEOUT_S", 0.0)
+    assert _main(monkeypatch, "ab-mode", "full") == 1
+    unknown = _set_audit(lib)[-1]
+    assert unknown["status"] == "unknown"
+    assert f"rollback --run {unknown['run_id']}" in capsys.readouterr().out
+    lib.ab.normal_restart()
+
+    res = lib.rollback(unknown["run_id"])
+
+    assert res["reverted"] == 1, res
+    assert lib.ab.flags() == OFF and lib.ab.running == {"rss": False, "renamer": False}
+    rec = _state(lib)
+    assert rec["mode"] == "subscription" and rec["run_id"] == first["run_id"]
+
+
+def test_rolling_back_a_switch_a_later_one_superseded_is_refused(ab_lib, monkeypatch):
+    """A 切到 subscription，之后 B 又切了一次（核对有问题、重新记基线）：状态文件是 B 写的。回退 A 只退这一步会让两边
+    对不上（B 的记录被删掉、开关却还是 B 的），整步跳过。"""
+    lib = ab_lib
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    run_a = _set_audit(lib)[-1]["run_id"]
+    lib.configure(ab_mode="subscription", ab_mode_source="state")
+    lib.ab.running["rss"] = True
+    lib.ab.poll_rss("2026-09-27T09:00:00+00:00")
+    lib.ab.running["rss"] = False
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    run_b = _state(lib)["run_id"]
+    assert run_b != run_a
+    lib.ab.calls.clear()
+
+    res = lib.rollback(run_a)
+
+    assert res["reverted"] == 0 and res["skipped"] == 1
+    assert "已不是这一步写的" in res["skipped_detail"][0]["skip_reason"]
+    assert "update_config" not in lib.ab.calls and "restart" not in lib.ab.calls
+    assert lib.ab.flags() == OFF and _state(lib)["run_id"] == run_b
+
+
 def test_rollback_does_not_touch_flags_a_human_changed_since(ab_lib, monkeypatch):
     lib = ab_lib
     assert _main(monkeypatch, "ab-mode", "subscription") == 0

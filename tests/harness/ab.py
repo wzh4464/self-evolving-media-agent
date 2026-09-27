@@ -217,6 +217,11 @@ class FakeAB:
         self._restart_polls = None
         self._restart_exc = httpx.ReadTimeout("timed out")
 
+    def normal_restart(self) -> None:
+        """之后的重启恢复正常（`slow_restart` / `hang_restart` 之后，AB 又好了）。"""
+        self._restart_polls = 0
+        self._restart_exc = None
+
     def _start(self) -> None:
         self.running = {"rss": bool(self.config["rss_parser"]["enable"]),
                         "renamer": bool(self.config["bangumi_manage"]["enable"])}

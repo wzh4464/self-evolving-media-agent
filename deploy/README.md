@@ -321,8 +321,9 @@ cd ~/media-agent && .venv/bin/media-agent ab-mode subscription
 任选其一：
 
 - `media-agent ab-mode full`：两个开关打开、重启、核对，`state/ab_mode.json` 记成 full。
-- `media-agent rollback --run <切换那一次的批次 ID>`：开关改回切换之前的样子、状态文件还原成切换之前的（原来没有就删）。切换
-  之后有人改过开关、或又切过一次，这一步跳过并写明——那时用上一条。
+- `media-agent rollback --run <切换那一次的批次 ID>`：开关改回切换之前的样子、状态文件还原成切换之前的（原来没有就删；回到
+  subscription 的按回退那一刻重新记核对用的基线）。没核对上（unknown）的那一次同样能这样退（它没写过状态文件，状态文件不动）。
+  切换之后有人改过开关、或又切过一次，这一步跳过并写明——那时用上一条。
 - AB 的 WebUI 设置里打开「RSS 解析」「番剧管理」、点应用（WebUI 会重启程序）——然后 `media-agent ab-mode full`，让本项目
   也认 full（或删掉 `state/ab_mode.json` 回到 `.env` 的 `AB_MODE`）。两边不一致时 `media-agent ab-mode` 退出码 1、说出来。
 
