@@ -141,3 +141,15 @@ def test_a_season_the_cached_show_list_does_not_know_yet_is_not_extra(lib):
 
     assert set(_grabs(fs)) == {"S02E03", "S02E04"}
     assert not [f for f in fs if f.kind == "season_layout_mismatch"]
+
+
+def test_a_subscribed_season_beyond_the_flattened_season_says_which_part_is_missing(lib):
+    """AB 里订了下一季（第 4 季，偏移 -36），TMDB 那一季还只到第 36 集：没有可抓的，说清楚缺的是"第 1 季第 37 集起"这一段，
+    而不是含糊地说"第 1 季还没有分集表"（它有 36 集）。"""
+    _hyakkano(lib, offsets={"2": -12, "3": -24, "4": -36}, s3=range(1, 13))
+    lib.show(HYAKKANO).sidecar(subscriptions={"4": {"source": "autobangumi", "bangumi_id": 41}})
+
+    [f] = [f for f in lib.diagnose(detectors=[EpisodeAvailableDetector]) if f.kind == "subscription_unserved"]
+
+    assert f.subject == "S04" and f.evidence["reason"] == "tmdb_no_episodes"
+    assert "第 37 集起" in f.summary

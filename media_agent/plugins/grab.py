@@ -662,7 +662,8 @@ class EpisodeAvailableDetector:
                 aired = {n for n, d in air_of.items() if recent_from <= d <= today}
                 if not aired and not eps and sub:
                     yield self._unserved(ctx, show, int(season_key), rows, "tmdb_no_episodes",
-                                         f"TMDB 第 {tmdb_season} 季还没有分集表", severity="minor")
+                                         (f"TMDB 第 {tmdb_season} 季第 {base + 1} 集起还没有分集（这一季是压平那一季的一段）"
+                                          if ranged else f"TMDB 第 {tmdb_season} 季还没有分集表"), severity="minor")
                     continue
                 # 已经在下的不重复抓（除非停滞太久，见 _inflight 的注释）
                 busy = inflight.get(int(season_key), set())
@@ -878,11 +879,15 @@ class EpisodeAvailableDetector:
         by_ab = any(abrow.library_season(r) == season for r in rows)
         if severity is None:
             severity = "minor" if (by_ab and abmode.ab_downloads(ctx.config)) else "important"
+        if by_ab and abmode.ab_downloads(ctx.config):
+            tail = "——AB 还在按它的订阅下"
+        elif reason == "tmdb_no_episodes":
+            tail = "——多半是还没定档，TMDB 有了分集就接着抓"
+        else:
+            tail = "——没有别人下：在 sidecar 里写 tmdb_id / 登记集号偏移，或改订阅"
         return Finding(
             rule=self.id, kind="subscription_unserved", severity=severity, subject=f"S{season:02d}",
-            summary=(f"「{show.official_title or show.dir_name}」第 {season} 季订阅着，但抓取抓不了：{why}"
-                     + ("——AB 还在按它的订阅下" if severity == "minor" and by_ab else
-                        "——订阅模式下没有别人下，在 sidecar 里写 tmdb_id / 登记集号偏移，或改订阅")),
+            summary=f"「{show.official_title or show.dir_name}」第 {season} 季订阅着，但抓取抓不了：{why}{tail}",
             show=show.dir_name,
             evidence={"season": season, "reason": reason, "detail": why,
                       "bangumi_ids": [r.get("id") for r in rows if abrow.library_season(r) == season]})
