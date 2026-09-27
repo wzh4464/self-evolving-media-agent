@@ -243,6 +243,36 @@ def test_an_unrecognised_config_shape_is_refused(ab_lib, monkeypatch):
     assert "update_config" not in ab_lib.ab.calls
 
 
+@pytest.mark.allow("unknown_record", match="set_ab_mode")
+def test_flags_read_back_different_after_the_restart_are_unknown(ab_lib, monkeypatch):
+    """重启的同时有人在 WebUI 里又打开了一个开关：AB 回来了，读回的开关不是目标。状态文件只在读回核对上之后才写——
+    本项目的模式不跟着一个说不清的切换走。"""
+    ab_lib.ab.tamper_on_restart("rss_parser.enable", True)
+
+    assert _main(monkeypatch, "ab-mode", "subscription") == 1
+
+    [a] = _set_audit(ab_lib)
+    assert a["status"] == "unknown" and "读回的开关" in a["reason"]
+    assert _state(ab_lib) is None
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_a_flag_that_is_not_a_boolean_is_refused(ab_lib, monkeypatch, value):
+    """开关的形状不对（字符串 "true"、整数、空）：认不出这份配置（AB 版本不同？），不 PATCH、不重启。"""
+    ab_lib.ab.config["rss_parser"]["enable"] = value
+    assert _main(monkeypatch, "ab-mode", "subscription") == cli.EXIT_DEGRADED
+    assert "update_config" not in ab_lib.ab.calls and "restart" not in ab_lib.ab.calls
+    assert not _set_audit(ab_lib) and _state(ab_lib) is None
+
+
+def test_the_switch_does_not_need_qbittorrent(ab_lib, monkeypatch):
+    """切换不碰媒体库与种子（`Executor.apply(need_qbit=False)`）：qBittorrent 连不上不该挡它。"""
+    ab_lib.qbit_down()
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+    assert _set_audit(ab_lib)[0]["status"] == "applied"
+    assert _state(ab_lib)["mode"] == "subscription"
+
+
 def test_dry_run_changes_nothing(ab_lib, monkeypatch, capsys):
     assert _main(monkeypatch, "ab-mode", "subscription", "--dry-run") == 0
     assert ab_lib.ab.flags() == ON
@@ -258,6 +288,20 @@ def test_already_in_the_mode_is_a_no_op(ab_lib, monkeypatch, capsys):
     assert _main(monkeypatch, "ab-mode", "subscription") == 0
     assert "update_config" not in ab_lib.ab.calls and "restart" not in ab_lib.ab.calls
     assert "已经是" in capsys.readouterr().out
+
+
+def test_a_mode_from_the_env_is_switched_once_to_get_a_baseline(ab_lib, monkeypatch):
+    """`.env` 里写了 AB_MODE=subscription、AB 的开关也已关：两边"一致"，可没有切换基线（`ab_mode_unverified`）。命令照样
+    重启一次、核对、记基线——只有状态文件来的模式才算"已经是"。"""
+    lib = ab_lib
+    lib.ab.config["rss_parser"]["enable"] = lib.ab.config["bangumi_manage"]["enable"] = False
+    lib.configure(ab_mode="subscription", ab_mode_source="env")
+
+    assert _main(monkeypatch, "ab-mode", "subscription") == 0
+
+    assert "restart" in lib.ab.calls and "update_config" not in lib.ab.calls
+    rec = _state(lib)
+    assert rec["mode"] == "subscription" and rec["baseline"]["bangumi_ids"] == [1, 2]
 
 
 def test_rerunning_after_a_one_off_poll_restarts_and_takes_a_fresh_baseline(ab_lib, monkeypatch, capsys):
@@ -466,6 +510,16 @@ def test_show_says_when_the_sides_disagree(ab_lib, monkeypatch, capsys):
     assert _main(monkeypatch, "ab-mode", "show") == 1
     out = capsys.readouterr().out
     assert "不一致" in out and "media-agent ab-mode subscription" in out
+
+
+def test_show_exits_1_when_ab_is_off_but_media_agent_thinks_full(ab_lib, monkeypatch, capsys):
+    """反过来的不一致：人在 WebUI 里关了两个开关，本项目还按 full 对待（判重让位给一个不再改名的 AB）。full 下没有基线
+    核对，退出码 1 只能来自"两边不一致"这一条。"""
+    lib = ab_lib
+    lib.ab.config["rss_parser"]["enable"] = lib.ab.config["bangumi_manage"]["enable"] = False
+    assert _main(monkeypatch, "ab-mode", "show") == 1
+    out = capsys.readouterr().out
+    assert "不一致" in out and "media-agent ab-mode full" in out
 
 
 def test_show_reports_polling_after_the_switch(ab_lib, monkeypatch, capsys):

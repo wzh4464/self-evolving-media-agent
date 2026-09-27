@@ -148,7 +148,8 @@ class FakeAB:
     配置与程序（`media-agent ab-mode`）：`config` 是 config.json 里此刻存的（生产的形状：下载器指向宿主、改名 `advance`、
     密码是 `SECRET`）；`running` 是此刻真在跑的两个线程——`update_config` 不动它，`restart()` 才按 `config` 重设
     （AB 的循环从不回头看开关）。`slow_restart(polls=n)`：重启请求超时，之后 n 次 `status()` 是 false；`hang_restart()`：
-    一直起不来。`poll_rss()`：RSS 线程在跑时，把启用的 rssitem 的 `last_checked_at` 推到此刻（AB 每 15 分钟做的事）。
+    一直起不来；`normal_restart()`：之后又正常了。`tamper_on_restart(key, value)`：重启的同时有别人改了配置。`poll_rss()`：
+    RSS 线程在跑时，把启用的 rssitem 的 `last_checked_at` 推到此刻（AB 每 15 分钟做的事）。
     """
 
     SECRET = "not-a-real-password-0000"
@@ -168,6 +169,7 @@ class FakeAB:
         self._restart_polls: int | None = 0         # 重启之后还要几次 status() 才回来；None = 永远不回来
         self._restart_exc: BaseException | None = None
         self._pending_polls = 0
+        self._tamper: tuple[str, object] | None = None
 
     def fail(self, method: str, times: int = 1, exc: BaseException | None = None) -> None:
         self._fail[method] = [times, exc or ConnectionResetError("Connection reset by peer")]
@@ -217,6 +219,10 @@ class FakeAB:
         self._restart_polls = None
         self._restart_exc = httpx.ReadTimeout("timed out")
 
+    def tamper_on_restart(self, key: str, value) -> None:
+        """重启的同时有别人改了配置（WebUI 里点了一下）：重启之后 config.json 里 `key`（`段名.键名`）是 `value`。"""
+        self._tamper = (key, value)
+
     def normal_restart(self) -> None:
         """之后的重启恢复正常（`slow_restart` / `hang_restart` 之后，AB 又好了）。"""
         self._restart_polls = 0
@@ -230,6 +236,10 @@ class FakeAB:
     def restart(self, timeout: float = 30.0) -> dict:
         self.calls.append("restart")
         self._maybe_fail("restart")
+        if self._tamper is not None:
+            (section, name), value = self._tamper[0].split("."), self._tamper[1]
+            self.config[section][name] = value
+            self._tamper = None
         self.running = {"rss": False, "renamer": False}
         self.up = False
         if self._restart_polls == 0:
