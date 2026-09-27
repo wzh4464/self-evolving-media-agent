@@ -15,7 +15,11 @@ from __future__ import annotations
 from harness import MikanItem, weekly
 
 from media_agent import history
-from media_agent.plugins.grab import NO_RELEASE_GRACE_DAYS, SUBSCRIBED_RECENT_DAYS, EpisodeAvailableDetector
+from media_agent.plugins.grab import (
+    NO_RELEASE_GRACE_DAYS,
+    SUBSCRIBED_RECENT_DAYS,
+    EpisodeAvailableDetector,
+)
 
 SHOW = "新番癸"
 TMDB = 3730

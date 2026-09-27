@@ -675,9 +675,9 @@ class EpisodeAvailableDetector:
                 grace_cut = (date.fromisoformat(today) - timedelta(days=NO_RELEASE_GRACE_DAYS)).isoformat()
                 newest = max(have | busy, default=0)
 
-                def stalled(ep: int) -> bool:
-                    return sub and int(season_key) > 0 and ep > newest and bool(air_of.get(ep)) \
-                        and air_of[ep] <= grace_cut
+                def stalled(ep: int, sub=sub, season=int(season_key), newest=newest, air_of=air_of,
+                            grace_cut=grace_cut) -> bool:
+                    return sub and season > 0 and ep > newest and bool(air_of.get(ep)) and air_of[ep] <= grace_cut
 
                 mid = _resolve_mikan_id(
                     sc, show, cache, log=ctx.log, season=int(season_key),

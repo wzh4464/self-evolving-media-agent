@@ -108,7 +108,9 @@ def test_the_subscription_page_wins_a_tie_against_an_earlier_candidate(lib):
     sh = lib.show("订阅甲")
     sh.sidecar(tmdb_id=3902, tmdb_source="human", tmdb_title="订阅甲", mikan_id="7001",
                subscriptions={"1": {"source": "cli", "mikan_id": "7002"}})
-    items = lambda: [MikanItem(title=f"[G] Dingyue Jia - {n:02d} [1080p][简日内嵌]", pub=d) for n, d in sched]  # noqa: E731
+    def items() -> list[MikanItem]:
+        return [MikanItem(title=f"[G] Dingyue Jia - {n:02d} [1080p][简日内嵌]", pub=d) for n, d in sched]
+
     lib.mikan("7001", items(), search=["订阅甲"])
     lib.mikan("7002", items())
 
