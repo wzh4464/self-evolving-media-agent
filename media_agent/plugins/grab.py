@@ -144,6 +144,15 @@ def _feed_items(bangumi_id: str) -> list[dict]:
     return out
 
 
+def _day(s) -> date | None:
+    """ISO 日期（`2026-08-09`）→ date；空的、坏的返回 None。发布的 pubDate、TMDB 的 air_date 都可能缺。
+    抓取里比日期的几处（`_plausible_for`、`_season_fit`、`_pub_span`、`_span_covers`、常年番判定）共用。"""
+    try:
+        return date.fromisoformat(s or "")
+    except (TypeError, ValueError):
+        return None
+
+
 # 发布可以早于播出（抢先版、跨时区），但早不了太多。放宽到 7 天是刻意的：
 # 这道闸只为拦"隔了好几季的同集号"，不该去管抢先党。
 PREAIR_SLACK_DAYS = 7
@@ -163,14 +172,10 @@ def _plausible_for(item: dict, air: str) -> bool | None:
     缺 pubDate 的按 None 返回——不淘汰，但由调用方排到后面去，
     宁可要一个来路不明的，也不要一个明确错季的。
     """
-    pub = item.get("pub") or ""
-    if not (pub and air):
+    pub, aired = _day(item.get("pub")), _day(air)
+    if not (pub and aired):
         return None
-    try:
-        return date.fromisoformat(pub) >= date.fromisoformat(air) - timedelta(
-            days=PREAIR_SLACK_DAYS)
-    except ValueError:
-        return None
+    return pub >= aired - timedelta(days=PREAIR_SLACK_DAYS)
 
 
 def _season_fit(items: list[dict], air: list[str]) -> float:
@@ -183,24 +188,12 @@ def _season_fit(items: list[dict], air: list[str]) -> float:
     唯一可靠的锚点是时间：一季的发布集中在它播出的那几个月。
     拿页面里条目的 pubDate 和 TMDB 给的播出日期比，对得上的比例就是分数。
     """
-    if not items or not air:
+    days = [_day(a) for a in air]
+    if not items or not days or not all(days):
         return 0.0
-    try:
-        lo = min(date.fromisoformat(a) for a in air) - timedelta(days=PREAIR_SLACK_DAYS)
-        hi = max(date.fromisoformat(a) for a in air) + timedelta(days=365)
-    except ValueError:
-        return 0.0
-    ok = 0
-    for it in items:
-        pub = it.get("pub")
-        if not pub:
-            continue
-        try:
-            if lo <= date.fromisoformat(pub) <= hi:
-                ok += 1
-        except ValueError:
-            pass
-    return ok / len(items)
+    lo = min(days) - timedelta(days=PREAIR_SLACK_DAYS)
+    hi = max(days) + timedelta(days=365)
+    return sum(1 for it in items if (d := _day(it.get("pub"))) and lo <= d <= hi) / len(items)
 
 
 _SPECIAL_RE = SPECIAL_RE
@@ -482,20 +475,16 @@ def _mikan_candidates(sc, show, cache, log=None, season: int | None = None, pref
 LATE_SLACK_DAYS = 30
 
 
-def _pub_span(items: list[dict]):
-    pubs = []
-    for it in items:
-        try:
-            pubs.append(date.fromisoformat(it.get("pub") or ""))
-        except ValueError:
-            pass
+def _pub_span(items: list[dict]) -> tuple[date, date] | None:
+    """番组页上发布时间的跨度（最早, 最晚）；一条带日期的都没有返回 None。"""
+    pubs = [d for d in (_day(it.get("pub")) for it in items) if d]
     return (min(pubs), max(pubs)) if pubs else None
 
 
-def _span_covers(span, air: str) -> bool:
-    try:
-        a = date.fromisoformat(air)
-    except (TypeError, ValueError):
+def _span_covers(span: tuple[date, date], air: str) -> bool:
+    """跨度为 `span` 的番组页覆盖得到 `air` 那天播的那一集吗（上面的松弛）；播出日期认不出按覆盖不到。"""
+    a = _day(air)
+    if a is None:
         return False
     lo, hi = span
     return lo - timedelta(days=LATE_SLACK_DAYS) <= a <= hi + timedelta(days=PREAIR_SLACK_DAYS)
@@ -680,13 +669,7 @@ class EpisodeAvailableDetector:
                 # 哆啦A梦的标记要到本轮 apply 才被改回 false，而抓取检测器在同一轮
                 # 更早的时候已经按旧标记提议了 6 集 2005 年的内容——两轮 run 抓了
                 # 两次。依赖会滞后一整轮的持久化状态，就是在给自己埋这种坑。
-                dates = []
-                for e in eps:
-                    if e.get("air_date"):
-                        try:
-                            dates.append(date.fromisoformat(e["air_date"]))
-                        except ValueError:
-                            pass
+                dates = [d for d in (_day(e.get("air_date")) for e in eps) if d]
                 recent_from = ""
                 if not is_seasonal(dates, len(eps), date.today()):
                     if not sub:

@@ -125,3 +125,18 @@ def test_a_page_whose_releases_start_late_still_covers_its_first_episodes(lib):
     fs = lib.diagnose(detectors=[EpisodeAvailableDetector])
 
     assert set(_grabs(fs)) == {"S01E01", "S01E02", "S01E03"}
+
+
+def test_date_helpers_treat_missing_or_broken_dates_as_unknown():
+    """抓取比日期的几处共用 `_day`：缺的、坏的日期一律"不知道"，不抛异常，也不当成能比。"""
+    from media_agent.plugins.grab import _plausible_for, _pub_span, _season_fit, _span_covers
+
+    assert _plausible_for({"pub": "2026-13-40"}, "2026-08-09") is None
+    assert _plausible_for({"pub": ""}, "2026-08-09") is None
+    assert _plausible_for({"pub": "2026-08-10"}, "") is None
+    assert _season_fit([{"pub": "2026-08-10"}], ["2026-08-09", "bad"]) == 0.0
+    assert _season_fit([{"pub": "2026-08-10"}, {"pub": None}, {"pub": "x"}], ["2026-08-09"]) == 1 / 3
+    assert _pub_span([{"pub": "x"}, {}]) is None
+    span = _pub_span([{"pub": "2026-08-10"}, {"pub": "bad"}, {"pub": "2026-09-01"}])
+    assert span and str(span[0]) == "2026-08-10" and str(span[1]) == "2026-09-01"
+    assert _span_covers(span, None) is False and _span_covers(span, "2026-08-09") is True
