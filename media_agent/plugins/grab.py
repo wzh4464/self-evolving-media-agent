@@ -235,6 +235,8 @@ def _resolve_mikan_id(sc, show, cache, air: list[str] | None = None, log=None,
     检测只许读媒体根；sidecar 里的 `mikan_id` 从此只由人写，这里只读它当候选。
     """
     stored = str(getattr(sc, "mikan_id", "") or "")
+    if stored and "mikan_id" in (sc.pinned or []):
+        return stored
     key = _pick_key(show, season)
     remembered = str((cache.get_llm(key, ttl=PICK_TTL) or {}).get("id") or "")
 
@@ -510,6 +512,7 @@ class EpisodeAvailableDetector:
                                  for k, v in (sc.season_offsets or {}).items()
                                  if str(k).isdigit()}
                 by_ep: dict[int, list[dict]] = {}
+                alternate_page: dict[int, str] = {}
                 off_season: dict[int, list[tuple[dict, str]]] = {}
                 for it in items:
                     n = _episode_of(it["title"])
@@ -524,18 +527,18 @@ class EpisodeAvailableDetector:
                 # TMDB 把多季压成一季、Mikan 却每季一页：主页面上某集一个候选都没有时，去别的候选页里
                 # **发布时间覆盖这集播出日期**的那些页找（2026-09-27 超百：按全季日期选中了第二季那页 3524，
                 # 第 30、31 集在第三季的 3997 上，检测器静默跳过、从没报过）。按日期选页，不拿别季同集号凑数。
-                need = [ep for ep in missing[:MAX_PER_SHOW] if not by_ep.get(ep) and not off_season.get(ep)]
+                need = [ep for ep in missing[:MAX_PER_SHOW] if not by_ep.get(ep)]
                 looked = [mid]
-                if need:
+                if need and "mikan_id" not in (sc.pinned or []):
                     for pid in _mikan_candidates(sc, show, cache, log=ctx.log, season=int(season_key)):
                         if pid in looked or len(looked) >= 4:
                             continue
+                        looked.append(pid)
                         try:
                             pitems = _feed_cached(pid, cache)
                         except Exception as e:
                             ctx.log(f"[episode-available] 拉候选番组页 {pid} 的 feed 失败：{type(e).__name__}: {e}")
                             continue
-                        looked.append(pid)
                         span = _pub_span(pitems)
                         covered = {ep for ep in need if span and _span_covers(span, air_of.get(ep, ""))}
                         for it in (pitems if covered else ()):
@@ -545,6 +548,7 @@ class EpisodeAvailableDetector:
                             ep_here, why = _slot_in_season(it["title"], n, int(season_key), off_by_season)
                             if ep_here in covered:
                                 by_ep.setdefault(ep_here, []).append(it)
+                                alternate_page[id(it)] = pid
                             elif ep_here is None and n in covered:
                                 off_season.setdefault(n, []).append((it, why))
 
@@ -625,7 +629,8 @@ class EpisodeAvailableDetector:
                                  f"可抓取（{len(cands)} 个候选中选 {verdict.why()}）"),
                         show=show.dir_name,
                         evidence={"season": season_key, "episode": ep,
-                                  "air_date": air_of.get(ep, ""), "mikan_id": mid,
+                                  "air_date": air_of.get(ep, ""),
+                                  "mikan_id": alternate_page.get(id(best), mid),
                                   "chosen": best["title"][:140],
                                   "chosen_pub": best.get("pub", ""),
                                   "rejected_by_date": len(wrong_season),
