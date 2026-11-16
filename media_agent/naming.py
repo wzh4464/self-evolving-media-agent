@@ -449,9 +449,19 @@ def target_subtitle_filename(
     return f"{official_title} S{season:02d}E{episode:02d}.{lang}{ext}"
 
 
+_SUB_LANG_RE = re.compile(
+    r"\.((?:jp)?(?:sc|tc|chs|cht|gb|big5)(?:jp)?|[a-z]{2}(?:jp)?|zh-[a-z]{2,4})\.[a-z]{3}$",
+    re.IGNORECASE)
+
+
 def subtitle_lang_tag(filename: str) -> str | None:
-    """提取字幕语言标记（scjp / tcjp / sc / tc / zh-CN ...）。"""
-    m = re.search(r"\.([a-zA-Z]{2}(?:jp)?|zh-[A-Za-z]{2,4})\.[a-zA-Z]{3}$", filename)
+    """提取字幕语言标记（scjp / tcjp / sc / tc / JPSC / JPTC / chs / zh-CN ...），原样返回。
+
+    `JP` 在前、大写的写法（VCB-Studio 外挂字幕 `[01][Ma10p_1080p][x265_flac].JPSC.ass`）以前认不出：
+    同一集的简繁两份都落到无后缀的 `S01E01.ass`，先改名的占了位，另一份每轮「集位被占」跳过，
+    超过 12 小时就成了健康报告里的「还是发布名」（2026-11-10 赛博朋克：边缘行者 10 个 `.JPTC.ass`）。
+    """
+    m = _SUB_LANG_RE.search(filename)
     return m.group(1) if m else None
 
 
