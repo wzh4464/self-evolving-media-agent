@@ -158,16 +158,22 @@ sys.exit(p.wait())
     esac
 }
 
+# 切换阶段的 `trap 'revert …' INT TERM` 只能由切换阶段的那个 bash 自己执行。bash 5.3
+# （Ubuntu 26.04）里 `( … )` 子 shell 收到打给进程组的 SIGINT 时会执行从父进程继承来的
+# trap 文本：退回跑进了 uv / 测试的子 shell，在那里打印第一行就死了，父进程既没退回也没
+# 记账（2026-11-17 CI 用 xtrace 复现；bash 3.2 / 5.2 不这样）。所以这两个在切换窗口里跑的
+# 子 shell 进去先把 INT/TERM 复位成默认：子 shell 按默认处置随前台命令一起结束，退回留给父进程。
 uv_in() {   # uv_in <目录> <uv 参数...>：不让外面的虚拟环境变量把 uv 引到别的 venv
     local dir=$1
     shift
-    (cd "$dir" && env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT "$UV" "$@")
+    (trap - INT TERM; cd "$dir" && env -u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT "$UV" "$@")
 }
 
 # 离线测试。DEPLOY_TEST_CMD 只给部署脚本自己的测试用（换成一条轻量命令）。
 # MEDIA_AGENT_DEPLOYING=1 让测试集里"测部署脚本"的那些用例跳过自己，避免递归。
 run_tests() {
     (
+        trap - INT TERM               # 见 uv_in 上面的说明
         cd "$1" || exit 1
         export PYTHONDONTWRITEBYTECODE=1 MEDIA_AGENT_DEPLOYING=1
         unset MEDIA_AGENT_LIVE

@@ -21,6 +21,9 @@
 - **一个 TMDB 条目 404 不再让整轮停问 TMDB**（`scan._tmdb_meta`）：404 是这一个条目没了（被删、并进别的条目），
   只这部用旧值，其余照常问；连不上、5xx 等仍熔断。2026-10 起凭物语 327851、历物语 328198 被 TMDB 并进「物语系列」，
   每轮 404 熔断，排在后面又没有旧标题的番（学生会也有洞！）每轮被 tmdb-identity 挡住改名和抓取，第 7 集播了两天没人抓。
+- **部署被 Ctrl-C 打断时在 bash 5.3 下不退回**（`deploy/deploy.sh`）：bash 5.3（ubuntu-26.04）的 `( … )` 子 shell
+  收到进程组的 SIGINT 会执行父进程继承来的 `revert` trap，退回跑进 uv / 测试的子 shell、打印第一行就死，HEAD 停在新 tag。
+  `uv_in` / `run_tests` 的子 shell 进去先复位 INT/TERM，退回只由切换阶段执行。生产 macOS 的 bash 3.2 行为不变。
 
 ### 变更
 - **偏好「无删减」认「规制解除 / 規制解除 / 限制解除」**（`.agents/preferences.json`）：悠哈璃羽写「规制解除版」，
