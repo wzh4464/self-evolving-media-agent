@@ -439,7 +439,9 @@ if [ -z "${_MA_DEPLOY_COPY:-}" ]; then
         >> "$APP/state/deploy.log" 2>/dev/null || true
     # tee 必须挺过 INT/TERM：打给进程组的信号若先杀了它，后面"自动退回"一往终端写就
     # 吃 SIGPIPE，退回死在半路。bash 只让异步进程自动忽略 INT，TERM 得自己挡。
-    exec > >(trap '' INT TERM; exec tee -a "$APP/state/deploy.log") 2>&1
+    # 再加 -i（POSIX：tee 自己忽略 SIGINT）：ubuntu-26.04（bash 5.3 + uutils tee）上光靠继承来的
+    # 忽略挡不住，tee 照样被 Ctrl-C 杀掉，退回打第一行警告就死（2026-11-18 CI xtrace）。
+    exec > >(trap '' INT TERM; exec tee -i -a "$APP/state/deploy.log") 2>&1
     copy=$(mktemp "${TMPDIR:-/tmp}/media-agent-deploy.XXXXXX") || die "mktemp 失败"
     cp "$0" "$copy" || die "复制部署脚本失败"
     export _MA_DEPLOY_COPY=$copy

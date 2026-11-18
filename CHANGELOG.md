@@ -23,7 +23,8 @@
   每轮 404 熔断，排在后面又没有旧标题的番（学生会也有洞！）每轮被 tmdb-identity 挡住改名和抓取，第 7 集播了两天没人抓。
 - **部署被 Ctrl-C 打断时在 bash 5.3 下不退回**（`deploy/deploy.sh`）：bash 5.3（ubuntu-26.04）的 `( … )` 子 shell
   收到进程组的 SIGINT 会执行父进程继承来的 `revert` trap，退回跑进 uv / 测试的子 shell、打印第一行就死，HEAD 停在新 tag。
-  `uv_in` / `run_tests` 的子 shell 进去先复位 INT/TERM，退回只由切换阶段执行。生产 macOS 的 bash 3.2 行为不变。
+  `uv_in` / `run_tests` 的子 shell 进去先复位 INT/TERM，退回只由切换阶段执行；接 deploy.log 的 `tee` 加 `-i`
+  （26.04 上它照样被 Ctrl-C 杀掉，退回写第一行日志就吃 SIGPIPE）。生产 macOS 的 bash 3.2 行为不变。
 
 ### 变更
 - **偏好「无删减」认「规制解除 / 規制解除 / 限制解除」**（`.agents/preferences.json`）：悠哈璃羽写「规制解除版」，
