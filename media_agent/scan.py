@@ -498,6 +498,14 @@ def _tmdb_meta(ctx: Context, cache, tid: int, dir_name: str, net: dict) -> dict 
         d = ctx.tmdb.tv_detail(tid)
         title, seasons = title_of(d)[0], seasons_of(d)
     except Exception as e:
+        # 404 是**这一个条目**没了（TMDB 删除 / 并入别的条目），不是 TMDB 连不上：只这部用旧值，
+        # 其余照常问。以前一律熔断——2026-10 凭物语 327851、历物语 328198 被 TMDB 并进「物语系列」后
+        # 每轮 404，排在后面、又没有旧标题可用的番（学生会也有洞！刚钉的 283938）因此每轮都被
+        # tmdb-identity 挡住改名和抓取，第 7 集播了两天没人抓。
+        if getattr(getattr(e, "response", None), "status_code", None) == 404:
+            ctx.log(f"[scan] TMDB 条目 {tid}（{dir_name}）已不存在（HTTP 404），这部用上次的；"
+                    f"多半被删或并进了别的条目，要在 sidecar 里改钉")
+            return None
         net["broken"] = _brief(e)
         ctx.log(f"[scan] TMDB 取条目 {tid} 的标题 / 季信息失败（{net['broken']}），用上次的；"
                 f"这一轮其余的也不再问 TMDB")
