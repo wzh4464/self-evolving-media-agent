@@ -13,6 +13,8 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-18
+
 ### 修复
 - **字幕语言后缀认不出 `JPSC` / `JPTC`**（`naming.subtitle_lang_tag`）：VCB-Studio 的外挂字幕把 `JP` 写在前面、
   用大写，旧正则只认 `scjp` / `sc` / `zh-CN` 这类写法，同一集的简繁两份都要改成无后缀的 `S01E0x.ass`——
@@ -635,7 +637,8 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.0...v0.4.1
