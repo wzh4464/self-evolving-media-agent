@@ -555,6 +555,7 @@ class UnrenamedDetector:
                 continue                 # 标题认不准：不按退回的名字改名（LAT-04），tmdb-identity 报原因
             title = show.official_title
             held = None                  # 封存冲突里不该拿集位名的种子：{集位: {hash}}，按需算
+            siblings = None              # 同一个种子里钉着同一集的视频有几份：{(hash, 集位): n}，按需算
             for f in show.files:
                 # 下载中的也要改名 —— 拿到种子就改好，不等下载完。
                 # 走 qBittorrent renameFile 是安全的：它会同步处理 `.!qB` 临时文件
@@ -628,6 +629,11 @@ class UnrenamedDetector:
 
                 if new == stem:
                     continue
+                if real_ext not in SUB_EXTS and f.torrent_hash and _pinned(f) == resolved:
+                    if siblings is None:
+                        siblings = _pinned_siblings(show)
+                    if siblings.get((f.torrent_hash, resolved), 0) > 1:
+                        continue         # 合并发布：先让判重挑，见 `_pinned_siblings`
                 yield Finding(
                     rule=self.id, kind=self.kind, severity="important",
                     summary=(f"{stem} → {new}"
@@ -639,6 +645,25 @@ class UnrenamedDetector:
                                   args={"path": str(f.path), "new_name": new,
                                         "torrent_hash": f.torrent_hash}),
                 )
+
+
+def _pinned_siblings(show: Show) -> dict[tuple[str, tuple[int, int]], int]:
+    """(种子, 钉着的集位) → 这个种子里钉着这一集的正片视频有几份（不下载的条目扫描时已经剔掉）。
+
+    不止一份就是合并发布（一个种子装 TV 版 + 无删减版），**这时谁都不改名**，等判重先挑：
+    2026-11-18《学生会也有洞！》S01E07 `[TV版&无修版]` 两份都提改名到 `S01E07`，执行器按种子里的文件顺序先改了
+    TV 版，限制解除版被「集位被占」跳过——用户要的那份反而拿不到集位名。
+
+    为什么不是「只给偏好分最高的那份改名」：偏好分先看文件名，「限制解除版」只写在原文件名里，改完名判据就没了；
+    而判重排除下载中的种子，改名却是拿到种子就改——等下载完判重再挑，只剩体积这类旁证，不一定还选它。推迟到判重
+    用原文件名作废落选那份（`bundled_version`，只作废一个文件、种子继续做种）之后，这一集只剩一份，改名在同一轮的
+    收敛循环里接上。判重挑不了的（探测不可用、复核不过）由判重自己报，改名不替它二选一。"""
+    out: dict[tuple[str, tuple[int, int]], int] = defaultdict(int)
+    for f in show.files:
+        pin = _pinned(f)
+        if pin and f.torrent_hash and _is_video(f) and not _is_extra(f, show) and not is_phantom(f):
+            out[(f.torrent_hash, pin)] += 1
+    return out
 
 
 # ---------------------------------------------------------------------------
