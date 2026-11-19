@@ -555,6 +555,8 @@ class UnrenamedDetector:
                 continue                 # 标题认不准：不按退回的名字改名（LAT-04），tmdb-identity 报原因
             title = show.official_title
             held = None                  # 封存冲突里不该拿集位名的种子：{集位: {hash}}，按需算
+            # 要改成同一个名字的视频先攒着，一个名字只给一份（`_one_per_name`）
+            pending: dict[str, list[tuple[MediaFile, Finding]]] = defaultdict(list)
             for f in show.files:
                 # 下载中的也要改名 —— 拿到种子就改好，不等下载完。
                 # 走 qBittorrent renameFile 是安全的：它会同步处理 `.!qB` 临时文件
@@ -628,7 +630,7 @@ class UnrenamedDetector:
 
                 if new == stem:
                     continue
-                yield Finding(
+                finding = Finding(
                     rule=self.id, kind=self.kind, severity="important",
                     summary=(f"{stem} → {new}"
                              + ("（下载中，改名不中断下载）" if f.is_incomplete else "")),
@@ -639,6 +641,39 @@ class UnrenamedDetector:
                                   args={"path": str(f.path), "new_name": new,
                                         "torrent_hash": f.torrent_hash}),
                 )
+                if real_ext in SUB_EXTS:
+                    yield finding
+                else:
+                    pending[str(f.path.parent / new)].append((f, finding))
+            yield from _one_per_name(show, pending)
+
+
+def _one_per_name(show: Show, pending: dict[str, list]) -> Iterable[Finding]:
+    """同一个种子里几份钉着同一集的视频要改成同一个名字时，只提一份改名。
+
+    2026-11-18《学生会也有洞！》S01E07：合并发布 `[TV版&无修版]` 一个种子里装着 TV 版和限制解除版，两份都钉着
+    `ma:S01E07`，以前两份都提改名，执行器按种子里的文件顺序先改了 TV 版，限制解除版被「集位被占」跳过——用户要的
+    那份反而拿不到集位名。跨种子的封存冲突由上面的 `held`（`slot_holder`）处理，同一个种子里的撞车没人管。
+
+    挑哪份与判重封存同一个判据（`_seal_candidates`：钉子对、复核通过、按偏好分从高到低），判重留下的就是拿到集位名
+    的那份；落选的不提改名，由判重取舍。偏好分要在**改名之前**比：改完名文件名里的「限制解除版」就没了。
+
+    只管这一种撞车。没钉集号的普通重复照旧都提：判重按画质规则（`_rank_for_keep`）定输赢，改名在这里拿偏好分去挑
+    就会和判重的结论对不上；目标名被占时执行器以「集位被占」跳过、判重腾出位置后同一轮里重试（收敛循环靠这个）。"""
+    for group in pending.values():
+        files = [f for f, _ in group]
+        hashes = {f.torrent_hash for f in files}
+        slots = {_pinned(f) for f in files}
+        if len(group) > 1 and len(hashes) == 1 and None not in hashes and len(slots) == 1 \
+                and None not in slots:
+            season, ep = next(iter(slots))
+            seals = _seal_candidates(files, season, ep, show)
+            if seals:
+                best = seals[0]
+                yield next(fd for f, fd in group if f is best)
+                continue
+        for _f, fd in group:
+            yield fd
 
 
 # ---------------------------------------------------------------------------
