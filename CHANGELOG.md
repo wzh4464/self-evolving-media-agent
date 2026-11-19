@@ -13,6 +13,8 @@
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-19
+
 ### 修复
 - **合并发布里 TV 版抢到集位名**（`unrenamed-file`）：一个种子装着 TV 版和无删减版、两份都钉着同一集时，两份都提
   改名到同一个集位名，执行器按种子里的文件顺序先改了排第一的 TV 版，无删减那份被「集位被占」跳过。2026-11-18
@@ -645,7 +647,8 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.4.1...v0.5.0
