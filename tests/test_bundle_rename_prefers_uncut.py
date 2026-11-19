@@ -10,8 +10,8 @@
 限制解除版被「集位被占」跳过——用户要的那份反而没拿到集位名。跨种子的封存冲突早有 `slot_holder`
 （`tests/test_seal_conflict_quiet.py`），同一个种子里的撞车没人管。
 
-现在：同一个种子里几份钉着同一集的视频要改成同一个名字时，只给判重会封存的那份（`_seal_candidates` 的第一名，
-按偏好分排序）提改名；落选的不提改名，由判重取舍。
+现在：同一个种子里钉着同一集的视频不止一份时，谁都不改名，先让判重用原文件名挑（`bundled_version` 只作废落选
+那一个文件），这一集只剩一份之后改名在同一轮的收敛循环里接上。
 """
 from __future__ import annotations
 
@@ -31,25 +31,44 @@ def _renames(findings):
             if f.action and f.action.op == "rename"}
 
 
-def _bundle(lib, tv_first=True):
+def _bundle(lib, tv_first=True, **kw):
     s1 = lib.show("学生会也有洞！").season(1)
     files = {TV: 495_339_739, UNCUT: 648_826_375}
     if not tv_first:
         files = dict(reversed(list(files.items())))
-    t = s1.torrent(files, name=BUNDLE, layout="nosub", tags="ab:42, ma:S01E07", probe=CHI)
+    t = s1.torrent(files, name=BUNDLE, layout="nosub", tags="ab:42, ma:S01E07", probe=CHI, **kw)
     return s1, t
 
 
-def test_only_the_uncut_file_is_offered_the_slot_name(lib):
-    _bundle(lib)
+@pytest.mark.parametrize("tv_first", [True, False])
+def test_neither_file_is_renamed_before_the_dedupe_has_picked(lib, tv_first):
+    """两份都还叫原名时谁都不改：改了名「限制解除版」这个判据就没了。种子里的顺序不影响。"""
+    _bundle(lib, tv_first=tv_first)
 
-    assert _renames(lib.diagnose()) == {UNCUT: SLOT}
+    found = lib.diagnose()
+
+    assert _renames(found) == {}
+    [void] = [f for f in found if f.kind == "bundled_version"]
+    assert void.path.endswith(TV)
 
 
-def test_order_inside_the_torrent_does_not_matter(lib):
-    _bundle(lib, tv_first=False)
+def test_while_downloading_nothing_is_renamed(lib):
+    """生产上改名发生在抓取后两秒、文件还在下。判重不看下载中的种子，这时先改名就只能凭顺序。"""
+    _bundle(lib, progress=0.3)
 
-    assert _renames(lib.diagnose()) == {UNCUT: SLOT}
+    assert _renames(lib.diagnose()) == {}
+
+
+def test_once_the_download_finishes_the_slot_name_goes_to_the_uncut_file(lib):
+    s1, t = _bundle(lib, progress=0.3)
+    lib.cycle()
+    t.complete()
+    uncut_ident = lib.ident(s1.path / UNCUT)
+
+    lib.converge()                          # 生产的 run：判重作废 TV 版，下一次迭代给限制解除版改名
+
+    assert lib.ident(s1.path / SLOT) == uncut_ident
+    assert lib.disk() == {f"学生会也有洞！/Season 1/{SLOT}": 648_826_375}
 
 
 def test_after_a_round_the_slot_name_is_the_uncut_file_and_nothing_is_skipped(lib):
