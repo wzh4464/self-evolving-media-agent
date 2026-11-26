@@ -13,6 +13,8 @@
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-11-26
+
 ### 修复
 - **合并发布的改名保护在抓取那一刻没生效**（`unrenamed-file`）：v0.5.3 数「同一个种子里钉着这一集的视频有几份」
   时把盘上没有的文件当幻影排除了，而刚加进来的种子两个文件都还没落盘（或只有一个开始写了）——保护没生效，
@@ -656,7 +658,8 @@ probe 探测字幕轨/时长判重；按番指定版本（sidecar `require_any`�
 诊断快照与批量执行之间的状态滞后；与 AutoBangumi 双头下载/改名；
 静默失败无人察觉；测试仅 3 个脚本、无 CI；生产部署靠手工 rsync。
 
-[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/wzh4464/self-evolving-media-agent/compare/v0.5.0...v0.5.1
