@@ -24,6 +24,7 @@ import os
 import pytest
 
 from harness import video
+from media_agent import converge
 from media_agent.kernel import Action, Finding
 
 CHI = video("h264", subs=["chi 简体中文", "chi 繁體中文"])
@@ -110,7 +111,7 @@ def test_when_the_tv_file_already_holds_the_name_the_dedupe_voids_it_and_keeps_t
     assert run.report.unknown == [] and run.report.failed == []
     skips = [r for r in lib.audit() if r["op"] == "rename" and r["status"] == "skipped"
              and "不许重名" in r.get("reason", "")]
-    assert len(skips) == 1                                   # 一轮一条：别的动作挪不开它，不重试
+    assert len(skips) == 1 and not converge.retryable(skips[0])   # 一轮一条：没有动作会去挪不下载的条目，不重试
     assert skips[0]["holder"] == {"index": 0, "name": SLOT, "priority": 0}
     assert not [c for c in lib.qbit.calls if c[0] == "rename_file" and c[1] == t.hash]
 
@@ -129,6 +130,30 @@ def test_once_the_voided_entry_gives_up_the_name_the_next_run_renames_the_uncut_
     assert lib.ident(s1.path / SLOT) == uncut_ident
     assert sorted(lib.qbit.file_names(t.hash)) == sorted([TV, SLOT])
     assert lib.loop().report.applied == []
+
+
+@pytest.mark.parametrize("progress", [0.0, 1.0], ids=["not-downloaded", "downloaded"])
+def test_a_live_entry_of_the_same_torrent_holding_the_name_is_still_a_retryable_occupied_slot(lib, progress):
+    """上面那条跳过只管**不下载**的条目。还要下载的同种子条目照旧由占用闸门拦成「集位被占」——可重试：它自己这一轮
+    可能被改走（PR #6 review 问的就是这个）。盘上有没有文件都一样。"""
+    s1 = lib.show("学生会也有洞！").season(1)
+    t = s1.torrent({SLOT: 495_339_739, UNCUT: 648_826_375}, name=BUNDLE, layout="nosub",
+                   tags="ab:42", probe=CHI, progress=progress)
+
+    def rename(src, dst):
+        return Finding(rule="unrenamed-file", kind="unrenamed", severity="important",
+                       summary=f"{src} → {dst}", show="学生会也有洞！", path=str(s1.path / src),
+                       torrent_hash=t.hash,
+                       action=Action(op="rename", args={"path": str(s1.path / src), "new_name": dst,
+                                                        "torrent_hash": t.hash}))
+
+    rep = lib.apply([rename(UNCUT, SLOT), rename(SLOT, TV)])        # 占着名字的那个排在后面才被改走
+
+    [skip] = rep.skipped
+    assert converge.retryable(skip) and "不许重名" not in skip["reason"]
+    assert [r["args"]["new_name"] for r in rep.applied] == [TV]
+    assert lib.apply([rename(UNCUT, SLOT)]).applied                 # 名字腾出来之后改得成
+    assert sorted(lib.qbit.file_names(t.hash)) == sorted([TV, SLOT])
 
 
 # ------------------------------------------------------------ 抓取的那一刻（2026-11-22 S01E08）
