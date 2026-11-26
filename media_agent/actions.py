@@ -683,6 +683,20 @@ class Executor:
                     "at": old_rel})
                 return
             new_rel = str(Path(old_rel).parent / new_name) if "/" in old_rel else new_name
+            # qBittorrent 不许同一个种子里两个条目重名，哪怕占着名字的那个已设为不下载、文件早进了隔离区。占用索引
+            # 不把不下载的条目算作声明者（它不往盘上写），所以走得到这里；照发 renameFile 就是 409，而新旧两个名字
+            # 此刻都列在条目里，`_rename_landed` 说不清，记成 unknown「也许生效了」。2026-11-22 起学生会 S01E08 就这样
+            # 记了 17 轮，其实一次都没生效。不发请求，照实记跳过；让那个条目自动让位要连回退一起改，没做（见笔记）。
+            # 只管不下载的条目：还要下载的同种子条目是声明者，上面的占用闸门已经按「集位被占」拦下（可重试——
+            # 它自己这一轮可能被改走）。没有动作会去挪一个不下载的条目，所以这条跳过同一轮不重试。
+            holder = self._entry_at(t, entries, target)
+            if holder is not None and holder is not entry and holder.get("priority", 1) == 0:
+                self._audit("skipped", f, a, {
+                    "reason": "同一个种子里一个已设为不下载的条目还叫这个名字，qBittorrent 不许重名，没有发改名请求",
+                    "hint": "把那个条目改成别的名字（它不下载、盘上没有文件，只是让出名字），下一轮就改得成",
+                    "holder": {"index": holder.get("index"), "name": holder.get("name"), "priority": 0},
+                    "at": old_rel})
+                return
             undo = {"op": "rename", "path": str(target), "new_name": path.name, "torrent_hash": h}
             self._intend(undo)
             try:
