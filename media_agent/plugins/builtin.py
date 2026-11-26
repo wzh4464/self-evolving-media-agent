@@ -657,11 +657,17 @@ def _pinned_siblings(show: Show) -> dict[tuple[str, tuple[int, int]], int]:
     为什么不是「只给偏好分最高的那份改名」：偏好分先看文件名，「限制解除版」只写在原文件名里，改完名判据就没了；
     而判重排除下载中的种子，改名却是拿到种子就改——等下载完判重再挑，只剩体积这类旁证，不一定还选它。推迟到判重
     用原文件名作废落选那份（`bundled_version`，只作废一个文件、种子继续做种）之后，这一集只剩一份，改名在同一轮的
-    收敛循环里接上。判重挑不了的（探测不可用、复核不过）由判重自己报，改名不替它二选一。"""
+    收敛循环里接上。判重挑不了的（探测不可用、复核不过）由判重自己报，改名不替它二选一。
+
+    **数的是种子的条目，不看盘上有没有文件。** v0.5.3 在这里多写了一个 `and not is_phantom(f)`（盘上连 `.!qB` 都没有
+    的不算）：刚加进来的种子两个文件都还没落盘，都不算，保护在它唯一要管的那一刻没生效——2026-11-22 S01E08 抓取
+    3 秒后 TV 版又先拿到了集位名，限制解除版此后每轮改名都撞 409。一个文件已经有 `.!qB`、另一个还没开始写时也一样。
+    那个排除想防的「下完之后丢了的那一份拖住另一份」不用它来防：判重会把丢了的那份作废（`bundled_version` 带
+    `phantom`），同一轮的下一次迭代另一份就改名（`tests/test_bundle_rename_prefers_uncut.py` 两头都守着）。"""
     out: dict[tuple[str, tuple[int, int]], int] = defaultdict(int)
     for f in show.files:
         pin = _pinned(f)
-        if pin and f.torrent_hash and _is_video(f) and not _is_extra(f, show) and not is_phantom(f):
+        if pin and f.torrent_hash and _is_video(f) and not _is_extra(f, show):
             out[(f.torrent_hash, pin)] += 1
     return out
 
