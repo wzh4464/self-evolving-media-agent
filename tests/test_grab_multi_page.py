@@ -15,8 +15,11 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from harness import MikanItem, days_ago
 
+from media_agent.plugins import grab
 from media_agent.plugins.grab import EpisodeAvailableDetector
 
 SHOW = "百人女友测试番"
@@ -32,7 +35,7 @@ def _grabs(findings) -> dict[str, dict]:
     return {f.subject: f for f in findings if f.action and f.action.op == "grab_episode"}
 
 
-def _build(lib, *, missing, page1_skip=(), page3_extra=(), page3_skip=()):
+def _build(lib, *, missing, page1_skip=(), page2_extra=(), page3_extra=(), page3_skip=()):
     lib.configure(qbit_allow_empty=True)
     lib.tmdb.add_show(2201, SHOW, seasons={1: C1 + C2 + C3})
     sh = lib.show(SHOW)
@@ -44,6 +47,7 @@ def _build(lib, *, missing, page1_skip=(), page3_extra=(), page3_skip=()):
                season_offsets={"2": 12, "3": 24}, seasons={"1": {"have": have}})
     p1 = [MikanItem(title=LOLI.format(show=SHOW, ep=n), pub=AIR[n]) for n in range(1, 13) if n not in page1_skip]
     p2 = [MikanItem(title=LOLI_S2.format(show=SHOW, ep=n), pub=AIR[12 + n]) for n in range(1, 13)]
+    p2 += list(page2_extra)
     p3 = [MikanItem(title=LOLI.format(show=SHOW, ep=n), pub=AIR[n]) for n in range(25, 37) if n not in page3_skip]
     p3 += list(page3_extra)
     lib.mikan("5001", p1, search=[SHOW])
@@ -60,6 +64,60 @@ def test_missing_episode_is_found_on_the_page_whose_dates_cover_it(lib):
     g = _grabs(fs)
     assert set(g) == {"S01E30"}
     assert "Hyakkano - 30" in g["S01E30"].action.args["title"]
+
+
+def test_pinned_page_does_not_grab_from_an_alternate_page(lib):
+    sh = _build(lib, missing={30})
+    sh.sidecar(pinned=["mikan_id"])
+
+    fs = lib.diagnose(detectors=[EpisodeAvailableDetector])
+
+    assert "S01E30" not in _grabs(fs)
+    [f] = [f for f in fs if f.subject == "S01E30"]
+    assert f.evidence["mikan_pages"] == ["5002"]
+
+
+def test_wrong_season_on_primary_does_not_block_valid_alternate(lib):
+    wrong = MikanItem(title=f"[SomeRaws] {SHOW} 第四季 - 30 [简日内嵌]", pub=AIR[30])
+    _build(lib, missing={30}, page2_extra=[wrong])
+
+    fs = lib.diagnose(detectors=[EpisodeAvailableDetector])
+
+    assert "S01E30" in _grabs(fs)
+    assert "Hyakkano - 30" in _grabs(fs)["S01E30"].action.args["title"]
+
+
+@pytest.mark.allow("log_failure", match="拉候选番组页")
+def test_failed_fallback_pages_count_toward_four_page_limit(lib, monkeypatch):
+    _build(lib, missing={30}, page3_skip={30})
+    monkeypatch.setattr(grab, "_resolve_mikan_id", lambda *a, **kw: "5002")
+    monkeypatch.setattr(grab, "_mikan_candidates", lambda *a, **kw:
+                        ["5002", "5001", "5003", "5004", "5005"])
+    original = grab._feed_cached
+    attempted = []
+
+    def feed(mid, cache):
+        attempted.append(mid)
+        if mid in {"5001", "5003", "5004"}:
+            raise OSError("feed unavailable")
+        if mid == "5005":
+            raise AssertionError("fifth page must not be fetched")
+        return original(mid, cache)
+
+    monkeypatch.setattr(grab, "_feed_cached", feed)
+    fs = lib.diagnose(detectors=[EpisodeAvailableDetector])
+
+    assert attempted == ["5002", "5001", "5003", "5004"]
+    [f] = [f for f in fs if f.subject == "S01E30"]
+    assert f.evidence["mikan_pages"] == attempted
+
+
+def test_alternate_page_is_recorded_as_chosen_release_provenance(lib):
+    _build(lib, missing={30})
+
+    fs = lib.diagnose(detectors=[EpisodeAvailableDetector])
+
+    assert _grabs(fs)["S01E30"].evidence["mikan_id"] == "5003"
 
 
 def test_a_bare_number_on_another_seasons_page_is_not_a_candidate(lib):
